@@ -1,0 +1,49 @@
+{
+  "name": "claude-anywhere",
+  "version": "0.1.0",
+  "description": "/anywhere for Claude Code: a floating, voice-enabled dialog that lets Claude Code see and operate your whole desktop (screen, mouse, keyboard, apps, browser, terminal) on macOS, Windows, WSL and Linux.",
+  "license": "MIT",
+  "author": "Deepanshu Patel",
+  "homepage": "https://github.com/patel-deepanshu/claude-anywhere",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/patel-deepanshu/claude-anywhere.git"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "skill",
+    "plugin",
+    "computer-use",
+    "voice",
+    "automation",
+    "mcp"
+  ],
+  "bin": {
+    "anywhere": "bin/anywhere.js",
+    "claude-anywhere": "bin/anywhere.js"
+  },
+  "main": "src/daemon/main.js",
+  "files": [
+    "bin/",
+    "src/",
+    "skills/",
+    "scripts/",
+    ".claude-plugin/",
+    ".mcp.json",
+    "docs/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "start": "node bin/anywhere.js start",
+    "doctor": "node bin/anywhere.js doctor",
+    "lint": "node scripts/check-syntax.js"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
