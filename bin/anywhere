@@ -1,0 +1,53 @@
+#!/bin/sh
+# Claude Anywhere CLI shim: finds Node.js and runs bin/anywhere.js next to this file.
+# Works when symlinked (e.g. ~/.local/bin/anywhere) and when Claude Code adds the
+# plugin's bin/ directory to the Bash PATH.
+
+script="$0"
+# Follow symlinks so the package is found from ~/.local/bin and similar.
+while [ -h "$script" ]; do
+  link=$(readlink "$script")
+  case "$link" in
+    /*) script="$link" ;;
+    *) script="$(dirname "$script")/$link" ;;
+  esac
+done
+dir=$(CDPATH='' cd -- "$(dirname -- "$script")" && pwd -P)
+
+node_bin="${ANYWHERE_NODE:-}"
+if [ -z "$node_bin" ]; then
+  if command -v node >/dev/null 2>&1; then
+    node_bin=node
+  else
+    # GUI launchers and hotkeys often run with a minimal PATH: try the usual places.
+    for candidate in \
+      /opt/homebrew/bin/node \
+      /usr/local/bin/node \
+      /usr/bin/node \
+      "$HOME/.volta/bin/node" \
+      "$HOME/.local/bin/node" \
+      "$HOME/.nodenv/shims/node" \
+      "$HOME/.asdf/shims/node" \
+      "$HOME/.local/share/mise/shims/node" \
+      "$HOME/.nix-profile/bin/node"; do
+      if [ -x "$candidate" ]; then node_bin="$candidate"; break; fi
+    done
+    if [ -z "$node_bin" ] && [ -d "$HOME/.nvm/versions/node" ]; then
+      for candidate in "$HOME"/.nvm/versions/node/*/bin/node; do
+        if [ -x "$candidate" ]; then node_bin="$candidate"; fi
+      done
+    fi
+  fi
+fi
+
+if [ -z "$node_bin" ]; then
+  echo "Claude Anywhere needs Node.js 18.17 or newer, and 'node' was not found." >&2
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) echo "Install it: brew install node   (or the LTS installer from https://nodejs.org)" >&2 ;;
+    *) echo "Install it with your package manager, or: curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash && nvm install --lts" >&2 ;;
+  esac
+  echo "Or point ANYWHERE_NODE at a node binary." >&2
+  exit 1
+fi
+
+exec "$node_bin" "$dir/anywhere.js" "$@"

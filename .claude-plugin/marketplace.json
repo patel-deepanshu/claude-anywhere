@@ -1,0 +1,26 @@
+{
+  "name": "anywhere-marketplace",
+  "owner": {
+    "name": "Deepanshu Patel"
+  },
+  "metadata": {
+    "description": "Claude Anywhere: control your whole computer from a floating, voice-enabled Claude Code dialog.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "anywhere",
+      "source": ".",
+      "description": "/anywhere opens a floating, voice-enabled dialog from which Claude Code sees and operates your desktop (screen, mouse, keyboard, apps, browser, terminal) to carry out tasks like \"deploy this repo to GCP\".",
+      "version": "0.1.0",
+      "category": "productivity",
+      "author": {
+        "name": "Deepanshu Patel"
+      },
+      "homepage": "https://github.com/patel-deepanshu/claude-anywhere",
+      "repository": "https://github.com/patel-deepanshu/claude-anywhere",
+      "license": "MIT",
+      "keywords": ["computer-use", "voice", "desktop-automation", "mcp"]
+    }
+  ]
+}

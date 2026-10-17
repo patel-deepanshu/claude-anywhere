@@ -57,9 +57,9 @@ update this file in the same commit.
 ## 2. File layout
 
 ```
-.claude-plugin/plugin.json          plugin manifest (name "anywhere")
+.claude-plugin/plugin.json          plugin manifest (name "anywhere"; inline mcpServers "anywhere" → node ${CLAUDE_PLUGIN_ROOT}/src/mcp/server.js.
+                                    Inline rather than a root .mcp.json, which would also load as a broken project server in this repo)
 .claude-plugin/marketplace.json     marketplace "anywhere-marketplace" listing plugin "anywhere" with source "."
-.mcp.json                           plugin MCP server "anywhere" → node ${CLAUDE_PLUGIN_ROOT}/src/mcp/server.js
 skills/anywhere/SKILL.md            the /anywhere skill
 skills/anywhere/run.js              locates the package and forwards argv to bin/anywhere.js
 bin/anywhere.js                     CLI entry point
