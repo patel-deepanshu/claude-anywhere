@@ -169,7 +169,10 @@ test('chromiumArgs: app window switches with our profile', () => {
     '--class=claude-anywhere',
     '--disable-session-crashed-bubble',
   ]);
-  assert.ok(U.chromiumArgs({ url: URL_, profileDir: '/p', width: 1, height: 1, noSandbox: true }).includes('--no-sandbox'));
+  const rootArgs = U.chromiumArgs({ url: URL_, profileDir: '/p', width: 1, height: 1, noSandbox: true });
+  assert.ok(rootArgs.includes('--no-sandbox'));
+  assert.ok(rootArgs.includes('--test-type'), '--test-type hides the "unsupported command-line flag" infobar');
+  assert.ok(!args.includes('--test-type'));
   assert.ok(!U.chromiumArgs({ url: URL_, profileDir: '/p', width: 1, height: 1 }).some((a) => a.startsWith('--window-position')));
 });
 
