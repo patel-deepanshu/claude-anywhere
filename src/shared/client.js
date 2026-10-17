@@ -2,7 +2,18 @@
 
 /** HTTP client for the daemon API, used by the CLI, MCP server and TUI. */
 
+const http = require('http');
+const https = require('https');
 const { findRunningDaemon } = require('./state');
+
+function abortError(signal) {
+  const reason = signal && signal.reason;
+  if (reason instanceof Error) return reason;
+  const err = new Error('The operation was aborted');
+  err.name = 'AbortError';
+  err.code = 'ABORT_ERR';
+  return err;
+}
 
 class DaemonClient {
   /** @param {{baseUrl:string, token:string}} opts */
@@ -26,67 +37,102 @@ class DaemonClient {
   }
 
   /**
+   * JSON request over node:http. Not fetch: undici aborts responses whose
+   * headers take longer than 300 s, and approvals or questions can block for
+   * much longer than that.
    * @param {string} method
    * @param {string} path
    * @param {object} [body]
-   * @param {{timeoutMs?:number}} [opts]
+   * @param {{timeoutMs?:number, signal?:AbortSignal}} [opts]
    */
-  async request(method, path, body, { timeoutMs = 30000 } = {}) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  async request(method, path, body, { timeoutMs = 30000, signal } = {}) {
+    const payload = body !== undefined ? Buffer.from(JSON.stringify(body)) : null;
+    const headers = this.headers(payload ? { 'Content-Type': 'application/json' } : {});
+    const { status, text } = await this.raw(method, path, payload, headers, { timeoutMs, signal });
+    let data;
     try {
-      const res = await fetch(this.baseUrl + path, {
-        method,
-        headers: this.headers(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-        body: body !== undefined ? JSON.stringify(body) : undefined,
-        signal: ctrl.signal,
-      });
-      const text = await res.text();
-      let data;
-      try {
-        data = text ? JSON.parse(text) : {};
-      } catch {
-        data = { raw: text };
-      }
-      if (!res.ok) {
-        const err = new Error((data && data.error) || `HTTP ${res.status}`);
-        err.status = res.status;
-        err.data = data;
-        throw err;
-      }
-      return data;
-    } catch (err) {
-      if (err.name === 'AbortError') {
-        const e = new Error(`Request to ${path} timed out after ${timeoutMs} ms`);
-        e.code = 'ETIMEDOUT';
-        throw e;
-      }
-      throw err;
-    } finally {
-      clearTimeout(timer);
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { raw: text };
     }
+    if (status < 200 || status >= 300) {
+      const err = new Error((data && data.error) || `HTTP ${status}`);
+      err.status = status;
+      err.data = data;
+      throw err;
+    }
+    return data;
   }
 
-  async postBinary(path, buffer, contentType, { timeoutMs = 120000 } = {}) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  async postBinary(path, buffer, contentType, { timeoutMs = 120000, signal } = {}) {
+    const { status, text } = await this.raw('POST', path, buffer, this.headers({ 'Content-Type': contentType }), {
+      timeoutMs,
+      signal,
+    });
+    let data;
     try {
-      const res = await fetch(this.baseUrl + path, {
-        method: 'POST',
-        headers: this.headers({ 'Content-Type': contentType }),
-        body: buffer,
-        signal: ctrl.signal,
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const err = new Error(data.error || `HTTP ${res.status}`);
-        err.status = res.status;
-        throw err;
-      }
-      return data;
-    } finally {
-      clearTimeout(timer);
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { raw: text };
     }
+    if (status < 200 || status >= 300) {
+      const err = new Error((data && data.error) || `HTTP ${status}`);
+      err.status = status;
+      err.data = data;
+      throw err;
+    }
+    return data;
+  }
+
+  /** @returns {Promise<{status:number, text:string}>} */
+  raw(method, path, payload, headers, { timeoutMs = 30000, signal } = {}) {
+    return new Promise((resolve, reject) => {
+      if (signal && signal.aborted) {
+        reject(abortError(signal));
+        return;
+      }
+      let url;
+      try {
+        url = new URL(this.baseUrl + path);
+      } catch (err) {
+        reject(err);
+        return;
+      }
+      const lib = url.protocol === 'https:' ? https : http;
+      const hdrs = { ...headers };
+      if (payload) hdrs['Content-Length'] = payload.length;
+      let settled = false;
+      const done = (fn, v) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', onAbort);
+        fn(v);
+      };
+      const req = lib.request(
+        { method, hostname: url.hostname, port: url.port, path: url.pathname + url.search, headers: hdrs, agent: false },
+        (res) => {
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => done(resolve, { status: res.statusCode || 0, text: Buffer.concat(chunks).toString('utf8') }));
+          res.on('error', (err) => done(reject, err));
+        },
+      );
+      const timer = setTimeout(() => {
+        const e = new Error(`Request to ${path} timed out after ${Math.round(timeoutMs / 1000)} s`);
+        e.code = 'ETIMEDOUT';
+        req.destroy();
+        done(reject, e);
+      }, timeoutMs);
+      const onAbort = () => {
+        req.destroy();
+        done(reject, abortError(signal));
+      };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      req.on('error', (err) => done(reject, err));
+      if (payload) req.end(payload);
+      else req.end();
+    });
   }
 
   /**

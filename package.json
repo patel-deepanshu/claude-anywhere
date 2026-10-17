@@ -30,7 +30,6 @@
     "skills/",
     "scripts/",
     ".claude-plugin/",
-    ".mcp.json",
     "docs/",
     "README.md",
     "LICENSE"

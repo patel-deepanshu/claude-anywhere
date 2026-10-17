@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <title>Claude Anywhere</title>
+  <link rel="icon" type="image/svg+xml" href="icon.svg">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <svg class="sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="2.5" width="6" height="12" rx="3"/><path d="M5 10.5v.5a7 7 0 0 0 14 0v-.5M12 18v3.5M8.5 21.5h7"/></symbol>
+      <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19.5V5M5.5 11.5 12 5l6.5 6.5"/></symbol>
+      <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2" class="fill"/></symbol>
+      <symbol id="i-screen" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12.5" rx="2"/><path d="M8.5 20.5h7M12 16.5v4"/></symbol>
+      <symbol id="i-gear" viewBox="0 0 24 24"><path d="M19.34 10.03L21.89 10.52L21.89 13.48L19.34 13.97L18.58 15.80L20.04 17.95L17.95 20.04L15.80 18.58L13.97 19.34L13.48 21.89L10.52 21.89L10.03 19.34L8.20 18.58L6.05 20.04L3.96 17.95L5.42 15.80L4.66 13.97L2.11 13.48L2.11 10.52L4.66 10.03L5.42 8.20L3.96 6.05L6.05 3.96L8.20 5.42L10.03 4.66L10.52 2.11L13.48 2.11L13.97 4.66L15.80 5.42L17.95 3.96L20.04 6.05L18.58 8.20Z"/><circle cx="12" cy="12" r="3"/></symbol>
+      <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H9l2 2.5h7.5A2.5 2.5 0 0 1 21 10v7.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></symbol>
+      <symbol id="i-spinner" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" class="track"/><path d="M12 3.5a8.5 8.5 0 0 1 8.5 8.5"/></symbol>
+      <symbol id="i-mouse" viewBox="0 0 24 24"><path d="M5.5 3.5l13 6.2-5.6 1.9-2.3 5.9z"/><path d="M13 11.6l5.5 5.5"/></symbol>
+      <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6.5 10h.01M10 10h.01M14 10h.01M17.5 10h.01M7.5 14h9"/></symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="16" rx="2.5"/><path d="M7 9.5l3 2.5-3 2.5M12.5 15h4.5"/></symbol>
+      <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7.5A2.5 2.5 0 0 0 5 5.5v13A2.5 2.5 0 0 0 7.5 21h9a2.5 2.5 0 0 0 2.5-2.5V8z"/><path d="M14 3v5h5M8.5 13h7M8.5 16.5h5"/></symbol>
+      <symbol id="i-web" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a13.5 13.5 0 0 1 0 18M12 3a13.5 13.5 0 0 0 0 18"/></symbol>
+      <symbol id="i-tool" viewBox="0 0 24 24"><path d="M13 2.5L4.5 13.5h6.5l-1 8 8.5-11h-6.5z"/></symbol>
+      <symbol id="i-window" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 8.5h18M6.5 6.3h.01M9 6.3h.01"/></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M6.5 9.5 12 15l5.5-5.5"/></symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11.5" height="11.5" rx="2.5"/><path d="M5.5 15H5a1.5 1.5 0 0 1-1.5-1.5V5A1.5 1.5 0 0 1 5 3.5h8.5A1.5 1.5 0 0 1 15 5v.5"/></symbol>
+      <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+      <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16.5v-5M12 8h.01"/></symbol>
+      <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 4.2a2 2 0 0 1 3.4 0l7.6 13.3a2 2 0 0 1-1.7 3H4.4a2 2 0 0 1-1.7-3z"/><path d="M12 9.5v4M12 17h.01"/></symbol>
+      <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7.5 3v5.5c0 4.8-3.2 8.2-7.5 9.5-4.3-1.3-7.5-4.7-7.5-9.5V6z"/></symbol>
+      <symbol id="i-question" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.6 9.3a2.5 2.5 0 0 1 4.9.7c0 1.7-2.5 2.2-2.5 4M12 17h.01"/></symbol>
+      <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></symbol>
+      <symbol id="i-spark" viewBox="0 0 24 24"><path class="fill" d="M12 2.5c.5 4.6 2.6 6.8 7.2 7.6l2.3.4-2.3.4c-4.6.8-6.7 3-7.2 7.6l-.2 2.5-.2-2.5c-.5-4.6-2.6-6.8-7.2-7.6L2.1 10.5l2.3-.4C9 9.3 11.1 7.1 11.6 2.5l.2-2z"/></symbol>
+      <symbol id="i-volume" viewBox="0 0 24 24"><path d="M11 5.5 6.5 9H3.5v6h3l4.5 3.5z"/><path d="M15.5 9a4.5 4.5 0 0 1 0 6M18.5 6a8.5 8.5 0 0 1 0 12"/></symbol>
+      <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3.5" width="18" height="17" rx="2.5"/><circle cx="9" cy="9" r="1.8"/><path d="M20.5 15.5l-5-5L5 20.5"/></symbol>
+      <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v8.5M17.7 6.8a8 8 0 1 1-11.4 0"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1L20.5 8.5M20.5 3.5v5h-5"/></symbol>
+      <symbol id="i-clip" viewBox="0 0 24 24"><path d="M20.5 11.5l-8.2 8.2a5 5 0 0 1-7.1-7.1l8.6-8.6a3.4 3.4 0 0 1 4.8 4.8l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l7.9-7.9"/></symbol>
+      <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6.5h11M9 12h11M9 17.5h11M4.5 6.5h.01M4.5 12h.01M4.5 17.5h.01"/></symbol>
+      <symbol id="i-branch" viewBox="0 0 24 24"><circle cx="6.5" cy="5.5" r="2"/><circle cx="6.5" cy="18.5" r="2"/><circle cx="17.5" cy="7.5" r="2"/><path d="M6.5 7.5v9M17.5 9.5c0 4-5 3.5-9.5 7.5"/></symbol>
+    </defs>
+  </svg>
+
+  <div class="app" id="app">
+    <header class="topbar">
+      <div class="topbar-row">
+        <div class="status-pill" id="status" data-state="offline" role="status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span class="status-label" id="status-label">Connecting</span>
+        </div>
+        <span class="status-detail" id="status-detail"></span>
+        <div class="topbar-actions">
+          <button type="button" class="icon-btn" id="new-session" aria-label="New session" title="New session">
+            <svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="open-settings" aria-label="Settings" title="Settings" aria-haspopup="dialog" aria-controls="drawer">
+            <svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="topbar-row">
+        <button type="button" class="project-chip" id="project-chip" aria-haspopup="dialog" aria-expanded="false" aria-controls="project-pop" title="Switch project">
+          <svg class="icon" aria-hidden="true"><use href="#i-folder"/></svg>
+          <span class="project-name" id="project-name">No project</span>
+          <span class="project-branch" id="project-branch" hidden>
+            <svg class="icon icon-xs" aria-hidden="true"><use href="#i-branch"/></svg><span id="project-branch-name"></span>
+          </span>
+          <svg class="icon icon-xs chev" aria-hidden="true"><use href="#i-chevron"/></svg>
+        </button>
+        <button type="button" class="mode-badge" id="mode-badge" aria-haspopup="dialog" aria-expanded="false" aria-controls="mode-pop" data-mode="companion">
+          <span class="mode-dot" id="mode-dot" aria-hidden="true"></span>
+          <span id="mode-label">Companion</span>
+        </button>
+      </div>
+    </header>
+
+    <div class="banner" id="banner" role="alert" hidden>
+      <svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg>
+      <span class="banner-text" id="banner-text"></span>
+      <button type="button" class="btn btn-sm" id="banner-retry" hidden>Retry</button>
+    </div>
+
+    <section class="view" id="view" hidden aria-label="Claude's view">
+      <button type="button" class="view-head" id="view-toggle" aria-expanded="false" aria-controls="view-body">
+        <svg class="icon" aria-hidden="true"><use href="#i-eye"/></svg>
+        <span class="view-title">Claude's view</span>
+        <span class="view-time" id="view-time"></span>
+        <svg class="icon icon-xs chev" aria-hidden="true"><use href="#i-chevron"/></svg>
+      </button>
+      <div class="view-body" id="view-body" hidden>
+        <button type="button" class="view-img-btn" id="view-img-btn" aria-label="Open the latest screenshot">
+          <img id="view-img" alt="The latest screenshot Claude took">
+        </button>
+      </div>
+    </section>
+
+    <main class="log-wrap">
+      <div class="log" id="log" role="log" aria-live="polite" aria-relevant="additions text" aria-label="Conversation with Claude" tabindex="-1">
+        <div class="empty" id="empty" hidden>
+          <div class="empty-mark" aria-hidden="true"><svg class="icon"><use href="#i-spark"/></svg></div>
+          <h1 class="empty-title" id="empty-title">What can I do for you?</h1>
+          <p class="empty-sub" id="empty-sub">I can see your screen, use your apps and run commands in your project. Type or talk.</p>
+          <div class="suggestions" id="suggestions"></div>
+        </div>
+        <div class="items" id="items"></div>
+        <div class="typing" id="typing" hidden aria-hidden="true"><span></span><span></span><span></span></div>
+      </div>
+      <button type="button" class="jump" id="jump" hidden>
+        <svg class="icon icon-xs" aria-hidden="true"><use href="#i-down"/></svg> Latest
+      </button>
+      <div class="toasts" id="toasts" aria-live="polite"></div>
+    </main>
+
+    <section class="cards" id="cards" aria-label="Waiting for your answer"></section>
+
+    <form class="composer" id="composer" autocomplete="off">
+      <div class="voice-line" id="voice-line" hidden>
+        <span class="meter" id="meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+        <span class="voice-text" id="voice-text" aria-live="polite">Listening…</span>
+        <button type="button" class="icon-btn icon-btn-sm" id="voice-cancel" aria-label="Cancel voice input" title="Cancel (Esc)">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"/></svg>
+        </button>
+      </div>
+      <div class="attachments" id="attachments" hidden></div>
+      <label class="sr-only" for="input">Message Claude</label>
+      <textarea id="input" rows="1" placeholder="Tell Claude what to do…" spellcheck="true" enterkeyhint="send"></textarea>
+      <div class="composer-bar">
+        <button type="button" class="chip-toggle" id="screen-toggle" aria-pressed="false" aria-label="Include screen" title="Attach a screenshot of your screen to each message">
+          <svg class="icon icon-sm" aria-hidden="true"><use href="#i-screen"/></svg>
+          <span>Include screen</span>
+        </button>
+        <span class="composer-hint" id="composer-hint">Enter to send · Shift+Enter for a new line</span>
+        <span class="spacer"></span>
+        <button type="button" class="icon-btn mic-btn" id="mic" aria-pressed="false" aria-label="Voice input" title="Voice: click to start or stop, hold to talk">
+          <svg class="icon" aria-hidden="true"><use href="#i-mic"/></svg>
+        </button>
+        <button type="submit" class="send-btn" id="send" aria-label="Send" title="Send (Enter)">
+          <svg class="icon" aria-hidden="true"><use id="send-icon" href="#i-send"/></svg>
+        </button>
+      </div>
+    </form>
+
+    <footer class="statusbar" id="statusbar">
+      <span class="sb-item" id="sb-model" title="Model">Default model</span>
+      <span class="sb-sep" aria-hidden="true">·</span>
+      <span class="sb-item" id="sb-cost" title="Cost of this session">$0.00</span>
+      <span class="spacer"></span>
+      <span class="sb-item sb-voice" id="sb-voice" title="Voice providers">
+        <svg class="icon icon-xs" aria-hidden="true"><use href="#i-mic"/></svg><span id="sb-stt">…</span>
+        <svg class="icon icon-xs" aria-hidden="true"><use href="#i-volume"/></svg><span id="sb-tts">…</span>
+      </span>
+    </footer>
+  </div>
+
+  <div class="popover" id="project-pop" role="dialog" aria-label="Switch project" hidden>
+    <div class="pop-head">Projects</div>
+    <div class="pop-list" id="project-list" role="listbox" aria-label="Detected projects"></div>
+    <form class="pop-form" id="project-form" autocomplete="off">
+      <label class="sr-only" for="project-path">Folder path</label>
+      <input type="text" id="project-path" placeholder="Type a folder path…" spellcheck="false">
+      <button type="submit" class="btn btn-sm btn-primary">Open</button>
+    </form>
+  </div>
+
+  <div class="popover" id="mode-pop" role="dialog" aria-label="Working style" hidden>
+    <div class="pop-head">Working style</div>
+    <button type="button" class="pop-option" data-mode="companion">
+      <span class="pop-option-title"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-spark"/></svg>Companion</span>
+      <span class="pop-option-sub">A dedicated Claude Code session works behind this dialog. Your terminal stays free.</span>
+    </button>
+    <button type="button" class="pop-option" data-mode="bridge">
+      <span class="pop-option-title"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-terminal"/></svg>Bridge</span>
+      <span class="pop-option-sub">Commands go to the Claude Code terminal that ran “/anywhere here”, so you can watch it work.</span>
+    </button>
+    <p class="pop-note" id="mode-note"></p>
+  </div>
+
+  <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+  <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" hidden>
+    <div class="drawer-head">
+      <h2 id="drawer-title">Settings</h2>
+      <button type="button" class="icon-btn" id="close-settings" aria-label="Close settings">
+        <svg class="icon" aria-hidden="true"><use href="#i-x"/></svg>
+      </button>
+    </div>
+    <form class="drawer-body" id="settings-form" autocomplete="off">
+      <fieldset class="set-group">
+        <legend>Permissions</legend>
+        <div class="segmented" role="radiogroup" aria-label="Permission mode">
+          <label><input type="radio" name="permissions.mode" value="ask" data-key="permissions.mode"><span>Ask</span></label>
+          <label><input type="radio" name="permissions.mode" value="smart" data-key="permissions.mode"><span>Smart</span></label>
+          <label><input type="radio" name="permissions.mode" value="auto" data-key="permissions.mode"><span>Autopilot</span></label>
+        </div>
+        <p class="set-help" id="perm-help"></p>
+        <label class="set-row">
+          <span class="set-label">Approval timeout <small>seconds before an unanswered request is denied</small></span>
+          <input type="number" min="10" max="86400" step="10" data-key="permissions.approvalTimeoutSec" class="input input-num">
+        </label>
+      </fieldset>
+
+      <fieldset class="set-group">
+        <legend>Working style</legend>
+        <div class="segmented" role="radiogroup" aria-label="Working style">
+          <label><input type="radio" name="mode" value="companion" data-key="mode"><span>Companion</span></label>
+          <label><input type="radio" name="mode" value="bridge" data-key="mode"><span>Bridge</span></label>
+        </div>
+        <p class="set-help">Bridge sends your commands to the Claude Code terminal that ran “/anywhere here”.</p>
+      </fieldset>
+
+      <fieldset class="set-group">
+        <legend>Voice</legend>
+        <label class="set-row">
+          <span class="set-label">Speech input</span>
+          <select class="input" data-key="voice.stt">
+            <option value="auto">Automatic</option>
+            <option value="browser">Browser speech recognition</option>
+            <option value="server">Server transcription</option>
+            <option value="off">Off</option>
+          </select>
+        </label>
+        <label class="set-row">
+          <span class="set-label">Language</span>
+          <input type="text" class="input" data-key="voice.language" list="lang-list" placeholder="en-US" spellcheck="false">
+        </label>
+        <datalist id="lang-list">
+          <option value="en-US"><option value="en-GB"><option value="en-IN"><option value="hi-IN"><option value="es-ES"><option value="es-MX">
+          <option value="fr-FR"><option value="de-DE"><option value="it-IT"><option value="pt-BR"><option value="nl-NL"><option value="ja-JP">
+          <option value="ko-KR"><option value="zh-CN"><option value="ru-RU"><option value="ar-SA"><option value="tr-TR"><option value="pl-PL">
+        </datalist>
+        <label class="set-switch"><input type="checkbox" data-key="voice.autoSend"><span class="switch" aria-hidden="true"></span><span class="set-label">Send when I stop talking</span></label>
+        <label class="set-switch"><input type="checkbox" data-key="voice.speakResponses"><span class="switch" aria-hidden="true"></span><span class="set-label">Speak Claude's answers</span></label>
+        <label class="set-switch"><input type="checkbox" data-key="voice.handsFree"><span class="switch" aria-hidden="true"></span><span class="set-label">Hands-free <small>keep listening for the wake word</small></span></label>
+        <label class="set-row">
+          <span class="set-label">Wake word</span>
+          <input type="text" class="input" data-key="voice.wakeWord" placeholder="hey claude" spellcheck="false">
+        </label>
+        <label class="set-row">
+          <span class="set-label">Speech output</span>
+          <select class="input" data-key="voice.tts">
+            <option value="auto">Automatic</option>
+            <option value="browser">Browser voices</option>
+            <option value="server">System voice (daemon)</option>
+            <option value="off">Off</option>
+          </select>
+        </label>
+        <label class="set-row">
+          <span class="set-label">Voice</span>
+          <select class="input" data-key="voice.ttsVoice" id="tts-voice">
+            <option value="">System default</option>
+          </select>
+        </label>
+        <label class="set-row">
+          <span class="set-label">Speaking rate <output id="rate-out" class="set-value">1.0×</output></span>
+          <input type="range" min="0.5" max="2" step="0.1" data-key="voice.ttsRate" id="tts-rate">
+        </label>
+        <div class="set-actions">
+          <button type="button" class="btn btn-sm" id="test-voice"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-volume"/></svg>Test voice</button>
+        </div>
+        <details class="set-details">
+          <summary>Server transcription</summary>
+          <p class="set-help">Used in Electron, Firefox, or when the browser can't transcribe. Works with Groq or OpenAI keys (also read from GROQ_API_KEY / OPENAI_API_KEY), any OpenAI-compatible endpoint, or a local whisper.cpp.</p>
+          <label class="set-row">
+            <span class="set-label">Provider</span>
+            <select class="input" data-key="voice.sttProvider">
+              <option value="auto">Automatic</option>
+              <option value="groq">Groq</option>
+              <option value="openai">OpenAI</option>
+              <option value="custom">Custom (OpenAI-compatible)</option>
+              <option value="whisper.cpp">whisper.cpp (local)</option>
+            </select>
+          </label>
+          <label class="set-row">
+            <span class="set-label">Base URL</span>
+            <input type="url" class="input" data-key="voice.sttBaseUrl" placeholder="https://api.groq.com/openai/v1" spellcheck="false">
+          </label>
+          <label class="set-row">
+            <span class="set-label">API key</span>
+            <input type="password" class="input" data-key="voice.sttApiKey" id="stt-key" placeholder="Not set" autocomplete="new-password" spellcheck="false">
+          </label>
+          <label class="set-row">
+            <span class="set-label">Model</span>
+            <input type="text" class="input" data-key="voice.sttModel" placeholder="whisper-large-v3-turbo" spellcheck="false">
+          </label>
+          <label class="set-row">
+            <span class="set-label">whisper.cpp binary</span>
+            <input type="text" class="input" data-key="voice.whisperCppPath" placeholder="whisper-cli" spellcheck="false">
+          </label>
+          <label class="set-row">
+            <span class="set-label">whisper.cpp model file</span>
+            <input type="text" class="input" data-key="voice.whisperModel" placeholder="~/.claude-anywhere/models/ggml-base.en.bin" spellcheck="false">
+          </label>
+        </details>
+        <p class="set-help" id="voice-diag"></p>
+      </fieldset>
+
+      <fieldset class="set-group">
+        <legend>Engine</legend>
+        <label class="set-row">
+          <span class="set-label">Model <small>blank uses your Claude Code default</small></span>
+          <input type="text" class="input" data-key="engine.model" list="model-list" placeholder="Default" spellcheck="false">
+        </label>
+        <datalist id="model-list"><option value="opus"><option value="sonnet"><option value="haiku"><option value="fable"></datalist>
+        <label class="set-row">
+          <span class="set-label">Effort</span>
+          <select class="input" data-key="engine.effort">
+            <option value="">Default</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="xhigh">Extra high</option>
+            <option value="max">Max</option>
+          </select>
+        </label>
+        <label class="set-row">
+          <span class="set-label">Budget per session <small>USD, 0 = no limit</small></span>
+          <input type="number" min="0" step="0.5" data-key="engine.maxBudgetUsd" class="input input-num">
+        </label>
+        <label class="set-switch"><input type="checkbox" data-key="engine.chrome"><span class="switch" aria-hidden="true"></span><span class="set-label">Claude in Chrome <small>drive your logged-in Chrome through the extension</small></span></label>
+        <label class="set-switch"><input type="checkbox" data-key="engine.addVsCodeWorkspaces"><span class="switch" aria-hidden="true"></span><span class="set-label">Give Claude access to open VS Code workspaces</span></label>
+        <label class="set-switch"><input type="checkbox" data-key="engine.resumeLast"><span class="switch" aria-hidden="true"></span><span class="set-label">Resume the last session for a project</span></label>
+      </fieldset>
+
+      <fieldset class="set-group">
+        <legend>Context</legend>
+        <label class="set-switch"><input type="checkbox" data-key="context.attachDesktopContext"><span class="switch" aria-hidden="true"></span><span class="set-label">Attach desktop context <small>open windows, editors, browser tabs, git and cloud CLIs</small></span></label>
+        <label class="set-switch"><input type="checkbox" data-key="context.attachScreenshotByDefault"><span class="switch" aria-hidden="true"></span><span class="set-label">Attach a screenshot by default</span></label>
+        <label class="set-switch"><input type="checkbox" data-key="context.includeCloud"><span class="switch" aria-hidden="true"></span><span class="set-label">Include cloud CLI accounts (gcloud, aws, az, kubectl)</span></label>
+      </fieldset>
+
+      <fieldset class="set-group">
+        <legend>Screen control</legend>
+        <label class="set-switch"><input type="checkbox" data-key="computer.failsafe"><span class="switch" aria-hidden="true"></span><span class="set-label">Failsafe <small>move the mouse to the top-left corner to pause Claude</small></span></label>
+        <label class="set-row">
+          <span class="set-label">Delay after each action <small>ms</small></span>
+          <input type="number" min="0" max="5000" step="10" data-key="computer.actionDelayMs" class="input input-num">
+        </label>
+      </fieldset>
+
+      <fieldset class="set-group">
+        <legend>Appearance</legend>
+        <div class="segmented" role="radiogroup" aria-label="Theme">
+          <label><input type="radio" name="ui.theme" value="system" data-key="ui.theme"><span>System</span></label>
+          <label><input type="radio" name="ui.theme" value="light" data-key="ui.theme"><span>Light</span></label>
+          <label><input type="radio" name="ui.theme" value="dark" data-key="ui.theme"><span>Dark</span></label>
+        </div>
+        <label class="set-switch"><input type="checkbox" data-key="ui.alwaysOnTop"><span class="switch" aria-hidden="true"></span><span class="set-label">Keep this window on top</span></label>
+        <label class="set-switch"><input type="checkbox" data-key="ui.hideFromScreenshots"><span class="switch" aria-hidden="true"></span><span class="set-label">Hide this window from screenshots <small>desktop app only</small></span></label>
+      </fieldset>
+
+      <fieldset class="set-group">
+        <legend>Privacy</legend>
+        <label class="set-switch"><input type="checkbox" data-key="privacy.auditLog"><span class="switch" aria-hidden="true"></span><span class="set-label">Keep an audit log of actions</span></label>
+        <label class="set-switch"><input type="checkbox" data-key="privacy.redactSecretsInLogs"><span class="switch" aria-hidden="true"></span><span class="set-label">Redact secrets in logs</span></label>
+      </fieldset>
+
+      <div class="set-about" id="about"></div>
+
+      <div class="drawer-foot">
+        <button type="button" class="btn btn-ghost btn-danger-text" id="shutdown"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-power"/></svg>Quit</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn" id="cancel-settings">Cancel</button>
+        <button type="submit" class="btn btn-primary" id="save-settings">Save</button>
+      </div>
+    </form>
+  </aside>
+
+  <div class="lightbox" id="lightbox" role="dialog" aria-modal="true" aria-label="Screenshot" hidden>
+    <img id="lightbox-img" alt="">
+    <div class="lightbox-bar">
+      <span id="lightbox-caption"></span>
+      <button type="button" class="icon-btn" id="lightbox-close" aria-label="Close">
+        <svg class="icon" aria-hidden="true"><use href="#i-x"/></svg>
+      </button>
+    </div>
+  </div>
+</body>
+</html>
