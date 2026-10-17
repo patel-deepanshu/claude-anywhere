@@ -161,7 +161,9 @@ function chromiumArgs({ url, profileDir, width, height, x, y, noSandbox = false 
     '--class=claude-anywhere',
     '--disable-session-crashed-bubble'
   );
-  if (noSandbox) args.push('--no-sandbox');
+  // --test-type stops Chromium from stacking its "unsupported command-line flag: --no-sandbox"
+  // (and "Google API keys are missing") infobars on top of the small dialog.
+  if (noSandbox) args.push('--no-sandbox', '--test-type');
   return args;
 }
 
