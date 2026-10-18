@@ -286,7 +286,7 @@ test('driver: windows, focus, minimize, topmost', async () => {
     assert.equal(wins[2].elevated, true);
     assert.equal(wins[0].elevated, false);
     assert.equal(wins[3].elevated, null, "another account's window: elevation unknown, not false");
-    assert.deepEqual(await driver.activeWindow(), { id: '1001', app: 'Visual Studio Code', title: 'claude-anywhere - Visual Studio Code', pid: 4101 });
+    assert.deepEqual(await driver.activeWindow(), { id: '1001', app: 'Visual Studio Code', title: 'claude-anywhere - Visual Studio Code', pid: 4101, process: 'Code.exe' });
 
     assert.equal(await driver.focusWindow('1002'), true);
     assert.equal((await driver.activeWindow()).id, '1002');

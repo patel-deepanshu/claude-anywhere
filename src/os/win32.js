@@ -939,7 +939,8 @@ class Win32Driver {
     const r = await this.host.request('active');
     if (!r.window) return null;
     const w = windowRecord(r.window);
-    return { id: w.id, app: w.app, title: w.title, pid: w.pid };
+    // process (e.g. cmd.exe, OpenConsole.exe) lets the permission broker tell when type_text lands in a terminal.
+    return { id: w.id, app: w.app, title: w.title, pid: w.pid, process: w.process };
   }
 
   async focusWindow(id) {
