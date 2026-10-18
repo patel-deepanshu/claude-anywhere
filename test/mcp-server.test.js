@@ -137,7 +137,8 @@ test('stdio server: discovery probe, initialize, list, ping, unknown tool', asyn
   const list = await peer.request('tools/list', {});
   const tools = list.result.tools;
   // Spawned without ANYWHERE_ROLE=engine, so the permission_prompt plumbing tool is hidden.
-  assert.equal(tools.length, 18);
+  // The 18 core tools (feature modules may add more after them).
+  assert.deepEqual(tools.slice(0, 18).map((t) => t.name), require('../src/mcp/tools').TOOL_NAMES.filter((n) => n !== 'permission_prompt'));
   assert.ok(!tools.some((t) => t.name === 'permission_prompt'));
   for (const tool of tools) {
     assert.equal(typeof tool.name, 'string');

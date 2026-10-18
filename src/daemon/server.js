@@ -220,6 +220,9 @@ function readBody(req, limit) {
 
 const HANDLED = Symbol('handled');
 
+/** Optional feature modules that add HTTP routes (missing ones are skipped). */
+const ROUTE_MODULES = ['routes-voice', 'routes-jira', 'routes-project', 'routes-calls'];
+
 class DaemonServer {
   /**
    * @param {object} deps
@@ -358,6 +361,17 @@ class DaemonServer {
     add('GET', '/api/mcp/guard', () => this.session.guard(), { noBody: true });
     add('POST', '/api/bridge/listen', this.bridgeListen);
     add('POST', '/api/bridge/reply', this.bridgeReply);
+    // Feature route modules (src/daemon/routes-*.js) export register(add, server); handlers are
+    // bound to this server and get the same ({ req, res, url, body, raw }) argument as the built-in ones.
+    for (const name of ROUTE_MODULES) {
+      let mod = null;
+      try {
+        mod = require(`./${name}`);
+      } catch (err) {
+        if (!(err && err.code === 'MODULE_NOT_FOUND' && String(err.message).includes(name))) throw err;
+      }
+      if (mod && typeof mod.register === 'function') mod.register(add, this);
+    }
     return r;
   }
 
