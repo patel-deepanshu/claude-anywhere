@@ -222,7 +222,7 @@ function readBody(req, limit) {
 const HANDLED = Symbol('handled');
 
 /** Optional feature modules that add HTTP routes (missing ones are skipped). */
-const ROUTE_MODULES = ['routes-voice', 'routes-jira', 'routes-project', 'routes-calls'];
+const ROUTE_MODULES = ['routes-voice', 'routes-jira', 'routes-project', 'routes-clone', 'routes-calls'];
 
 class DaemonServer {
   /**

@@ -71,6 +71,21 @@ function modelsDir() {
   return ensureDir(path.join(stateDir(), 'models'));
 }
 
+/** stateDir()/voice: Piper, voices and the cloned-voice data. */
+function voiceDir() {
+  return ensureDir(path.join(stateDir(), 'voice'));
+}
+
+/** stateDir()/voice/clone: the consented voice profile (0700). */
+function cloneDir() {
+  return ensureDir(path.join(voiceDir(), 'clone'));
+}
+
+/** stateDir()/calls: call transcripts and audio kept for keepCallDataDays (0700). */
+function callsDir() {
+  return ensureDir(path.join(stateDir(), 'calls'));
+}
+
 function lastShotPath() {
   return path.join(runDir(), 'last-shot.json');
 }
@@ -96,5 +111,8 @@ module.exports = {
   uiProfileDir,
   modelsDir,
   lastShotPath,
+  voiceDir,
+  cloneDir,
+  callsDir,
   claudeHome,
 };
