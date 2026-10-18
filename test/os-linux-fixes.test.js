@@ -29,7 +29,7 @@ const x11 = (f, extra = {}) => L.createDriver({ displayServer: 'x11', run: f.run
 
 function tmpDir(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-linux-fixes-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   return dir;
 }
 

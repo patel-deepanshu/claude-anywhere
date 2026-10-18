@@ -27,7 +27,7 @@ const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-integrator-'));
 process.env.ANYWHERE_HOME = HOME;
 delete process.env.ANYWHERE_DAEMON_URL;
 delete process.env.ANYWHERE_TOKEN;
-test.after(() => fs.rmSync(HOME, { recursive: true, force: true }));
+test.after(() => fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
 
 const ROOT = path.join(__dirname, '..');
 const cli = require('../bin/anywhere.js');

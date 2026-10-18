@@ -23,7 +23,7 @@ const {
 } = require('../src/daemon/permissions');
 
 test.after(() => {
-  fs.rmSync(HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 const LINUX = { projectDir: '/home/u/proj', homeDir: '/home/u', platform: 'linux', noRealpath: true, tmpDir: '/tmp' };
@@ -363,7 +363,7 @@ test('symlinks out of the project count as outside', (t) => {
     assert.match(r.reason, /SSH/);
     assert.equal(classify('Bash', { command: `echo key >> ${path.join(proj, 'escape', 'authorized_keys')}` }, opts).risk, 'high');
   } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 
@@ -391,7 +391,7 @@ test('symlinks out of the project are caught when the home folder itself sits be
     assert.equal(classify('Write', { file_path: path.join(proj, 'escape', 'authorized_keys') }, { ...opts, homeDir: path.join(real, 'home') }).risk, 'high');
   } finally {
     fs.rmSync(alias, { force: true });
-    fs.rmSync(real, { recursive: true, force: true });
+    fs.rmSync(real, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 

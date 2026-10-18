@@ -11,7 +11,7 @@ const Module = require('module');
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-oscore2-'));
 process.env.ANYWHERE_HOME = HOME;
-test.after(() => fs.rmSync(HOME, { recursive: true, force: true }));
+test.after(() => fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
 
 const osIndex = require('../src/os/index');
 const common = require('../src/os/common');

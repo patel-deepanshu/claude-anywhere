@@ -17,7 +17,7 @@ function tmpDir() {
   return dir;
 }
 test.after(() => {
-  for (const dir of tmpRoots) fs.rmSync(dir, { recursive: true, force: true });
+  for (const dir of tmpRoots) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 function fakeDriver(extra = {}, opts = {}) {

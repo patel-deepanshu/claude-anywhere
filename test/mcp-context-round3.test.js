@@ -19,7 +19,7 @@ delete process.env.ANYWHERE_TOKEN;
 const desktop = require('../src/context/desktop');
 const { createTools } = require('../src/mcp/tools');
 
-test.after(() => fs.rmSync(tmpHome, { recursive: true, force: true }));
+test.after(() => fs.rmSync(tmpHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
 
 const EN = '–';
 

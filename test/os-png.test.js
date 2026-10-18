@@ -243,7 +243,7 @@ const FIXTURES = [
 
 test('decode matches ImageMagick for gray, palette+tRNS, 16-bit and interlaced fixtures', { skip: CONVERT ? false : 'ImageMagick convert not installed' }, (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-png-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   for (const fx of FIXTURES) {
     const file = path.join(dir, `${fx.name}.png`);
     im([...fx.args, `${fx.out ? `${fx.out}:` : ''}${file}`]);
@@ -269,7 +269,7 @@ test('decode matches ImageMagick for gray, palette+tRNS, 16-bit and interlaced f
 
 test('ImageMagick can read what encode writes', { skip: CONVERT ? false : 'ImageMagick convert not installed' }, (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-png-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const img = makeImage(40, 25, (x, y) => [x * 6, y * 10, (x * y) & 255, 200]);
   const file = path.join(dir, 'ours.png');
   fs.writeFileSync(file, png.encode(img));

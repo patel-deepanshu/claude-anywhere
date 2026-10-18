@@ -35,7 +35,7 @@ const configMod = require('../src/shared/config');
 const { randomToken, sleep } = require('../src/shared/util');
 
 test.after(() => {
-  fs.rmSync(HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 const OK = { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, aborted: false, error: null };

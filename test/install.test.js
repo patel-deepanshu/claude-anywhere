@@ -51,7 +51,7 @@ function sandbox(t) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   return { base, home, claudeHome: set.CLAUDE_CONFIG_DIR, state: set.ANYWHERE_HOME };
 }
@@ -117,7 +117,7 @@ test('install moves an unrelated "anywhere" skill aside instead of deleting it',
   const un = await installer.uninstall({ quiet: true, mcp: false, skillDir: custom });
   assert.ok(fs.existsSync(path.join(custom, 'SKILL.md')));
   assert.ok(un.notes.some((n) => n.includes('not the Claude Anywhere skill')));
-  fs.rmSync(custom, { recursive: true, force: true });
+  fs.rmSync(custom, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('install honours a custom skillDir', async (t) => {
@@ -134,7 +134,7 @@ const linuxHotkey = process.platform === 'linux' && !process.env.WSL_DISTRO_NAME
 
 test('Linux hotkey: .desktop entry and GNOME keybinding appended without clobbering', { skip: linuxHotkey ? false : 'Linux-only' }, (t) => {
   const base = tmpDir();
-  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const fakeBin = path.join(base, 'bin');
   fs.mkdirSync(fakeBin);
   const store = path.join(base, 'gsettings.json');
@@ -326,7 +326,7 @@ test('check-syntax: SKILL.md frontmatter rules', () => {
 
 test('check-syntax: catches broken JS, JSON, ES modules and skills in a fixture tree', async (t) => {
   const root = tmpDir('anywhere-syntax-fixture-');
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const w = (rel, text) => {
     const p = path.join(root, rel);
     fs.mkdirSync(path.dirname(p), { recursive: true });

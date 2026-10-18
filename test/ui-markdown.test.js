@@ -25,7 +25,7 @@ fs.writeFileSync(path.join(TMP, 'package.json'), '{"type":"module"}\n');
 for (const f of fs.readdirSync(UI)) if (f.endsWith('.js')) fs.copyFileSync(path.join(UI, f), path.join(TMP, f));
 
 test.after(() => {
-  fs.rmSync(TMP, { recursive: true, force: true });
+  fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 const load = (name) => import(pathToFileURL(path.join(TMP, name)).href);

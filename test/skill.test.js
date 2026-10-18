@@ -172,7 +172,7 @@ test('run.js resolution 1: ../../bin/anywhere.js next to the skill', () => {
   // The real repository layout resolves the same way.
   const real = runMod.resolveLauncher({ env: { PATH: '' }, homedir: base });
   assert.equal(real.script, path.join(ROOT, 'bin', 'anywhere.js'));
-  fs.rmSync(base, { recursive: true, force: true });
+  fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('run.js resolution 2: packageRoot from install.json', () => {
@@ -193,7 +193,7 @@ test('run.js resolution 2: packageRoot from install.json', () => {
   // A stale install.json (package moved) is ignored.
   fs.writeFileSync(path.join(state, 'install.json'), JSON.stringify({ packageRoot: path.join(base, 'gone') }));
   assert.equal(runMod.resolveLauncher({ skillDir, env: { ANYWHERE_HOME: state, PATH: '' }, homedir: path.join(base, 'nohome') }), null);
-  fs.rmSync(base, { recursive: true, force: true });
+  fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('run.js resolution 3: `anywhere` on PATH', { skip: process.platform === 'win32' ? 'POSIX executable bits' : false }, () => {
@@ -226,7 +226,7 @@ test('run.js resolution 3: `anywhere` on PATH', { skip: process.platform === 'wi
   fs.mkdirSync(noexec);
   fs.writeFileSync(path.join(noexec, 'anywhere'), 'x', { mode: 0o644 });
   assert.equal(runMod.resolveLauncher({ skillDir, env: env(noexec), homedir: base }), null);
-  fs.rmSync(base, { recursive: true, force: true });
+  fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('run.js findOnPath honours PATHEXT on Windows-style lookups', () => {
@@ -234,7 +234,7 @@ test('run.js findOnPath honours PATHEXT on Windows-style lookups', () => {
   fs.writeFileSync(path.join(base, 'anywhere.cmd'), '@echo off\r\n');
   const found = runMod.findOnPath('anywhere', { PATH: base, PATHEXT: '.EXE;.CMD' }, 'win32');
   assert.equal(found, path.join(base, 'anywhere.cmd'));
-  fs.rmSync(base, { recursive: true, force: true });
+  fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('run.js spawnSpec: node for scripts, quoted shell for .cmd shims', () => {
@@ -258,7 +258,7 @@ test('run.js forwards argv, unicode and the exit code', async () => {
   assert.deepEqual(JSON.parse(r.stdout.trim()), { args: ['send', 'déploy "this" ✓', '--json'] });
   const ok = spawnSync(process.execPath, [run, 'status'], { encoding: 'utf8', env: { ...process.env, STUB_EXIT: '0' } });
   assert.equal(ok.status, 0);
-  fs.rmSync(base, { recursive: true, force: true });
+  fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('run.js prints install instructions when the package cannot be found', () => {
@@ -272,7 +272,7 @@ test('run.js prints install instructions when the package cannot be found', () =
   });
   assert.equal(r.status, 1);
   assert.match(r.stderr, /not installed where this skill can find it/);
-  fs.rmSync(base, { recursive: true, force: true });
+  fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('run.js forwards SIGTERM to the CLI', { skip: process.platform === 'win32' ? 'POSIX signals' : false }, async () => {
@@ -294,7 +294,7 @@ test('run.js forwards SIGTERM to the CLI', { skip: process.platform === 'win32' 
   const code = await new Promise((resolve) => child.on('close', (c) => resolve(c)));
   assert.equal(code, 5);
   assert.match(out, /got SIGTERM/);
-  fs.rmSync(base, { recursive: true, force: true });
+  fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('run.js and bin/anywhere.js avoid syntax newer than Node 10 (so old Node gets upgrade advice)', () => {

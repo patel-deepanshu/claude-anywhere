@@ -113,7 +113,7 @@ test('install.ps1 keeps a one-entry user Path and %VAR% entries intact', { skip:
   const file = path.join(dir, 'path-test.ps1');
   fs.writeFileSync(file, script);
   const r = spawnSync(pwsh, ['-NoProfile', '-NonInteractive', '-File', file], { encoding: 'utf8' });
-  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   assert.equal(r.status, 0, r.stdout + r.stderr);
   const out = Object.fromEntries(
     r.stdout
@@ -166,7 +166,7 @@ test('a daemon started from a bare PATH gets node and the install-time PATH', { 
   delete env.WAYLAND_DISPLAY;
   t.after(async () => {
     await runCli(['stop'], { env }).catch(() => {});
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   const start = await runCli(['start', '--no-open', '--port', '0', '--project', ROOT, '--json'], { env, timeoutMs: 45000 });
   assert.equal(start.code, 0, start.stdout + start.stderr);
@@ -192,7 +192,7 @@ test('install records a stable node path and the install-time PATH', async (t) =
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   await installer.install({ mcp: false, quiet: true });
   const info = JSON.parse(fs.readFileSync(path.join(set.ANYWHERE_HOME, 'install.json'), 'utf8'));
@@ -253,7 +253,7 @@ test('the macOS launcher only shows a running dialog (show --launcher)', async (
 
 test('stableNodePath swaps a Homebrew Cellar path for a link that survives upgrades', { skip: process.platform === 'win32' ? 'symlinks need privileges on Windows' : false }, (t) => {
   const prefix = tmpDir('anywhere-brew-');
-  t.after(() => fs.rmSync(prefix, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(prefix, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const keg = path.join(prefix, 'Cellar', 'node', '22.11.0');
   fs.mkdirSync(path.join(keg, 'bin'), { recursive: true });
   const cellarNode = path.join(keg, 'bin', 'node');

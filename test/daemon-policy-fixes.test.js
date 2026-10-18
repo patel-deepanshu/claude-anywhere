@@ -22,7 +22,7 @@ delete process.env.CLAUDE_CONFIG_DIR;
 const { classify } = require('../src/daemon/permissions');
 
 test.after(() => {
-  fs.rmSync(HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 const LINUX = { projectDir: '/home/u/proj', homeDir: '/home/u', platform: 'linux', noRealpath: true, tmpDir: '/tmp' };

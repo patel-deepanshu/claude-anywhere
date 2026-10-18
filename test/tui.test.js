@@ -558,7 +558,7 @@ test('TUI: /voice records, transcribes and sends the text as a voice command', a
   assert.deepEqual(cmd.body, { text: 'deploy to cloud run', source: 'voice', attachScreenshot: false });
   assert.match(cap.text, /You \(voice\): deploy to cloud run/);
   assert.deepEqual(fs.readdirSync(tmp), [], 'temporary audio removed');
-  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('TUI: a spoken answer resolves a pending approval; missing recorder gives an install hint', async () => {
@@ -619,6 +619,6 @@ test('runTui without a daemon throws NOT_RUNNING', async () => {
     if (saved.token !== undefined) process.env.ANYWHERE_TOKEN = saved.token;
     if (saved.home !== undefined) process.env.ANYWHERE_HOME = saved.home;
     else delete process.env.ANYWHERE_HOME;
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });

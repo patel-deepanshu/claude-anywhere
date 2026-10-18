@@ -295,7 +295,7 @@ test('TUI /voice: a recorder that runs but finds no device does not say "install
     assert.doesNotMatch(s.cap.text, /No working microphone/);
     assert.deepEqual(fs.readdirSync(tmp), [], 'no audio files left behind');
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 

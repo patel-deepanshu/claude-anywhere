@@ -21,7 +21,7 @@ const path = require('path');
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-policy-r2-'));
 process.env.ANYWHERE_HOME = HOME;
-test.after(() => fs.rmSync(HOME, { recursive: true, force: true }));
+test.after(() => fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
 
 const { classify, PermissionBroker } = require('../src/daemon/permissions');
 const { VoiceService, parseSayVoices } = require('../src/daemon/voice');

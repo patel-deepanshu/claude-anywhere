@@ -23,7 +23,7 @@ const proc = require('../src/shared/proc');
 const configMod = require('../src/shared/config');
 const { configPath } = require('../src/shared/paths');
 
-test.after(() => fs.rmSync(tmpHome, { recursive: true, force: true }));
+test.after(() => fs.rmSync(tmpHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
 
 function toolMap(opts) {
   return Object.fromEntries(createTools(opts).map((t) => [t.name, t]));

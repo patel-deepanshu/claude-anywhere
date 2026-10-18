@@ -144,7 +144,7 @@ test('plain start hands a bridge dialog with a waiting command back, or says why
   );
   t.after(async () => {
     await d.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   // A daemon that would drop the command refuses (409): the CLI asked without force and explains.
@@ -199,7 +199,7 @@ test('start --mode companion with a waiting command: tried without force, --swit
   );
   t.after(async () => {
     await d.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   const held = await runCli(['start', '--no-open', '--mode', 'companion', '--project', dir, '--json'], { env: d.env });
   assert.equal(held.code, 0, held.stderr);
@@ -223,7 +223,7 @@ test('send --project names the waiting command instead of "wait for it to finish
   );
   t.after(async () => {
     await d.close();
-    for (const p of [a, b]) fs.rmSync(p, { recursive: true, force: true });
+    for (const p of [a, b]) fs.rmSync(p, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   const r = await runCli(['send', '--project', b, 'deploy it'], { env: d.env });
   assert.equal(r.code, 1);
@@ -244,7 +244,7 @@ test('the send warning names a command that switches (with --switch and the curr
   );
   t.after(async () => {
     await d.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   const r = await runCli(['send', 'deploy it'], { env: d.env });
   assert.equal(r.code, 0, r.stderr);
@@ -259,7 +259,7 @@ test('doctor prints the bare dialog address, never the token, and does not cut l
   const d = await fakeDaemon(() => ({ __status: 404, error: 'not found' }), { project: dir });
   t.after(async () => {
     await d.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   const fakeBin = path.join(dir, 'bin');
   fs.mkdirSync(fakeBin);
@@ -302,7 +302,7 @@ test('--json and status print the token URL only when the page must be opened by
   );
   t.after(async () => {
     await d.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   const bare = `http://127.0.0.1:${d.port}/`;
   const full = `${bare}?token=fake-token-123`;
@@ -344,8 +344,8 @@ test('send that starts the dialog prints the bare address', { skip: haveDaemon ?
   const dir = tmpDir();
   t.after(async () => {
     await runCli(['stop'], { env }).catch(() => {});
-    fs.rmSync(dir, { recursive: true, force: true });
-    fs.rmSync(env.ANYWHERE_HOME, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    fs.rmSync(env.ANYWHERE_HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   const r = await runCli(['send', '--no-open', '--project', dir, 'hello'], { env, timeoutMs: 80000 });
   assert.equal(r.code, 0, `${r.stdout}\n${r.stderr}`);
@@ -387,7 +387,7 @@ function copyPackage(dest, version) {
 
 test('a plugin install links a stable launcher that follows /plugin update', { skip: posixOnly, timeout: 120000 }, async (t) => {
   const base = tmpDir('anywhere-r3-plugin-');
-  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const home = path.join(base, 'home');
   const claudeHome = path.join(home, '.claude');
   const state = path.join(base, 'state');
@@ -457,7 +457,7 @@ test('a plugin install links a stable launcher that follows /plugin update', { s
 
 test('uninstall also removes a link an earlier version made into a versioned plugin folder', { skip: posixOnly }, (t) => {
   const base = tmpDir();
-  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const target = path.join(base, '.claude', 'plugins', 'cache', 'mkt', 'anywhere', '0.1.0', 'bin', 'anywhere');
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, '#!/bin/sh\n');
@@ -471,7 +471,7 @@ test('uninstall also removes a link an earlier version made into a versioned plu
 
 test('run.js picks the installed plugin version and only trusts ../../bin inside a package', (t) => {
   const base = tmpDir();
-  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const pluginsDir = path.join(base, 'plugins');
   const pkg = (rel) => {
     const dir = path.join(pluginsDir, ...rel.split('/'));

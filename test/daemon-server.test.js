@@ -21,7 +21,7 @@ const { SessionManager } = require('../src/daemon/session');
 const { createServer, tokenMatches, validateConfigUpdate } = require('../src/daemon/server');
 
 test.after(() => {
-  fs.rmSync(HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 /** Engine stand-in: answers every send with a tiny turn. */

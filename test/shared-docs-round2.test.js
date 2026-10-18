@@ -25,7 +25,7 @@ const { DaemonClient } = require('../src/shared/client');
 const { writeDaemonState, clearDaemonState } = require('../src/shared/state');
 
 test.after(() => {
-  fs.rmSync(HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');

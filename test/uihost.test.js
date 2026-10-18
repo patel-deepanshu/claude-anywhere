@@ -414,7 +414,7 @@ test('WSL launch script runs under PowerShell with a fake browser', { skip: !PWS
     const kill = spawnSync(PWSH, U.psArgs(U.buildWinKillScript({ profileDirExpr: U.psString('C:\\x') })), { env, encoding: 'utf8', timeout: 60000 });
     assert.match(kill.stdout, /ANYWHERE_KILLED 0/);
   } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 
@@ -872,7 +872,7 @@ test('waitForExit and cmdEscape helpers', async () => {
 });
 
 test.after(() => {
-  fs.rmSync(TMP_HOME, { recursive: true, force: true });
+  fs.rmSync(TMP_HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 // ---------------------------------------------------------------- electron/main.js against a fake Electron API
@@ -1059,7 +1059,7 @@ test('electron main.js runs against a fake Electron API', () => {
     assert.ok(secondLog.some((e) => e[0] === 'quit'), 'a second instance quits after handing over');
     assert.ok(!secondLog.some((e) => e[0] === 'loadURL'));
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 

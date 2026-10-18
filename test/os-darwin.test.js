@@ -1436,7 +1436,7 @@ test('driver: captureDisplay runs screencapture -D and reads the PNG size', asyn
     await assert.rejects(d.captureDisplay(2), { code: 'INVALID_DISPLAY' });
     await assert.rejects(d.captureDisplay(-1), { code: 'INVALID_ARGUMENT' });
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 
@@ -1451,7 +1451,7 @@ test('driver: captureDisplay falls back to the display rectangle when -D picks a
     assert.equal(calls.length, 2);
     assert.ok(calls[1].args.includes('-R-1920,-1080,1920,1080'), calls[1].args.join(' '));
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 
@@ -1473,7 +1473,7 @@ test('driver: a failed or empty capture is a PERMISSION error with a Screen Reco
       assert.equal(err.settingsUrl, D.SETTINGS_URLS.screenRecording);
     }
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 
@@ -2191,7 +2191,7 @@ test('e2e: the real helper serves JSON lines over real pipes', { skip: posixOnly
     assert.equal(t.mode, 'serve');
   } finally {
     await t.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 
@@ -2206,7 +2206,7 @@ test('e2e: falls back to one-shot processes when serve mode fails', { skip: posi
     assert.deepEqual(await t.request('cursor'), { x: 5, y: 6 }, 'every one-shot call is a fresh process');
   } finally {
     await t.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 
@@ -2223,7 +2223,7 @@ test('e2e: the driver drives the helper through the fake osascript', { skip: pos
     assert.equal(caps.permissions.hostApp, 'Terminal');
   } finally {
     await d.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 });
 
