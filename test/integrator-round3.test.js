@@ -549,10 +549,17 @@ test('R3-10: the CLI and the TUI share the locale-aware Unicode rule', async () 
   assert.equal(util.unicodeSupported({ TERM: 'xterm-256color', LANG: 'en_US.UTF-8' }, 'linux'), true);
   assert.equal(util.unicodeSupported({ TERM: 'xterm-256color', LANG: 'C.UTF-8', ANYWHERE_ASCII: '1' }, 'linux'), false);
   assert.equal(util.unicodeSupported({ TERM: 'linux', ANYWHERE_UNICODE: '1' }, 'linux'), true);
+  assert.equal(util.unicodeSupported({ TERM: 'xterm-256color' }, 'darwin'), true, 'macOS terminals are UTF-8 even with no locale');
+  assert.equal(util.unicodeSupported({}, 'win32'), false, 'legacy Windows console: ASCII');
+  assert.equal(util.unicodeSupported({ WT_SESSION: 'x' }, 'win32'), true, 'Windows Terminal draws the symbols');
+  // The CLI subprocess follows the same rule for the host it runs on (CI runs this on Linux, macOS and Windows).
   const env = childEnv({ TERM: 'xterm-256color', LANG: '', LC_ALL: '', LC_CTYPE: '' });
+  const expectUnicode = util.unicodeSupported(env, process.platform);
   let r = await runCli(['notify', 'hello'], env); // no daemon: falls back to an OS notification or fails; the symbol is what matters
-  const ascii = `${r.stdout}${r.stderr}`;
-  assert.doesNotMatch(ascii, /[✓✗✳·…→]/, ascii);
+  const out = `${r.stdout}${r.stderr}`;
+  if (!expectUnicode) assert.doesNotMatch(out, /[✓✗✳·…→]/, out);
+  r = await runCli(['notify', 'hello'], { ...env, ANYWHERE_ASCII: '1' });
+  assert.doesNotMatch(`${r.stdout}${r.stderr}`, /[✓✗✳·…→]/, 'ANYWHERE_ASCII=1 forces ASCII on every host');
   r = await runCli(['help'], { ...env, ANYWHERE_UNICODE: '1' });
   assert.match(r.stdout, /ANYWHERE_UNICODE=1/);
   assert.match(r.stdout, /5  reply\/ask: the user stopped this command/);
