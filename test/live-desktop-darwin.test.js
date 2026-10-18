@@ -7,11 +7,15 @@
  * `node scripts/test.js --test-name-pattern=live-desktop`.
  *
  * Skipped unless process.platform is darwin and ANYWHERE_LIVE_DESKTOP=1: they move the mouse,
- * type into TextEdit and overwrite the clipboard. Screenshots are saved to ANYWHERE_LIVE_OUT.
+ * type into TextEdit and overwrite the clipboard, and turn macOS text checking (auto
+ * capitalization and corrections) off while TextEdit runs. Screenshots are saved to
+ * ANYWHERE_LIVE_OUT.
  *
  * Checks that need a privacy permission (Accessibility, Screen Recording) assert the real
  * behaviour when macOS reports it granted, and otherwise assert that the driver detects the
- * missing permission and fails with a PERMISSION error and an actionable hint.
+ * missing permission and fails with a PERMISSION error and an actionable hint. On throwaway
+ * GitHub-hosted runners the last check also revokes both permissions with tccutil to see
+ * that detection on a real Mac.
  */
 
 const { test, after } = require('node:test');
@@ -187,7 +191,7 @@ const TEXT_CHECKING = [
 ];
 let savedTextChecking = null;
 
-function quietTextEdit() {
+function quietTextChecking() {
   if (savedTextChecking) return;
   savedTextChecking = {};
   for (const key of TEXT_CHECKING) {
@@ -197,7 +201,7 @@ function quietTextEdit() {
   }
 }
 
-function restoreTextEdit() {
+function restoreTextChecking() {
   if (!savedTextChecking) return;
   for (const [key, value] of Object.entries(savedTextChecking)) {
     if (value === null) sh('defaults', ['delete', '-g', key]);
@@ -211,7 +215,7 @@ after(async () => {
   try {
     if (textEditRunning()) sh('killall', ['TextEdit']);
     await waitFor(() => !textEditRunning(), 5000);
-    restoreTextEdit();
+    restoreTextChecking();
   } catch {
     /* best effort */
   }
@@ -387,7 +391,7 @@ test('live-desktop darwin f: open TextEdit, find its window with listWindows and
     sh('killall', ['TextEdit']);
     await waitFor(() => !textEditRunning(), 10000);
   }
-  quietTextEdit();
+  quietTextChecking();
   const doc = path.join(HOME, 'anywhere-live.txt');
   fs.writeFileSync(doc, '');
   const opened = sh('open', ['-a', 'TextEdit', doc], { timeoutMs: 30000 });
