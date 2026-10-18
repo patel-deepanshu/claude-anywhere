@@ -203,6 +203,20 @@ public static class AnywhereNative
     [DllImport("shcore.dll")] static extern int SetProcessDpiAwareness(int value);
     [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr hMonitor, int dpiType, out uint dpiX, out uint dpiY);
 
+    // ---- clipboard (raw Win32: see ClipboardSetText)
+    [DllImport("user32.dll", SetLastError = true)] static extern bool OpenClipboard(IntPtr owner);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool CloseClipboard();
+    [DllImport("user32.dll", SetLastError = true)] static extern bool EmptyClipboard();
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetClipboardData(uint format, IntPtr mem);
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr GetClipboardData(uint format);
+    [DllImport("user32.dll")] static extern bool IsClipboardFormatAvailable(uint format);
+    [DllImport("user32.dll")] static extern IntPtr GetOpenClipboardWindow();
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr GlobalAlloc(uint flags, UIntPtr bytes);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr GlobalLock(IntPtr mem);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GlobalUnlock(IntPtr mem);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr GlobalFree(IntPtr mem);
+    [DllImport("kernel32.dll")] static extern UIntPtr GlobalSize(IntPtr mem);
+
     const uint INPUT_MOUSE = 0;
     const uint INPUT_KEYBOARD = 1;
     const uint MOUSEEVENTF_MOVE = 0x0001;
@@ -251,6 +265,9 @@ public static class AnywhereNative
     const byte VK_UNASSIGNED = 0xE8;
     const ushort VK_RETURN = 0x0D;
     const ushort VK_TAB = 0x09;
+    const uint CF_UNICODETEXT = 13;
+    const uint GMEM_MOVEABLE = 0x0002;
+    const int CLIPBOARD_OPEN_MS = 3000;
 
     public static string DpiMode = "unaware";
 
@@ -864,6 +881,94 @@ public static class AnywhereNative
         return t;
     }
 
+    // ---------------------------------------------------------------- clipboard
+
+    // The clipboard is opened with no owner window. Whoever empties the clipboard becomes its owner,
+    // and Windows sends the owner WM_DESTROYCLIPBOARD (synchronously) when another program empties
+    // it on its next copy. This host's thread waits on stdin and never pumps messages, so with an
+    // owner window here (Set-Clipboard / WinForms make OLE's window the owner) every later Ctrl+C in
+    // any app blocked inside EmptyClipboard, holding the clipboard open, until this host happened to
+    // touch the clipboard again. With no owner nothing is sent to this process.
+
+    static string ClipboardHolder()
+    {
+        IntPtr h = GetOpenClipboardWindow();
+        if (h == IntPtr.Zero) return "";
+        uint pid;
+        GetWindowThreadProcessId(h, out pid);
+        string exe = ProcessPath(pid);
+        return " (held open by " + (exe.Length > 0 ? Path.GetFileName(exe) : "pid " + pid) + ")";
+    }
+
+    static void OpenClip()
+    {
+        int waited = 0;
+        while (!OpenClipboard(IntPtr.Zero))
+        {
+            if (waited >= CLIPBOARD_OPEN_MS)
+                throw Fail("The clipboard is in use by another program" + ClipboardHolder() + ".", "CLIPBOARD_BUSY",
+                    "Try again in a moment. A clipboard manager or a hung app can keep the clipboard open.");
+            Thread.Sleep(20);
+            waited += 20;
+        }
+    }
+
+    /// The clipboard's Unicode text, or "" when it holds no text.
+    public static string ClipboardGetText()
+    {
+        OpenClip();
+        try
+        {
+            if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return "";
+            IntPtr h = GetClipboardData(CF_UNICODETEXT);
+            if (h == IntPtr.Zero) return "";
+            IntPtr p = GlobalLock(h);
+            if (p == IntPtr.Zero) return "";
+            try
+            {
+                long chars = (long)(GlobalSize(h).ToUInt64() / 2);
+                if (chars <= 0) return "";
+                string s = Marshal.PtrToStringUni(p, (int)Math.Min(chars, int.MaxValue));
+                // The text ends at the first NUL; the memory block may be larger than the string.
+                int nul = s.IndexOf('\0');
+                return nul >= 0 ? s.Substring(0, nul) : s;
+            }
+            finally { GlobalUnlock(h); }
+        }
+        finally { CloseClipboard(); }
+    }
+
+    /// Replace the clipboard with text ("" empties it). Windows adds CF_TEXT, CF_OEMTEXT and CF_LOCALE.
+    public static void ClipboardSetText(string text)
+    {
+        OpenClip();
+        try
+        {
+            if (!EmptyClipboard())
+                throw Fail("EmptyClipboard failed (Win32 error " + Marshal.GetLastWin32Error() + ").", "CLIPBOARD_FAILED", null);
+            if (string.IsNullOrEmpty(text)) return;
+            IntPtr mem = GlobalAlloc(GMEM_MOVEABLE, new UIntPtr((ulong)(text.Length + 1) * 2));
+            if (mem == IntPtr.Zero) throw Fail("GlobalAlloc failed for the clipboard text.", "CLIPBOARD_FAILED", null);
+            bool handedOver = false;
+            try
+            {
+                IntPtr p = GlobalLock(mem);
+                if (p == IntPtr.Zero) throw Fail("GlobalLock failed for the clipboard text.", "CLIPBOARD_FAILED", null);
+                try
+                {
+                    Marshal.Copy(text.ToCharArray(), 0, p, text.Length);
+                    Marshal.WriteInt16(p, text.Length * 2, 0);
+                }
+                finally { GlobalUnlock(mem); }
+                if (SetClipboardData(CF_UNICODETEXT, mem) == IntPtr.Zero)
+                    throw Fail("SetClipboardData failed (Win32 error " + Marshal.GetLastWin32Error() + ").", "CLIPBOARD_FAILED", null);
+                handedOver = true; // the system owns the memory now
+            }
+            finally { if (!handedOver) GlobalFree(mem); }
+        }
+        finally { CloseClipboard(); }
+    }
+
     // ---------------------------------------------------------------- monitors
 
     public static MonitorInfo[] Monitors()
@@ -1149,8 +1254,18 @@ function Show-Notification([string]$Title, [string]$Body) {
 
 # ---------------------------------------------------------------- clipboard
 
+# The clipboard goes through the native bridge (no owner window, see AnywhereNative.ClipboardSetText):
+# Get-Clipboard / Set-Clipboard and WinForms make this non-pumping thread the clipboard owner, which
+# stalls other apps' copies, and they report a clipboard held open by another app as empty. The
+# cmdlets remain only as a fallback while the bridge has not compiled.
+function Test-NativeClipboard {
+  if (-not $script:NativeOk -and ([DateTime]::UtcNow - $script:NativeTriedAt).TotalSeconds -ge 5) { Initialize-Native }
+  return [bool]$script:NativeOk
+}
+
 function Get-ClipText {
   Assert-Windows
+  if (Test-NativeClipboard) { return [string][AnywhereNative]::ClipboardGetText() }
   $last = $null
   if (Get-Command Get-Clipboard -ErrorAction SilentlyContinue) {
     for ($i = 0; $i -lt 3; $i++) {
@@ -1177,6 +1292,10 @@ function Get-ClipText {
 
 function Set-ClipText([string]$Text) {
   Assert-Windows
+  if (Test-NativeClipboard) {
+    [AnywhereNative]::ClipboardSetText($Text)
+    return @{ ok = $true }
+  }
   $last = $null
   if (Get-Command Set-Clipboard -ErrorAction SilentlyContinue) {
     for ($i = 0; $i -lt 3; $i++) {
