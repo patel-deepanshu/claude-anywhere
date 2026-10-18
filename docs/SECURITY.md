@@ -5,12 +5,16 @@ safeguards and what remains your responsibility.
 
 ## 1. The local API
 
-- The daemon binds to **127.0.0.1** only, on port 47120 by default, falling back to a random port.
-- Every `/api/*` call except `/api/health` needs a **random per-run token**. The token is compared in constant time and stored only in `~/.claude-anywhere/daemon.json`, which is created with mode 0600.
+- The daemon binds to **127.0.0.1** only, on port 47120 by default, falling back to a nearby port and then a random one.
+- Every `/api/*` call except `/api/health` and the launch-code exchange (`/api/launch`, below) needs a **random per-run token**, compared in constant time. A new token is made each time the daemon starts, so `anywhere restart` invalidates every copy. The token goes to these places:
+  - `~/.claude-anywhere/daemon.json` (mode 0600), where the CLI, TUI and plugin look up the running daemon;
+  - `~/.claude-anywhere/run/mcp-<instance>.json` (mode 0600), the MCP config of the dialog's own Claude Code session, deleted when the daemon stops;
+  - the environment of the `anywhere` MCP server that session starts, and of the Electron shell (`ANYWHERE_UI_URL`) if you use it. A process environment is readable only by its owner;
+  - the output of `anywhere url` (and of `anywhere start` when no window could open, or with `--show-token`). `/anywhere` runs `start` through Claude Code's Bash tool, so in that case the token URL also ends up in that session's transcript under `~/.claude/projects/`.
 - The **Host** header must be `127.0.0.1:<port>` or `localhost:<port>`, which blocks DNS rebinding. Requests with an **Origin** header must come from the dialog's own origin, so a website can't drive it (CSRF).
 - The UI is served with a strict Content-Security-Policy: no inline scripts, no third-party origins, no framing.
 - The UI removes the token from the address bar after loading.
-- The dialog window is opened with a **single-use launch code** that expires after 60 s, rather than the token. Electron gets its URL through the environment. As a result, the token never appears on a browser command line that other local users could read in the process list. `anywhere url` and `anywhere start` still print a token URL for manual use, so keep that output private.
+- The dialog window is opened with a **single-use launch code** that expires after 60 s, rather than the token. Electron gets its URL through the environment. As a result, the token never appears on a browser command line that other local users could read in the process list. `anywhere url` (and `anywhere start` when no window could open) still prints a token URL for manual use, so keep that output (and those transcripts) private.
 
 ## 2. What Claude may do without asking
 
@@ -22,8 +26,13 @@ Every tool call Claude Code would normally prompt for goes to the dialog through
 |---|---|
 | low | reading files, searching, screenshots, listing windows, `git status`, `gcloud config list` |
 | medium | editing files inside the project, clicks, typing, opening URLs, builds and tests, `git commit` |
-| high | deploys and cloud changes (`gcloud run deploy`, `terraform apply`, `kubectl delete`), recursive deletes, `sudo`, force-pushes, package installs, `curl … \| sh`, remote shells, edits outside the project or to secrets, typing text that looks like a secret, system key combos |
+| high | deploys and cloud changes (`gcloud run deploy`, `terraform apply`, `kubectl delete`), recursive deletes, `sudo`, force-pushes, package installs, `curl … \| sh` and decoded or computed scripts piped into a shell (`base64 -d \| sh`, `eval "$(…)"` of an unknown command), commands whose name is only known at run time (`$X args`), `find … -exec rm` outside the project, git config keys that run commands (`core.hooksPath`, `core.fsmonitor`, `!` aliases), remote shells, edits outside the project or to secrets (also through Windows path aliases such as `\\?\C:\…` or `file::$DATA`), typing text that looks like a secret, system key combos |
 | critical | `rm -rf /`, disk formatting, shutdown, deleting cloud projects, and any change to Claude Anywhere's or Claude Code's own config or settings (self-escalation) |
+
+Typed text (`type_text`) gets the same command scrutiny, judged by where it lands: in a terminal (or with
+a Return in it, or when the focused app is unknown) it counts as the command it is; typed into an app that
+is not a terminal it stays at most high, and an ordinary sentence ("Reboot the router if the light is red.")
+stays medium there.
 
 | Mode | Asks you for |
 |---|---|
@@ -48,13 +57,17 @@ The classifier still enforces approvals, even if the model is tricked.
 ## 4. Stopping it
 
 - Stop button, **Esc**, or saying "stop": interrupts the turn, cancels pending cards, and pauses input actions for 3 s.
-- **Failsafe**: move the mouse to the top-left corner of the primary screen, and every mouse or keyboard action fails until you move it away.
-- `anywhere stop`, or closing the dialog, stops the daemon.
+- **Failsafe**: move the mouse to the top-left corner of the primary screen, and every mouse or keyboard action fails until you move it away. Works on X11, macOS, Windows, WSL and Hyprland. Other Wayland compositors (GNOME, KDE, sway, wlroots) do not expose the pointer position, so the failsafe cannot trip there: use Esc, the Stop button or say "stop".
+- `anywhere stop` (or `/anywhere stop`, or **Quit** in the dialog's settings) stops the daemon and Claude's session.
+- Closing the dialog window does **not** stop Claude. It only hides the window: a running task carries on, and the dialog reopens (or a desktop notification appears) when Claude needs an approval or an answer. Press Stop or Esc, or say "stop", first.
 
 ## 5. Audit and privacy
 
 - `~/.claude-anywhere/logs/audit-YYYY-MM-DD.jsonl` records commands, permission decisions, screen actions and engine starts. API keys, tokens, private keys and `password=` values are redacted, and images aren't stored. Turn it off with `privacy.auditLog false`.
-- Screenshots go to the Claude model, as any Claude Code image does. They aren't written to disk, except temporary files on macOS during capture and CLI `--out` files you request.
+- Screenshots go to the Claude model, as any Claude Code image does. The dialog's own session doesn't keep them on disk; some capture tools write a temporary file that is deleted right after capture (`screencapture` on macOS; `scrot`, `gnome-screenshot`, `spectacle` and others on Linux). These do stay on disk:
+  - `anywhere computer screenshot` without `--out`, which bridge mode (`/anywhere here`) runs after each step, saves `~/.claude-anywhere/run/screenshot-*.png` and keeps the last 30, for at most an hour. They are readable only by you (0600) and are deleted when the daemon stops and by `anywhere uninstall`. `--out` files stay where you put them.
+  - In bridge mode, "Include screen" captures and pasted images are saved as `~/.claude-anywhere/run/bridge-*` for the terminal session to read, and deleted when the daemon stops.
+  - Delete `~/.claude-anywhere/run/screenshot-*.png` to clear them sooner. `anywhere uninstall` keeps the rest of `~/.claude-anywhere` (settings, logs) unless you add `--purge`.
 - Desktop context (window titles, editor folders, git remotes with credentials stripped, the active cloud project) is sent with each command. Turn it off with `context.attachDesktopContext false`.
 - Browser speech recognition sends audio to the browser vendor's service. Server STT sends it to the provider you configure, or keeps it local with whisper.cpp.
 

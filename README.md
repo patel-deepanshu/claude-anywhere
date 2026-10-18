@@ -13,7 +13,9 @@ servers) running in your repo.
 
 It runs on **macOS, Windows, WSL and Linux (X11 and Wayland)**, with **zero npm dependencies**. When a
 capability is missing it falls back to something simpler: an Electron window, then a Chrome/Edge app
-window, then a browser tab, then a terminal UI. `anywhere doctor` tells you exactly what to fix.
+window, then a browser tab. With no display at all it prints the dialog's URL (open it through an SSH
+tunnel) and the command for the terminal dialog (`anywhere tui`) that you can run yourself.
+`anywhere doctor` tells you exactly what to fix.
 
 ---
 
@@ -47,12 +49,19 @@ curl -fsSL https://raw.githubusercontent.com/patel-deepanshu/claude-anywhere/mai
 irm https://raw.githubusercontent.com/patel-deepanshu/claude-anywhere/main/scripts/install.ps1 | iex
 ```
 
-Then run `anywhere doctor`, or `/anywhere doctor`, and follow any `✗` fixes. On macOS, grant
-**Accessibility** and **Screen Recording** to the app that runs Claude Code.
+Then run `/anywhere doctor` in Claude Code (or `anywhere doctor` in a terminal; after Option A or B,
+before `anywhere` is on your PATH, `node ~/.claude-anywhere/app/bin/anywhere.js doctor` for Option B) and
+follow any `✗` fixes. `anywhere install` links the `anywhere` command into `~/.local/bin` on macOS, Linux
+and WSL. On macOS, grant **Accessibility** and **Screen Recording** to the app that runs Claude Code.
+Option B, and Option C on macOS/Linux, show those permission prompts for you when run in a terminal; the
+others print the System Settings shortcuts.
 
 Optional extras:
 - `anywhere install --electron`: an always-on-top window, a global hotkey (Ctrl/Cmd+Shift+Space), and a dialog that is hidden from Claude's screenshots.
 - `anywhere install --hotkey`: an OS-level shortcut or launcher (Windows Ctrl+Alt+F12, GNOME Ctrl+Alt+A, a macOS app to bind in Shortcuts).
+
+`anywhere uninstall` removes the skill, the MCP registration, the `~/.local/bin/anywhere` link and the user
+PATH entry that install.ps1 added; `--purge` also deletes `~/.claude-anywhere`.
 
 ---
 
@@ -60,7 +69,7 @@ Optional extras:
 
 | In Claude Code | What happens |
 |---|---|
-| `/anywhere` | Opens the dialog for the current repo. A dedicated headless Claude Code session works behind it, and your terminal stays free. |
+| `/anywhere` | Opens the dialog for the current repo. A dedicated headless Claude Code session works behind it, and your terminal stays free. A dialog left in bridge mode with no terminal listening goes back to companion mode. |
 | `/anywhere deploy this to Cloud Run` | Opens the dialog and hands it the task. |
 | `/anywhere here` | **Bridge mode**: *this* terminal session takes the dialog's commands, so you can watch it work. |
 | `/anywhere status` · `/anywhere stop` | Shows what it's doing, or shuts it down. |
@@ -70,7 +79,7 @@ In the dialog:
 - **Type** and press Enter, or **talk**: click the mic, or hold Space for push-to-talk. Say "stop" to interrupt.
 - **Approvals** appear as cards for risky actions (deploys, deletes, `sudo`, force-pushes…). Click, or say *"yes"*, *"always"* or *"no"*.
 - **Questions** from Claude appear as cards with options. Answer by clicking, typing or speaking.
-- **Include screen** attaches a screenshot to your message ("what's wrong with this page?").
+- **Include screen** attaches a screenshot to your message ("what's wrong with this page?") (remembered per browser until “Attach a screenshot by default” changes).
 - **Claude's view** shows the last screenshot Claude took. The tool timeline shows every click, keystroke and command.
 - Pick a different repo from the project chip (it lists detected VS Code/Cursor workspaces). ⚙ opens the settings.
 - Shortcuts: Esc stops, Ctrl/Cmd+K focuses the input, Ctrl/Cmd+Shift+M toggles the mic, Ctrl/Cmd+Shift+N starts a new session.
@@ -81,7 +90,11 @@ anywhere "summarize the PR that's open in my browser"   # start if needed, then 
 anywhere show                                           # bring the dialog back
 anywhere tui                                            # terminal dialog (SSH or headless)
 anywhere computer screenshot --out screen.png           # the screen tools, without MCP
+anywhere send --project ~/other-repo "run the tests"    # a task for another folder
 ```
+
+A busy dialog keeps its project and mode: `anywhere start` and `anywhere send --project` leave a running
+task alone and say so. Add `--switch` to stop that task and switch.
 
 ---
 
@@ -105,7 +118,7 @@ Details: [docs/VOICE.md](docs/VOICE.md).
   - `smart` (default): also lets edits, screen actions and normal commands run, and asks for anything risky.
   - `auto`: asks only for catastrophic commands. Changes to Anywhere's or Claude's own config always count as critical.
 - Claude is instructed to ask before costly or irreversible steps, never to type your passwords, 2FA codes or card numbers, and to treat on-screen and web text as untrusted.
-- To stop it: **Esc**, the Stop button, say "stop", or move the mouse into the **top-left corner** (failsafe).
+- To stop it: **Esc**, the Stop button, say "stop", or move the mouse into the **top-left corner** (failsafe; works on X11, macOS, Windows, WSL and Hyprland. On GNOME/KDE/sway Wayland use Esc, Stop or "stop").
 - Every command, approval and screen action is written to `~/.claude-anywhere/logs/audit-*.jsonl`, with secrets redacted.
 
 More: [docs/SECURITY.md](docs/SECURITY.md).
@@ -116,7 +129,7 @@ More: [docs/SECURITY.md](docs/SECURITY.md).
 
 | | macOS | Windows | WSL | Linux X11 | Linux Wayland |
 |---|---|---|---|---|---|
-| Screen and input | ✓ (grant permissions) | ✓ built-in PowerShell | ✓ via Windows | ✓ `xdotool` + `wmctrl` + `xclip` + ImageMagick | ◐ `ydotool`, `grim`, `wl-clipboard` (sway/Hyprland window control) |
+| Screen and input | ✓ (grant permissions) | ✓ built-in PowerShell | ✓ via Windows | ✓ `xdotool` + `wmctrl` + `xclip` + ImageMagick | ◐ `ydotool` 1.0+, `grim`, `wl-clipboard` (sway/Hyprland window control) |
 | Dialog | Chrome, Edge, Brave app window or Electron | Edge app window (always present) or Electron | Windows Edge | Chromium-family app window or Electron | same |
 | Voice | ✓ | ✓ | ✓ | ✓ | ✓ |
 
@@ -173,7 +186,7 @@ Environment variables: `ANYWHERE_HOME`, `ANYWHERE_CLAUDE_PATH`, `ANYWHERE_BROWSE
 - **Nothing opens**: run `anywhere show`, or open the URL from `anywhere url`. Check `anywhere doctor` and `anywhere logs -n 80`.
 - **"claude not found"**: run `anywhere config set engine.claudePath "$(which claude)"`, then `anywhere restart`.
 - **Clicks land in the wrong place or nothing happens on macOS**: grant Accessibility and Screen Recording to your terminal or VS Code, then restart it.
-- **Linux**: `sudo apt install xdotool wmctrl xclip imagemagick x11-xserver-utils` (X11). On Wayland, see [docs/PLATFORMS.md](docs/PLATFORMS.md).
+- **Linux**: `sudo apt install xdotool wmctrl xclip imagemagick x11-xserver-utils` (X11). On Wayland, input needs ydotool 1.0 or newer (Debian 12 and Ubuntu up to 24.04 ship 0.1.8, which doesn't work); see [docs/PLATFORMS.md](docs/PLATFORMS.md).
 - **Voice button greyed out**: use Chrome or Edge, or set `GROQ_API_KEY` or `OPENAI_API_KEY` (see [docs/VOICE.md](docs/VOICE.md)).
 
 ---
@@ -181,7 +194,7 @@ Environment variables: `ANYWHERE_HOME`, `ANYWHERE_CLAUDE_PATH`, `ANYWHERE_BROWSE
 ## Development
 
 ```bash
-npm test                     # about 710 node:test tests (Node 18+); no network or display needed
+npm test                     # about 850 node:test tests (Node 18+); no network or display needed
 node scripts/check-syntax.js
 ANYWHERE_DRIVER=mock node bin/anywhere.js computer screenshot --out /tmp/s.png
 ```

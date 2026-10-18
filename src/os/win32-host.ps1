@@ -908,6 +908,7 @@ public static class AnywhereNative
 
 $script:NativeOk = $false
 $script:NativeError = $null
+$script:NativeTriedAt = [DateTime]::MinValue
 $script:HostElevated = $false
 
 function Import-Native {
@@ -928,14 +929,24 @@ if ($env:ANYWHERE_HOST_SELFTEST -eq 'compile') {
   }
 }
 
-try {
-  Import-Native
-  [void][AnywhereNative]::InitDpi()
-  $script:NativeOk = $true
-  if ($script:IsWin) { $script:HostElevated = [AnywhereNative]::HostElevated() }
-} catch {
-  $script:NativeError = $_.Exception.Message
+# Compile the Win32 bridge. Called at startup and again by Assert-Native (at most every 5 s) while
+# it has not succeeded: a transient Add-Type failure, such as CS0016 while an antivirus scanner
+# holds the temp DLL, must not disable the host for the rest of its life. A failed Add-Type
+# registers no type, so a retry is safe.
+function Initialize-Native {
+  $script:NativeTriedAt = [DateTime]::UtcNow
+  try {
+    Import-Native
+    [void][AnywhereNative]::InitDpi()
+    $script:NativeOk = $true
+    $script:NativeError = $null
+    if ($script:IsWin) { $script:HostElevated = [AnywhereNative]::HostElevated() }
+  } catch {
+    $script:NativeError = $_.Exception.Message
+  }
 }
+
+Initialize-Native
 
 # ---------------------------------------------------------------- helpers
 
@@ -954,6 +965,7 @@ function Assert-Windows {
 
 function Assert-Native {
   Assert-Windows
+  if (-not $script:NativeOk -and ([DateTime]::UtcNow - $script:NativeTriedAt).TotalSeconds -ge 5) { Initialize-Native }
   if (-not $script:NativeOk) {
     throw (New-HostError ('The Windows API bridge failed to compile: ' + $script:NativeError) 'NATIVE_UNAVAILABLE' 'Check that PowerShell can run Add-Type (it needs the .NET C# compiler and a writable TEMP folder).')
   }

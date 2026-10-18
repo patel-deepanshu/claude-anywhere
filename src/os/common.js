@@ -331,24 +331,111 @@ async function classify(target, kind, cwd, flavor) {
 
 // ---------------------------------------------------------------- per-OS openers
 
-async function openDarwin(kind, value, args) {
+// Chromium browsers (app bundle names, lower case). A second instance started with `open -n`
+// hands its whole command line to the instance that owns the default profile (or becomes it),
+// so URLs and flags reach the user's browser, never the dialog's own --user-data-dir instance.
+const MAC_CHROMIUM_APPS = new Set([
+  'google chrome',
+  'google chrome beta',
+  'google chrome dev',
+  'google chrome canary',
+  'chromium',
+  'microsoft edge',
+  'microsoft edge beta',
+  'microsoft edge dev',
+  'microsoft edge canary',
+  'brave browser',
+  'brave browser beta',
+  'brave browser nightly',
+  'vivaldi',
+]);
+
+// Prints whether an app (name, bundle path or id) is running, without launching it.
+const MAC_APP_RUNNING_JXA = "function run(argv) { return Application(argv[0]).running() ? 'running' : 'stopped'; }";
+
+/**
+ * macOS: one argument for an app. A URL or an existing file or folder is a document: `open`
+ * hands it over as an open-URL / open-documents event, which also reaches a running app, and
+ * relative paths are resolved against `cwd` (apps started by LaunchServices run in /). Anything
+ * else (flags, their values) is a command-line argument, which macOS gives only to an app that
+ * `open` starts.
+ * @returns {{doc?:string, arg?:string}}
+ */
+function darwinAppArg(a, cwd) {
+  if (!a || a.startsWith('-')) return { arg: a };
+  const norm = normalizeUrl(a);
+  if (norm) return { doc: checkUrl(norm) };
+  if (urlScheme(a) && (/^[a-z][a-z0-9+.-]*:\/\//i.test(a) || /^mailto:/i.test(a))) return { doc: checkUrl(a) };
+  const abs = expandPath(a, cwd, path.posix);
+  if (R.exists(abs)) return { doc: abs };
+  return { arg: a };
+}
+
+/** Whether a macOS app is running: true, false, or null when that cannot be told. */
+async function darwinAppRunning(app) {
+  const res = await R.run('osascript', ['-l', 'JavaScript', '-e', MAC_APP_RUNNING_JXA, app], { timeoutMs: 5000 });
+  const out = String(res.stdout || '').trim();
+  if (res.code === 0 && (out === 'running' || out === 'stopped')) return out === 'running';
+  return null;
+}
+
+/** @returns {Promise<{how:string, note?:string}>} */
+async function openDarwin(kind, value, args, cwd) {
+  const asApp = kind === 'app' || (kind === 'path' && /\.app\/?$/i.test(value) && args.length > 0);
+  if (!asApp) {
+    const res = await R.run('open', [value], { timeoutMs: 20000 });
+    if (res.code === 0) return { how: 'open' };
+    throw darwinOpenError(res);
+  }
+  const parsed = args.map((a) => darwinAppArg(a, cwd));
   let argv;
-  if (kind === 'app' || (kind === 'path' && /\.app\/?$/i.test(value) && args.length)) {
-    argv = ['-a', value, ...(args.length ? ['--args', ...args] : [])];
+  let how = 'open -a';
+  let note;
+  if (args.length && MAC_CHROMIUM_APPS.has(path.posix.basename(value).replace(/\.app$/i, '').toLowerCase())) {
+    argv = ['-n', '-a', value, '--args', ...parsed.map((p) => p.doc || p.arg)];
+    how = 'open -n -a';
   } else {
-    argv = [value];
+    const docs = parsed.filter((p) => p.doc).map((p) => p.doc);
+    const rest = parsed.filter((p) => !p.doc).map((p) => p.arg);
+    argv = ['-a', value, ...docs];
+    if (rest.length) {
+      if ((await darwinAppRunning(value)) === true) {
+        how = `open -a; it was already running, so these arguments were not passed: ${rest.join(' ')}`;
+        note =
+          `${value} was already running, and macOS passes command-line arguments only to an app that open starts. ` +
+          'URLs and existing files were handed over; quit the app and open it again to apply the other arguments.';
+      } else {
+        argv.push('--args', ...rest);
+      }
+    }
   }
   const res = await R.run('open', argv, { timeoutMs: 20000 });
-  if (res.code === 0) return kind === 'app' ? 'open -a' : 'open';
-  const msg = (res.stderr || (res.error && res.error.message) || '').trim();
-  if (kind === 'app' && /unable to find application/i.test(msg)) {
+  if (res.code === 0) return note ? { how, note } : { how };
+  const msg = darwinOpenMessage(res);
+  if (/unable to find application/i.test(msg)) {
+    // Not an app bundle name: a command on PATH such as `code` or `subl`, started in cwd.
+    const exe = !value.includes('/') ? R.which(value) : null;
+    if (exe) {
+      const r = await R.launch(exe, args, { waitMs: 700, cwd: cwd || R.cwd() });
+      if (r.ok) return { how: 'exec' };
+      throw makeError(`Could not start ${exe}: ${launchFailure(value, r)}`, 'OPEN_FAILED');
+    }
     throw makeError(
-      `No application named "${value}" was found`,
+      `No application named "${value}" was found (in /Applications or on PATH)`,
       'NOT_FOUND',
       `Use the name shown in /Applications, e.g. "Google Chrome" or "Visual Studio Code". List apps with: mdfind "kMDItemKind == Application" | grep -i "${value.replace(/"/g, '')}"`
     );
   }
-  throw makeError(`open failed${msg ? `: ${msg}` : res.timedOut ? ': timed out' : ''}`, 'OPEN_FAILED');
+  throw darwinOpenError(res);
+}
+
+function darwinOpenMessage(res) {
+  return (res.stderr || (res.error && res.error.message) || '').trim();
+}
+
+function darwinOpenError(res) {
+  const msg = darwinOpenMessage(res);
+  return makeError(`open failed${msg ? `: ${msg}` : res.timedOut ? ': timed out' : ''}`, 'OPEN_FAILED');
 }
 
 const PS_APP_SCRIPT = `
@@ -695,8 +782,9 @@ async function openTarget(target, opts = {}) {
   const flavor = osFlavor(info);
   const { kind: k, value } = await classify(target, kind, cwd, flavor);
   let how;
+  let note;
   if (flavor === 'darwin') {
-    how = await openDarwin(k, value, strArgs);
+    ({ how, note } = await openDarwin(k, value, strArgs, cwd));
   } else if (flavor === 'win32') {
     how = await openWindows(info, k, value, strArgs);
   } else if (flavor === 'wsl') {
@@ -716,7 +804,9 @@ async function openTarget(target, opts = {}) {
     how = await openLinuxUrlOrPath(k, value);
   }
   log.debug('opened', k, value, how);
-  return { opened: true, kind: k, how, target: value };
+  const result = { opened: true, kind: k, how, target: value };
+  if (note) result.note = note;
+  return result;
 }
 
 // ---------------------------------------------------------------- notifications

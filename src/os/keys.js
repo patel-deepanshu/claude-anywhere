@@ -270,12 +270,16 @@ const MAC_LAYOUT_CHARS = new Set([...LOWER, ...DIGITS, ...UNSHIFTED_PUNCT]);
  * last modifier as the key.
  *
  * `chars` is aligned with `keyCodes`: for a layout-dependent key (letter, digit,
- * punctuation) it is the character the key must produce without modifiers
- * ('/' for '?'), and null for position-independent keys (Return, Tab, arrows,
- * F-keys, modifiers...). The helper should post the key code that types that
- * character in the current input source, and fall back to `keyCodes` (US ANSI
- * positions) when the layout has no such key, as with non-Latin layouts where
- * macOS already matches cmd shortcuts by QWERTY position.
+ * punctuation) it is the character to type, which may be a shifted one ('?', '+',
+ * '!'), and null for position-independent keys (Return, Tab, arrows, F-keys,
+ * modifiers...). The helper posts the key code that types that character on the
+ * current input source and adds or removes Shift/Option itself for a single-key
+ * chord (Cmd++ on German is the unshifted "+" key, not Cmd+Shift+0). Cmd chords are
+ * looked up in the layout's Command keymap; non-ASCII-capable and "QWERTY ⌘"
+ * layouts keep US positions under Cmd, and digits in Cmd/Ctrl chords keep their
+ * number-row key. When the layout has no such key the helper falls back to
+ * `keyCodes` (US ANSI positions) and the flags here, which add Shift for a US-shifted
+ * character.
  * @param {string[]|string} keys
  * @returns {{keyCode:number,keyCodes:number[],chars:(string|null)[],flags:number,modifierKeyCodes:number[]}}
  */
@@ -296,7 +300,9 @@ function toMacKeyCodes(keys) {
       throw err;
     }
     keyCodes.push(code);
-    chars.push(MAC_LAYOUT_CHARS.has(base) ? base : null);
+    // The real target ('+', not '='): on other layouts the shifted character is often on a
+    // different key, or on an unshifted one.
+    chars.push(MAC_LAYOUT_CHARS.has(base) ? k : null);
   }
   const ordered = MODIFIERS.filter((m) => mods.has(m));
   let flags = 0;

@@ -2291,17 +2291,23 @@ class WaylandDriver extends LinuxDriverBase {
 
   // ----- pointer -----
 
+  /**
+   * Only Hyprland reports the real pointer. Elsewhere Wayland hides it, so the last position this driver set
+   * (else the primary display's centre) is returned with `estimated: true`: callers that act on where the user
+   * put the pointer (the top-left-corner failsafe) must treat it as unknown.
+   * @returns {Promise<{x:number, y:number, estimated?:true}>}
+   */
   async cursorPosition() {
     if (this._hyprOk()) {
       const r = await this._run('hyprctl', ['cursorpos'], { timeoutMs: 2000 });
       const m = ok(r) ? /(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)/.exec(r.stdout) : null;
       if (m) return { x: Math.round(+m[1]), y: Math.round(+m[2]) };
     }
-    if (this._lastPointer) return { ...this._lastPointer };
-    // Wayland does not expose the pointer position; report the primary display's centre.
+    if (this._lastPointer) return { x: this._lastPointer.x, y: this._lastPointer.y, estimated: true };
     const ds = await this._displaysSafe();
     const d = ds && ds[0];
-    return d ? { x: Math.round(d.x + d.width / 2), y: Math.round(d.y + d.height / 2) } : { x: 640, y: 360 };
+    const p = d ? { x: Math.round(d.x + d.width / 2), y: Math.round(d.y + d.height / 2) } : { x: 640, y: 360 };
+    return { ...p, estimated: true };
   }
 
   async moveMouse(x, y) {
@@ -2635,7 +2641,12 @@ class WaylandDriver extends LinuxDriverBase {
     if (ydotoolReady && !this._swayOk() && !this._hyprOk()) {
       notes.push('ydotool moves the pointer relatively; use a flat pointer-acceleration profile for accurate clicks.');
     }
-    if (!this._swayOk() && !this._hyprOk()) notes.push('The pointer position cannot be read on this compositor; the last position set is reported.');
+    if (!this._hyprOk()) {
+      notes.push(
+        `The pointer position cannot be read on ${this.compositor} Wayland (only an estimate is reported), so the ` +
+          'top-left-corner failsafe is unavailable: stop Claude with Esc, the Stop button or by saying "stop".',
+      );
+    }
     const wtype = this._has('wtype') && this.compositor !== 'gnome';
     if (!this._has('wtype') && this.compositor !== 'gnome') missing.push('wtype');
     const keyboard = wtype || ydotoolReady;

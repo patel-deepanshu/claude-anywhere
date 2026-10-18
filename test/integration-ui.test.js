@@ -17,7 +17,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const http = require('http');
-const { spawn, execFileSync } = require('child_process');
+const { execFileSync } = require('child_process');
+const { launchChrome } = require('./fixtures/chrome-launch');
 
 const ROOT = path.join(__dirname, '..');
 const UI = path.join(ROOT, 'src', 'ui');
@@ -111,29 +112,10 @@ function findChrome() {
 
 /** Tiny CDP client over the browser's page WebSocket. */
 async function openPage(chrome, { width, height, scheme }) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-chrome-'));
-  const proc = spawn(
-    chrome,
-    [
-      '--headless=new', '--no-sandbox', '--disable-gpu', '--hide-scrollbars', '--no-first-run', '--disable-background-networking',
-      '--disable-component-update', '--disable-sync', '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream',
-      `--user-data-dir=${dir}`, '--remote-debugging-port=0', 'about:blank',
-    ],
-    { stdio: ['ignore', 'ignore', 'ignore'] }
-  );
-  let port = null;
-  for (let i = 0; i < 150 && !port; i += 1) {
-    await new Promise((r) => setTimeout(r, 100));
-    try {
-      port = fs.readFileSync(path.join(dir, 'DevToolsActivePort'), 'utf8').split('\n')[0];
-    } catch {
-      /* not yet */
-    }
-  }
-  if (!port) {
-    proc.kill('SIGKILL');
-    throw new Error('Chromium did not start');
-  }
+  const { port, cleanup } = await launchChrome(chrome, {
+    extraArgs: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'],
+    prefix: 'anywhere-chrome-',
+  });
   const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
   const target = list.find((x) => x.type === 'page');
   const ws = new WebSocket(target.webSocketDebuggerUrl);
@@ -180,8 +162,7 @@ async function openPage(chrome, { width, height, scheme }) {
     } catch {
       /* ignore */
     }
-    proc.kill('SIGKILL');
-    setTimeout(() => fs.rmSync(dir, { recursive: true, force: true }), 500).unref();
+    cleanup();
   };
   return { send, evaluate, problems, close };
 }

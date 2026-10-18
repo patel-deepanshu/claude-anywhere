@@ -78,7 +78,15 @@ class Hub extends EventEmitter {
       res.end(JSON.stringify({ error: 'daemon is shutting down' }));
       return null;
     }
-    const client = { id: this.nextId++, res, since: Date.now(), allowance: 0, draining: false };
+    // ?client=ui marks a dialog page (src/ui/app.js), so UiHost can count open dialogs apart from
+    // TUIs and CLI watchers.
+    let kind = null;
+    try {
+      kind = new URL((req && req.url) || '/', 'http://x').searchParams.get('client') || null;
+    } catch {
+      kind = null;
+    }
+    const client = { id: this.nextId++, res, since: Date.now(), allowance: 0, draining: false, kind };
     if (!res.headersSent) {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
@@ -192,9 +200,15 @@ class Hub extends EventEmitter {
     for (const client of [...this.clients]) this.write(client, frame);
   }
 
-  /** @returns {number} connected SSE clients */
-  clientCount() {
-    return this.clients.size;
+  /**
+   * @param {string} [kind] only clients that connected with ?client=<kind> (e.g. 'ui')
+   * @returns {number} connected SSE clients
+   */
+  clientCount(kind) {
+    if (!kind) return this.clients.size;
+    let n = 0;
+    for (const c of this.clients) if (c.kind === kind) n += 1;
+    return n;
   }
 
   /** End every stream and stop the heartbeat. */

@@ -61,7 +61,8 @@ test('start → status → bridge send/listen/reply → stop with the real daemo
   assert.match(s.url, /^http:\/\/127\.0\.0\.1:\d+\/\?token=/);
   assert.ok(fs.existsSync(path.join(home, 'daemon.json')));
 
-  const again = await runCli(['start', '--no-open', '--json'], e);
+  // --mode bridge: without a mode, a bridge dialog nobody listens to goes back to companion mode.
+  const again = await runCli(['start', '--no-open', '--mode', 'bridge', '--json'], e);
   assert.equal(JSON.parse(again.stdout).reused, true, again.stderr);
 
   const status = await runCli(['status', '--json'], e);
@@ -72,6 +73,9 @@ test('start → status → bridge send/listen/reply → stop with the real daemo
 
   const human = await runCli(['status'], e);
   assert.match(human.stdout, /Claude Anywhere .* is running/);
+  // The token URL stays out of human output that lands in transcripts; `anywhere url` prints it.
+  assert.doesNotMatch(human.stdout, /token=/);
+  assert.match(human.stdout, /Dialog {4}http:\/\/127\.0\.0\.1:\d+\/ .*url.* prints the full link/);
 
   const url = await runCli(['url'], e);
   assert.equal(url.stdout.trim(), s.url);

@@ -636,10 +636,9 @@ async function main() {
   require('../shared/log').applyPrivacyConfig(configSource.config);
   const config = configSource.config;
   const role = process.env.ANYWHERE_ROLE || 'interactive';
-  // A plugin or user-scope copy of this server started under the daemon's own engine would
-  // duplicate the daemon's tools (and bypass its role). It stays up so Claude Code does not
-  // report a failed server, but serves nothing. The daemon's server (role engine) is unaffected.
-  const engineChild = process.env.ANYWHERE_ENGINE_CHILD === '1' && role !== 'engine';
+  // Always serve the tools. The daemon keeps a plugin copy of this server out of its own
+  // engine with --disallowedTools mcp__plugin_anywhere_anywhere, so no environment marker is
+  // needed (an ANYWHERE_ENGINE_CHILD left over from an older daemon is ignored).
   const computers = createComputerSource({ source: configSource, log });
 
   const { DaemonClient } = require('../shared/client');
@@ -660,10 +659,10 @@ async function main() {
   };
 
   const { createTools } = require('./tools');
-  const tools = engineChild ? [] : createTools({ computer: computers.getComputer, getClient, config, role });
-  const instructions = engineChild ? undefined : buildInstructions(role);
+  const tools = createTools({ computer: computers.getComputer, getClient, config, role });
+  const instructions = buildInstructions(role);
   const server = startStdioServer({ name: 'anywhere', version, tools, log, instructions });
-  log.debug(`anywhere MCP server ${version} ready (role ${role}${engineChild ? ', inside the daemon engine: no tools' : ''}, ${tools.length} tools)`);
+  log.debug(`anywhere MCP server ${version} ready (role ${role}, ${tools.length} tools)`);
 
   let exiting = false;
   const shutdown = async (code = 0) => {

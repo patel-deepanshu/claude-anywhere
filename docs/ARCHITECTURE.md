@@ -165,7 +165,7 @@ config change, and by the MCP server whenever it (re)loads `config.json`.
 readDaemonState()  -> {pid, port, token, instanceId, version, startedAt, project, mode, url} | null
 writeDaemonState(obj)                    // 0600
 clearDaemonState()
-async findRunningDaemon({timeoutMs=1500}) -> state | null   // pid alive AND GET /api/health ok AND instanceId matches; clears stale file
+async findRunningDaemon({timeoutMs=1500}) -> state | null   // pid alive AND GET /api/health 2xx AND instanceId matches; clears stale file (a daemon that is shutting down answers 503, so it is not reused)
 isPidAlive(pid) -> bool
 ```
 
@@ -411,6 +411,8 @@ Bind `127.0.0.1` only. Security on **every** request:
   page trades it through `POST /api/launch` (no token; the Origin check applies) before its first API call, keeps
   the token in sessionStorage and removes `launch` from the address bar. `get url` (the token URL) is unchanged:
   it is printed to the user's own terminal and given to Electron through its environment.
+- While the daemon shuts down, `POST /api/command`, `/api/session/new`, `/api/project`, `/api/mode` and `/api/show`
+  answer 503 ("Claude Anywhere is shutting down").
 - Non-GET requests with an `Origin` header must match `http://127.0.0.1:<port>` or `http://localhost:<port>`.
 - JSON bodies ≤ 25 MB; `/api/stt` audio ≤ 25 MB.
 - HTML has CSP `default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob: data:; connect-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'`.
@@ -418,20 +420,20 @@ Bind `127.0.0.1` only. Security on **every** request:
 | Method & path | Body | Response |
 |---|---|---|
 | GET `/` and static `/app.js` etc. | | files from `src/ui` (no auth; static only) |
-| GET `/api/health` | | `{ok, app:'claude-anywhere', version, instanceId, pid}` |
+| GET `/api/health` | | `{ok, app:'claude-anywhere', version, instanceId, pid, home, uid}` (`home`: a non-secret id of the state dir); 503 `{ok:false, shuttingDown:true, …}` while the daemon stops |
 | POST `/api/launch` | `{code}` (no token) | `{token}` once per code; 401 for an unknown, used or expired code |
 | GET `/api/permissions` | | `{platform, permissions}`: the daemon driver's `capabilities().permissions` (macOS TCC state, read-only) or null |
 | GET `/api/events?token=` | | SSE stream; first event `snapshot` |
 | GET `/api/state` | | snapshot |
-| POST `/api/command` | `{text, attachScreenshot?, images?:[{mediaType,data}], source?:'text'|'voice'|'cli'|'skill'}` | `{ok, id}` |
+| POST `/api/command` | `{text, attachScreenshot?, images?:[{mediaType,data}], source?:'text'|'voice'|'cli'|'skill'}` | `{ok, id, mode, bridge:{listening}}` |
 | POST `/api/interrupt` | | `{ok}` |
 | POST `/api/approval` | `{id, decision:'allow'|'allow_session'|'deny', message?}` | `{ok}` |
 | POST `/api/answer` | `{id, text}` | `{ok}` |
 | POST `/api/session/new` | | `{ok, sessionId}` |
-| POST `/api/project` | `{dir}` | `{ok, project}` (restarts engine in the new cwd) |
+| POST `/api/project` | `{dir, force?}` | `{ok, project}` (restarts engine in the new cwd); 409 while a task runs unless `force:true`, which stops it first |
 | GET `/api/projects` | | `{projects:[…]}` |
 | GET `/api/config` · POST `/api/config` | partial config | public config |
-| POST `/api/mode` | `{mode}` | `{ok, mode}` |
+| POST `/api/mode` | `{mode, force?}` | `{ok, mode}`; 409 while a task runs unless `force:true` |
 | POST `/api/stt` | raw `audio/wav` (also webm/ogg/mp4 pass-through) `?language=` | `{text, provider}` |
 | POST `/api/tts` | `{text}` | `{ok, provider}` |
 | POST `/api/tts/stop` | | `{ok}` |
@@ -447,13 +449,19 @@ Bind `127.0.0.1` only. Security on **every** request:
 | POST `/api/bridge/reply` | `{text, final?, speak?}` | `{ok}`; 409 (with a hint) when the dialog is in companion mode: `anywhere reply` then prints STOP and exits 3 |
 
 ### SSE events (server → UI): `event: <type>` + `data: <json>`
-- `snapshot` `{version, mode, status, statusDetail, project:{dir,name,git}, session:{id, model, costUsd, turns}, messages:[…], pending:{approvals:[…], questions:[…]}, config:<public>, voice:{serverStt, sttProvider, serverTts, ttsProvider}, bridge:{listening}, platform:{platform, displayServer, driver}, screenshot:{dataUrl,width,height,ts}|null}`
-- `status` `{status:'idle'|'starting'|'thinking'|'acting'|'waiting_approval'|'waiting_answer'|'stopping'|'error'|'offline', detail?}`
+- `snapshot` `{version, mode, status, statusDetail, project:{dir,name,git}, session:{id, model, costUsd, turns}, messages:[…], pending:{approvals:[…], questions:[…]}, config:<public>, voice:{serverStt, sttProvider, serverTts, ttsProvider}, bridge:{listening, queued}, platform:{platform, displayServer, driver}, screenshot:{dataUrl,width,height,ts}|null}`
+- `status` `{status:'idle'|'starting'|'thinking'|'acting'|'waiting_approval'|'waiting_answer'|'stopping'|'queued'|'error'|'offline', detail?}`
+  (`queued`: bridge commands wait for a terminal to run `/anywhere here`; Stop drops them)
 - `message` (transcript item; see below), `delta` `{id, text}` (append to an assistant item)
 - `tool_update` `{toolUseId, status:'ok'|'error', output?, image?}`
 - `approval_request` `{id, toolName, displayName, summary, input, risk, reason, ts}` · `approval_resolved` `{id, decision}`
 - `question` `{id, question, options, ts}` · `question_resolved` `{id, answer}`
-- `notify` `{text, level, speak}` · `result` `{text, costUsd, totalCostUsd, durationMs, isError, sessionId, numTurns, interrupted?}` (`interrupted` marks a turn the user stopped)
+- `notify` `{text, level, speak}` · `result` `{text, costUsd, totalCostUsd, durationMs, isError, sessionId, numTurns, commandIds, interrupted?}`
+  (`commandIds`: the commands this result answers, so a command queued during a turn waits for the next result;
+  `interrupted` marks a turn the user stopped)
+- `commands_cancelled` `{commandIds, reason:'stopped'|'reset'|'cancelled'|'engine_exit'|'failed'}`: these commands will
+  get no `result` (Stop, a new session, a project or mode switch dropped them, or Claude Code exited); `anywhere send
+  --wait` ends on it
 - `screenshot` `{dataUrl, width, height, ts}` · `project` `{dir, name, git}` · `session` `{id, model}`
 - `config` `<public config>` · `mode` `{mode}` · `bridge` `{listening}` · `show` `{}` · `error` `{message}`
 
@@ -498,9 +506,10 @@ dialog's approvals; `engine.permissionMode` overrides it, and both flags are lef
 them. The settings file is `{"enabledPlugins":{"anywhere@anywhere-marketplace":false, …every anywhere@* key from the
 user/project settings: false}}`, so the plugin's copy of the desktop tools and the /anywhere skill stay off inside
 the daemon's own session.
-Env: `process.env` minus `engine.stripEnv`, plus `ANYWHERE_ENGINE_CHILD=1` (a plugin or user-scope copy of the
-anywhere MCP server started under the engine then serves no tools; the daemon's own server has
-`ANYWHERE_ROLE=engine` and is unaffected); on POSIX the directory of `process.execPath` is prepended to `PATH`
+`--disallowedTools mcp__plugin_anywhere_anywhere` keeps a plugin copy of the anywhere MCP server out of the
+engine (its tools would duplicate the daemon's own server, which runs with `ANYWHERE_ROLE=engine`).
+Env: `process.env` minus `engine.stripEnv` and minus any `ANYWHERE_ENGINE_CHILD` (set by older daemons, now
+unused: the MCP server always serves its tools); on POSIX the directory of `process.execPath` is prepended to `PATH`
 when missing, so `#!/usr/bin/env node` shims resolve; `MCP_TOOL_TIMEOUT` raised to at least 3600000 (an inherited
 larger value is kept, a smaller or invalid one is replaced, since approvals and `ask_user` block inside MCP calls) and
 `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` (blocking `ask_user` calls must not be auto-backgrounded after 2 min).
@@ -514,6 +523,8 @@ quoted) refuses a UNC cwd (error code `UNC_CWD`). The system prompt and MCP conf
 argument holds newlines.
 
 Interrupt message: `{"type":"control_request","request_id":"<uuid>","request":{"subtype":"interrupt"}}`.
+On POSIX, interrupt and stop also signal the command trees the CLI started in other process groups (Bash tool
+commands, background tasks): SIGTERM first, then SIGKILL if they outlive it.
 
 ### session.js
 ```js
@@ -523,8 +534,8 @@ class SessionManager extends EventEmitter {
   async submit({ text, images, attachScreenshot, source }) -> { id }
   async interrupt()
   async newSession()
-  async setProject(dir)
-  setMode(mode)
+  async setProject(dir, { force })   // 409 while busy (a turn, queued follow-ups, approvals, questions, busy bridge) unless force
+  setMode(mode, { force })
   async shutdown()
 }
 ```
@@ -550,16 +561,21 @@ class SessionManager extends EventEmitter {
 - A result that arrives before init (resume of an unknown id) is not reported. Only "No conversation found…" stderr
   triggers the fresh-session retry; other early exits keep `sessions.json`.
 - New session and project switch clear the broker's session allow rules and cancel commands still being prepared.
-- main.js: `run/daemon.lock` is the start lock; EADDRINUSE on the configured port while a claude-anywhere daemon
-  answers `/api/health` means ALREADY_RUNNING (exit 0; `anywhere start` keeps waiting for that daemon). A saved
+- The transcript keeps at most 12 screenshots and 8 MB of image data; older images are dropped from the items.
+- main.js: `run/daemon.lock` is the start lock. Ports are tried in this order: the one recorded in
+  `run/last-port.json` for the configured port, the configured port, its 19 neighbours in an order rotated by a hash of
+  the state dir, then a random free port. A busy port means ALREADY_RUNNING (exit 0; `anywhere start` keeps waiting for
+  that daemon) only when its `/api/health` reports the same `home` and `uid`; a daemon of another user or
+  `ANYWHERE_HOME` just moves this one to the next port, and our own daemon that is shutting down is waited for.
+  Shutdown removes `daemon.json` first, so nothing reuses a daemon that is going away. A saved
   `mode` (Settings or `config set mode`) switches the session live; `privacy.*` applies to the daemon and, on its next
   config read, to the MCP server.
 
 ### permissions.js
 ```js
-classify(toolName, input, { projectDir }) -> { risk: 'low'|'medium'|'high'|'critical', reason, summary }
+classify(toolName, input, { projectDir, platform?, homeDir?, focusedApp? }) -> { risk: 'low'|'medium'|'high'|'critical', reason, summary }
 class PermissionBroker {
-  constructor({ config, hub, onNeedAttention })
+  constructor({ config, hub, onNeedAttention, projectDir?, getProjectDir?, activeWindow? })  // activeWindow: the driver's, for type_text
   async request({ tool_name, input, tool_use_id }) -> { behavior:'allow', updatedInput } | { behavior:'deny', message }
   resolve(id, decision, message) -> bool
   cancelAll(reason)
@@ -574,7 +590,9 @@ Policy: `ask` allows only `low`; `smart` (default) allows `low` and `medium`; `a
 Every decision is written to the audit log. The anywhere `open` tool with `args` is classified like the command it
 runs (`{target:'bash', args:['-c', …]}` gets the verdict of that `bash -c`): at least high for shells, interpreters,
 PowerShell, cmd/osascript/wscript/cscript/mshta, and terminal emulators given a command (`-e`, `--`, `-x`,
-`--command`); its summary shows the arguments.
+`--command`); its summary shows the arguments. `type_text` is judged by where it lands (the broker asks the
+driver for the focused window): in a terminal, with a Return, or with unknown focus it gets full command scrutiny;
+in an app that is not a terminal it stays at most high, and a plain sentence stays medium there.
 
 ### questions.js · bridge.js
 ```js
@@ -647,13 +665,17 @@ header on fetch and `?token=` on EventSource. Features:
   tool rows (icon, name, summary, spinner/✓/✗, expandable input and output, screenshot thumbnail),
   approval cards (Allow once / Always this session / Deny, risk badge, keyboard Enter/Esc), question cards (options
   and free text), system notices. Enter/Esc on a card are ignored as key repeats and for 600 ms after the card takes
-  focus; a focused card shows a focus ring.
+  focus; a focused card shows a focus ring. A new card takes focus when the composer is empty; Enter in an empty
+  composer while a card waits moves focus to the card (armed) instead of stopping Claude, and the card's ↵/Esc hints
+  show only while the card has focus. With exactly one question pending (and no approval), text typed in the
+  composer answers it.
 - "Claude's view": collapsible latest-screenshot preview.
 - Composer: textarea (Enter sends, Shift+Enter adds a newline), mic button (click to toggle, press-and-hold for
   push-to-talk), "include screen" toggle, Send/Stop button.
 - Voice (`voice.js`): providers `browser` (SpeechRecognition with interim results) and `server` (`wav-recorder.js` →
   16 kHz mono WAV with a silence VAD → POST `/api/stt`); `auto` picks browser unless Electron or unsupported, and falls
-  back to server on `network`/`not-allowed`/`service-not-allowed` errors. Hands-free mode with wake word. Voice intents:
+  back to server on `network`/`not-allowed`/`service-not-allowed` errors. Inside Electron, browser speech is never
+  tried (it has no speech-service key there): server speech or none. Hands-free mode with wake word. Voice intents:
   "stop"/"cancel" → interrupt; with a pending approval, an utterance that is only a yes ("yes", "yeah, go ahead",
   "do it") → allow, only an "always" ("always", "yes always", "always allow", "allow it for this session") →
   allow_session, one starting with "no"/"deny"/"don't" → deny with the rest as the reason; anything hedged ("okay
@@ -661,8 +683,15 @@ header on fetch and `?token=` on EventSource. Features:
   utterance answers it: options match whole words, and hedged or ambiguous answers are sent as said. The wake word
   must open the utterance (after at most one filler such as "okay"; later only the exact phrase); while Claude
   speaks and ~0.7 s after, only the exact wake phrase (or "stop" with no wake word set) gets through. TTS: `speechSynthesis` or `/api/tts`; speak
-  `result` text (via stripMarkdown, ≤ 600 chars) and `notify` with `speak:true`; barge-in cancels speech.
+  `result` text (via stripMarkdown, ≤ 600 chars) and `notify` with `speak:true`; barge-in cancels speech. With
+  several dialog windows open, only the most recently focused or shown one speaks and listens hands-free
+  (BroadcastChannel `claude-anywhere`).
 - Settings drawer: permission mode, voice options, engine model and Claude in Chrome, context options, UI theme and always-on-top.
+  Save sends only the fields changed in the drawer; a config change made elsewhere while it is open refreshes the
+  untouched fields. A project or mode switch the daemon refuses because a task is running (409) asks for
+  confirmation, then retries with `force`.
+- The event stream is opened with `&client=ui`, so the daemon counts dialog pages apart from TUIs and watchers. An app
+  window (`display-mode: standalone`) whose token is rejected (the daemon restarted) closes itself after 4 s.
 - Shortcuts: Ctrl/Cmd+K focuses input; Esc closes the lightbox/popover/drawer, cancels a voice capture, then stops
   speech, then interrupts Claude; hands-free that is only waiting for its wake word is turned off last (the mic
   button turns it back on); Ctrl/Cmd+Shift+M toggles the mic, holding Space (when not typing) is push-to-talk,

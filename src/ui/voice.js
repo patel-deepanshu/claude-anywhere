@@ -29,6 +29,11 @@ const ECHO_TAIL_MS = 700;
 // Whisper's usual output for silence; dropped when the recorder heard no speech.
 const SILENCE_HALLUCINATIONS = new Set(['thank you', 'thanks', 'thanks for watching', 'thank you for watching', 'you', 'bye', 'bye bye']);
 
+export const ELECTRON_VOICE_HELP =
+  'The Electron window has no browser speech recognition, so it needs server transcription: set GROQ_API_KEY or ' +
+  'OPENAI_API_KEY before starting Claude Anywhere (or add a key in Settings › Voice), or install whisper.cpp. ' +
+  'Or use the Chrome/Edge app window, which has browser speech (anywhere config set ui.host app, then anywhere restart).';
+
 export const VOICE_HELP =
   'To use voice, open this dialog in Chrome, Edge or Safari (built-in speech recognition), or enable server ' +
   'transcription: set GROQ_API_KEY or OPENAI_API_KEY before starting Claude Anywhere (or add a key in ' +
@@ -429,12 +434,14 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
     if (mode === 'server') return canRecord ? 'server' : 'none';
     if (mode === 'browser') return SR ? 'browser' : 'none';
     const srv = serverVoice();
-    if (browserFailed && srv.serverStt && canRecord) return 'server';
-    if (isElectron && canRecord && (srv.serverStt || !SR)) return 'server';
-    if (SR && !browserFailed) return 'browser';
     // The daemon reports serverStt:false both before it has checked (no hint yet) and once it
     // knows there is no provider (with a hint saying what to set up). Only the second rules it out.
     const noServerStt = srv.serverStt === false && Boolean(srv.sttHint);
+    if (browserFailed && srv.serverStt && canRecord) return 'server';
+    // Electron's Chromium has webkitSpeechRecognition but no key for Google's speech service, so
+    // it always fails there: only server speech can work.
+    if (isElectron) return canRecord && !noServerStt ? 'server' : 'none';
+    if (SR && !browserFailed) return 'browser';
     if (canRecord && !noServerStt) return 'server';
     return SR ? 'browser' : 'none';
   }
@@ -783,7 +790,7 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
       return;
     }
     if (p === 'none') {
-      fail(`Voice input isn't available in this window. ${VOICE_HELP}`, 'unsupported');
+      fail(`Voice input isn't available in this window. ${isElectron ? ELECTRON_VOICE_HELP : VOICE_HELP}`, 'unsupported');
       return;
     }
     if (p === 'browser') startBrowser(m);

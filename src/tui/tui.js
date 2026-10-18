@@ -18,10 +18,16 @@ const childProcess = require('child_process');
 const proc = require('../shared/proc');
 const { truncate } = require('../shared/util');
 
-const BUSY_STATUSES = new Set(['starting', 'thinking', 'acting', 'waiting_approval', 'waiting_answer', 'stopping']);
+// 'queued': bridge commands wait for a terminal; Esc, Ctrl+C and /stop drop them.
+const BUSY_STATUSES = new Set(['starting', 'thinking', 'acting', 'waiting_approval', 'waiting_answer', 'stopping', 'queued']);
 const LOUD_STATUSES = new Set(['starting', 'stopping', 'error', 'offline']);
 const DOUBLE_CTRL_C_MS = 2000;
 const PIPED_CONNECT_WAIT_MS = 10000;
+// Piped input ended: leave once the daemon has stayed idle this long with nothing of ours pending.
+// The pause covers a status event racing the POST /api/command reply, and the brief idle between
+// a turn and the queued follow-ups the daemon sends next.
+const PIPED_IDLE_QUIT_MS = 1500;
+const IDLE_STATUSES = new Set(['idle', 'error']);
 const MAX_RECORD_MS = 120000;
 const MIN_AUDIO_BYTES = 44 + 3200; // 0.1 s of 16 kHz mono 16-bit
 const SNAPSHOT_HISTORY = 40;
@@ -215,7 +221,7 @@ function statusColor(status, t) {
   const { c } = t;
   if (status === 'error' || status === 'offline') return c.red;
   if (status === 'idle') return c.green;
-  if (status === 'waiting_approval' || status === 'waiting_answer') return c.yellow;
+  if (status === 'waiting_approval' || status === 'waiting_answer' || status === 'queued') return c.yellow;
   return c.cyan;
 }
 
@@ -313,8 +319,8 @@ function renderHelp(t = PLAIN_THEME) {
   const cmds = [
     ['/stop', 'interrupt Claude (also Ctrl+C)'],
     ['/new', 'start a new session'],
-    ['/mode companion|bridge', 'switch mode'],
-    ['/project <dir>', 'switch the project directory'],
+    ['/mode companion|bridge', 'switch mode (add --switch to stop a running task)'],
+    ['/project <dir>', 'switch the project directory (add --switch to stop a running task)'],
     ['/screen', 'attach a screenshot to the next message (toggle)'],
     ['/voice', 'record a voice message; press Enter to stop'],
     ['/status', 'show what Claude Anywhere is doing'],
@@ -390,6 +396,22 @@ function parseQuestionAnswer(input, options = []) {
  * @param {string} line
  * @returns {{name:string,arg:string}|null}
  */
+/**
+ * A trailing --switch (or !) on /mode and /project arguments: stop a running task to switch.
+ * @param {string} arg
+ * @returns {{rest:string, force:boolean}}
+ */
+function splitSwitchFlag(arg) {
+  let rest = String(arg || '').trim();
+  let force = false;
+  const m = rest.match(/(?:^|\s)(--switch|--force|!)$/);
+  if (m) {
+    force = true;
+    rest = rest.slice(0, rest.length - m[0].length).trim();
+  }
+  return { rest, force };
+}
+
 function parseSlash(line) {
   const s = String(line || '').trim();
   if (!s.startsWith('/') || s.startsWith('//')) return null;
@@ -524,7 +546,8 @@ class Tui {
    * @param {object} o.client DaemonClient (request, postBinary, subscribe)
    * @param {NodeJS.ReadableStream} [o.input]
    * @param {NodeJS.WritableStream} [o.output]
-   * Test seams: env, platform, which, spawn, run, tmpdir, cwd, homedir, exists, color, unicode.
+   * Test seams: env, platform, which, spawn, run, tmpdir, cwd, homedir, exists, color, unicode,
+   * idleQuitMs.
    */
   constructor({ client, input = process.stdin, output = process.stdout, env = process.env, ...deps }) {
     this.client = client;
@@ -556,7 +579,13 @@ class Tui {
     this.attachNext = false;
     this.attachDefault = false; // config.context.attachScreenshotByDefault, from the snapshot
     this.recording = null;
+    // Commands sent and not yet answered by a result. Only a hint (busy prompt, Ctrl+C): the
+    // daemon folds follow-ups queued during a turn into one turn (one result), and commands
+    // dropped by Stop or a failed engine start get none.
     this.inFlight = 0;
+    this.postsPending = 0; // POST /api/command requests not yet answered
+    this.idleQuitMs = deps.idleQuitMs != null ? deps.idleQuitMs : PIPED_IDLE_QUIT_MS;
+    this._idleTimer = null;
     this.everConnected = false;
     this.disconnectedNotice = false;
     this.lastCtrlC = 0;
@@ -687,6 +716,7 @@ class Tui {
         } else {
           this._refreshPrompt();
         }
+        this._checkIdleQuit();
         break;
       }
       case 'message':
@@ -703,12 +733,14 @@ class Tui {
         break;
       case 'approval_resolved':
         this._removePrompt(data.id, data.decision ? c.dim(`(approval answered: ${String(data.decision).replace('_', ' ')})`) : null);
+        this._checkIdleQuit();
         break;
       case 'question':
         this._addPrompt('question', data);
         break;
       case 'question_resolved':
         this._removePrompt(data.id, data.answer != null ? c.dim(`(answered: ${truncate(String(data.answer), 120)})`) : null);
+        this._checkIdleQuit();
         break;
       case 'notify':
         if (data.text) this.line(renderNotify(data, this.theme));
@@ -716,7 +748,7 @@ class Tui {
       case 'result':
         this.inFlight = Math.max(0, this.inFlight - 1);
         this.line(renderResult(data, this.theme));
-        if (this.quitWhenIdle && this.inFlight === 0) this.quit();
+        this._checkIdleQuit();
         break;
       case 'project': {
         const prevDir = this.state.project && this.state.project.dir;
@@ -754,11 +786,29 @@ class Tui {
         break;
       case '_disconnected':
         this.state.status = 'offline';
+        this._checkIdleQuit();
         if (!this.disconnectedNotice) {
           this.disconnectedNotice = true;
           this.line(c.yellow(`${s.warn} Lost connection to Claude Anywhere; reconnecting… (/quit to leave)`));
         }
         break;
+      case '_daemon_replaced': {
+        // The client followed daemon.json to a new daemon (a restart); its snapshot comes next and
+        // fills everything in again. Cards and streams of the old daemon can no longer be answered.
+        this.disconnectedNotice = false;
+        this.prompts = [];
+        this.streamText.clear();
+        this.tools.clear();
+        this.openKind = null;
+        this.openId = null;
+        this.inFlight = this.postsPending;
+        this.state.status = 'idle';
+        this.state.statusDetail = '';
+        const where = [data.pid ? `pid ${data.pid}` : '', data.port ? `port ${data.port}` : ''].filter(Boolean).join(', ');
+        this.line(c.green(`${s.ok} Claude Anywhere restarted${where ? ` (${where})` : ''}; reconnected.`));
+        this._checkIdleQuit();
+        break;
+      }
       default:
         // screenshot, show and future events need no terminal output.
         break;
@@ -777,6 +827,9 @@ class Tui {
     this.state.mode = snap.mode || this.state.mode;
     this.state.status = snap.status || this.state.status;
     this.state.statusDetail = snap.statusDetail || '';
+    // A result missed while disconnected is never replayed: an idle daemon has nothing of ours
+    // running except commands whose POST is still out.
+    if (!BUSY_STATUSES.has(this.state.status)) this.inFlight = this.postsPending;
     if (snap.project) this.state.project = snap.project;
     if (snap.session) this.state.session = snap.session;
     if (snap.config) {
@@ -819,6 +872,7 @@ class Tui {
     if (head && head.id !== headBefore) this._renderPromptCard(head);
     else this._refreshPrompt();
     this._showPrompt();
+    this._checkIdleQuit();
   }
 
   _consumeEcho(text) {
@@ -1116,16 +1170,21 @@ class Tui {
     const body = { text, source, attachScreenshot: Boolean(this.attachNext) };
     this.attachNext = this.attachDefault;
     this.inFlight += 1;
+    this.postsPending += 1;
+    this._checkIdleQuit();
     try {
       await this.client.request('POST', '/api/command', body);
     } catch (err) {
       this.inFlight = Math.max(0, this.inFlight - 1);
+      this.postsPending = Math.max(0, this.postsPending - 1);
       if (echoed) this._consumeEcho(text);
       this.line(c.red(`${s.fail} Could not send: ${err.message}`));
-      if (this.quitWhenIdle && this.inFlight === 0) this.quit();
+      this._checkIdleQuit();
       return;
     }
+    this.postsPending = Math.max(0, this.postsPending - 1);
     this._refreshPrompt();
+    this._checkIdleQuit();
   }
 
   async _post(pathName, body) {
@@ -1133,6 +1192,22 @@ class Tui {
       return await this.client.request('POST', pathName, body);
     } catch (err) {
       this.line(this.theme.c.red(`${this.theme.s.fail} ${err.message}`));
+      return null;
+    }
+  }
+
+  /**
+   * A project or mode switch. The daemon refuses one that would stop a running task (409);
+   * the user confirms by repeating the command with --switch, which sends force.
+   */
+  async _postSwitch(pathName, body, force, retry) {
+    const { c, s } = this.theme;
+    try {
+      return await this.client.request('POST', pathName, force ? { ...body, force: true } : body);
+    } catch (err) {
+      if (err && err.status === 409 && !force) {
+        this.line(c.yellow(`${s.warn} ${err.message}. Wait for it, stop it (/stop), or run ${c.bold(retry)} to stop it and switch now.`));
+      } else this.line(c.red(`${s.fail} ${err.message}`));
       return null;
     }
   }
@@ -1151,12 +1226,13 @@ class Tui {
         break;
       }
       case 'mode': {
-        const mode = arg.toLowerCase();
+        const { rest, force } = splitSwitchFlag(arg);
+        const mode = rest.toLowerCase();
         if (mode !== 'companion' && mode !== 'bridge') {
           this.line(`Mode is ${c.bold(this.state.mode || 'companion')}. Use ${c.bold('/mode companion')} or ${c.bold('/mode bridge')}.`);
           break;
         }
-        const r = await this._post('/api/mode', { mode });
+        const r = await this._postSwitch('/api/mode', { mode }, force, `/mode ${mode} --switch`);
         if (r && r.mode && r.mode !== this.state.mode) {
           this.state.mode = r.mode;
           this.line(`${c.dim('Mode:')} ${c.bold(r.mode)}`);
@@ -1165,13 +1241,14 @@ class Tui {
       }
       case 'project':
       case 'cd': {
-        if (!arg) {
+        const { rest, force } = splitSwitchFlag(arg);
+        if (!rest) {
           const p = this.state.project || {};
           this.line(p.dir ? `Project: ${c.bold(p.name || path.basename(p.dir))} ${c.dim(`(${p.dir})`)}` : 'No project. Use /project <dir>.');
           break;
         }
-        const dir = path.resolve(this.cwd, expandHome(arg.replace(/^["']|["']$/g, ''), this.homedir));
-        const r = await this._post('/api/project', { dir });
+        const dir = path.resolve(this.cwd, expandHome(rest.replace(/^["']|["']$/g, ''), this.homedir));
+        const r = await this._postSwitch('/api/project', { dir }, force, `/${name} ${rest} --switch`);
         if (r && r.project && (!this.state.project || this.state.project.dir !== r.project.dir)) {
           this.state.project = r.project;
           this.line(`${c.dim('Project:')} ${c.bold(r.project.name || path.basename(r.project.dir || dir))} ${c.dim(`(${r.project.dir || dir})`)}`);
@@ -1261,16 +1338,43 @@ class Tui {
   _afterInputClosed() {
     if (this.closed) return;
     // Piped input ended: wait for the work it started, then leave.
-    if (!this.isTTY && (this.inFlight > 0 || BUSY_STATUSES.has(this.state.status))) {
+    if (!this.isTTY && (this.postsPending > 0 || this.inFlight > 0 || BUSY_STATUSES.has(this.state.status))) {
       this.quitWhenIdle = true;
+      this._checkIdleQuit();
       return;
     }
     this.quit();
   }
 
+  /**
+   * Piped input ended with work pending: whether that work is over. Results are not counted (see
+   * inFlight); the daemon's status is the truth: idle or error, nothing of ours still being
+   * posted, and no approval or question waiting.
+   */
+  _idleForQuit() {
+    return this.postsPending === 0 && this.prompts.length === 0 && IDLE_STATUSES.has(this.state.status);
+  }
+
+  /** With quitWhenIdle set, quit once the daemon has stayed idle for idleQuitMs. */
+  _checkIdleQuit() {
+    if (!this.quitWhenIdle || this.closed) return;
+    if (!this._idleForQuit()) {
+      if (this._idleTimer) clearTimeout(this._idleTimer);
+      this._idleTimer = null;
+      return;
+    }
+    if (this._idleTimer) return;
+    this._idleTimer = setTimeout(() => {
+      this._idleTimer = null;
+      if (this.quitWhenIdle && !this.closed && this._idleForQuit()) this.quit();
+    }, this.idleQuitMs);
+  }
+
   /** Leave the TUI (the daemon keeps running). */
   quit() {
     if (this.closed) return;
+    if (this._idleTimer) clearTimeout(this._idleTimer);
+    this._idleTimer = null;
     this._cancelRecording();
     this._clearPrompt();
     if (!this.col0) this._write('\n');

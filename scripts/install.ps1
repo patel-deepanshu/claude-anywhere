@@ -111,7 +111,11 @@ function Install-ClaudeAnywhere {
 
   Write-Step 'Installing the /anywhere skill and MCP tools'
   $cli = Join-Path $appDir 'bin\anywhere.js'
-  & node $cli install @Arguments
+  # The PATH step below makes 'anywhere' available, so the installer does not point at it.
+  $prevNoLink = $env:ANYWHERE_NO_LINK
+  if ($env:ANYWHERE_NO_PATH -ne '1') { $env:ANYWHERE_NO_LINK = '1' }
+  try { & node $cli install @Arguments }
+  finally { $env:ANYWHERE_NO_LINK = $prevNoLink }
   if ($LASTEXITCODE -ne 0) { throw "anywhere install failed (exit code $LASTEXITCODE). Run: node `"$cli`" doctor" }
 
   if ($env:ANYWHERE_NO_PATH -ne '1') {

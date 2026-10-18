@@ -1504,6 +1504,8 @@ a {
 .card-reason {
   color: var(--text-2);
   font-size: 12.5px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .card-details summary {
@@ -1543,9 +1545,18 @@ a {
   min-height: 32px;
 }
 
+/* The key hints are true only where the keys go: Esc denies from anywhere in the card, Enter
+   allows only on the card itself (or Allow). Elsewhere, Enter and Esc belong to the composer. */
+.card:not(:focus-within) .card-actions kbd,
+.card:not(:focus) .card-actions .btn-primary:not(:focus) kbd {
+  display: none;
+}
+
 .card-q {
   font-size: 14px;
   font-weight: 500;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .q-options {

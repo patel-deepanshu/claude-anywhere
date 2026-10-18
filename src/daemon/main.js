@@ -315,6 +315,27 @@ function isOwnDaemon(body, { home = homeId(), uid = currentUid() } = {}) {
   return body.uid == null || uid == null || body.uid === uid;
 }
 
+/**
+ * Delete run/screenshot-*.png: `anywhere computer screenshot` (bridge mode takes one after every
+ * step) saves them there, and each can show anything that was on screen.
+ */
+function removeCliScreenshots(dir = paths.runDir()) {
+  let names = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const n of names) {
+    if (!/^screenshot-.*\.png$/.test(n)) continue;
+    try {
+      fs.unlinkSync(path.join(dir, n));
+    } catch {
+      /* in use or already gone */
+    }
+  }
+}
+
 /** @returns {string} run/last-port.json: the port this state dir's daemon bound last, for a stable dialog origin */
 function lastPortPath() {
   return path.join(paths.runDir(), 'last-port.json');
@@ -559,6 +580,8 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
         // Browsers get a single-use launch URL, not the token URL (command lines are readable
         // by every local user). `server` is assigned below, before any dialog opens.
         launchUrl: (u) => (server && typeof server.launchUrl === 'function' ? server.launchUrl(u) : u),
+        // Dialog pages only: a connected TUI must not stop show() from reopening a closed dialog.
+        clientCount: () => hub.clientCount('ui'),
       });
     } catch (err) {
       log.error('UiHost failed to start; the dialog URL will be printed instead:', err);
@@ -597,7 +620,15 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     try {
       // The live project: the broker's own copy only follows 'project' broadcasts, which come
       // after the git probe (up to 4 s), while the engine may already run in the new folder.
-      permissions = new permMod.PermissionBroker({ config, hub, onNeedAttention, projectDir, getProjectDir: () => (session ? session.projectDir : projectDir) });
+      permissions = new permMod.PermissionBroker({
+        config,
+        hub,
+        onNeedAttention,
+        projectDir,
+        getProjectDir: () => (session ? session.projectDir : projectDir),
+        // type_text is judged by where it lands: a terminal runs it, an email does not (REGRESSIONS-7).
+        activeWindow: () => lazyDriver.activeWindow(),
+      });
     } catch (err) {
       log.error('PermissionBroker failed to start; using the basic always-ask broker:', err);
     }
@@ -689,6 +720,7 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
       if (session) await step('stop session', () => session.shutdown());
       if (uihost) await step('close dialog', () => uihost.close());
       if (voice) await step('stop voice', () => voice.stop());
+      await step('remove CLI screenshots', () => removeCliScreenshots());
       if (driverInstance) {
         await step('close driver', () => (osMod && typeof osMod.resetDriver === 'function' ? osMod.resetDriver() : driverInstance.close && driverInstance.close()));
       }
@@ -762,6 +794,18 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     }
   }
 
+  // Linux: this process's start time in clock ticks (/proc/self/stat field 22), so `anywhere stop`
+  // can tell this daemon from a later process that reused its pid (bin/anywhere.js daemonIdentity).
+  let selfStartTicks = null;
+  if (process.platform === 'linux') {
+    try {
+      const stat = fs.readFileSync('/proc/self/stat', 'utf8');
+      const ticks = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]);
+      if (Number.isFinite(ticks)) selfStartTicks = ticks;
+    } catch {
+      /* no /proc */
+    }
+  }
   const writeState = () => {
     if (shuttingDown) return; // shutdown removed daemon.json for good
     try {
@@ -772,6 +816,7 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
         instanceId,
         version,
         startedAt,
+        ...(selfStartTicks != null ? { startTicks: selfStartTicks } : {}),
         project: session.projectDir,
         mode: session.mode,
         url,

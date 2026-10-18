@@ -181,12 +181,16 @@ test('stdio server: discovery probe, initialize, list, ping, unknown tool', asyn
   assert.equal(code, 0, 'exits cleanly when stdin ends');
 });
 
-test('stdio server: a copy started under the daemon engine serves no tools (DAEMON-PROTOCOL-8)', async (t) => {
+test('stdio server: a leftover ANYWHERE_ENGINE_CHILD no longer blanks the tools (DAEMON-PROTOCOL-8, round 2)', async (t) => {
+  // The daemon now keeps the plugin copy out of its engine with --disallowedTools, and no
+  // longer sets this variable. A VS Code or terminal started from a round-1 daemon can still
+  // carry it, and an interactive session there must keep its tools.
   const { peer } = spawnServer(t, { ANYWHERE_ENGINE_CHILD: '1' });
   const init = await peer.request('initialize', { protocolVersion: '2025-11-25' });
   assert.equal(init.result.serverInfo.name, 'anywhere');
+  assert.ok(init.result.instructions, 'instructions are served');
   const list = await peer.request('tools/list', {});
-  assert.deepEqual(list.result.tools, []);
+  assert.ok(list.result.tools.some((tool) => tool.name === 'screenshot'), 'interactive tools are listed');
   // The daemon's own server (role engine) in the same environment keeps its tools.
   const own = spawnServer(t, { ANYWHERE_ENGINE_CHILD: '1', ANYWHERE_ROLE: 'engine' });
   await own.peer.request('initialize', { protocolVersion: '2025-11-25' });

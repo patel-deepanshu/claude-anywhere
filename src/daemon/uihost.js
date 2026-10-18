@@ -46,6 +46,8 @@ const TOPMOST_WAIT_MS = 6000;
 const BROWSER_WAIT_MS = 1500;
 const PID_WAIT_MS = 3000;
 const DRIVER_TIMEOUT_MS = 5000;
+/** err.code of a withTimeout rejection: the operation may still be running. */
+const TIMEOUT_CODE = 'ETIMEDOUT';
 // Background window searches: on macOS, skip reading blank titles through System Events, which
 // can raise the Automation consent prompt and hold the helper queue. Other drivers ignore it.
 const BACKGROUND_LIST = Object.freeze({ axTitles: false });
@@ -59,7 +61,9 @@ const WSL_SYSTEM32 = '/mnt/c/Windows/System32';
 const WSL_PROFILE_KEY = 'wsl:%LOCALAPPDATA%\\claude-anywhere\\ui-profile';
 const WSL_PROFILE_EXPR = "(Join-Path $env:LOCALAPPDATA 'claude-anywhere\\ui-profile')";
 
-// [name, app bundle name, CFBundleIdentifier]
+// [name, app bundle name, CFBundleIdentifier]. Chrome, Canary and Edge first: their
+// webkitSpeechRecognition reaches a speech service. Brave, Chromium and Vivaldi expose the API,
+// but recognition fails there with 'network' (see MAC_WEB_SPEECH_IDS).
 const MAC_BROWSERS = [
   ['Google Chrome', 'Google Chrome', 'com.google.Chrome'],
   ['Google Chrome Canary', 'Google Chrome Canary', 'com.google.Chrome.canary'],
@@ -68,6 +72,9 @@ const MAC_BROWSERS = [
   ['Chromium', 'Chromium', 'org.chromium.Chromium'],
   ['Vivaldi', 'Vivaldi', 'com.vivaldi.Vivaldi'],
 ];
+
+/** Bundle ids (lower case) whose Web Speech recognition works: Chrome, Canary and Edge. */
+const MAC_WEB_SPEECH_IDS = new Set(['com.google.chrome', 'com.google.chrome.canary', 'com.microsoft.edgemac']);
 
 /** JXA that prints the bundle id of the app LaunchServices opens https links with. */
 const MAC_DEFAULT_BROWSER_JXA = [
@@ -492,6 +499,59 @@ function preferNonDefaultBrowser(candidates, defaultBundleId) {
   return [...candidates.filter((c) => !isDefault(c)), ...candidates.filter(isDefault)];
 }
 
+/**
+ * Whether a browser candidate's Web Speech recognition works (the dialog's free voice input):
+ * Google Chrome, Chrome Canary and Microsoft Edge. Brave, Chromium and Vivaldi expose
+ * webkitSpeechRecognition without a speech service behind it, so recognition fails with 'network'.
+ * @param {{name?:string,bundleId?:string}} c
+ * @returns {boolean}
+ */
+function hasBrowserSpeech(c) {
+  if (!c) return false;
+  if (c.bundleId) return MAC_WEB_SPEECH_IDS.has(String(c.bundleId).toLowerCase());
+  const name = String(c.name || '');
+  return /chrome|edge|msedge/i.test(name) && !/chromium/i.test(name);
+}
+
+/**
+ * macOS: the order the dialog tries browsers in. Explicit choices (ANYWHERE_BROWSER, CHROME_PATH:
+ * no bundle id) stay first. Then browsers whose Web Speech works (Chrome, Canary, Edge) before
+ * those where it fails (Brave, Chromium, Vivaldi), and only within each of those tiers is the
+ * default link handler moved last (see preferNonDefaultBrowser): voice input matters more than
+ * keeping links out of the dialog's profile, which close() already guards.
+ * The doctor uses this too, so it reports the browser the dialog actually opens in.
+ * @param {Array<{name?:string,bundleId?:string}>} candidates
+ * @param {string|null} defaultBundleId
+ */
+function orderMacCandidates(candidates, defaultBundleId) {
+  const def = String(defaultBundleId || '').trim().toLowerCase();
+  const rank = (c) => {
+    if (!c.bundleId) return 0;
+    const id = String(c.bundleId).toLowerCase();
+    return (hasBrowserSpeech(c) ? 2 : 4) + (def && id === def ? 1 : 0);
+  };
+  return (candidates || [])
+    .map((c, i) => ({ c, i, r: rank(c) }))
+    .sort((a, b) => a.r - b.r || a.i - b.i)
+    .map((x) => x.c);
+}
+
+/**
+ * macOS: the bundle id of the app LaunchServices opens https links with, or null.
+ * @param {{run?:Function, which?:Function}} [o]
+ * @returns {Promise<string|null>}
+ */
+async function readMacDefaultBrowserId({ run = proc.run, which = proc.which } = {}) {
+  try {
+    const r = await run(which('osascript') || '/usr/bin/osascript', ['-l', 'JavaScript', '-e', MAC_DEFAULT_BROWSER_JXA], { timeoutMs: 5000 });
+    const id = String((r && r.stdout) || '').trim();
+    if (r && !r.error && r.code === 0 && /^[\w.-]+$/.test(id)) return id;
+  } catch (err) {
+    log.debug(`cannot read the default browser: ${err.message}`);
+  }
+  return null;
+}
+
 /** Escape a URL for `cmd.exe /c start "" <url>`. */
 function cmdEscape(s) {
   return String(s).replace(/([&|<>^()%!"])/g, '^$1');
@@ -605,26 +665,30 @@ function resolveElectron({
  * Pick our dialog window from a driver window list: windows owned by our processes, then
  * exact, prefix and substring title matches for "Claude Anywhere". A blank title on a window of
  * ours still counts (macOS hides window titles without Screen Recording permission).
+ * Within one of those classes a window that is not `stale` wins, then one that is not minimized.
+ * `stale` lists ids that existed before this daemon opened anything: a window a crashed daemon
+ * left behind, whose page holds a dead access key, must not shadow the new dialog.
  * @param {Array<{id:any,title?:string,pid?:number,minimized?:boolean,layer?:number}>} windows
- * @param {{pids?:number[]}} [opts]
+ * @param {{pids?:number[], stale?:Iterable<any>}} [opts]
  */
-function pickWindow(windows, { pids = [] } = {}) {
+function pickWindow(windows, { pids = [], stale = [] } = {}) {
   const pidSet = new Set((pids || []).filter((p) => Number(p) > 0).map(Number));
+  const staleSet = new Set([...(stale || [])].map(String));
   let best = null;
   let bestRank = Infinity;
   for (const w of Array.isArray(windows) ? windows : []) {
     if (!w || w.id == null) continue;
     const t = String(w.title || '');
     const pidMatch = Boolean(w.pid) && pidSet.has(Number(w.pid));
-    let rank;
-    if (pidMatch && t.includes(WINDOW_TITLE)) rank = 0;
-    else if (t === WINDOW_TITLE) rank = 1;
-    else if (pidMatch && t.trim()) rank = 2;
-    else if (pidMatch && (w.layer == null || Number(w.layer) === 0)) rank = 2.5;
-    else if (t.startsWith(WINDOW_TITLE)) rank = 3;
-    else if (t.includes(WINDOW_TITLE)) rank = 4;
+    let cls;
+    if (pidMatch && t.includes(WINDOW_TITLE)) cls = 0;
+    else if (t === WINDOW_TITLE) cls = 1;
+    else if (pidMatch && t.trim()) cls = 2;
+    else if (pidMatch && (w.layer == null || Number(w.layer) === 0)) cls = 3;
+    else if (t.startsWith(WINDOW_TITLE)) cls = 4;
+    else if (t.includes(WINDOW_TITLE)) cls = 5;
     else continue;
-    if (w.minimized) rank += 0.5;
+    const rank = cls * 4 + (staleSet.has(String(w.id)) ? 2 : 0) + (w.minimized ? 1 : 0);
     if (rank < bestRank) {
       best = w;
       bestRank = rank;
@@ -705,6 +769,17 @@ function findProfilePids(psOutput, profileDirs, exclude = []) {
 }
 
 /**
+ * powershell.exe as WSL (or another Linux with Windows interop) reaches it, or null: PATH first,
+ * then the fixed System32 path under /mnt/c, then pwsh.exe. The same lookup UiHost uses to open
+ * the dialog in a Windows browser; `anywhere doctor` reports from it.
+ * @param {{which?:Function, exists?:Function}} [deps]
+ * @returns {string|null}
+ */
+function wslPowershellPath({ which = proc.which, exists = fs.existsSync } = {}) {
+  return which('powershell.exe') || (exists(WSL_POWERSHELL) ? WSL_POWERSHELL : null) || which('pwsh.exe') || null;
+}
+
+/**
  * Wait until a child exits or `ms` passes.
  * @returns {Promise<{exited:boolean,code?:number|null,signal?:string|null,error?:Error}>}
  */
@@ -740,7 +815,7 @@ function withTimeout(promise, ms, what) {
   return Promise.race([
     Promise.resolve(promise),
     new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`${what || 'operation'} timed out after ${ms} ms`)), ms);
+      timer = setTimeout(() => reject(Object.assign(new Error(`${what || 'operation'} timed out after ${ms} ms`), { code: TIMEOUT_CODE })), ms);
     }),
   ]).finally(() => clearTimeout(timer));
 }
@@ -763,14 +838,20 @@ class UiHost {
    *   ?token=) into one that is safe on a child-process command line, such as a URL with a
    *   single-use launch code that the page exchanges for the token. Every browser launch asks
    *   for a fresh one. Without it browsers get the token URL itself.
+   * @param {()=>number} [opts.clientCount] how many dialog pages are connected to the daemon (its
+   *   SSE clients, ideally without TUI or CLI watchers). Where windows cannot be listed (GNOME and
+   *   KDE on Wayland), show() relies on it instead of opening another window.
+   * @param {boolean} [opts.cleanupLeftovers] default true: before the first window search or
+   *   launch, stop dialog browsers a previous daemon left running with our profile.
    * Test seams: which, exists, spawn, run, env, getuid, kill, homedir, realpath, readHead,
    * resolveModule, loadModule, profileDir, stateDir, logFile, earlyExitMs, topmostWaitMs,
-   * browserWaitMs, pidWaitMs.
+   * browserWaitMs, pidWaitMs, driverTimeoutMs.
    */
   constructor({ config, platformInfo, driver, ...deps } = {}) {
     this.config = config || {};
     this.platformInfo = platformInfo || platform.info();
     this.driver = driver || null;
+    this._closed = false;
     this.env = deps.env || process.env;
     this._which = deps.which || proc.which;
     this._exists = deps.exists || fs.existsSync;
@@ -790,7 +871,10 @@ class UiHost {
     this.topmostWaitMs = deps.topmostWaitMs != null ? deps.topmostWaitMs : TOPMOST_WAIT_MS;
     this.browserWaitMs = deps.browserWaitMs != null ? deps.browserWaitMs : BROWSER_WAIT_MS;
     this.pidWaitMs = deps.pidWaitMs != null ? deps.pidWaitMs : PID_WAIT_MS;
+    this.driverTimeoutMs = deps.driverTimeoutMs != null ? deps.driverTimeoutMs : DRIVER_TIMEOUT_MS;
     this._launchUrlFn = typeof deps.launchUrl === 'function' ? deps.launchUrl : null;
+    this._clientCountFn = typeof deps.clientCount === 'function' ? deps.clientCount : null;
+    this._cleanupLeftovers = deps.cleanupLeftovers !== false;
 
     this._host = null;
     this._external = false; // a window exists that we did not spawn directly (hand-off, `open -n`, WSL, browser tab)
@@ -799,6 +883,8 @@ class UiHost {
     this._appProfiles = new Set(); // profile dirs (or WSL_PROFILE_KEY) our app windows were started with
     this._wslPid = null;
     this._profilePids = new Set(); // macOS: the dialog browser started through `open -n` (not our child)
+    this._staleIds = new Set(); // ids (as strings) of dialog-like windows that predate this daemon
+    this._cleanedUp = false;
     this._topmost = null;
     this._x11ScaleCache = null;
     this._macHandlerCache = null;
@@ -943,7 +1029,7 @@ class UiHost {
     let displays = null;
     if (this.driver && typeof this.driver.displays === 'function') {
       try {
-        displays = await withTimeout(this.driver.displays(), DRIVER_TIMEOUT_MS, 'listing displays');
+        displays = await withTimeout(this.driver.displays(), this.driverTimeoutMs, 'listing displays');
       } catch (err) {
         log.debug(`displays() failed; assuming ${DEFAULT_DISPLAY.width}x${DEFAULT_DISPLAY.height}: ${err.message}`);
       }
@@ -1030,7 +1116,12 @@ class UiHost {
       const builtin = path.win32.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
       return this._which('powershell.exe') || (this._exists(builtin) ? builtin : null) || this._which('pwsh.exe');
     }
-    return this._which('powershell.exe') || (this._exists(WSL_POWERSHELL) ? WSL_POWERSHELL : null) || this._which('pwsh.exe');
+    return wslPowershellPath({ which: this._which, exists: this._exists });
+  }
+
+  /** powershell.exe as WSL reaches it (see the module-level wslPowershellPath). */
+  static wslPowershellPath(deps) {
+    return wslPowershellPath(deps);
   }
 
   async _wslPreferredExe() {
@@ -1106,7 +1197,7 @@ class UiHost {
       profileDir: defaultProfile,
     });
     if (pi.platform === 'darwin' && candidates.length > 1) {
-      candidates = preferNonDefaultBrowser(candidates, await this._macDefaultBrowserId());
+      candidates = orderMacCandidates(candidates, await this._macDefaultBrowserId());
     }
     if (!candidates.length) reasons.push(noBrowserHint(pi));
     const noSandbox = this._noSandbox();
@@ -1179,14 +1270,7 @@ class UiHost {
   async _macDefaultBrowserId() {
     const now = Date.now();
     if (this._macHandlerCache && now - this._macHandlerCache.at < HANDLER_CACHE_MS) return this._macHandlerCache.value;
-    let value = null;
-    try {
-      const r = await this._run(this._which('osascript') || '/usr/bin/osascript', ['-l', 'JavaScript', '-e', MAC_DEFAULT_BROWSER_JXA], { timeoutMs: 5000 });
-      const id = String((r && r.stdout) || '').trim();
-      if (r && !r.error && r.code === 0 && /^[\w.-]+$/.test(id)) value = id;
-    } catch (err) {
-      log.debug(`cannot read the default browser: ${err.message}`);
-    }
+    const value = await readMacDefaultBrowserId({ run: this._run, which: this._which });
     this._macHandlerCache = { at: now, value };
     return value;
   }
@@ -1257,7 +1341,7 @@ class UiHost {
       while (!token.cancelled && Date.now() < deadline) {
         try {
           const wins = await withTimeout(d.listWindows(BACKGROUND_LIST), 3000, 'listing windows');
-          const w = pickWindow(wins, { pids: this._ownedPids() });
+          const w = this._pick(wins);
           if (w) {
             const ok = await withTimeout(d.setTopmost(w.id, true), 3000, 'setTopmost').catch(() => false);
             if (!ok) log.debug('the window manager did not accept always-on-top for the app window');
@@ -1276,26 +1360,157 @@ class UiHost {
 
   // ----- window search
 
+  /** pickWindow over a fresh listing; ids that predate the daemon and are gone are forgotten (ids get reused). */
+  _pick(wins) {
+    if (this._staleIds.size && Array.isArray(wins)) {
+      const present = new Set(wins.filter((w) => w && w.id != null).map((w) => String(w.id)));
+      for (const id of this._staleIds) if (!present.has(id)) this._staleIds.delete(id);
+    }
+    return pickWindow(wins, { pids: this._ownedPids(), stale: this._staleIds });
+  }
+
+  /**
+   * Look for the dialog window.
+   * @returns {Promise<{win:object|null, listed:boolean}>} listed is false when the windows could
+   *   not be listed at all (no driver, GNOME/KDE on Wayland, a failing or slow driver): then a
+   *   missing window says nothing about whether the dialog is open.
+   */
   async _findWindow() {
     const d = this.driver;
-    if (!d || typeof d.listWindows !== 'function') return null;
+    if (!d || typeof d.listWindows !== 'function') return { win: null, listed: false };
     try {
-      const wins = await withTimeout(d.listWindows(BACKGROUND_LIST), DRIVER_TIMEOUT_MS, 'listing windows');
-      return pickWindow(wins, { pids: this._ownedPids() });
+      const wins = await withTimeout(d.listWindows(BACKGROUND_LIST), this.driverTimeoutMs, 'listing windows');
+      return { win: this._pick(wins), listed: true };
     } catch (err) {
-      log.debug(`cannot list windows: ${err.message}`);
-      return null;
+      if (err && err.code === 'UNSUPPORTED') log.debug(`this desktop cannot list windows: ${err.message}`);
+      else log.debug(`cannot list windows: ${err.message}`);
+      return { win: null, listed: false };
     }
   }
 
+  /**
+   * Ask the driver to focus a window.
+   * @returns {Promise<'focused'|'failed'|'pending'>} 'pending' when the request outlived our wait
+   *   and is still running: on macOS it waits behind the Automation consent prompt (System Events)
+   *   or a context probe in the helper queue, and raises the window once it gets through.
+   */
   async _focus(id) {
     const d = this.driver;
-    if (!d || typeof d.focusWindow !== 'function') return false;
+    if (!d || typeof d.focusWindow !== 'function') return 'failed';
     try {
-      return Boolean(await withTimeout(d.focusWindow(id), DRIVER_TIMEOUT_MS, 'focusing the window'));
+      return (await withTimeout(d.focusWindow(id), this.driverTimeoutMs, 'focusing the window')) ? 'focused' : 'failed';
     } catch (err) {
+      if (err && err.code === TIMEOUT_CODE) {
+        log.info(`focusing the dialog window is taking a while (${err.message}); it comes forward when the request completes`);
+        return 'pending';
+      }
       log.debug(`cannot focus the dialog window: ${err.message}`);
-      return false;
+      return 'failed';
+    }
+  }
+
+  /** Connected dialog pages, from the daemon (0 when it did not say). */
+  _clientCount() {
+    if (!this._clientCountFn) return 0;
+    try {
+      return Number(this._clientCountFn()) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Where windows cannot be listed: whether the dialog is evidently open anyway. Our own app
+   * browser still running means its window is (Chromium leaves when its last window closes,
+   * except on macOS), and a connected dialog page means a window or tab shows it. Electron is
+   * not covered: a second instance only forwards to the running one, which shows its window.
+   */
+  _dialogLikelyOpen() {
+    if (this._host !== 'app' && this._host !== 'browser') return false;
+    if (this._host === 'app' && this.platformInfo.platform !== 'darwin' && this._ownedLive().some((o) => o.host === 'app')) return true;
+    return this._clientCount() > 0;
+  }
+
+  // ----- leftovers of a previous daemon
+
+  /**
+   * Once per UiHost, before its first window search or launch: deal with what a previous daemon
+   * left behind. A daemon that crashed or was killed leaves its app window running. That page
+   * holds a dead access key, and launching again with the same --user-data-dir only adds a
+   * window to that browser, beneath which the dead one would keep matching "Claude Anywhere".
+   * The daemon's start lock guarantees that no live daemon of this state directory owns them.
+   */
+  async _cleanupOnce() {
+    if (this._cleanedUp) return;
+    this._cleanedUp = true;
+    if (!this._cleanupLeftovers) return;
+    let kept = [];
+    try {
+      kept = await this._stopLeftoverBrowsers();
+    } catch (err) {
+      log.debug(`could not look for dialog browsers left by a previous run: ${err.message}`);
+    }
+    await this._notePreexistingWindows(kept);
+  }
+
+  /**
+   * Stop browsers still running with our dialog profile (only when the app host may be used).
+   * @returns {Promise<number[]>} pids of a macOS instance left running because it also holds
+   *   the user's own windows (links opened while their copy of the browser was closed)
+   */
+  async _stopLeftoverBrowsers() {
+    if (!hostOrder(this._ui().host).includes('app')) return [];
+    const pi = this.platformInfo;
+    let dirs;
+    try {
+      dirs = [this._profileDir()];
+    } catch {
+      return [];
+    }
+    if (pi.platform === 'darwin') {
+      const v = await this._macAppInstanceInUse({ dirs, pids: [] });
+      if (!v.pids.length) return [];
+      if (v.inUse) return v.pids;
+      log.info('stopping the dialog browser a previous run left behind');
+      await this._killProfileProcesses(dirs);
+      return [];
+    }
+    if (pi.platform === 'linux') {
+      // Snap browsers keep their profile under ~/snap/<name>/common.
+      const cands = findChromiumCandidates({
+        platformInfo: pi,
+        env: this.env,
+        which: this._which,
+        exists: this._exists,
+        realpath: this._realpath,
+        readHead: this._readHead,
+        homedir: this._homedir,
+        profileDir: dirs[0],
+      });
+      for (const c of cands) if (c.profileDir && !dirs.includes(c.profileDir)) dirs.push(c.profileDir);
+      if (pi.isWSL && (await this._powershellPath())) dirs.push(WSL_PROFILE_KEY);
+    }
+    await this._killProfileProcesses(dirs);
+    return [];
+  }
+
+  /**
+   * Remember the dialog-like windows that exist before this daemon opens anything (a dead page
+   * a sweep could not stop, an old browser tab), so pickWindow prefers the window opened now.
+   * @param {number[]} instancePids processes of a macOS dialog browser that was left running
+   */
+  async _notePreexistingWindows(instancePids = []) {
+    const d = this.driver;
+    if (!d || typeof d.listWindows !== 'function') return;
+    const pidSet = new Set(instancePids.map(Number));
+    try {
+      const wins = await withTimeout(d.listWindows(BACKGROUND_LIST), this.driverTimeoutMs, 'listing windows');
+      for (const w of Array.isArray(wins) ? wins : []) {
+        if (!w || w.id == null) continue;
+        if (String(w.title || '').includes(WINDOW_TITLE) || (w.pid && pidSet.has(Number(w.pid)))) this._staleIds.add(String(w.id));
+      }
+    } catch (err) {
+      log.debug(`cannot list windows before opening the dialog: ${err.message}`);
     }
   }
 
@@ -1307,11 +1522,13 @@ class UiHost {
    * @returns {Promise<{host:'electron'|'app'|'browser'|'none', detail:string}>}
    */
   open(url) {
-    return this._serialize(() => this._open(url));
+    if (this._closed) return Promise.resolve({ host: 'none', detail: 'the daemon is shutting down' });
+    return this._serialize(() => (this._closed ? { host: 'none', detail: 'the daemon is shutting down' } : this._open(url)));
   }
 
   async _open(url) {
     if (!url) throw new Error('UiHost.open(url): url is required');
+    await this._cleanupOnce();
     this._url = url;
     const requested = String(this._ui().host || 'auto').trim().toLowerCase();
     if (!KNOWN_HOSTS.includes(requested)) log.warn(`unknown ui.host "${requested}"; using auto`);
@@ -1352,23 +1569,38 @@ class UiHost {
 
   /**
    * Bring the dialog to the front: focus the existing "Claude Anywhere" window through the
-   * driver, otherwise reopen it.
+   * driver, otherwise reopen it. The daemon has already broadcast a 'show' event, which an open
+   * page answers with window.focus().
    * @param {string} [url]
    * @returns {Promise<{host:string}>}
    */
   show(url) {
+    if (this._closed) return Promise.resolve({ host: 'none' });
     return this._serialize(async () => {
+      // A show queued behind close() (daemon shutdown) must not launch a new window.
+      if (this._closed) return { host: 'none' };
+      await this._cleanupOnce();
       const target = url || this._url;
-      const win = await this._findWindow();
-      if (win && (await this._focus(win.id))) {
-        if (this._host === 'app' && this._ui().alwaysOnTop && this._topmostSupported()) {
-          Promise.resolve()
-            .then(() => this.driver.setTopmost(win.id, true))
-            .catch(() => {});
+      const { win, listed } = await this._findWindow();
+      if (win) {
+        const focus = await this._focus(win.id);
+        if (focus === 'focused') {
+          if (this._host === 'app' && this._ui().alwaysOnTop && this._topmostSupported()) {
+            Promise.resolve()
+              .then(() => this.driver.setTopmost(win.id, true))
+              .catch(() => {});
+          }
+          return { host: this._host || 'browser' };
         }
-        return { host: this._host || 'browser' };
+        // The window exists and the request will still raise it: another launch would only
+        // add a second dialog window.
+        if (focus === 'pending') return { host: this._host || 'browser' };
       }
       if (!target) return { host: this._host || 'none' };
+      if (!listed && this._dialogLikelyOpen()) {
+        log.info('windows cannot be listed here, but the dialog is open; asking it to come forward instead of opening another window');
+        return { host: this._host };
+      }
       const live = this._ownedLive();
       if (this._host === 'electron' && live.some((o) => o.host === 'electron')) {
         // A second instance forwards to the running one (single-instance lock), which shows its window.
@@ -1389,16 +1621,22 @@ class UiHost {
     });
   }
 
-  /** Close only what we started: the Electron child and app-mode browsers using our profile. */
+  /**
+   * Close only what we started: the Electron child and app-mode browsers using our profile.
+   * Final: open() and show() launch nothing afterwards (LIFECYCLE-9).
+   */
   close() {
+    this._closed = true;
     return this._serialize(async () => {
       this._cancelTopmost();
       let keepApp = false;
       if (this.platformInfo.platform === 'darwin' && this._appProfiles.size) {
-        keepApp = await this._macAppInstanceInUse().catch((err) => {
-          log.debug(`cannot check the dialog browser's windows: ${err.message}`);
-          return false;
-        });
+        keepApp = await this._macAppInstanceInUse()
+          .then((v) => v.inUse)
+          .catch((err) => {
+            log.debug(`cannot check the dialog browser's windows: ${err.message}`);
+            return false;
+          });
       }
       const tasks = this._ownedLive()
         .filter((o) => !(keepApp && o.host === 'app'))
@@ -1428,31 +1666,34 @@ class UiHost {
    * the user's own copy of that browser is closed land in it, as normal windows. Before stopping
    * it, make sure it holds nothing but the dialog. If it holds more, close only the dialog window
    * (when the driver can) and leave the instance running.
-   * @returns {Promise<boolean>} true when the instance must be left running
+   * @param {{dirs?:string[], pids?:Iterable<number>}} [o] the profile directories to look for
+   *   (default: those our app windows were started with) and processes already known
+   * @returns {Promise<{inUse:boolean, pids:number[]}>} inUse is true when the instance must be
+   *   left running; pids are the instance's processes
    */
-  async _macAppInstanceInUse() {
+  async _macAppInstanceInUse({ dirs = [...this._appProfiles], pids: known } = {}) {
     const d = this.driver;
-    if (!d || typeof d.listWindows !== 'function') return false;
-    const pids = new Set(this._profilePids);
-    for (const o of this._ownedLive()) if (o.host === 'app' && o.child.pid) pids.add(o.child.pid);
+    const pids = new Set(known || this._profilePids);
+    if (!known) for (const o of this._ownedLive()) if (o.host === 'app' && o.child.pid) pids.add(o.child.pid);
     const r = await this._run('ps', ['-A', '-ww', '-o', 'pid=,args='], { timeoutMs: 5000 });
     if (r && !r.error && r.code === 0) {
-      for (const pid of findProfilePids(r.stdout, [...this._appProfiles], [process.pid])) pids.add(pid);
+      for (const pid of findProfilePids(r.stdout, dirs, [process.pid])) pids.add(pid);
     }
-    if (!pids.size) return false;
+    const found = [...pids];
+    if (!found.length || !d || typeof d.listWindows !== 'function') return { inUse: false, pids: found };
     let wins;
     try {
-      wins = await withTimeout(d.listWindows(BACKGROUND_LIST), DRIVER_TIMEOUT_MS, 'listing windows');
+      wins = await withTimeout(d.listWindows(BACKGROUND_LIST), this.driverTimeoutMs, 'listing windows');
     } catch (err) {
       log.debug(`cannot list windows; stopping the dialog browser: ${err.message}`);
-      return false;
+      return { inUse: false, pids: found };
     }
-    const v = classifyInstanceWindows(wins, [...pids]);
-    if (v.onlyDialog) return false;
+    const v = classifyInstanceWindows(wins, found);
+    if (v.onlyDialog) return { inUse: false, pids: found };
     let closed = 0;
     if (typeof d.closeWindow === 'function') {
       for (const w of v.dialog) {
-        const ok = await withTimeout(d.closeWindow(w.id), DRIVER_TIMEOUT_MS, 'closing the dialog window').catch(() => false);
+        const ok = await withTimeout(d.closeWindow(w.id), this.driverTimeoutMs, 'closing the dialog window').catch(() => false);
         if (ok) closed += 1;
       }
     }
@@ -1461,7 +1702,7 @@ class UiHost {
       `the dialog's browser also holds ${otherCount} other window(s); leaving it running` +
         (closed ? ' and closing only the dialog window' : ' (close the "Claude Anywhere" window yourself)')
     );
-    return true;
+    return { inUse: true, pids: found };
   }
 
   _signal(rec, sig) {
@@ -1506,9 +1747,13 @@ class UiHost {
     }
   }
 
-  async _killProfileProcesses() {
+  /**
+   * Stop the browser processes started with one of our profile directories.
+   * @param {string[]} [dirs] profile directories (or WSL_PROFILE_KEY); default: those our app
+   *   windows were started with
+   */
+  async _killProfileProcesses(dirs = [...this._appProfiles]) {
     const pi = this.platformInfo;
-    const dirs = [...this._appProfiles];
     const windowsSide = [];
     if (pi.platform === 'win32') windowsSide.push(...dirs.map((d) => psString(d)));
     else if (dirs.includes(WSL_PROFILE_KEY)) windowsSide.push(WSL_PROFILE_EXPR);
@@ -1579,6 +1824,11 @@ module.exports = {
   classifyInstanceWindows,
   x11ScaleFrom,
   preferNonDefaultBrowser,
+  orderMacCandidates,
+  hasBrowserSpeech,
+  readMacDefaultBrowserId,
+  wslPowershellPath,
+  MAC_BROWSERS,
   electronEnv,
   ELECTRON_URL_ENV,
   findProfilePids,

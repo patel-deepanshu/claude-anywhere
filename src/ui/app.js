@@ -13,10 +13,12 @@ const EVENT_TYPES = [
   'snapshot', 'status', 'message', 'delta', 'tool_update', 'approval_request', 'approval_resolved', 'question',
   'question_resolved', 'notify', 'result', 'screenshot', 'project', 'session', 'config', 'mode', 'bridge', 'show',
 ];
-const BUSY = new Set(['starting', 'thinking', 'acting', 'waiting_approval', 'waiting_answer', 'stopping']);
+// 'queued': bridge commands wait for a terminal; Stop and Esc drop them (POST /api/interrupt).
+const BUSY = new Set(['starting', 'thinking', 'acting', 'waiting_approval', 'waiting_answer', 'stopping', 'queued']);
 const MAX_ITEMS = 600;
 // Tool rows that keep their screenshot (matches the daemon's transcript policy).
 const MAX_IMAGES_IN_TRANSCRIPT = 12;
+const MAX_IMAGE_CHARS_IN_TRANSCRIPT = 8 * 1024 * 1024; // same caps as the daemon's transcript
 // A card that has just taken focus ignores Enter/Esc for this long, so a key meant for
 // whatever had focus before (or a held one) can't answer it unseen.
 const CARD_ARM_MS = 600;
@@ -219,6 +221,15 @@ const state = {
   histDraft: '',
   sending: false,
   lastSentAt: 0,
+  // The daemon was found down (diagnose) or quit from this window: keep saying so instead
+  // of "Reconnecting…" on every retry.
+  offlineDiagnosed: false,
+  shutDown: false,
+  // Settings drawer: the config and mode the form was filled from, and the keys edited since.
+  formBase: null,
+  formDirty: new Set(),
+  // context.attachScreenshotByDefault as last seen; a change resets the "Include screen" chip.
+  lastAttachDefault: undefined,
   voicePhase: 'idle',
   voiceMode: null,
   speaking: false,
@@ -383,16 +394,25 @@ let retryTimer = 0;
 let retryDelay = 1000;
 let slowTimer = 0;
 
+function clearSlowTimer() {
+  clearTimeout(slowTimer);
+  slowTimer = 0;
+}
+
+function closeEvents() {
+  if (!es) return;
+  try {
+    es.close();
+  } catch {
+    /* ignore */
+  }
+  es = null;
+}
+
 function connect() {
   clearTimeout(retryTimer);
-  if (es) {
-    try {
-      es.close();
-    } catch {
-      /* ignore */
-    }
-    es = null;
-  }
+  closeEvents();
+  if (state.shutDown) return;
   if (!state.token) {
     showBanner('This window has no access key. Open the dialog with /anywhere in Claude Code, or run “anywhere url” and open the link it prints.', 'error', false);
     markOffline();
@@ -401,7 +421,7 @@ function connect() {
   state.authFailed = false;
   let source;
   try {
-    source = new EventSource(`/api/events?token=${encodeURIComponent(state.token)}`);
+    source = new EventSource(`/api/events?token=${encodeURIComponent(state.token)}&client=ui`);
   } catch {
     scheduleReconnect();
     return;
@@ -410,9 +430,10 @@ function connect() {
   source.onopen = () => {
     if (es !== source) return;
     retryDelay = 1000;
-    clearTimeout(slowTimer);
+    clearSlowTimer();
     state.connected = true;
     state.everConnected = true;
+    state.offlineDiagnosed = false;
     hideBanner();
   };
   source.onerror = (ev) => {
@@ -429,11 +450,16 @@ function connect() {
       es = null;
       diagnose(false);
     } else {
-      showBanner('Reconnecting to Claude Anywhere…', 'warning', false);
-      clearTimeout(slowTimer);
-      slowTimer = setTimeout(() => {
-        if (!state.connected) diagnose(true);
-      }, wasConnected ? 6000 : 3000);
+      // Once diagnose() has said the daemon is down, keep that banner (and its Retry button).
+      if (!state.offlineDiagnosed) showBanner('Reconnecting to Claude Anywhere…', 'warning', false);
+      // The browser retries every ~2 s and each failed retry lands here: only arm the check
+      // once, or a retry interval shorter than the delay would keep pushing it back forever.
+      if (!slowTimer) {
+        slowTimer = setTimeout(() => {
+          slowTimer = 0;
+          if (!state.connected) diagnose(true);
+        }, wasConnected ? 6000 : 3000);
+      }
     }
   };
   for (const type of EVENT_TYPES) {
@@ -458,12 +484,14 @@ async function diagnose(sourceStillRetrying) {
   } catch {
     healthy = false;
   }
-  if (state.connected) return;
+  if (state.connected || state.shutDown || state.authFailed) return;
   if (!healthy) {
+    state.offlineDiagnosed = true;
     showBanner('Claude Anywhere isn’t running. Run /anywhere in Claude Code (or “anywhere start”); this window reconnects on its own.', 'error', true);
     if (!sourceStillRetrying) scheduleReconnect();
     return;
   }
+  state.offlineDiagnosed = false;
   try {
     await api('GET', '/api/config', undefined, { timeoutMs: 5000 });
     if (!sourceStillRetrying) scheduleReconnect(300);
@@ -477,17 +505,29 @@ function onUnauthorized() {
   if (state.authFailed) return;
   state.authFailed = true;
   clearTimeout(retryTimer);
-  clearTimeout(slowTimer);
-  if (es) {
-    try {
-      es.close();
-    } catch {
-      /* ignore */
-    }
-    es = null;
-  }
+  clearSlowTimer();
+  closeEvents();
   state.connected = false;
   markOffline();
+  let standalone = false;
+  try {
+    standalone = Boolean(window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+  } catch {
+    standalone = false;
+  }
+  if (standalone) {
+    // An app window (--app) of a daemon that is gone: the new daemon opens its own window, so
+    // close this one rather than leave a dead duplicate behind.
+    showBanner('This window’s access key was rejected because Claude Anywhere restarted. This window closes in a moment; run “anywhere show” or /anywhere if no new one appears.', 'error', false);
+    setTimeout(() => {
+      try {
+        window.close();
+      } catch {
+        /* the browser keeps it */
+      }
+    }, 4000);
+    return;
+  }
   showBanner('This window’s access key was rejected, probably because Claude Anywhere restarted. Run “anywhere show” or /anywhere to open a fresh window.', 'error', true);
 }
 
@@ -570,6 +610,7 @@ const handlers = {
     state.mode = d.mode || state.mode;
     renderMode();
     renderComposerButtons();
+    refreshOpenSettings();
   },
   bridge(d) {
     state.bridge = { ...state.bridge, ...d };
@@ -582,6 +623,7 @@ const handlers = {
       /* ignore */
     }
     focusInput();
+    if (!document.hidden) speaker.claim();
   },
   error(d) {
     toast(d.message || 'Something went wrong.', 'error');
@@ -661,13 +703,19 @@ function trimItems() {
  * @param {boolean} [render] re-render the rows that lose their image
  */
 function trimImages(render = true) {
-  let seen = 0;
+  let kept = 0;
+  let chars = 0;
   for (let i = state.order.length - 1; i >= 0; i -= 1) {
     const id = state.order[i];
     const it = state.items.get(id);
     if (!it || it.role !== 'tool' || !it.image) continue;
-    seen += 1;
-    if (seen <= MAX_IMAGES_IN_TRANSCRIPT) continue;
+    const len = String(it.image).length;
+    // By count and by total size, like the daemon (the newest image always stays).
+    if (kept === 0 || (kept < MAX_IMAGES_IN_TRANSCRIPT && chars + len <= MAX_IMAGE_CHARS_IN_TRANSCRIPT)) {
+      kept += 1;
+      chars += len;
+      continue;
+    }
     it.image = null;
     const n = render ? nodes.get(id) : null;
     const fresh = n ? buildItem(it) : null;
@@ -1067,6 +1115,7 @@ function addApproval(card) {
   cardNodes.set(card.id, n);
   el.cards.append(n);
   updateTimers();
+  renderComposerButtons();
   maybeFocusCard(n);
 }
 
@@ -1078,6 +1127,7 @@ function addQuestion(q) {
   cardSource.set(n, cardSignature('question', q));
   cardNodes.set(q.id, n);
   el.cards.append(n);
+  renderComposerButtons();
   maybeFocusCard(n);
 }
 
@@ -1095,6 +1145,19 @@ function armCard(node) {
   return (e) => e.repeat || (e.target === node && Date.now() < (cardArmAt.get(node) || 0));
 }
 
+/**
+ * A card takes focus from an empty composer when it arrives, so someone who starts typing
+ * at that moment would type into nothing: send printable keys on the card itself back to
+ * the composer (the character follows the focus).
+ * @returns {boolean} true when the key was handed to the composer
+ */
+function typeThrough(node, e) {
+  if (e.target !== node || e.ctrlKey || e.metaKey || e.altKey) return false;
+  if (typeof e.key !== 'string' || [...e.key].length !== 1 || e.key === ' ') return false;
+  focusInput();
+  return true;
+}
+
 /** Focus a card from code (no focus event fires while the window is in the background). */
 function focusCard(node) {
   cardArmAt.set(node, Date.now() + CARD_ARM_MS);
@@ -1104,6 +1167,7 @@ function focusCard(node) {
 function removeCard(id, kind) {
   if (kind === 'approval') state.approvals.delete(id);
   else state.questions.delete(id);
+  renderComposerButtons();
   const n = cardNodes.get(id);
   if (!n) return;
   const hadFocus = n.contains(document.activeElement);
@@ -1116,9 +1180,16 @@ function removeCard(id, kind) {
   }
 }
 
+/** A new card takes focus unless the user is busy elsewhere (typing, another card, a menu). */
 function maybeFocusCard(node) {
   const a = document.activeElement;
-  if (!a || a === document.body || a === el.log) focusCard(node);
+  const idleComposer = a === el.input && !el.input.value.trim() && !state.attachments.length;
+  if (!a || a === document.body || a === el.log || idleComposer) focusCard(node);
+}
+
+/** The card that Enter in an empty composer goes to (the oldest one, as shown first). */
+function firstCardNode() {
+  return el.cards.querySelector('.card');
 }
 
 function firstApproval() {
@@ -1140,7 +1211,11 @@ function buildApprovalCard(card) {
     'aria-label': 'Reason for denying',
     maxlength: '2000',
   });
-  const allow = h('button', { type: 'button', class: 'btn btn-primary' }, 'Allow once', h('kbd', null, '↵'));
+  // Critical actions need a deliberate click: Enter on the card never allows them.
+  const allow =
+    risk === 'critical'
+      ? h('button', { type: 'button', class: 'btn btn-primary', title: 'Critical actions need a click to allow' }, 'Allow once')
+      : h('button', { type: 'button', class: 'btn btn-primary' }, 'Allow once', h('kbd', null, '↵'));
   const always = h(
     'button',
     {
@@ -1170,6 +1245,7 @@ function buildApprovalCard(card) {
   const ignoreKey = armCard(node);
   node.addEventListener('keydown', (e) => {
     if (e.isComposing || e.keyCode === 229) return;
+    if (typeThrough(node, e)) return;
     if ((e.key === 'Escape' || e.key === 'Enter') && ignoreKey(e)) {
       // A held key, or one pressed for whatever had focus a moment ago: not a decision.
       e.preventDefault();
@@ -1187,7 +1263,7 @@ function buildApprovalCard(card) {
         decide('deny');
       } else if (t === node) {
         e.preventDefault();
-        decide('allow');
+        if (risk !== 'critical') decide('allow');
       }
     }
   });
@@ -1216,6 +1292,7 @@ function buildQuestionCard(q) {
   const ignoreKey = armCard(node);
   node.addEventListener('keydown', (e) => {
     if (e.isComposing || e.keyCode === 229) return;
+    if (typeThrough(node, e)) return;
     if ((e.key === 'Escape' || e.key === 'Enter') && ignoreKey(e)) {
       // A held Enter would otherwise focus the first option and then pick it.
       e.preventDefault();
@@ -1252,12 +1329,14 @@ async function resolveApproval(id, decision, message) {
   }
 }
 
+/** @returns {Promise<boolean>} whether the answer reached the waiting question */
 async function answerQuestion(id, text) {
   const n = cardNodes.get(id);
   if (n) n.classList.add('busy');
   try {
     await api('POST', '/api/answer', { id, text });
     removeCard(id, 'question');
+    return true;
   } catch (err) {
     if (n) n.classList.remove('busy');
     if (err.status === 404) {
@@ -1266,6 +1345,7 @@ async function answerQuestion(id, text) {
     } else {
       toast(`Couldn't send your answer: ${err.message}`, 'error');
     }
+    return false;
   }
 }
 
@@ -1311,6 +1391,8 @@ function pillState() {
       return ['waiting', 'Question'];
     case 'stopping':
       return ['waiting', 'Stopping'];
+    case 'queued':
+      return ['waiting', 'Queued'];
     case 'error':
       return ['error', 'Error'];
     case 'offline':
@@ -1529,12 +1611,28 @@ async function openProjects() {
   }
 }
 
+/**
+ * POST a project or mode switch. The daemon refuses one that would stop a running task (409):
+ * ask first, then retry with force. Resolves null when the user keeps the task.
+ */
+async function postSwitch(path, body, opts) {
+  try {
+    return await api('POST', path, body, opts);
+  } catch (err) {
+    if (!err || err.status !== 409) throw err;
+    const what = path === '/api/project' ? 'switch the project' : 'change the mode';
+    if (!window.confirm(`A task is running. Stop it and ${what}?`)) return null;
+    return api('POST', path, { ...body, force: true }, opts);
+  }
+}
+
 async function switchProject(dir) {
   const d = String(dir || '').trim();
   if (!d) return;
   closePopover(true);
   try {
-    const res = await api('POST', '/api/project', { dir: d }, { timeoutMs: 30000 });
+    const res = await postSwitch('/api/project', { dir: d }, { timeoutMs: 30000 });
+    if (!res) return;
     const p = (res && res.project) || {};
     toast(`Switched to ${p.name || basename(d)}`, 'success');
   } catch (err) {
@@ -1546,7 +1644,7 @@ async function setMode(mode) {
   closePopover(true);
   if (mode === state.mode) return;
   try {
-    await api('POST', '/api/mode', { mode });
+    if (!(await postSwitch('/api/mode', { mode }))) return;
     state.mode = mode;
     renderMode();
     toast(mode === 'bridge' ? 'Bridge mode: commands go to your Claude Code terminal' : 'Companion mode', 'success');
@@ -1579,10 +1677,18 @@ function populateVoices(selected) {
   el.ttsVoice.value = selected || '';
 }
 
-function populateSettings() {
+/**
+ * Fill the form from state.config and state.mode, and remember them as the baseline that
+ * collectSettings compares against.
+ * @param {{keepEdits?:boolean}} [opts] keepEdits: the drawer is open and the config changed
+ *   elsewhere; refresh only the fields the user hasn't edited
+ */
+function populateSettings({ keepEdits = false } = {}) {
   const cfg = state.config || {};
+  if (!keepEdits) state.formDirty.clear();
   for (const input of settingsFields()) {
     const key = input.dataset.key;
+    if (keepEdits && state.formDirty.has(key)) continue;
     const val = key === 'mode' ? state.mode : getPath(cfg, key);
     if (input.type === 'checkbox') input.checked = Boolean(val);
     else if (input.type === 'radio') input.checked = String(val) === input.value;
@@ -1593,8 +1699,23 @@ function populateSettings() {
     else if (input.type === 'range') input.value = String(val == null ? 1 : val);
     else input.value = val == null ? '' : String(val);
   }
+  let base;
+  try {
+    base = JSON.parse(JSON.stringify(cfg));
+  } catch {
+    base = {};
+  }
+  state.formBase = { config: base, mode: state.mode };
   updateSettingsHelp();
   renderAbout();
+}
+
+/** The config changed (here or elsewhere) while the drawer is open: keep the user's edits. */
+function refreshOpenSettings() {
+  if (el.drawer.hidden) return;
+  populateSettings({ keepEdits: true });
+  const theme = el.settingsForm.querySelector('input[name="ui.theme"]:checked');
+  if (theme && state.formDirty.has('ui.theme')) applyTheme(theme.value);
 }
 
 function updateSettingsHelp() {
@@ -1628,8 +1749,9 @@ function openSettings() {
   el.drawerBackdrop.hidden = false;
   el.drawer.hidden = false;
   el.openSettings.setAttribute('aria-expanded', 'true');
-  const first = el.drawer.querySelector('input:checked, input, select, button');
-  if (first) first.focus();
+  // A selector list matches in document order (the close button comes first): ask in order of preference.
+  const first = el.settingsForm.querySelector('input:checked') || el.settingsForm.querySelector('input, select, button') || el.closeSettings;
+  first.focus();
 }
 
 function closeSettings(returnFocus) {
@@ -1642,8 +1764,14 @@ function closeSettings(returnFocus) {
   drawerReturn = null;
 }
 
+/**
+ * The settings the user changed: each field is compared with the values the form was filled
+ * from (state.formBase), not the live config, so a change made elsewhere while the drawer
+ * was open isn't sent back with its old value.
+ */
 function collectSettings() {
-  const cfg = state.config || {};
+  const base = state.formBase || { config: state.config || {}, mode: state.mode };
+  const cfg = base.config || {};
   const partial = {};
   let mode = null;
   for (const input of settingsFields()) {
@@ -1656,25 +1784,35 @@ function collectSettings() {
     } else if (input.type === 'number' || input.type === 'range') {
       if (input.value === '') continue;
       val = Number(input.value);
-      if (!Number.isFinite(val) || val < 0) {
-        const label = input.closest('label') && input.closest('label').querySelector('.set-label');
-        const name = label && label.firstChild ? String(label.firstChild.textContent).trim() : key;
-        throw new Error(`${name} must be a number of zero or more.`);
-      }
+      if (!Number.isFinite(val) || val < 0) throw new Error(`${fieldName(input)} must be a number of zero or more.`);
     } else val = input.value.trim();
     if (key === 'voice.sttApiKey') {
       if (val) setPath(partial, key, val);
       continue;
     }
     if (key === 'mode') {
-      if (val !== state.mode) mode = val;
+      if (val !== base.mode) mode = val;
       continue;
     }
     const cur = getPath(cfg, key);
     if (cur === val || (cur == null && val === '')) continue;
+    // The form has novalidate (a stored value off the input's step or range must not block
+    // saving other fields), so check the range here, and only for what was changed.
+    if (input.type === 'number') {
+      const min = input.min === '' ? NaN : Number(input.min);
+      const max = input.max === '' ? NaN : Number(input.max);
+      if (val < min || val > max) {
+        throw new Error(Number.isFinite(max) ? `${fieldName(input)} must be between ${min} and ${max}.` : `${fieldName(input)} must be at least ${min}.`);
+      }
+    }
     setPath(partial, key, val);
   }
   return { partial, mode };
+}
+
+function fieldName(input) {
+  const label = input.closest('label') && input.closest('label').querySelector('.set-label');
+  return label && label.firstChild ? String(label.firstChild.textContent).trim() : input.dataset.key;
 }
 
 async function saveSettings() {
@@ -1696,7 +1834,7 @@ async function saveSettings() {
       }
     }
     if (mode) {
-      await api('POST', '/api/mode', { mode });
+      if (!(await postSwitch('/api/mode', { mode }))) throw new Error('the mode was not changed because a task is running');
       state.mode = mode;
       renderMode();
     }
@@ -1731,8 +1869,20 @@ function trapFocus(e) {
 function applyConfig() {
   const cfg = state.config || {};
   applyTheme();
+  const attachDefault = Boolean(cfg.context && cfg.context.attachScreenshotByDefault);
+  if (state.config) {
+    // The "Include screen" chip remembers its last click, but a change to "Attach a
+    // screenshot by default" since then (in this window or anywhere else) wins.
+    if (state.includeScreenStored && state.lastAttachDefault !== undefined && attachDefault !== state.lastAttachDefault) {
+      state.includeScreenStored = false;
+      store.set('includeScreen', null);
+      store.set('includeScreenDefault', null);
+    }
+    state.lastAttachDefault = attachDefault;
+    if (state.includeScreenStored) store.set('includeScreenDefault', attachDefault);
+  }
   if (!state.includeScreenStored) {
-    state.includeScreen = Boolean(cfg.context && cfg.context.attachScreenshotByDefault);
+    state.includeScreen = attachDefault;
     renderScreenToggle();
   }
   const ui = cfg.ui || {};
@@ -1757,12 +1907,53 @@ function applyConfig() {
   state.lastHandsFree = hf;
   renderFooter();
   renderEmpty();
-  if (!el.drawer.hidden && document.activeElement && !el.drawer.contains(document.activeElement)) populateSettings();
+  refreshOpenSettings();
 }
+
+// ------------------------------------------------------------------ one speaking window
+// With two dialog windows open (a stray browser tab, or a second window on Wayland), only the
+// most recently focused or shown one reads replies aloud and listens hands-free; the others
+// stay quiet. Best effort: BroadcastChannel reaches windows of the same browser profile.
+const speaker = {
+  id: Math.random().toString(36).slice(2),
+  active: true, // alone until another window claims
+  channel: null,
+  init() {
+    try {
+      if (typeof BroadcastChannel === 'function') this.channel = new BroadcastChannel('claude-anywhere');
+    } catch {
+      this.channel = null;
+    }
+    if (this.channel) {
+      this.channel.onmessage = (e) => {
+        const m = e && e.data;
+        if (!m || m.type !== 'speaker' || m.id === this.id || !this.active) return;
+        this.active = false;
+        voice.cancelSpeech();
+        if (voice.mode() === 'handsfree') {
+          voice.cancel();
+          state.handsFreeStarted = false;
+        }
+      };
+    }
+    this.claim();
+  },
+  claim() {
+    const was = this.active;
+    this.active = true;
+    try {
+      if (this.channel) this.channel.postMessage({ type: 'speaker', id: this.id });
+    } catch {
+      /* closed */
+    }
+    if (!was) maybeStartHandsFree();
+  },
+};
 
 function maybeStartHandsFree() {
   const cfg = state.config || {};
   if (!cfg.voice || !cfg.voice.handsFree || cfg.voice.stt === 'off') return;
+  if (!speaker.active) return;
   if (state.handsFreeStarted || voice.isActive()) return;
   state.handsFreeStarted = true;
   voice.start('handsfree');
@@ -1798,11 +1989,18 @@ function renderComposerButtons() {
   el.send.setAttribute('aria-label', stopMode ? 'Stop' : 'Send');
   el.send.title = stopMode ? 'Stop (Esc)' : 'Send (Enter)';
   el.send.disabled = !stopMode && (empty || state.sending);
-  el.input.placeholder = state.mode === 'bridge'
-    ? 'Send a task to your Claude Code terminal…'
-    : busy
-      ? 'Queue a follow-up, or press Esc to stop…'
-      : 'Tell Claude what to do…';
+  // While a card waits, say where the answer goes (see composerAnswersQuestion).
+  el.input.placeholder = state.approvals.size
+    ? 'Allow or deny the request above…'
+    : state.questions.size === 1
+      ? 'Type your answer to Claude’s question…'
+      : state.questions.size
+        ? 'Answer Claude’s questions above…'
+        : state.mode === 'bridge'
+          ? 'Send a task to your Claude Code terminal…'
+          : busy
+            ? 'Queue a follow-up, or press Esc to stop…'
+            : 'Tell Claude what to do…';
 }
 
 function renderScreenToggle() {
@@ -1893,12 +2091,56 @@ async function send(textOverride, { source = 'text' } = {}) {
  */
 function submit({ fromKey = false } = {}) {
   const empty = !el.input.value.trim() && !state.attachments.length;
+  if (empty && fromKey && (state.approvals.size || state.questions.size)) {
+    // Enter while a card waits means the card (its Allow/answer), never "stop the whole
+    // task". Focus it, armed, so this same key press can't decide it; the Stop button still stops.
+    const card = firstCardNode();
+    if (card) {
+      focusCard(card);
+      return;
+    }
+  }
   if (isBusy() && empty) {
     if (fromKey && (state.sending || Date.now() - state.lastSentAt < 1500)) return;
     interrupt();
     return;
   }
+  if (composerAnswersQuestion()) {
+    answerFromComposer();
+    return;
+  }
   send();
+}
+
+/**
+ * Typed text answers Claude's question, as a spoken reply does, when that question is the
+ * only thing waiting. Queued as a follow-up instead, it would sit behind the question that
+ * keeps the turn blocked.
+ */
+function composerAnswersQuestion() {
+  if (!el.input.value.trim() || state.attachments.length || state.approvals.size || state.questions.size !== 1) return false;
+  // Its answer is already on the way: more text is a follow-up.
+  const q = firstQuestion();
+  const n = q && cardNodes.get(q.id);
+  return Boolean(q) && !(n && n.classList.contains('busy'));
+}
+
+async function answerFromComposer() {
+  const q = firstQuestion();
+  const text = el.input.value.trim();
+  if (!q || !text) return;
+  el.input.value = '';
+  state.histIdx = -1;
+  autosize();
+  renderComposerButtons();
+  pushHistory(text);
+  const ok = await answerQuestion(q.id, text);
+  if (!ok && !el.input.value) {
+    // Not delivered (the question went away, or the daemon is unreachable): keep the text.
+    el.input.value = text;
+    autosize();
+    renderComposerButtons();
+  }
 }
 
 async function interrupt() {
@@ -1923,24 +2165,38 @@ async function newSession() {
 
 const MAX_ATTACH = 4;
 const MAX_ATTACH_BYTES = 8 * 1024 * 1024;
+// Images being read (FileReader) and not yet in state.attachments.
+let pendingReads = 0;
 
 function addFiles(files) {
   const imgs = [...files].filter((f) => /^image\/(png|jpeg|gif|webp)$/.test(f.type));
   if (!imgs.length) return false;
+  const tooMany = () => toast(`You can attach up to ${MAX_ATTACH} images.`, 'warning');
+  // Files are added when their reader finishes, so count the ones already on their way.
+  let queued = state.attachments.length + pendingReads;
   for (const f of imgs) {
-    if (state.attachments.length >= MAX_ATTACH) {
-      toast(`You can attach up to ${MAX_ATTACH} images.`, 'warning');
+    if (queued >= MAX_ATTACH) {
+      tooMany();
       break;
     }
     if (f.size > MAX_ATTACH_BYTES) {
       toast(`${f.name || 'Image'} is larger than 8 MB.`, 'warning');
       continue;
     }
+    queued += 1;
+    pendingReads += 1;
     const reader = new FileReader();
+    reader.onloadend = () => {
+      pendingReads = Math.max(0, pendingReads - 1);
+    };
     reader.onload = () => {
       const url = String(reader.result || '');
       const comma = url.indexOf(',');
-      if (comma < 0 || state.attachments.length >= MAX_ATTACH) return;
+      if (comma < 0) return;
+      if (state.attachments.length >= MAX_ATTACH) {
+        tooMany();
+        return;
+      }
       state.attachments.push({ mediaType: f.type, data: url.slice(comma + 1), url, name: f.name || 'image' });
       renderAttachments();
       renderComposerButtons();
@@ -2090,12 +2346,12 @@ function onResult(d) {
   state.session.turns = (Number(state.session.turns) || 0) + 1;
   renderFooter();
   const v = (state.config && state.config.voice) || {};
-  if (v.speakResponses !== false && v.tts !== 'off' && d.speak !== false && !d.isError && d.text) voice.speak(d.text);
+  if (speaker.active && v.speakResponses !== false && v.tts !== 'off' && d.speak !== false && !d.isError && d.text) voice.speak(d.text);
 }
 
 function onNotify(d) {
   const v = (state.config && state.config.voice) || {};
-  if (d.speak && v.tts !== 'off' && d.text) voice.speak(d.text);
+  if (speaker.active && d.speak && v.tts !== 'off' && d.text) voice.speak(d.text);
   if (d.text && (d.level === 'warning' || d.level === 'error' || !isNearBottom() || document.hidden)) {
     toast(d.text, ['info', 'success', 'warning', 'error'].includes(d.level) ? d.level : 'info');
   }
@@ -2307,6 +2563,7 @@ function bindUi() {
     state.includeScreen = !state.includeScreen;
     state.includeScreenStored = true;
     store.set('includeScreen', state.includeScreen);
+    if (state.lastAttachDefault !== undefined) store.set('includeScreenDefault', state.lastAttachDefault);
     renderScreenToggle();
   });
   el.voiceCancel.addEventListener('click', () => voice.cancel());
@@ -2321,7 +2578,13 @@ function bindUi() {
     e.preventDefault();
     saveSettings();
   });
+  const markDirty = (e) => {
+    const key = e.target && e.target.dataset && e.target.dataset.key;
+    if (key) state.formDirty.add(key);
+  };
+  el.settingsForm.addEventListener('input', markDirty);
   el.settingsForm.addEventListener('change', (e) => {
+    markDirty(e);
     const t = e.target;
     if (t && t.name === 'ui.theme') applyTheme(t.value);
     updateSettingsHelp();
@@ -2346,6 +2609,13 @@ function bindUi() {
     if (!window.confirm('Quit Claude Anywhere? This stops the background service and Claude’s session.')) return;
     try {
       await api('POST', '/api/shutdown', {});
+      // Stop listening: the stream's retries would replace this banner with "Reconnecting…".
+      state.shutDown = true;
+      clearTimeout(retryTimer);
+      clearSlowTimer();
+      closeEvents();
+      state.connected = false;
+      markOffline();
       closeSettings(false);
       showBanner('Claude Anywhere has been shut down. Run /anywhere in Claude Code to start it again.', 'warning', true);
     } catch (err) {
@@ -2424,6 +2694,9 @@ function bindUi() {
   el.bannerRetry.addEventListener('click', () => {
     retryDelay = 1000;
     state.authFailed = false;
+    state.shutDown = false;
+    state.offlineDiagnosed = false;
+    clearSlowTimer();
     showBanner('Reconnecting…', 'warning', false);
     connect();
   });
@@ -2489,11 +2762,16 @@ function init() {
   if (typeof storedScreen === 'boolean') {
     state.includeScreen = storedScreen;
     state.includeScreenStored = true;
+    // "Attach a screenshot by default" as it was then: changed since, the setting wins.
+    const def = store.get('includeScreenDefault', null);
+    if (typeof def === 'boolean') state.lastAttachDefault = def;
   }
   const hist = store.get('history', []);
   state.history = Array.isArray(hist) ? hist.filter((x) => typeof x === 'string').slice(-100) : [];
   bindUi();
   bindKeys();
+  speaker.init();
+  window.addEventListener('focus', () => speaker.claim());
   renderScreenToggle();
   renderStatus();
   renderProject();

@@ -307,7 +307,9 @@ test('New session and project switch cancel a command still being prepared', asy
     await s.submit({ text: 'run the tests' });
     await sleep(20);
     const other = fs.mkdtempSync(path.join(HOME, 'projB-'));
-    await s.setProject(other);
+    // A switch that would stop the command needs force (LIFECYCLE-4); forced, it cancels it.
+    await assert.rejects(s.setProject(other), (e) => e.status === 409);
+    await s.setProject(other, { force: true });
     release();
     await s.drain();
     assert.ok(CliLikeEngine.instances.every((e) => e.sent.length === 0), 'not sent into project B');
@@ -332,7 +334,7 @@ test('a project switch during an engine start never mixes the old conversation w
     await s.submit({ text: 'hello' });
     await sleep(20); // startEngine waits in vsCodeDirs()
     const projectB = fs.mkdtempSync(path.join(HOME, 'projB-'));
-    const switching = s.setProject(projectB);
+    const switching = s.setProject(projectB, { force: true });
     await sleep(5);
     releaseDetect();
     await switching;

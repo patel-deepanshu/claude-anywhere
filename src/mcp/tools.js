@@ -615,8 +615,9 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
       const comp = await getComputer();
       const p = await comp.cursorPosition();
       const logical = p && p.logical ? ` (logical screen position ${num(p.logical.x)}, ${num(p.logical.y)})` : '';
-      if (!p || p.x == null || p.display == null) return ok(`The mouse is outside every display${logical}.`);
-      return ok(`Mouse at (${num(p.x)}, ${num(p.y)}) in screenshot pixels of display ${p.display}${logical}.`);
+      const est = p && p.estimated ? ' (estimated: this Wayland session cannot read the real pointer; this is the last position Claude set, so the user may have moved it)' : '';
+      if (!p || p.x == null || p.display == null) return ok(`The mouse is outside every display${logical}${est}.`);
+      return ok(`Mouse at (${num(p.x)}, ${num(p.y)}) in screenshot pixels of display ${p.display}${logical}${est}.`);
     },
   });
 
@@ -734,6 +735,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
         'Open a URL, a file or folder, or an application with the operating system\'s default handler.',
         'kind "auto" (default) decides: http(s), mailto and similar URLs open in the default browser, existing paths open in their default app, anything else is treated as an application name ("Google Chrome", "Visual Studio Code", "Terminal", "code", "firefox").',
         'args are extra command-line arguments for kind "app", e.g. {"target": "Google Chrome", "kind": "app", "args": ["https://console.cloud.google.com"]} to open a URL in a specific browser, or {"target": "code", "kind": "app", "args": ["/path/to/repo"]}.',
+        'On macOS, URLs and existing files in args are handed to the app as documents, so they reach it even when it is already running; flags reach only an app that open starts (the result says when they were not passed); Chromium browsers (Chrome, Edge, Brave) get all args through a new instance that forwards them to the user\'s own browser window; a name that is not an installed app (e.g. "code") runs that command from PATH.',
         'Apps can take a few seconds to appear: wait, then take a screenshot.',
       ].join('\n\n'),
       inputSchema: objectSchema(
@@ -751,8 +753,9 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
         const kind = (r && r.kind) || a.kind || 'target';
         const how = r && r.how ? ` (via ${r.how})` : '';
         const target = (r && r.target) || a.target;
+        const note = r && r.note ? ` ${r.note}` : '';
         return {
-          text: `Opened ${kind} ${oneLine(target, 200)}${how}. It may take a moment to appear; take a screenshot to verify.`,
+          text: `Opened ${kind} ${oneLine(target, 200)}${how}.${note} It may take a moment to appear; take a screenshot to verify.`,
           summary: `Opened ${kind} ${oneLine(target, 100)}`,
         };
       },

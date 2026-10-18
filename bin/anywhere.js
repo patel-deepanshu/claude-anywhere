@@ -50,7 +50,7 @@ class CliError extends Error {
 }
 
 function usageError(message, command) {
-  const err = new CliError(message, EXIT.ERROR, `Run "anywhere help${command ? ` ${command}` : ''}" for usage.`);
+  const err = new CliError(message, EXIT.ERROR, `Run ${cliQ(`help${command ? ` ${command}` : ''}`)} for usage.`);
   err.usage = true;
   return err;
 }
@@ -59,8 +59,48 @@ function notRunningError(extra, hint) {
   return new CliError(
     `Claude Anywhere is not running.${extra ? ` ${extra}` : ''}`,
     EXIT.NOT_RUNNING,
-    hint === undefined ? 'Start it with /anywhere in Claude Code, or run: anywhere start' : hint
+    hint === undefined ? `Start it with /anywhere in Claude Code, or run: ${cliCmd('start')}` : hint
   );
+}
+
+let cliCommandCache = null;
+
+/**
+ * How the user runs this CLI in a terminal of their own: "anywhere" when that command on PATH is
+ * this package, else `node "<package>/bin/anywhere.js"`. Plugin and clone installs usually have no
+ * `anywhere` on the user's PATH: Claude Code adds a plugin's bin/ to its own Bash tool only.
+ * @returns {string}
+ */
+function cliCommand() {
+  if (cliCommandCache) return cliCommandCache;
+  let cmd = null;
+  try {
+    const found = shared('proc').which('anywhere');
+    if (found) {
+      const binDir = path.dirname(BIN_PATH);
+      // Found through a link in another folder (~/.local/bin), or the package's bin/ is on PATH
+      // itself (install.ps1 adds it) while not a plugin, whose bin/ only Claude Code's Bash sees.
+      const viaLink = !samePath(path.dirname(found), binDir);
+      const plugins = realPathOr(path.join(shared('paths').claudeHome(), 'plugins'));
+      const isPlugin = realPathOr(PACKAGE_ROOT).indexOf(plugins + path.sep) === 0;
+      if (samePath(path.dirname(realPathOr(found)), binDir) && (viaLink || !isPlugin)) cmd = 'anywhere';
+    }
+  } catch (_) {
+    cmd = null;
+  }
+  cliCommandCache = cmd || `node "${BIN_PATH}"`;
+  return cliCommandCache;
+}
+
+/** `anywhere <sub>` as the user can type it (see cliCommand). */
+function cliCmd(sub) {
+  return sub ? `${cliCommand()} ${sub}` : cliCommand();
+}
+
+/** cliCmd() set off for prose: "anywhere sub" in quotes, the node form (already quoted) as is. */
+function cliQ(sub) {
+  const c = cliCmd(sub);
+  return c.indexOf('"') >= 0 ? c : `"${c}"`;
 }
 
 // ------------------------------------------------------------------ node version
@@ -120,7 +160,7 @@ function requirePkg(rel, what) {
     throw new CliError(
       `${what} is missing from this installation (${rel}).`,
       EXIT.ERROR,
-      `Update or reinstall Claude Anywhere (${REPO_URL}), then run: anywhere doctor`
+      `Update or reinstall Claude Anywhere (${REPO_URL}), then run: ${cliCmd('doctor')}`
     );
   }
   return mod;
@@ -418,10 +458,21 @@ function expandHome(p) {
   return String(p).replace(/^~(?=$|[\\/])/, os.homedir());
 }
 
+/** The real path (symlinks resolved), or the resolved path when it does not exist. */
+function realPathOr(p) {
+  const abs = path.resolve(String(p));
+  try {
+    return fs.realpathSync.native(abs);
+  } catch (_) {
+    return abs;
+  }
+}
+
+/** Same folder? Symlinked paths to one folder count as the same. */
 function samePath(a, b) {
   if (!a || !b) return false;
-  const x = path.resolve(String(a));
-  const y = path.resolve(String(b));
+  const x = realPathOr(a);
+  const y = realPathOr(b);
   return process.platform === 'win32' || process.platform === 'darwin' ? x.toLowerCase() === y.toLowerCase() : x === y;
 }
 
@@ -634,7 +685,8 @@ async function getDaemon() {
   }
   const st = await shared('state').findRunningDaemon();
   if (!st) return null;
-  return { client: new DaemonClient({ baseUrl: `http://127.0.0.1:${st.port}`, token: st.token }), state: st };
+  // fromState: watchers and long polls follow daemon.json to a restarted daemon.
+  return { client: new DaemonClient({ baseUrl: `http://127.0.0.1:${st.port}`, token: st.token, fromState: true }), state: st };
 }
 
 async function requireDaemon(extra) {
@@ -650,7 +702,7 @@ async function call(client, method, urlPath, body, opts) {
   } catch (err) {
     if (isConnectionError(err)) throw notRunningError('(the daemon stopped responding)');
     if (err && err.status === 401) {
-      throw new CliError('The daemon rejected the access token.', EXIT.ERROR, 'Restart it: anywhere stop && anywhere start');
+      throw new CliError('The daemon rejected the access token.', EXIT.ERROR, `Restart it: ${cliCmd('restart')}`);
     }
     if (err && err.status) {
       const hint = err.data && err.data.hint;
@@ -818,6 +870,8 @@ function daemonEnv(base) {
   delete env.ANYWHERE_DAEMON_URL;
   delete env.ANYWHERE_TOKEN;
   delete env.ANYWHERE_ROLE;
+  // Set by round-1 daemons for their engine; never pass one on to a new daemon.
+  delete env.ANYWHERE_ENGINE_CHILD;
   if (process.platform !== 'win32') {
     const install = readInstallInfo();
     env.PATH = daemonPath(env.PATH, { nodeDir: path.dirname(process.execPath), recorded: install && typeof install.envPath === 'string' ? install.envPath : '' });
@@ -825,16 +879,42 @@ function daemonEnv(base) {
   return env;
 }
 
+// Statuses in which a project or mode switch would stop work in progress.
+const BUSY_STATUSES = ['starting', 'thinking', 'acting', 'waiting_approval', 'waiting_answer', 'queued'];
+
+/**
+ * What keeps the dialog busy, from a GET /api/state snapshot: '' when it is free (or unknown).
+ * @param {object|null} snap
+ * @returns {string}
+ */
+function busyReason(snap) {
+  if (!snap || typeof snap !== 'object') return '';
+  const pend = snap.pending || {};
+  const na = Array.isArray(pend.approvals) ? pend.approvals.length : 0;
+  const nq = Array.isArray(pend.questions) ? pend.questions.length : 0;
+  if (na) return na === 1 ? 'an approval is waiting' : `${na} approvals are waiting`;
+  if (nq) return nq === 1 ? 'a question is waiting for an answer' : `${nq} questions are waiting for answers`;
+  if (BUSY_STATUSES.indexOf(snap.status) >= 0) return 'a task is running';
+  return '';
+}
+
 /**
  * Reuse the running daemon (switching project and mode as asked) or spawn a
  * detached one and wait until it answers /api/health.
- * @param {{project:string, mode?:string, ui?:string, open?:boolean, timeoutMs?:number, waitHost?:boolean}} opts
- * @returns {Promise<{state:object, reused:boolean, host:string|null, notes:string[], pid:number}>}
+ *
+ * A busy dialog (a task running, an approval or question waiting) keeps its project and mode
+ * unless `force` (--switch) is set, because switching stops the running task. Without a requested
+ * mode, a bridge-mode dialog that no Claude Code terminal listens to goes back to companion mode,
+ * so the task runs in the dialog's own session instead of waiting for a terminal.
+ * @param {{project:string, mode?:string, ui?:string, open?:boolean, timeoutMs?:number, waitHost?:boolean,
+ *   force?:boolean, keepMode?:boolean}} opts
+ * @returns {Promise<{state:object, reused:boolean, host:string|null, notes:string[], pid:number, held?:boolean, busy?:string}>}
  */
 async function ensureDaemon(opts) {
   const project = opts.project;
   const mode = opts.mode;
   const open = opts.open !== false;
+  const force = Boolean(opts.force);
   const stateMod = shared('state');
   const paths = shared('paths');
   const { DaemonClient } = shared('client');
@@ -843,23 +923,62 @@ async function ensureDaemon(opts) {
   const running = await stateMod.findRunningDaemon();
   if (running) {
     const client = new DaemonClient({ baseUrl: `http://127.0.0.1:${running.port}`, token: running.token });
-    if (project && !samePath(running.project, project)) {
+    const wantProject = Boolean(project && !samePath(running.project, project));
+    const wantMode = Boolean(mode && running.mode !== mode);
+    const maybeCompanion = !mode && !opts.keepMode && running.mode === 'bridge';
+    let snap = null;
+    if (wantProject || wantMode || maybeCompanion) {
       try {
-        await call(client, 'POST', '/api/project', { dir: project }, { timeoutMs: 30000 });
-        notes.push(`switched the project to ${project}`);
-      } catch (err) {
-        notes.push(`could not switch the project to ${project}: ${err.message}`);
+        snap = await call(client, 'GET', '/api/state', undefined, { timeoutMs: 10000 });
+      } catch (_) {
+        snap = null; // unknown: the daemon refuses (HTTP 409) a switch that would stop a task
       }
     }
-    if (mode && running.mode !== mode) {
-      try {
-        await call(client, 'POST', '/api/mode', { mode }, { timeoutMs: 15000 });
-        notes.push(`switched to ${mode} mode`);
-      } catch (err) {
-        notes.push(`could not switch to ${mode} mode: ${err.message}`);
+    const busy = busyReason(snap);
+    const where = (snap && snap.project && snap.project.dir) || running.project;
+    const rerun = (what) => `rerun with --switch to stop it and ${what}`;
+    let held = false;
+    if (wantProject) {
+      if (busy && !force) {
+        held = true;
+        notes.push(`the dialog is busy in ${where} (${busy}), so it stays on that project; ${rerun(`switch to ${project}`)}`);
+      } else {
+        try {
+          await call(client, 'POST', '/api/project', force ? { dir: project, force: true } : { dir: project }, { timeoutMs: 30000 });
+          notes.push(`switched the project to ${project}${busy ? ' (the running task was stopped)' : ''}`);
+        } catch (err) {
+          if (err && err.status === 409) {
+            held = true;
+            notes.push(`the dialog is busy in ${where} (${err.serverMessage || 'a task is running'}), so it stays on that project; ${rerun(`switch to ${project}`)}`);
+          } else notes.push(`could not switch the project to ${project}: ${err.message}`);
+        }
       }
     }
-    if (opts.ui) notes.push('--ui only applies when the daemon starts (run "anywhere restart --ui ..." to change it)');
+    if (wantMode) {
+      if (busy && !force) {
+        held = true;
+        notes.push(`the dialog is busy (${busy}), so it stays in ${running.mode} mode; ${rerun(`switch to ${mode} mode`)}`);
+      } else {
+        try {
+          await call(client, 'POST', '/api/mode', force ? { mode, force: true } : { mode }, { timeoutMs: 15000 });
+          notes.push(`switched to ${mode} mode${busy ? ' (the running task was stopped)' : ''}`);
+        } catch (err) {
+          if (err && err.status === 409) {
+            held = true;
+            notes.push(`the dialog is busy (${err.serverMessage || 'a task is running'}), so it stays in ${running.mode} mode; ${rerun(`switch to ${mode} mode`)}`);
+          } else notes.push(`could not switch to ${mode} mode: ${err.message}`);
+        }
+      }
+    } else if (maybeCompanion && snap && snap.mode === 'bridge' && !(snap.bridge && snap.bridge.listening) && !busy) {
+      // `/anywhere here` ended (Esc) without leaving bridge mode: nothing would pick up commands.
+      try {
+        await call(client, 'POST', '/api/mode', { mode: 'companion' }, { timeoutMs: 15000 });
+        notes.push('switched back to companion mode (no Claude Code terminal was listening)');
+      } catch (err) {
+        notes.push(`still in bridge mode (${err.message}): commands wait for a terminal that runs /anywhere here`);
+      }
+    }
+    if (opts.ui) notes.push(`--ui only applies when the daemon starts (run ${cliQ('restart --ui ...')} to change it)`);
     let host = null;
     if (open) {
       try {
@@ -870,7 +989,7 @@ async function ensureDaemon(opts) {
       }
     }
     const fresh = stateMod.readDaemonState() || running;
-    return { state: Object.assign({}, running, fresh), reused: true, host, notes, pid: running.pid };
+    return { state: Object.assign({}, running, fresh), reused: true, host, notes, pid: running.pid, held, busy: busy || null };
   }
 
   const logFile = paths.daemonLogPath();
@@ -886,7 +1005,7 @@ async function ensureDaemon(opts) {
   try {
     child = spawnDetached(process.execPath, args, { cwd: isDir(project) ? project : os.homedir(), env, logFile });
   } catch (err) {
-    throw new CliError(`Could not start the Claude Anywhere daemon: ${err.message}`, EXIT.ERROR, 'Run: anywhere doctor');
+    throw new CliError(`Could not start the Claude Anywhere daemon: ${err.message}`, EXIT.ERROR, `Run: ${cliCmd('doctor')}`);
   }
   let exited = null;
   child.on('exit', (code, signal) => {
@@ -903,7 +1022,7 @@ async function ensureDaemon(opts) {
     const err = new CliError(
       `Claude Anywhere did not start: ${why}.${tail ? `\n--- daemon log (${logFile}) ---\n${tail}\n---` : `\nLog: ${logFile}`}`,
       EXIT.ERROR,
-      'Run "anywhere doctor" to check this machine, or "anywhere start --foreground" to see the daemon output directly.'
+      `Run ${cliQ('doctor')} to check this machine, or ${cliQ('start --foreground')} to see the daemon output directly.`
     );
     return err;
   };
@@ -933,7 +1052,7 @@ async function ensureDaemon(opts) {
   throw failure(`no answer within ${Math.round(timeoutMs / 1000)} s`);
 }
 
-function startSummary(res, config, { mode: requestedMode } = {}) {
+function startSummary(res, config, { mode: requestedMode, showToken = false } = {}) {
   const s = sym();
   const st = res.state || {};
   const mode = st.mode || requestedMode || config.mode || 'companion';
@@ -943,7 +1062,11 @@ function startSummary(res, config, { mode: requestedMode } = {}) {
   lines.push(`${color.bold(`${s.star} Claude Anywhere is running`)} ${s.dot} dialog: ${dialog} ${s.dot} project: ${st.project || '?'} ${s.dot} mode: ${mode}`);
   if (res.reused) lines.push(color.dim(`  (reused the daemon that was already running, pid ${st.pid})`));
   for (const n of res.notes || []) lines.push(color.dim(`  ${s.dot} ${n}`));
-  lines.push(`  URL      ${st.url || `http://127.0.0.1:${st.port}/`}`);
+  // The token URL controls this computer; print it only when the user has to open it themselves.
+  // Everyone else gets the bare address (the output often lands in Claude's transcript).
+  const bare = `http://127.0.0.1:${st.port}/`;
+  if (showToken || host === 'none') lines.push(`  URL      ${st.url || bare}`);
+  else lines.push(`  URL      ${bare}   (${cliQ('url')} prints the full link)`);
   const install = readInstallInfo();
   const osHotkey = install && install.hotkey && install.hotkey.installed ? install.hotkey.label || null : null;
   if (host === 'electron') {
@@ -952,17 +1075,22 @@ function startSummary(res, config, { mode: requestedMode } = {}) {
     lines.push(`  Hotkey   ${osHotkey} (OS shortcut) brings the dialog back`);
   }
   if (host === 'none') {
-    lines.push('  Note     No window could be opened here. Open the URL above in a browser, or run "anywhere tui" in a terminal.');
+    if (process.env.SSH_CONNECTION) {
+      lines.push(`  Tunnel   ssh -L ${st.port}:127.0.0.1:${st.port} <user>@<this host>   (same port on both ends), then open the URL on your computer`);
+      lines.push(`  Note     No window could be opened here. Use the tunnel above, or in a terminal run: ${cliCmd('tui')}`);
+    } else {
+      lines.push(`  Note     No window could be opened here. Open the URL above in a browser, or in a terminal run: ${cliCmd('tui')}`);
+    }
   } else if (host === null) {
-    lines.push('  Note     The dialog window is still opening; if it does not appear, run "anywhere show".');
+    lines.push(`  Note     The dialog window is still opening; if it does not appear, run: ${cliCmd('show')}`);
   }
   if (mode === 'bridge') {
-    lines.push('  Next     Commands from the dialog go to the Claude Code session that runs "anywhere listen".');
-    lines.push('           Loop: anywhere listen  →  do the work  →  anywhere reply --final "summary".');
+    lines.push(`  Next     Commands from the dialog go to the Claude Code session that runs ${cliQ('listen')}.`);
+    lines.push(`           Loop: ${cliCmd('listen')}  →  do the work  →  ${cliCmd('reply --final "summary"')}.`);
   } else {
     lines.push('  Next     Type or talk (mic button; hold Space to talk) in the dialog. Claude works in the project above.');
   }
-  lines.push(`           "anywhere show" brings the dialog back ${s.dot} "anywhere stop" (or /anywhere stop) quits.`);
+  lines.push(`           ${cliQ('show')} (or /anywhere) brings the dialog back ${s.dot} ${cliQ('stop')} (or /anywhere stop) quits.`);
   return lines.join('\n');
 }
 
@@ -983,6 +1111,7 @@ function startJson(res, config, requestedMode) {
     version: st.version || packageVersion(),
     logFile: shared('paths').daemonLogPath(),
     notes: res.notes || [],
+    busy: res.held ? res.busy || 'busy' : null,
   };
 }
 
@@ -999,10 +1128,10 @@ async function cmdStart(p) {
   const config = shared('config').load();
   if (f.foreground) return runDaemonForeground({ project, mode, ui, open, port: f.port, announce: true });
   const timeoutMs = f.timeout ? toInt(f.timeout, '--timeout', 1, 600) * 1000 : START_TIMEOUT_MS;
-  const res = await ensureDaemon({ project, mode, ui, open, timeoutMs, port: f.port });
+  const res = await ensureDaemon({ project, mode, ui, open, timeoutMs, port: f.port, force: Boolean(f.switch) });
   if (!open) res.host = undefined;
   if (f.json) printJson(startJson(res, config, mode));
-  else writeOut(startSummary(res, config, { mode }));
+  else writeOut(startSummary(res, config, { mode, showToken: Boolean(f['show-token']) }));
   return EXIT.OK;
 }
 
@@ -1020,7 +1149,7 @@ async function runDaemonForeground({ project, mode, ui, open, port, announce }) 
     d = await main.runDaemon(opts);
   } catch (err) {
     if (err && err.code === 'ALREADY_RUNNING') {
-      if (announce) throw new CliError(err.message, EXIT.ERROR, 'Stop it first: anywhere stop');
+      if (announce) throw new CliError(err.message, EXIT.ERROR, `Stop it first: ${cliCmd('stop')}`);
       writeErr(err.message);
       return EXIT.OK;
     }
@@ -1036,28 +1165,93 @@ async function cmdDaemon(p) {
   return runDaemonForeground({ project, mode: validateMode(f.mode), ui: validateUi(f.ui), open: f.open !== false, port: f.port, announce: false });
 }
 
-/** Best effort: does this pid look like a Claude Anywhere daemon? true/false, or null when unknown. */
-async function looksLikeDaemon(pid) {
-  const { run } = shared('proc');
+// The daemon's command line: the process title runDaemonForeground sets, or `anywhere.js daemon …`.
+const DAEMON_CMD_RE = /claude-anywhere-daemon|anywhere(\.js)?["']?\s+daemon(\s|$)|daemon[\\/]main\.js/;
+// ps etime and /proc tick counts are coarse; daemon.json's startedAt is written just after start.
+const START_TOLERANCE_MS = 2000;
+
+/** Is this command line a Claude Anywhere daemon? true/false, or null when unknown. */
+function looksLikeDaemon(cmdline) {
+  if (cmdline == null) return null;
+  return DAEMON_CMD_RE.test(String(cmdline));
+}
+
+/** ps etime ("[[dd-]hh:]mm:ss") in seconds, or null. */
+function parseEtime(text) {
+  const m = /^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s*$/.exec(String(text || ''));
+  if (!m) return null;
+  return ((Number(m[1] || 0) * 24 + Number(m[2] || 0)) * 60 + Number(m[3])) * 60 + Number(m[4]);
+}
+
+/**
+ * When a live process started and what it runs, as far as the OS tells: {startMs, startTicks,
+ * cmdline}, each null when unknown. Linux reads /proc, macOS and other Unixes ps, Windows CIM.
+ * @param {number} pid
+ */
+async function processIdentity(pid) {
+  const out = { startMs: null, startTicks: null, cmdline: null };
+  const { run, which } = shared('proc');
   try {
-    if (process.platform === 'linux') {
-      const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
-      return /anywhere|claude-anywhere-daemon|daemon[\\/]main\.js/.test(cmd);
-    }
-    if (process.platform === 'darwin') {
-      const r = await run('ps', ['-p', String(pid), '-o', 'command='], { timeoutMs: 3000 });
-      if (r.code !== 0) return null;
-      return /anywhere|claude-anywhere-daemon|node/.test(r.stdout);
+    if (process.platform === 'linux' && fs.existsSync(`/proc/${pid}/stat`)) {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      // Field 22, starttime (clock ticks after boot); the name in field 2 may hold spaces and ")".
+      const ticks = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]);
+      const uptime = parseFloat(fs.readFileSync('/proc/uptime', 'utf8'));
+      if (Number.isFinite(ticks) && Number.isFinite(uptime)) {
+        out.startTicks = ticks;
+        out.startMs = Date.now() - (uptime - ticks / 100) * 1000; // USER_HZ is 100
+      }
+      out.cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0+/g, ' ').trim();
+      return out;
     }
     if (process.platform === 'win32') {
-      const r = await run('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { timeoutMs: 5000 });
-      if (r.code !== 0) return null;
-      return /node/i.test(r.stdout);
+      const root = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
+      const builtin = path.win32.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+      const ps = fs.existsSync(builtin) ? builtin : which('powershell.exe') || which('pwsh.exe');
+      if (!ps) return out;
+      const script =
+        `$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${Number(pid)}'; ` +
+        "if ($p) { [pscustomobject]@{ start = $p.CreationDate.ToUniversalTime().ToString('o'); cmd = $p.CommandLine } | ConvertTo-Json -Compress }";
+      const r = await run(ps, ['-NoProfile', '-NonInteractive', '-Command', script], { timeoutMs: 15000 });
+      const text = String(r.stdout || '').trim();
+      if (r.code !== 0 || !text) return out;
+      const data = JSON.parse(text);
+      const t = Date.parse(data.start);
+      if (Number.isFinite(t)) out.startMs = t;
+      if (typeof data.cmd === 'string') out.cmdline = data.cmd;
+      return out;
     }
+    const r = await run('ps', ['-o', 'etime=', '-o', 'command=', '-p', String(pid)], { timeoutMs: 3000, env: Object.assign({}, process.env, { LC_ALL: 'C' }) });
+    const m = /^\s*(\S+)\s+([\s\S]*?)\s*$/.exec(String(r.stdout || ''));
+    if (r.code !== 0 || !m) return out;
+    const secs = parseEtime(m[1]);
+    if (secs != null) out.startMs = Date.now() - secs * 1000;
+    out.cmdline = m[2];
   } catch (_) {
-    return null;
+    /* unknown */
   }
-  return null;
+  return out;
+}
+
+/**
+ * Is the live process `raw.pid` still the daemon that wrote daemon.json? PIDs are reused (on
+ * Windows quickly, and after every reboot), so a pid alone proves nothing: the process must have
+ * started no later than the daemon recorded its start, and run the daemon's command line.
+ * @param {object} raw daemon.json
+ * @returns {Promise<'match'|'mismatch'|'unknown'>}
+ */
+async function daemonIdentity(raw, identity) {
+  const id = identity || (await processIdentity(raw.pid));
+  let recorded = typeof raw.startTime === 'number' ? raw.startTime : Date.parse(raw.startTime || raw.startedAt || '');
+  if (!Number.isFinite(recorded)) recorded = null;
+  let timeOk = null;
+  if (typeof raw.startTicks === 'number' && id.startTicks != null) timeOk = raw.startTicks === id.startTicks;
+  else if (id.startMs != null && recorded != null) timeOk = id.startMs <= recorded + START_TOLERANCE_MS;
+  // A process that started after the daemon wrote daemon.json got the pid after the daemon ended.
+  if (timeOk === false) return 'mismatch';
+  const looks = looksLikeDaemon(id.cmdline);
+  if (looks === false) return 'mismatch';
+  return timeOk && looks ? 'match' : 'unknown';
 }
 
 async function killPid(pid) {
@@ -1070,35 +1264,53 @@ async function killPid(pid) {
     }
     return !stateMod.isPidAlive(pid);
   };
+  if (process.platform === 'win32') {
+    // process.kill is TerminateProcess: it ends only this process, and Windows leaves its children
+    // (claude, the MCP server, the app window) running. taskkill /T walks the tree while the
+    // parent is still alive, so it runs first.
+    await shared('proc').run('taskkill', ['/PID', String(pid), '/T', '/F'], { timeoutMs: 8000 });
+    if (await waitDead(3000)) return 'taskkill';
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch (_) {
+      /* already gone */
+    }
+    return (await waitDead(3000)) ? 'SIGKILL' : null;
+  }
   try {
     process.kill(pid, 'SIGTERM');
   } catch (_) {
     /* already gone */
   }
   if (await waitDead(3000)) return 'SIGTERM';
-  if (process.platform === 'win32') {
-    await shared('proc').run('taskkill', ['/PID', String(pid), '/T', '/F'], { timeoutMs: 8000 });
-  } else {
-    try {
-      process.kill(pid, 'SIGKILL');
-    } catch (_) {
-      /* already gone */
-    }
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch (_) {
+    /* already gone */
   }
   return (await waitDead(3000)) ? 'SIGKILL' : null;
 }
 
-/** Stop the daemon. @returns {Promise<{stopped:boolean, pid:number|null, how:string}>} */
+/**
+ * Stop the daemon.
+ * @returns {Promise<{stopped:boolean, pid:number|null, how:string, stale?:boolean, unconfirmed?:boolean}>}
+ */
 async function stopDaemon() {
   const stateMod = shared('state');
   const { DaemonClient } = shared('client');
   const st = await stateMod.findRunningDaemon();
   if (!st) {
     const raw = stateMod.readDaemonState();
-    if (raw && raw.pid && stateMod.isPidAlive(raw.pid) && raw.pid !== process.pid && (await looksLikeDaemon(raw.pid)) !== false) {
-      const how = await killPid(raw.pid);
+    if (raw && raw.pid && stateMod.isPidAlive(raw.pid) && raw.pid !== process.pid) {
+      // The daemon does not answer: only kill the pid when it is provably still that daemon.
+      const identity = await daemonIdentity(raw);
       stateMod.clearDaemonState();
-      return { stopped: Boolean(how), pid: raw.pid, how: how ? `unresponsive daemon killed (${how})` : 'could not kill the unresponsive daemon' };
+      if (identity === 'match') {
+        const how = await killPid(raw.pid);
+        return { stopped: Boolean(how), pid: raw.pid, how: how ? `unresponsive daemon killed (${how})` : 'could not kill the unresponsive daemon' };
+      }
+      if (identity === 'mismatch') return { stopped: false, pid: null, stale: true, how: `not running (daemon.json was stale: pid ${raw.pid} now belongs to another program, which was left alone)` };
+      return { stopped: false, pid: raw.pid, unconfirmed: true, how: `the daemon did not answer, and pid ${raw.pid} could not be confirmed as the daemon, so it was not killed` };
     }
     stateMod.clearDaemonState();
     return { stopped: false, pid: null, how: 'not running' };
@@ -1122,16 +1334,20 @@ async function stopDaemon() {
 
 async function cmdStop(p) {
   const r = await stopDaemon();
-  if (p.flags.json) printJson(Object.assign({ ok: r.how !== 'still running' }, r));
+  const killHint = r.pid ? (process.platform === 'win32' ? `taskkill /PID ${r.pid} /T /F` : `kill ${r.pid}`) : '';
+  if (p.flags.json) printJson(Object.assign({ ok: r.how !== 'still running' && !r.unconfirmed }, r));
   else if (r.how === 'not running') writeOut('Claude Anywhere is not running.');
+  else if (r.stale) writeOut(`Claude Anywhere is ${r.how}.`);
   else if (r.stopped) writeOut(`${color.green(sym().ok)} Claude Anywhere stopped (pid ${r.pid}${r.how !== 'shutdown' ? `, ${r.how}` : ''}).`);
-  else throw new CliError(`Could not stop Claude Anywhere (pid ${r.pid}).`, EXIT.ERROR, `Kill the process manually (pid ${r.pid}).`);
+  else if (r.unconfirmed) throw new CliError(`Claude Anywhere is not answering: ${r.how}.`, EXIT.ERROR, `If pid ${r.pid} is the Claude Anywhere daemon, end it yourself: ${killHint}`);
+  else throw new CliError(`Could not stop Claude Anywhere (pid ${r.pid}).`, EXIT.ERROR, `Kill the process manually: ${killHint}`);
   return EXIT.OK;
 }
 
 async function cmdRestart(p) {
   const prev = shared('state').readDaemonState();
-  await stopDaemon();
+  const stopped = await stopDaemon();
+  if (stopped.unconfirmed && !p.flags.json) writeErr(color.yellow(`${sym().warn} The old daemon did not answer: ${stopped.how}.`, process.stderr));
   if (!p.flags.project && prev && prev.project && isDir(prev.project)) p.flags.project = prev.project;
   if (!p.flags.mode && prev && prev.mode) p.flags.mode = prev.mode;
   return cmdStart(p);
@@ -1141,7 +1357,7 @@ async function cmdStatus(p) {
   const d = await getDaemon();
   if (!d) {
     if (p.flags.json) printJson({ running: false });
-    else writeOut('Claude Anywhere is not running. Start it with /anywhere in Claude Code, or: anywhere start');
+    else writeOut(`Claude Anywhere is not running. Start it with /anywhere in Claude Code, or: ${cliCmd('start')}`);
     return EXIT.NOT_RUNNING;
   }
   const snap = await call(d.client, 'GET', '/api/state', undefined, { timeoutMs: 10000 });
@@ -1168,7 +1384,8 @@ async function cmdStatus(p) {
     const cost = typeof sess.costUsd === 'number' && sess.costUsd > 0 ? ` ${s.dot} $${sess.costUsd.toFixed(sess.costUsd < 1 ? 4 : 2)}` : '';
     lines.push(`  Session   ${sess.id}${sess.model ? ` ${s.dot} ${sess.model}` : ''}${cost} ${s.dot} ${sess.turns || 0} turn${sess.turns === 1 ? '' : 's'}`);
   }
-  if (st.url) lines.push(`  Dialog    ${st.url}`);
+  // The token URL controls this computer and this output often lands in Claude's transcript.
+  if (st.url) lines.push(`  Dialog    ${st.port ? `http://127.0.0.1:${st.port}/` : st.url.replace(/\?token=[^&#]*/, '')}   (${cliQ('url')} prints the full link)`);
   const v = snap.voice || {};
   lines.push(`  Voice     speech-to-text: ${v.serverStt ? v.sttProvider : 'browser only'} ${s.dot} text-to-speech: ${v.serverTts ? v.ttsProvider : 'browser only'}`);
   if (snap.mode === 'bridge') lines.push(`  Bridge    ${snap.bridge && snap.bridge.listening ? 'a Claude Code session is listening' : 'no Claude Code session is listening (run /anywhere here)'}`);
@@ -1214,7 +1431,7 @@ async function cmdShow(p) {
       const r = await startViaTerminal(project);
       if (p.flags.json) printJson(Object.assign({ ok: r.opened, running: false }, r));
       else if (r.opened) writeOut('Claude Anywhere was not running; opened Terminal to start it.');
-      else writeOut(`Claude Anywhere is not running, and Terminal could not be opened (${r.error}). Type /anywhere in Claude Code, or run: anywhere start`);
+      else writeOut(`Claude Anywhere is not running, and Terminal could not be opened (${r.error}). Type /anywhere in Claude Code, or run: ${cliCmd('start')}`);
       return r.opened ? EXIT.OK : EXIT.NOT_RUNNING;
     }
     const config = shared('config').load();
@@ -1229,7 +1446,7 @@ async function cmdShow(p) {
     return EXIT.OK;
   }
   if (r && r.host && r.host !== 'none') writeOut(`${color.green(sym().ok)} Dialog shown (${hostLabel(r.host)}).`);
-  else writeOut(`No dialog window could be opened${r && r.error ? ` (${r.error})` : ''}. Open ${d.state.url || 'the dialog URL'} in a browser, or run: anywhere tui`);
+  else writeOut(`No dialog window could be opened${r && r.error ? ` (${r.error})` : ''}. Open ${d.state.url || 'the dialog URL'} in a browser, or in a terminal run: ${cliCmd('tui')}`);
   return EXIT.OK;
 }
 
@@ -1258,31 +1475,94 @@ function readImageFile(file) {
   return { mediaType: type, data: buf.toString('base64') };
 }
 
+/**
+ * Wait for the result of one command sent with POST /api/command.
+ * commandId.value is filled in once the POST answers; events that arrive before that are kept
+ * and matched when it is (see the returned promise's idKnown()).
+ * A daemon that tags results with `commandIds` (the commands a result answers) is matched
+ * exactly, so a result for another command never ends the wait; an older daemon without the
+ * field falls back to the first result after our user message. `commands_cancelled`
+ * {commandIds, reason} ends the wait with `cancelled` (Stop, a reset or a mode switch dropped it).
+ */
 function waitForResult(client, commandId, timeoutMs) {
-  return new Promise((resolve) => {
+  let check = () => {};
+  const promise = new Promise((resolve) => {
     const seenUser = new Set();
+    const early = [];
     let ours = false;
     let assistantText = '';
     let timer = null;
-    const sub = client.subscribe((type, data) => {
+    let done = false;
+    let sub = null;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (sub) sub.close();
+      resolve(value);
+    };
+    const handle = (type, data) => {
+      if (done) return;
+      const id = commandId.value;
+      // The client followed daemon.json to a new daemon: ours (and the command) is gone.
+      if (type === '_daemon_replaced') return void finish({ cancelled: 'daemon_restarted', text: assistantText });
       if (type === 'message' && data && data.role === 'user') {
         seenUser.add(data.id);
-        if (data.id === commandId.value) ours = true;
+        if (id && data.id === id) ours = true;
       }
-      if (!ours && commandId.value && seenUser.has(commandId.value)) ours = true;
+      if (!ours && id && seenUser.has(id)) ours = true;
+      if (type === 'commands_cancelled' && data && Array.isArray(data.commandIds)) {
+        if (!id) return void early.push([type, data]);
+        if (data.commandIds.includes(id)) finish({ cancelled: String(data.reason || 'cancelled'), text: assistantText });
+        return;
+      }
+      if (type === 'result' && data && Array.isArray(data.commandIds)) {
+        if (!id) return void early.push([type, data]);
+        if (data.commandIds.includes(id)) finish({ result: data, text: data.text || assistantText });
+        return; // it answers another command: keep waiting
+      }
       if (!ours) return;
       if (type === 'message' && data && data.role === 'assistant' && data.text && !data.streaming) assistantText = data.text;
-      if (type === 'result') {
-        clearTimeout(timer);
-        sub.close();
-        resolve({ result: data, text: (data && data.text) || assistantText });
-      }
-    });
-    timer = setTimeout(() => {
-      sub.close();
-      resolve({ timeout: true, text: assistantText });
-    }, timeoutMs);
+      if (type === 'result') finish({ result: data, text: (data && data.text) || assistantText }); // older daemon
+    };
+    check = () => {
+      for (const [type, data] of early.splice(0)) handle(type, data);
+    };
+    sub = client.subscribe(handle);
+    timer = setTimeout(() => finish({ timeout: true, text: assistantText }), timeoutMs);
   });
+  promise.idKnown = () => check();
+  return promise;
+}
+
+const CANCEL_REASONS = {
+  stopped: 'it was stopped before it ran',
+  reset: 'the conversation was reset before it ran',
+  cancelled: 'it was cancelled before it ran',
+  engine_exit: 'Claude Code exited before it answered',
+  daemon_restarted: 'Claude Anywhere restarted before it answered',
+  failed: 'it could not be run',
+};
+
+/**
+ * Whether a command just queued can be picked up: the dialog's mode and, in bridge mode, whether
+ * a Claude Code terminal listens. Uses the /api/command answer when it carries them, else
+ * daemon.json and GET /api/state. null when unknown.
+ * @returns {Promise<{mode:string, listening:boolean}|null>}
+ */
+async function bridgeInfo(d, answer) {
+  if (answer && typeof answer.mode === 'string') {
+    const b = answer.bridge && typeof answer.bridge === 'object' ? answer.bridge.listening : answer.listening;
+    if (answer.mode !== 'bridge' || typeof b === 'boolean') return { mode: answer.mode, listening: Boolean(b) };
+  }
+  const st = d.state && d.state.fromEnv ? null : shared('state').readDaemonState();
+  if (st && st.mode && st.mode !== 'bridge') return { mode: st.mode, listening: false };
+  try {
+    const snap = await call(d.client, 'GET', '/api/state', undefined, { timeoutMs: 8000 });
+    return snap && snap.mode ? { mode: snap.mode, listening: Boolean(snap.bridge && snap.bridge.listening) } : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 async function cmdSend(p, opts) {
@@ -1297,6 +1577,21 @@ async function cmdSend(p, opts) {
     const project = f.project ? resolveProject(f.project) : process.cwd();
     started = await ensureDaemon({ project, open: f.open !== false, waitHost: false });
     d = await requireDaemon();
+  } else if (f.project && !d.state.fromEnv) {
+    // A task for another folder: switch the dialog there, but never stop a task in progress silently.
+    const project = resolveProject(f.project);
+    if (!samePath(d.state.project, project)) {
+      const res = await ensureDaemon({ project, open: false, keepMode: true, force: Boolean(f.switch) });
+      if (res.held) {
+        throw new CliError(
+          `Not sent: the dialog is busy in ${res.state.project || 'another project'} (${res.busy || 'a task is running'}), so it was not switched to ${project}.`,
+          EXIT.ERROR,
+          `Wait for it to finish, rerun with --switch to stop that task and switch, or send without --project to queue it in ${res.state.project || 'that project'}.`
+        );
+      }
+      for (const n of res.notes) if (!f.json) writeErr(color.dim(`${sym().dot} ${n}`, process.stderr));
+      d = (await getDaemon()) || d;
+    }
   }
   const body = { text, source: f.source || (opts && opts.source) || 'cli' };
   // --screenshot / --no-screenshot override context.attachScreenshotByDefault; neither = the default.
@@ -1312,19 +1607,29 @@ async function cmdSend(p, opts) {
   }
   const r = await call(d.client, 'POST', '/api/command', body, { timeoutMs: 60000 });
   commandId.value = r && r.id;
+  if (waiting) waiting.idKnown();
+  const bi = await bridgeInfo(d, r);
+  const warning =
+    bi && bi.mode === 'bridge' && !bi.listening
+      ? `The dialog is in bridge mode and no Claude Code terminal is listening, so this task waits until one runs /anywhere here. To have the dialog's own session do it, switch to companion mode (the mode button in the dialog, or: ${cliCmd('start --mode companion')}) and send it again.`
+      : null;
   if (!waiting) {
-    if (f.json) printJson({ ok: true, id: r.id, started: Boolean(started) });
+    if (f.json) printJson({ ok: true, id: r.id, started: Boolean(started), mode: bi ? bi.mode : null, warning });
     else {
       if (started) writeOut(`${sym().star} Started Claude Anywhere for ${started.state.project} (${started.state.url}).`);
-      writeOut(`${color.green(sym().ok)} Sent to Claude Anywhere (command ${r.id}). Follow along in the dialog.`);
+      writeOut(`${color.green(sym().ok)} Sent to Claude Anywhere (command ${r.id}). ${warning ? 'It is queued in the dialog.' : 'Follow along in the dialog.'}`);
+      if (warning) writeOut(color.yellow(`${sym().warn} ${warning}`));
     }
     return EXIT.OK;
   }
+  if (warning && !f.json) writeErr(color.yellow(`${sym().warn} ${warning}`, process.stderr));
   const res = await waiting;
-  if (f.json) printJson(Object.assign({ ok: !res.timeout, id: r.id }, res));
+  if (f.json) printJson(Object.assign({ ok: !res.timeout && !res.cancelled, id: r.id }, res));
   else if (res.timeout) writeOut('TIMEOUT');
+  else if (res.cancelled) writeErr(color.yellow(`${sym().warn} Not answered: ${CANCEL_REASONS[res.cancelled] || `it was cancelled (${res.cancelled})`}.`, process.stderr));
   else writeOut(res.text || (res.result && res.result.interrupted ? 'Stopped.' : '(no text in the result)'));
   if (res.timeout) return EXIT.TIMEOUT;
+  if (res.cancelled) return res.cancelled === 'stopped' ? EXIT.INTERRUPTED : EXIT.ERROR;
   if (res.result && res.result.interrupted) return EXIT.INTERRUPTED;
   return res.result && res.result.isError ? EXIT.ERROR : EXIT.OK;
 }
@@ -1353,7 +1658,7 @@ async function cmdListen(p) {
   const f = p.flags;
   const secs = f.timeout != null ? toInt(f.timeout, '--timeout', 1, LISTEN_MAX_SEC) : LISTEN_DEFAULT_SEC;
   const d = await getDaemon();
-  if (!d) throw notRunningError('', 'Start the dialog in bridge mode with /anywhere here (or: anywhere start --mode bridge).');
+  if (!d) throw notRunningError('', `Start the dialog in bridge mode with /anywhere here (or: ${cliCmd('start --mode bridge')}).`);
   let r;
   try {
     r = await callLong(d.client, 'POST', '/api/bridge/listen', { timeoutSec: secs }, (secs + 30) * 1000);
@@ -1475,14 +1780,19 @@ async function cmdNotify(p) {
 
 const COMPUTER_OPS = ['screenshot', 'click', 'move', 'drag', 'scroll', 'type', 'key', 'windows', 'focus', 'open', 'clipboard', 'cursor', 'screens', 'context', 'capabilities'];
 
-function pruneScreenshots(dir, keep) {
+/**
+ * Keep the newest `keep` CLI screenshots in run/, and none older than maxAgeMs: bridge mode
+ * takes one after every step, and each can show whatever was on screen.
+ */
+function pruneScreenshots(dir, keep, maxAgeMs = 60 * 60 * 1000) {
   try {
+    const now = Date.now();
     const files = fs
       .readdirSync(dir)
       .filter((n) => /^screenshot-.*\.png$/.test(n))
       .map((n) => ({ n, t: fileMtime(path.join(dir, n)) }))
       .sort((a, b) => b.t - a.t);
-    for (const f of files.slice(keep)) {
+    for (const f of files.filter((x, i) => i >= keep || now - x.t > maxAgeMs)) {
       try {
         fs.unlinkSync(path.join(dir, f.n));
       } catch (_) {
@@ -1609,8 +1919,16 @@ async function runComputerOp(op, p, env) {
       const runDir = shared('paths').runDir();
       const out = f.out ? path.resolve(expandHome(f.out)) : path.join(runDir, `screenshot-${stamp()}.png`);
       fs.mkdirSync(path.dirname(out), { recursive: true });
-      fs.writeFileSync(out, shot.png);
-      if (!f.out) pruneScreenshots(runDir, 30);
+      // Owner-only, like the rest of run/: a screenshot can show anything that was on screen.
+      fs.writeFileSync(out, shot.png, { mode: 0o600 });
+      if (!f.out) {
+        try {
+          fs.chmodSync(out, 0o600);
+        } catch (_) {
+          /* Windows */
+        }
+        pruneScreenshots(runDir, 30);
+      }
       env.activity = {
         tool: 'screenshot',
         summary: shot.region
@@ -1810,9 +2128,74 @@ async function locateClaude(config) {
   return { path: p, version: m ? m[0] : null };
 }
 
-/** Look for an installed copy of the anywhere plugin under ~/.claude/plugins. */
+const WSL_POWERSHELL = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe';
+const WSL_INTEROP_HINT = 'powershell.exe is not reachable from WSL: enable interop ([interop] enabled=true and appendWindowsPath=true in /etc/wsl.conf), then run wsl --shutdown';
+
+/**
+ * powershell.exe as WSL reaches it, or null. The daemon opens the dialog in Windows Edge or Chrome
+ * through it (UiHost._launchWslApp), so with it a WSL machine needs no Linux browser.
+ * @param {object} [uihost] src/daemon/uihost.js, whose own lookup wins when it exports one
+ */
+function wslPowershell(uihost) {
+  if (uihost && typeof uihost.wslPowershellPath === 'function') {
+    try {
+      return uihost.wslPowershellPath() || null;
+    } catch (_) {
+      /* fall back to the same lookup here */
+    }
+  }
+  const { which } = shared('proc');
+  return which('powershell.exe') || (fs.existsSync(WSL_POWERSHELL) ? WSL_POWERSHELL : null) || which('pwsh.exe');
+}
+
+/**
+ * The installed copy of the anywhere plugin under ~/.claude/plugins, or null.
+ * Claude Code lists installed plugins in plugins/installed_plugins.json ("anywhere@<marketplace>"
+ * with an installPath); a marketplace clone or a cache copy left after /plugin uninstall is not an
+ * install. Only when that file cannot be read is the folder searched, skipping marketplaces/.
+ * @param {string} claudeHomeDir
+ * @returns {string|null}
+ */
 function findPluginInstall(claudeHomeDir) {
   const root = path.join(claudeHomeDir, 'plugins');
+  const hasSkill = (dir) => fs.existsSync(path.join(dir, 'skills', 'anywhere', 'SKILL.md'));
+  let manifest = null;
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(root, 'installed_plugins.json'), 'utf8'));
+  } catch (_) {
+    manifest = null;
+  }
+  if (manifest && typeof manifest === 'object') {
+    const plugins = manifest.plugins && typeof manifest.plugins === 'object' ? manifest.plugins : manifest;
+    for (const key of Object.keys(plugins)) {
+      if (key.split('@')[0] !== 'anywhere') continue;
+      // Version 2 keeps a list of installs (one per scope), version 1 a single entry.
+      const entries = Array.isArray(plugins[key]) ? plugins[key] : [plugins[key]];
+      for (const e of entries) {
+        const dir = e && typeof e.installPath === 'string' ? e.installPath : null;
+        if (dir && hasSkill(dir)) return dir;
+      }
+    }
+    return null;
+  }
+  return findPluginCopy(root);
+}
+
+/** Is the plugin disabled in Claude Code's settings (enabledPlugins "anywhere@…": false)? */
+function pluginDisabled(claudeHomeDir) {
+  try {
+    const settings = JSON.parse(fs.readFileSync(path.join(claudeHomeDir, 'settings.json'), 'utf8'));
+    const enabled = settings && settings.enabledPlugins;
+    if (!enabled || typeof enabled !== 'object') return false;
+    const keys = Object.keys(enabled).filter((k) => k.split('@')[0] === 'anywhere');
+    return keys.length > 0 && keys.every((k) => enabled[k] === false);
+  } catch (_) {
+    return false;
+  }
+}
+
+/** Search ~/.claude/plugins for a copy of the anywhere plugin (marketplace clones excluded). */
+function findPluginCopy(root) {
   const found = [];
   const walk = (dir, depth) => {
     if (depth > 6 || found.length) return;
@@ -1824,6 +2207,8 @@ function findPluginInstall(claudeHomeDir) {
     }
     for (const e of entries) {
       if (!e.isDirectory() || e.name === 'node_modules' || e.name === '.git') continue;
+      // A marketplace clone (its source is ".") holds the plugin files without installing them.
+      if (depth === 0 && e.name === 'marketplaces') continue;
       const full = path.join(dir, e.name);
       if (e.name === '.claude-plugin') {
         try {
@@ -1908,20 +2293,23 @@ async function runDoctor() {
       return {
         status: 'fail',
         detail: 'not found (needed for the dialog\'s own Claude Code session)',
-        fix: 'Install Claude Code (npm install -g @anthropic-ai/claude-code, or see https://docs.claude.com/en/docs/claude-code). If it is installed somewhere unusual: anywhere config set engine.claudePath /full/path/to/claude',
+        fix: `Install Claude Code (npm install -g @anthropic-ai/claude-code, or see https://docs.claude.com/en/docs/claude-code). If it is installed somewhere unusual: ${cliCmd('config set engine.claudePath /full/path/to/claude')}`,
       };
     }
     return { detail: `${claude.version || 'unknown version'} ${sym().dot} ${claude.path}` };
   });
 
+  // Headless Linux (SSH, servers): the terminal dialog plus Claude Code's own tools is a supported setup.
+  const headless = pinfo.platform === 'linux' && !pinfo.isWSL && pinfo.displayServer === 'none';
+  const headlessFix = `Over SSH use the terminal dialog: ${cliCmd('tui')}. For screen control run inside your desktop session (DISPLAY or WAYLAND_DISPLAY must be set), or start a virtual display: Xvfb :99 -screen 0 1920x1080x24 & export DISPLAY=:99`;
   await check('platform', 'Platform', false, () => {
     const parts = [pinfo.osName, pinfo.arch, `display: ${pinfo.displayServer}${pinfo.isWSL ? ' (Windows desktop via WSL)' : ''}`];
     if (pinfo.desktop) parts.push(pinfo.desktop);
-    if (pinfo.platform === 'linux' && !pinfo.isWSL && pinfo.displayServer === 'none') {
+    if (headless) {
       return {
         status: 'warn',
         detail: `${parts.join(` ${sym().dot} `)} (no graphical display)`,
-        fix: 'Run Claude Anywhere inside your desktop session (DISPLAY or WAYLAND_DISPLAY must be set), or start a virtual display: Xvfb :99 -screen 0 1920x1080x24 & export DISPLAY=:99. Over SSH use: anywhere tui',
+        fix: headlessFix,
       };
     }
     const r = { detail: parts.join(` ${sym().dot} `) };
@@ -1937,57 +2325,71 @@ async function runDoctor() {
     true,
     async () => {
       if (!osIndex) return { status: 'fail', detail: 'src/os is missing from this installation', fix: 'Reinstall Claude Anywhere.' };
-      const driver = await withTimeout(osIndex.getDriver(), 15000, 'loading the desktop driver');
-      caps = await withTimeout(driver.capabilities(), 15000, 'reading driver capabilities');
-      const s = sym();
-      const mark = (b) => (b ? s.ok : s.fail);
-      let shot = null;
-      let shotErr = null;
-      if (caps.screenshot) {
-        try {
-          const c = await withTimeout(driver.captureDisplay(0), 15000, 'test screenshot');
-          shot = `${c.width}x${c.height}`;
-        } catch (err) {
-          shotErr = err;
-        }
-      }
-      let cursor = null;
-      if (caps.mouse) {
-        try {
-          const pos = await withTimeout(driver.cursorPosition(), 5000, 'reading the cursor');
-          cursor = `(${Math.round(pos.x)}, ${Math.round(pos.y)})`;
-        } catch (_) {
-          cursor = null;
-        }
-      }
-      let displays = null;
+      if (!headless) return probeDriver();
+      // Without a display this is expected, not a blocker: the terminal dialog still works.
+      let r;
       try {
-        displays = (await withTimeout(driver.displays(), 8000, 'listing displays')).length;
+        r = await probeDriver();
       } catch (_) {
-        displays = null;
+        r = { status: 'fail' };
       }
-      const detail = [
-        `${driver.name}`,
-        `screenshot ${shot || mark(false)}`,
-        displays ? `${displays} display${displays === 1 ? '' : 's'}` : null,
-        `mouse ${mark(caps.mouse)}${cursor ? ` at ${cursor}` : ''}`,
-        `keyboard ${mark(caps.keyboard)}`,
-        `windows ${mark(caps.windows)}`,
-        `clipboard ${mark(caps.clipboard)}`,
-      ]
-        .filter(Boolean)
-        .join(` ${s.dot} `);
-      const notes = (caps.notes || []).filter(Boolean);
-      if (shotErr) notes.unshift(`Test screenshot failed: ${shotErr.message}${shotErr.hint ? ` (${shotErr.hint})` : ''}`);
-      const installNote = notes.filter((n) => /^install|grant |not granted|sudo |brew |winget /i.test(n));
-      const fix = driver.hint || installNote[0] || '';
-      const rest = notes.filter((n) => n !== fix);
-      if (shot && caps.mouse && caps.keyboard) return { detail, notes: rest, fix, status: installNote.length ? 'warn' : 'ok' };
-      if (shot || caps.mouse || caps.keyboard) return { status: 'warn', detail, notes: rest, fix: fix || 'See the notes above.' };
-      return { status: 'fail', detail: `${detail}${driver.reason ? ` (${driver.reason})` : ''}`, notes: rest, fix: fix || 'Run "anywhere doctor" inside your desktop session.' };
+      if (r.status !== 'fail') return r;
+      return { status: 'warn', detail: 'no graphical display: screen control unavailable', notes: [], fix: headlessFix };
     },
     45000
   );
+
+  /** Load the desktop driver and try each capability (the 'driver' check). */
+  async function probeDriver() {
+    const driver = await withTimeout(osIndex.getDriver(), 15000, 'loading the desktop driver');
+    caps = await withTimeout(driver.capabilities(), 15000, 'reading driver capabilities');
+    const s = sym();
+    const mark = (b) => (b ? s.ok : s.fail);
+    let shot = null;
+    let shotErr = null;
+    if (caps.screenshot) {
+      try {
+        const c = await withTimeout(driver.captureDisplay(0), 15000, 'test screenshot');
+        shot = `${c.width}x${c.height}`;
+      } catch (err) {
+        shotErr = err;
+      }
+    }
+    let cursor = null;
+    if (caps.mouse) {
+      try {
+        const pos = await withTimeout(driver.cursorPosition(), 5000, 'reading the cursor');
+        cursor = pos && pos.estimated ? 'position unknown (Wayland hides the pointer; the corner failsafe is unavailable)' : `at (${Math.round(pos.x)}, ${Math.round(pos.y)})`;
+      } catch (_) {
+        cursor = null;
+      }
+    }
+    let displays = null;
+    try {
+      displays = (await withTimeout(driver.displays(), 8000, 'listing displays')).length;
+    } catch (_) {
+      displays = null;
+    }
+    const detail = [
+      `${driver.name}`,
+      `screenshot ${shot || mark(false)}`,
+      displays ? `${displays} display${displays === 1 ? '' : 's'}` : null,
+      `mouse ${mark(caps.mouse)}${cursor ? ` ${cursor}` : ''}`,
+      `keyboard ${mark(caps.keyboard)}`,
+      `windows ${mark(caps.windows)}`,
+      `clipboard ${mark(caps.clipboard)}`,
+    ]
+      .filter(Boolean)
+      .join(` ${s.dot} `);
+    const notes = (caps.notes || []).filter(Boolean);
+    if (shotErr) notes.unshift(`Test screenshot failed: ${shotErr.message}${shotErr.hint ? ` (${shotErr.hint})` : ''}`);
+    const installNote = notes.filter((n) => /^install|grant |not granted|sudo |brew |winget /i.test(n));
+    const fix = driver.hint || installNote[0] || '';
+    const rest = notes.filter((n) => n !== fix);
+    if (shot && caps.mouse && caps.keyboard) return { detail, notes: rest, fix, status: installNote.length ? 'warn' : 'ok' };
+    if (shot || caps.mouse || caps.keyboard) return { status: 'warn', detail, notes: rest, fix: fix || 'See the notes above.' };
+    return { status: 'fail', detail: `${detail}${driver.reason ? ` (${driver.reason})` : ''}`, notes: rest, fix: fix || `Run ${cliQ('doctor')} inside your desktop session.` };
+  }
 
   if (pinfo.platform === 'darwin') {
     await check('permissions', 'macOS permissions', false, async () => {
@@ -2014,7 +2416,7 @@ async function runDoctor() {
         const r = { detail: `Accessibility ${word(perms.accessibility)} ${sym().dot} Screen Recording ${word(perms.screenRecording)} (for ${host})`, notes };
         if (daemonMissing.length) {
           r.status = 'warn';
-          r.fix = `The running daemon lacks ${daemonMissing.map((k) => (k === 'accessibility' ? 'Accessibility' : 'Screen Recording')).join(' and ')}: grant it to "${(running.permissions.hostApp) || 'the app that started it'}", or restart it from here: anywhere restart`;
+          r.fix = `The running daemon lacks ${daemonMissing.map((k) => (k === 'accessibility' ? 'Accessibility' : 'Screen Recording')).join(' and ')}: grant it to "${(running.permissions.hostApp) || 'the app that started it'}", or restart it from here: ${cliCmd('restart')}`;
         }
         return r;
       }
@@ -2029,21 +2431,53 @@ async function runDoctor() {
     });
   }
 
+  // Server voice capabilities: the dialog-window advice and the voice check both need them.
+  let voicePending = null;
+  const voiceCaps = () => {
+    if (!voicePending) {
+      voicePending = Promise.resolve().then(() => {
+        const voiceMod = optionalPkg('src/daemon/voice.js');
+        if (!voiceMod) return null;
+        return withTimeout(new voiceMod.VoiceService({ config }).capabilities(), 15000, 'voice detection');
+      });
+    }
+    return voicePending;
+  };
+  const voiceCapsOrNull = () => voiceCaps().catch(() => null);
+  const ELECTRON_VOICE = 'Voice input in Electron needs GROQ_API_KEY or OPENAI_API_KEY, or whisper.cpp: browser speech recognition does not work there.';
+
   let chromeLike = [];
-  await check('ui', 'Dialog window', false, () => {
+  let electronFound = false;
+  let wslPs = null;
+  // Chrome and Edge ship a Web Speech service; Chromium, Brave and Vivaldi do not.
+  let speechOk = (c) => /chrome|edge/i.test(c.name) && !/chromium/i.test(c.name);
+  await check('ui', 'Dialog window', false, async () => {
     const uihost = optionalPkg('src/daemon/uihost.js');
-    if (!uihost) return { status: 'warn', detail: 'src/daemon/uihost.js is missing; the URL is printed instead', fix: 'Reinstall Claude Anywhere, or use: anywhere tui' };
+    if (!uihost) return { status: 'warn', detail: 'src/daemon/uihost.js is missing; the URL is printed instead', fix: `Reinstall Claude Anywhere, or use: ${cliCmd('tui')}` };
     let electron = null;
     try {
       electron = uihost.resolveElectron();
     } catch (_) {
       electron = null;
     }
+    electronFound = Boolean(electron);
+    if (typeof uihost.hasBrowserSpeech === 'function') speechOk = (c) => uihost.hasBrowserSpeech(c);
     try {
       chromeLike = uihost.findChromiumCandidates({ platformInfo: pinfo, profileDir: paths.uiProfileDir() }) || [];
     } catch (_) {
       chromeLike = [];
     }
+    // macOS: list (and judge voice by) the browsers in the order the dialog launches them, which
+    // prefers one that is not the default link handler.
+    if (pinfo.platform === 'darwin' && chromeLike.length && typeof uihost.orderMacCandidates === 'function' && typeof uihost.readMacDefaultBrowserId === 'function') {
+      try {
+        chromeLike = uihost.orderMacCandidates(chromeLike, await uihost.readMacDefaultBrowserId());
+      } catch (_) {
+        /* keep the found order */
+      }
+    }
+    // WSL opens the dialog in Windows Edge or Chrome through powershell.exe before any Linux browser.
+    if (pinfo.isWSL) wslPs = wslPowershell(uihost);
     let opener = null;
     try {
       opener = (uihost.browserOpenCommands({ platformInfo: pinfo, url: 'http://127.0.0.1/' }) || []).filter((c) => c && c.cmd)[0] || null;
@@ -2051,40 +2485,46 @@ async function runDoctor() {
       opener = null;
     }
     const s = sym();
+    const apps = (wslPs ? ['Windows Edge/Chrome (via powershell.exe)'] : []).concat(chromeLike.slice(0, 3).map((c) => c.name));
     const detail = [
       `Electron ${electron ? s.ok : s.fail}`,
-      `app window: ${chromeLike.length ? chromeLike.slice(0, 3).map((c) => c.name).join(', ') : 'none'}`,
+      `app window: ${apps.length ? apps.join(', ') : 'none'}`,
       `default browser: ${opener ? opener.name : 'none'}`,
       `ui.host = ${config.ui.host}`,
     ].join(` ${s.dot} `);
-    if (electron || chromeLike.length) {
-      const r = { detail };
-      if (!electron && pinfo.platform === 'darwin' && config.ui.host !== 'browser' && config.ui.host !== 'none') {
+    const notes = [];
+    if (pinfo.isWSL && !wslPs) notes.push(`${WSL_INTEROP_HINT}; until then the dialog cannot open in Windows Edge or Chrome.`);
+    if (electron || apps.length) {
+      const r = { detail, notes };
+      const vc = await voiceCapsOrNull();
+      const noServerStt = Boolean(vc && !vc.serverStt);
+      if (electron && (config.ui.host === 'auto' || config.ui.host === 'electron')) {
+        if (noServerStt) notes.push(`The dialog opens in Electron. ${ELECTRON_VOICE} (Or keep Chrome/Edge speech: ${cliCmd('config set ui.host app')})`);
+      } else if (!electron && pinfo.platform === 'darwin' && config.ui.host !== 'browser' && config.ui.host !== 'none') {
         // On macOS the app window is a second instance of the user's browser app (same Dock
-        // icon and bundle id), so links and focus can end up in the wrong instance.
-        r.status = 'warn';
-        r.fix = 'anywhere install --electron   (gives the dialog its own app, so it stays out of your browser\'s windows and link handling)';
+        // icon and bundle id), so links and focus can end up in the wrong instance. Electron
+        // avoids that but loses browser speech, so this stays optional advice.
+        notes.push(`Optional: ${cliQ('install --electron')} gives the dialog its own app, so it stays out of your browser's windows and link handling.${noServerStt ? ` ${ELECTRON_VOICE}` : ''}`);
       } else if (!electron) {
-        r.notes = ['Optional: "anywhere install --electron" adds an always-on-top window with a global hotkey that hides itself from screenshots.'];
+        notes.push(`Optional: ${cliQ('install --electron')} adds an always-on-top window with a global hotkey that hides itself from screenshots.${noServerStt ? ` ${ELECTRON_VOICE}` : ''}`);
       }
       return r;
     }
-    if (opener) return { status: 'warn', detail, fix: 'Install Google Chrome, Microsoft Edge, Brave or Chromium for a compact app window, or run: anywhere install --electron' };
-    return { status: 'warn', detail, fix: 'No browser was found: install Chrome or Edge, run "anywhere install --electron", or use the terminal dialog: anywhere tui' };
+    if (pinfo.isWSL) return { status: 'warn', detail, notes: [], fix: `${WSL_INTEROP_HINT}, so the dialog opens in Windows Edge or Chrome.` };
+    if (opener) return { status: 'warn', detail, notes, fix: `Install Google Chrome, Microsoft Edge, Brave or Chromium for a compact app window, or run: ${cliCmd('install --electron')}` };
+    return { status: 'warn', detail, notes, fix: `No browser was found: install Chrome or Edge, run ${cliQ('install --electron')}, or use the terminal dialog: ${cliCmd('tui')}` };
   });
 
   await check('voice', 'Voice', false, async () => {
-    const voiceMod = optionalPkg('src/daemon/voice.js');
-    const browserStt = chromeLike.filter((c) => /chrome|edge/i.test(c.name) && !/chromium/i.test(c.name)).length > 0;
-    if (!voiceMod) return { status: 'warn', detail: `browser speech: ${browserStt ? 'Chrome/Edge' : 'unavailable'} ${sym().dot} server voice module missing` };
-    const vs = new voiceMod.VoiceService({ config });
-    const vc = await withTimeout(vs.capabilities(), 15000, 'voice detection');
+    // The auto host tries Electron first, and Electron has no browser speech recognition.
+    const inElectron = electronFound && (config.ui.host === 'auto' || config.ui.host === 'electron');
+    // The app window uses the first candidate, so that browser decides whether browser speech works.
+    const browserStt = !inElectron && (Boolean(wslPs) || (chromeLike.length > 0 && Boolean(chromeLike[0]) && speechOk(chromeLike[0])));
+    const sttWhere = inElectron ? 'no browser speech in the Electron window' : browserStt ? 'browser (Chrome/Edge)' : 'no Chrome/Edge for browser speech';
+    if (!optionalPkg('src/daemon/voice.js')) return { status: 'warn', detail: `speech-to-text: ${sttWhere} ${sym().dot} server voice module missing` };
+    const vc = await voiceCaps();
     const s = sym();
-    const detail = [
-      `speech-to-text: ${browserStt ? 'browser (Chrome/Edge)' : 'no Chrome/Edge for browser speech'}`,
-      `server ${vc.serverStt ? vc.sttProvider : 'none'}`,
-      `text-to-speech: ${vc.serverTts ? vc.ttsProvider : 'browser only'}`,
-    ].join(` ${s.dot} `);
+    const detail = [`speech-to-text: ${sttWhere}`, `server ${vc.serverStt ? vc.sttProvider : 'none'}`, `text-to-speech: ${vc.serverTts ? vc.ttsProvider : 'browser only'}`].join(` ${s.dot} `);
     if (vc.serverStt || browserStt) {
       const r = { detail };
       if (!vc.serverStt) r.notes = ['Optional: set GROQ_API_KEY or OPENAI_API_KEY (or install whisper.cpp) so voice also works in Electron, Firefox and the terminal dialog.'];
@@ -2094,7 +2534,9 @@ async function runDoctor() {
     return {
       status: 'warn',
       detail,
-      fix: vc.sttHint || 'For voice input set GROQ_API_KEY (free tier) or OPENAI_API_KEY, or install whisper.cpp; or install Chrome/Edge for browser speech recognition.',
+      fix: inElectron
+        ? `${ELECTRON_VOICE} Set GROQ_API_KEY (free tier) or OPENAI_API_KEY, install whisper.cpp, or use Chrome/Edge speech: ${cliCmd('config set ui.host app')}`
+        : vc.sttHint || 'For voice input set GROQ_API_KEY (free tier) or OPENAI_API_KEY, or install whisper.cpp; or install Chrome/Edge for browser speech recognition.',
     };
   });
 
@@ -2102,14 +2544,14 @@ async function runDoctor() {
   await check('daemon', 'Daemon', false, async () => {
     daemon = await shared('state').findRunningDaemon();
     if (daemon) return { detail: `running ${sym().dot} pid ${daemon.pid} ${sym().dot} ${daemon.mode} mode ${sym().dot} ${daemon.project} ${sym().dot} ${daemon.url}` };
-    return { detail: 'not running (it starts with /anywhere or "anywhere start")' };
+    return { detail: `not running (it starts with /anywhere or ${cliQ('start')})` };
   });
 
   if (!daemon) {
     await check('port', 'Port', false, async () => {
       const port = Number(config.port) || 47120;
       const free = await portFree(port);
-      if (free === false) return { status: 'warn', detail: `${port} is in use by another program`, notes: ['The daemon will pick a random free port instead; change it with: anywhere config set port <n>'] };
+      if (free === false) return { status: 'warn', detail: `${port} is in use by another program`, notes: [`The daemon will pick a random free port instead; change it with: ${cliCmd('config set port <n>')}`] };
       return { detail: `127.0.0.1:${port} is free` };
     });
   }
@@ -2119,6 +2561,7 @@ async function runDoctor() {
     const home = paths.claudeHome();
     const personal = path.join(home, 'skills', 'anywhere', 'SKILL.md');
     plugin = findPluginInstall(home);
+    if (plugin && pluginDisabled(home)) plugin = null;
     if (fs.existsSync(personal)) {
       let same = true;
       try {
@@ -2126,14 +2569,17 @@ async function runDoctor() {
       } catch (_) {
         same = true;
       }
-      if (!same) return { status: 'warn', detail: `personal skill at ${path.dirname(personal)} is out of date`, fix: 'Update it: anywhere install' };
+      if (!same) return { status: 'warn', detail: `personal skill at ${path.dirname(personal)} is out of date`, fix: `Update it: ${cliCmd('install')}` };
       return { detail: `personal skill ${sym().dot} ${path.dirname(personal)}${plugin ? ` ${sym().dot} plugin also installed` : ''}` };
     }
     if (plugin) return { detail: `plugin ${sym().dot} ${plugin} (use /anywhere:anywhere, or /anywhere when unambiguous)` };
+    if (findPluginInstall(home)) {
+      return { status: 'warn', detail: 'the anywhere plugin is installed but disabled in Claude Code', fix: 'In Claude Code: /plugin enable anywhere@anywhere-marketplace' };
+    }
     return {
       status: 'warn',
       detail: 'not installed for Claude Code',
-      fix: 'Run "anywhere install" (personal skill /anywhere + MCP tools), or in Claude Code: /plugin marketplace add patel-deepanshu/claude-anywhere then /plugin install anywhere@anywhere-marketplace',
+      fix: `Run ${cliQ('install')} (personal skill /anywhere + MCP tools), or in Claude Code: /plugin marketplace add patel-deepanshu/claude-anywhere then /plugin install anywhere@anywhere-marketplace`,
     };
   });
 
@@ -2155,17 +2601,17 @@ async function runDoctor() {
           return {
             status: 'warn',
             detail: `${detail} ${sym().dot} ${gone.join(' and ')} no longer exist${gone.length === 1 ? 's' : ''} (moved, or removed by an upgrade such as "brew upgrade node")`,
-            fix: 'Register it again: anywhere install',
+            fix: `Register it again: ${cliCmd('install')}`,
           };
         }
         return { detail };
       }
       if (plugin) return { detail: 'provided by the anywhere plugin (mcp__plugin_anywhere_anywhere__*)' };
-      if (r.timedOut) return { status: 'warn', detail: '"claude mcp get anywhere" timed out', fix: 'Retry, or register it: anywhere install' };
+      if (r.timedOut) return { status: 'warn', detail: '"claude mcp get anywhere" timed out', fix: `Retry, or register it: ${cliCmd('install')}` };
       return {
         status: 'warn',
         detail: 'the "anywhere" MCP server is not registered (screen tools are unavailable in your own Claude Code sessions; the dialog still works)',
-        fix: 'Run: anywhere install   (or anywhere install --no-mcp to skip it)',
+        fix: `Run: ${cliCmd('install')}   (or ${cliCmd('install --no-mcp')} to skip it)`,
       };
     },
     12000
@@ -2194,7 +2640,7 @@ async function runDoctor() {
       const n = Object.keys(parsed || {}).length;
       return { detail: `${file} (${n} section${n === 1 ? '' : 's'} overridden)` };
     } catch (err) {
-      return { status: 'warn', detail: `${file} is not valid JSON (${err.message}); defaults are used`, fix: 'Fix the file or run: anywhere config reset' };
+      return { status: 'warn', detail: `${file} is not valid JSON (${err.message}); defaults are used`, fix: `Fix the file or run: ${cliCmd('config reset')}` };
     }
   });
 
@@ -2317,8 +2763,15 @@ async function cmdInstall(p) {
     quiet,
     print: quiet ? () => {} : (line) => writeOut(line),
   });
-  if (process.platform === 'darwin' && !quiet && f.permissions !== false && process.stdin.isTTY && process.stdout.isTTY && !(res && res.ok === false)) {
-    await askMacPermissions();
+  if (process.platform === 'darwin' && !quiet && f.permissions !== false && !(res && res.ok === false)) {
+    if (process.stdin.isTTY && process.stdout.isTTY) await askMacPermissions();
+    else {
+      // No terminal to answer the prompts in (a pipe, the plugin, or `curl | bash` without /dev/tty).
+      writeOut('macOS permissions were not requested (no terminal). Grant Accessibility and Screen Recording to the app that runs Claude Code:');
+      writeOut('  open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"');
+      writeOut('  open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"');
+      writeOut(`then run ${cliQ('doctor')}.`);
+    }
   }
   if (f.json) printJson(res);
   return res && res.ok === false ? EXIT.ERROR : EXIT.OK;
@@ -2340,10 +2793,10 @@ async function askMacPermissions() {
     const word = (v) => (v === true ? 'granted' : v === false ? 'not granted' : 'not answered');
     writeOut(`  Accessibility ${word(r.accessibility)} ${sym().dot} Screen Recording ${word(r.screenRecording)} ${sym().dot} Automation ${word(r.automation)}`);
     if (r.accessibility === false || r.screenRecording === false) {
-      writeOut('  Grant them in System Settings → Privacy & Security, then quit and reopen this app. "anywhere doctor" shows the exact panes.');
+      writeOut(`  Grant them in System Settings → Privacy & Security, then quit and reopen this app. ${cliQ('doctor')} shows the exact panes.`);
     }
   } catch (err) {
-    writeOut(`  Could not ask for permissions (${err.message}). Run "anywhere doctor" later.`);
+    writeOut(`  Could not ask for permissions (${err.message}). Run ${cliQ('doctor')} later.`);
   } finally {
     if (typeof osIndex.resetDriver === 'function') {
       try {
@@ -2487,26 +2940,40 @@ async function cmdConfig(p) {
     const partial = configMod.setPath({}, key, value);
     configMod.save(partial);
     let live = false;
+    let busy = false;
     const d = await getDaemon().catch(() => null);
     if (d) {
       try {
         await d.client.request('POST', '/api/config', partial, { timeoutMs: 5000 });
         // The saved mode is only the start-up default; switch the running dialog too.
-        if (key === 'mode') await d.client.request('POST', '/api/mode', { mode: value }, { timeoutMs: 15000 });
+        if (key === 'mode') {
+          try {
+            await d.client.request('POST', '/api/mode', { mode: value }, { timeoutMs: 15000 });
+          } catch (err) {
+            // 409: a task is running; the switch would stop it, so the dialog keeps its mode for now.
+            busy = Boolean(err && err.status === 409);
+            throw err;
+          }
+        }
         live = STARTUP_ONLY.indexOf(key) < 0;
       } catch (_) {
         live = false;
       }
     }
     const shown = SECRET_PATHS.indexOf(key) >= 0 && value ? '(hidden)' : JSON.stringify(value);
-    if (f.json) printJson({ ok: true, key, value: SECRET_PATHS.indexOf(key) >= 0 ? undefined : value, appliedToRunningDaemon: live });
-    else writeOut(`${color.green(sym().ok)} ${key} = ${shown}${d ? (live ? ' (applied to the running dialog)' : ' (restart to apply: anywhere restart)') : ''}`);
+    const where = busy
+      ? ' (saved; the running dialog keeps its mode while a task runs: switch with its mode button when the task is done)'
+      : live
+        ? ' (applied to the running dialog)'
+        : ` (restart to apply: ${cliCmd('restart')})`;
+    if (f.json) printJson({ ok: true, key, value: SECRET_PATHS.indexOf(key) >= 0 ? undefined : value, appliedToRunningDaemon: live, busy: busy || undefined });
+    else writeOut(`${color.green(sym().ok)} ${key} = ${shown}${d ? where : ''}`);
     return EXIT.OK;
   }
   if (sub === 'reset') {
     configMod.reset();
     if (f.json) printJson({ ok: true });
-    else writeOut(`${color.green(sym().ok)} Settings reset to defaults (${paths.configPath()}). Restart a running dialog to apply: anywhere restart`);
+    else writeOut(`${color.green(sym().ok)} Settings reset to defaults (${paths.configPath()}). Restart a running dialog to apply: ${cliCmd('restart')}`);
     return EXIT.OK;
   }
   throw usageError(`Unknown config action "${sub}". Use: path, get KEY, set KEY VALUE, reset`, 'config');
@@ -2589,13 +3056,16 @@ const COMMANDS = {
     run: cmdStart,
     group: 'Dialog',
     summary: 'Start (or reuse) the daemon and open the dialog',
-    usage: 'anywhere start [--project DIR] [--mode companion|bridge] [--ui auto|electron|app|browser|tui|none] [--no-open] [--foreground] [--json]',
+    usage: 'anywhere start [--project DIR] [--mode companion|bridge] [--switch] [--ui auto|electron|app|browser|tui|none] [--no-open] [--show-token] [--foreground] [--json]',
     details: [
       'Reuses a running daemon: switches its project and mode if they differ, then brings the dialog to the front.',
       'Otherwise starts the daemon in the background (log: ~/.claude-anywhere/logs/daemon.log) and waits up to 15 s for it.',
       '--foreground runs the daemon in this terminal instead (Ctrl+C stops it).',
+      'A busy dialog (a task running, an approval or question waiting) keeps its project and mode; --switch stops that task and switches.',
+      'Without --mode, a dialog left in bridge mode with no Claude Code terminal listening goes back to companion mode.',
+      'The URL with the access token is printed only when no window could open (or with --show-token); `anywhere url` prints it any time.',
     ],
-    spec: spec({ string: ['project', 'mode', 'ui', 'timeout', 'port'], boolean: ['open', 'foreground'], alias: { p: 'project' } }),
+    spec: spec({ string: ['project', 'mode', 'ui', 'timeout', 'port'], boolean: ['open', 'foreground', 'switch', 'show-token'], alias: { p: 'project' } }),
   },
   stop: { run: cmdStop, group: 'Dialog', summary: 'Stop the daemon and close the dialog', usage: 'anywhere stop [--json]', spec: spec() },
   restart: {
@@ -2603,7 +3073,7 @@ const COMMANDS = {
     group: 'Dialog',
     summary: 'Stop and start again (keeps the project and mode)',
     usage: 'anywhere restart [start options]',
-    spec: spec({ string: ['project', 'mode', 'ui', 'timeout', 'port'], boolean: ['open', 'foreground'], alias: { p: 'project' } }),
+    spec: spec({ string: ['project', 'mode', 'ui', 'timeout', 'port'], boolean: ['open', 'foreground', 'show-token'], alias: { p: 'project' } }),
   },
   status: { run: cmdStatus, group: 'Dialog', summary: 'Show whether the dialog runs, and what it is doing', usage: 'anywhere status [--json]', spec: spec() },
   show: {
@@ -2620,12 +3090,13 @@ const COMMANDS = {
     run: cmdSend,
     group: 'Talk to Claude',
     summary: 'Send a task to the dialog (starts it if needed)',
-    usage: 'anywhere send <text…> [--screenshot | --no-screenshot] [--image FILE]… [--wait [--timeout SEC]] [--stdin] [--no-start]',
+    usage: 'anywhere send <text…> [--screenshot | --no-screenshot] [--image FILE]… [--wait [--timeout SEC]] [--stdin] [--project DIR [--switch]] [--no-start]',
     details: [
+      '--project DIR sends the task to the dialog for that folder; a dialog busy in another folder refuses unless --switch stops its task.',
       '--screenshot attaches the current screen and --no-screenshot never does (default: context.attachScreenshotByDefault); --wait prints the final answer (companion mode).',
       'Text that starts with "-" goes after "--": anywhere send -- "-v flag fails"',
     ],
-    spec: spec({ string: ['timeout', 'source', 'project'], boolean: ['screenshot', 'wait', 'stdin', 'start', 'open'], multi: ['image'] }),
+    spec: spec({ string: ['timeout', 'source', 'project'], boolean: ['screenshot', 'wait', 'stdin', 'start', 'open', 'switch'], multi: ['image'] }),
   },
   interrupt: { run: cmdInterrupt, group: 'Talk to Claude', summary: 'Stop the task Claude is working on', usage: 'anywhere interrupt', spec: spec() },
   ask: {
@@ -2850,7 +3321,7 @@ function reportError(err) {
   writeErr(`${color.red(s.fail, process.stderr)} ${(err && err.message) || err}`);
   if (err && err.hint) writeErr(`  ${err.hint}`);
   if (process.env.ANYWHERE_DEBUG === '1' && err && err.stack) writeErr(err.stack);
-  else writeErr('  Run "anywhere doctor" to check this machine (set ANYWHERE_DEBUG=1 for a stack trace).');
+  else writeErr(`  Run ${cliQ('doctor')} to check this machine (set ANYWHERE_DEBUG=1 for a stack trace).`);
   return EXIT.ERROR;
 }
 
@@ -2901,6 +3372,16 @@ module.exports = {
   renderDoctor,
   ensureDaemon,
   stopDaemon,
+  daemonIdentity,
+  looksLikeDaemon,
+  parseEtime,
+  busyReason,
+  waitForResult,
+  startSummary,
+  pruneScreenshots,
+  samePath,
+  pluginDisabled,
+  cliCommand,
   daemonPath,
   staleMcpPaths,
   broadAllowRules,

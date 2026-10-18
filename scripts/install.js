@@ -8,7 +8,9 @@
  *   3. registers the `anywhere` MCP server at user scope (`claude mcp add-json`),
  *   4. optionally downloads Electron into the state directory,
  *   5. optionally adds an OS launcher with a keyboard shortcut,
- * and reverses all of it on uninstall.
+ *   6. links the `anywhere` command into ~/.local/bin (POSIX; ANYWHERE_BIN_DIR, ANYWHERE_NO_LINK=1),
+ *      or on Windows says how to run it when it is not on PATH,
+ * and reverses all of it on uninstall (plus install.ps1's user PATH entry on Windows).
  *
  * Usage: node scripts/install.js [--electron] [--no-mcp] [--hotkey] [--hotkey-key=Ctrl+Alt+F12] [--quiet]
  *        node scripts/install.js uninstall [--purge]
@@ -229,13 +231,28 @@ async function locateClaude() {
   return p && exists(p) ? { path: p, version: null } : null;
 }
 
-/** How to spawn the claude binary with an args array (shell only for .cmd/.bat shims). */
+// cmd.exe flips its quote state at every `"`, whatever backslash precedes it, so in an argument that
+// holds an embedded quote these characters can end up outside cmd's quotes and be run by cmd itself.
+const CMD_META_RE = /[&|<>^%!]/;
+
+/**
+ * How to spawn the claude binary with an args array. Uses engine-cli's launchSpec, which runs an
+ * npm claude.cmd shim as `node cli.js` (or the .exe it names) without cmd.exe. Only a .cmd/.bat that
+ * names no usable target still goes through cmd.exe; `unsafe` is then set when an argument (such as
+ * the MCP server JSON) cannot be passed through it intact.
+ * @returns {{command:string, args:string[], shell:boolean, unsafe?:string}}
+ */
 function claudeSpawnSpec(cliPath, args, platform = process.platform) {
-  if (/\.(c|m)?js$/i.test(cliPath)) return { command: process.execPath, args: [cliPath, ...args], shell: false };
-  if (platform === 'win32' && /\.(cmd|bat)$/i.test(cliPath)) {
-    return { command: proc.quoteWinArg(cliPath), args: args.map((a) => proc.quoteWinArg(a)), shell: true };
+  const engine = optionalRequire('../src/daemon/engine-cli');
+  let spec;
+  if (engine && typeof engine.launchSpec === 'function') spec = engine.launchSpec(cliPath, args, platform);
+  else if (/\.(c|m)?js$/i.test(cliPath)) spec = { command: process.execPath, args: [cliPath, ...args], shell: false };
+  else if (platform === 'win32' && /\.(cmd|bat)$/i.test(cliPath)) spec = { command: proc.quoteWinArg(cliPath), args: args.map((a) => proc.quoteWinArg(a)), shell: true };
+  else spec = { command: cliPath, args: args.slice(), shell: false };
+  if (spec.shell && args.some((a) => String(a).includes('"') && CMD_META_RE.test(String(a)))) {
+    spec.unsafe = `${path.basename(cliPath)} can only be run through cmd.exe, which would misread an argument that contains both a double quote and one of & | < > ^ % !`;
   }
-  return { command: cliPath, args: args.slice(), shell: false };
+  return spec;
 }
 
 /**
@@ -307,9 +324,25 @@ function parseHotkeyCombo(text) {
 const LINUX_DEFAULT_HOTKEY = parseHotkeyCombo(HOTKEY_LABEL);
 const WIN_DEFAULT_HOTKEY = parseHotkeyCombo(WIN_HOTKEY_LABEL);
 
-/** The command a user can paste to register the MCP server by hand. */
+/**
+ * The command a user can paste to register the MCP server by hand. On Windows it is
+ * `claude mcp add … "<node>" "<server.js>"`: with no embedded quotes the same line works in cmd.exe
+ * (which misreads `\"` inside JSON) and in PowerShell (which drops embedded quotes passed to claude).
+ */
 function manualMcpCommand(json, platform = process.platform) {
-  if (platform === 'win32') return `claude mcp add-json --scope user anywhere ${proc.quoteWinArg(json)}`;
+  if (platform === 'win32') {
+    let cfg = null;
+    try {
+      cfg = JSON.parse(json);
+    } catch {
+      cfg = null;
+    }
+    const argv = cfg && typeof cfg.command === 'string' && Array.isArray(cfg.args) ? [cfg.command, ...cfg.args] : null;
+    if (argv && argv.every((a) => typeof a === 'string' && a && !/["\r\n]/.test(a))) {
+      return `claude mcp add --scope user anywhere ${argv.map((a) => `"${a}"`).join(' ')}`;
+    }
+    return `claude mcp add-json --scope user anywhere ${psQuote(json)}`;
+  }
   return `claude mcp add-json --scope user anywhere ${shQuote(json)}`;
 }
 
@@ -326,9 +359,11 @@ async function registerMcp(nodePath = stableNodePath()) {
   if (!claude) return { registered: false, reason: 'the claude CLI was not found', manual };
   const env = claudeEnv();
   const opts = { timeoutMs: 30000, env, cwd: os.homedir() };
+  const add = claudeSpawnSpec(claude.path, ['mcp', 'add-json', '--scope', 'user', 'anywhere', json]);
+  // Checked before the remove below, so a working registration is not dropped for nothing.
+  if (add.unsafe) return { registered: false, reason: add.unsafe, manual, claude: claude.path };
   const rm = claudeSpawnSpec(claude.path, ['mcp', 'remove', '--scope', 'user', 'anywhere']);
   await proc.run(rm.command, rm.args, { ...opts, shell: rm.shell });
-  const add = claudeSpawnSpec(claude.path, ['mcp', 'add-json', '--scope', 'user', 'anywhere', json]);
   const r = await proc.run(add.command, add.args, { ...opts, shell: add.shell });
   if (r.error || r.timedOut || r.code !== 0) {
     const why = r.error ? r.error.message : r.timedOut ? 'timed out' : firstLine(r.stderr) || firstLine(r.stdout) || `exit code ${r.code}`;
@@ -368,27 +403,204 @@ function electronBinary(prefix) {
   }
 }
 
-async function installElectron({ print }) {
-  const prefix = path.join(paths.stateDir(), 'electron');
-  fs.mkdirSync(prefix, { recursive: true });
-  const args = ['install', '--prefix', prefix, 'electron@latest', '--no-audit', '--no-fund'];
-  const manual = `npm ${args.map((a) => (process.platform === 'win32' ? proc.quoteWinArg(a) : shQuote(a))).join(' ')}`;
-  const npm = findNpm();
+const ELECTRON_PARTIAL_RE = /^electron\.(partial|old)-\d+$/;
+
+/** Remove leftovers of interrupted Electron installs (electron.partial-<pid>, electron.old-<pid>). */
+function removeElectronLeftovers(stateDir) {
+  const removed = [];
+  let names = [];
+  try {
+    names = fs.readdirSync(stateDir);
+  } catch {
+    return removed;
+  }
+  for (const name of names) {
+    if (!ELECTRON_PARTIAL_RE.test(name)) continue;
+    const pid = Number(name.split('-').pop());
+    if (pid !== process.pid && isPidAlive(pid)) continue; // another install is running
+    try {
+      rmrf(path.join(stateDir, name));
+      removed.push(path.join(stateDir, name));
+    } catch {
+      /* in use; try again next time */
+    }
+  }
+  return removed;
+}
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return Boolean(err && err.code === 'EPERM');
+  }
+}
+
+/**
+ * Download Electron with npm into a temporary prefix and move it to <state>/electron only once the
+ * binary is there, so an interrupted download (a killed terminal or tool timeout) leaves no
+ * half-installed Electron for the daemon to find. `npm` replaces the npm lookup (tests).
+ */
+async function installElectron({ print = () => {}, npm = findNpm() } = {}) {
+  const sd = paths.stateDir();
+  const prefix = path.join(sd, 'electron');
+  const manualArgs = ['install', '--prefix', prefix, 'electron@latest', '--no-audit', '--no-fund'];
+  const manual = `npm ${manualArgs.map((a) => (process.platform === 'win32' ? proc.quoteWinArg(a) : shQuote(a))).join(' ')}`;
   if (!npm) return { installed: false, reason: 'npm was not found next to node or on PATH', manual };
+  fs.mkdirSync(sd, { recursive: true });
+  removeElectronLeftovers(sd);
+  const tmp = path.join(sd, `electron.partial-${process.pid}`);
+  rmrf(tmp);
+  fs.mkdirSync(tmp, { recursive: true });
+  const args = ['install', '--prefix', tmp, 'electron@latest', '--no-audit', '--no-fund'];
   print('  Downloading Electron (about 100 MB; this can take a few minutes)…');
   const shell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(npm);
   const r = await proc.run(shell ? proc.quoteWinArg(npm) : npm, shell ? args.map((a) => proc.quoteWinArg(a)) : args, {
     timeoutMs: 20 * 60 * 1000,
     shell,
-    cwd: prefix,
+    cwd: tmp,
   });
+  const fail = (result) => {
+    try {
+      rmrf(tmp);
+    } catch {
+      /* removed on the next install */
+    }
+    return { installed: false, manual, ...result };
+  };
   if (r.error || r.timedOut || r.code !== 0) {
     const tail = `${r.stderr || ''}\n${r.stdout || ''}`.trim().split(/\r?\n/).slice(-8).join('\n');
-    return { installed: false, reason: r.error ? r.error.message : r.timedOut ? 'npm timed out' : `npm exited with code ${r.code}`, output: tail, manual };
+    return fail({ reason: r.error ? r.error.message : r.timedOut ? 'npm timed out' : `npm exited with code ${r.code}`, output: tail });
   }
+  if (!electronBinary(tmp)) return fail({ reason: 'npm finished but the Electron binary is missing (its download may have been blocked)' });
+  // The electron package locates its binary relative to itself, so the prefix can move.
+  const old = path.join(sd, `electron.old-${process.pid}`);
+  try {
+    if (exists(prefix)) fs.renameSync(prefix, old);
+    fs.renameSync(tmp, prefix);
+  } catch (err) {
+    if (!exists(prefix) && exists(old)) {
+      try {
+        fs.renameSync(old, prefix);
+      } catch {
+        /* keep going: report the failure */
+      }
+    }
+    return fail({ reason: `could not move Electron into ${prefix}: ${err.message}` });
+  }
+  try {
+    rmrf(old);
+  } catch {
+    /* removed on the next install */
+  }
+  // A new module path, so require() loads the package afresh and reports the moved binary.
   const bin = electronBinary(prefix);
-  if (!bin) return { installed: false, reason: 'npm finished but the Electron binary is missing (its download may have been blocked)', manual };
+  if (!bin) return { installed: false, reason: `Electron was moved to ${prefix}, but its binary is not there`, manual };
   return { installed: true, prefix, binary: bin };
+}
+
+// ---------------------------------------------------------------- the `anywhere` command
+
+/** Where the POSIX `anywhere` link goes: install.sh's BIN_DIR (ANYWHERE_BIN_DIR, else ~/.local/bin). */
+function cliBinDir() {
+  return process.env.ANYWHERE_BIN_DIR ? path.resolve(process.env.ANYWHERE_BIN_DIR) : path.join(os.homedir(), '.local', 'bin');
+}
+
+function dirOnPath(dir) {
+  return String(process.env.PATH || '')
+    .split(path.delimiter)
+    .some((d) => d && path.resolve(d.replace(/^"(.*)"$/, '$1')) === path.resolve(dir));
+}
+
+function linkTarget(link) {
+  try {
+    return path.resolve(path.dirname(link), fs.readlinkSync(link));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Link <binDir>/anywhere to this package's bin/anywhere shim, as install.sh does, so plugin and
+ * clone installs get an `anywhere` command in the user's own terminals (Claude Code only adds a
+ * plugin's bin/ to its own Bash tool). Leaves regular files and unrelated links alone.
+ * @returns {{linked:boolean, link:string, target?:string, onPath?:boolean, reason?:string}}
+ */
+function linkCli({ binDir = cliBinDir(), target = path.join(PACKAGE_ROOT, 'bin', 'anywhere') } = {}) {
+  const link = path.join(binDir, 'anywhere');
+  let st = null;
+  try {
+    st = fs.lstatSync(link);
+  } catch {
+    st = null;
+  }
+  if (st && !st.isSymbolicLink()) return { linked: false, link, reason: `${link} already exists and is not a link` };
+  if (st) {
+    const cur = linkTarget(link);
+    if (cur === target) return { linked: true, link, target, onPath: dirOnPath(binDir) };
+    // Another Claude Anywhere shim (an older checkout or plugin version) is replaced, like `ln -sf`.
+    if (!cur || path.basename(cur) !== 'anywhere') return { linked: false, link, reason: `${link} links to ${cur || 'something else'}` };
+  }
+  try {
+    fs.mkdirSync(binDir, { recursive: true });
+    if (st) fs.unlinkSync(link);
+    fs.symlinkSync(target, link);
+  } catch (err) {
+    return { linked: false, link, reason: err.message };
+  }
+  return { linked: true, link, target, onPath: dirOnPath(binDir) };
+}
+
+/** Is `link` a symlink to this package's shim or into the state directory's app (install.sh)? */
+function isOurCliLink(link, recorded) {
+  let st = null;
+  try {
+    st = fs.lstatSync(link);
+  } catch {
+    return false;
+  }
+  if (!st.isSymbolicLink()) return false;
+  const target = linkTarget(link);
+  if (!target) return false;
+  if (target === path.join(PACKAGE_ROOT, 'bin', 'anywhere') || isInside(target, path.join(paths.stateDir(), 'app'))) return true;
+  return Boolean(recorded) && path.resolve(recorded) === path.resolve(link) && !exists(target);
+}
+
+/**
+ * PowerShell that removes `dir` from HKCU\Environment\Path, mirroring install.ps1's
+ * Add-UserPathEntry: the raw value is read without expanding %VARS%, written back with its
+ * registry kind, and WM_SETTINGCHANGE is broadcast. Prints "removed" when it changed the Path.
+ */
+function windowsPathRemoveScript(dir) {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    `$want = ${psQuote(dir)}.TrimEnd('\\')`,
+    '$changed = $false',
+    "$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)",
+    'if ($null -ne $key) {',
+    '  try {',
+    "    if ($key.GetValueNames() -contains 'Path') {",
+    "      $raw = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)",
+    "      $kind = $key.GetValueKind('Path')",
+    "      $parts = @($raw.Split(';') | Where-Object { $_ })",
+    "      $keep = @($parts | Where-Object { -not ($_.TrimEnd('\\') -ieq $want -or [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\\') -ieq $want) })",
+    '      if ($keep.Count -ne $parts.Count) {',
+    "        $new = $keep -join ';'",
+    "        if ($kind -ne [Microsoft.Win32.RegistryValueKind]::String -or $new.Contains('%')) { $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString }",
+    "        $key.SetValue('Path', $new, $kind)",
+    '        $changed = $true',
+    '      }',
+    '    }',
+    '  }',
+    '  finally { $key.Close() }',
+    '}',
+    'if ($changed) {',
+    "  try { [Environment]::SetEnvironmentVariable('CLAUDE_ANYWHERE_PATH_REFRESH', $null, 'User') } catch { }",
+    "  Write-Output 'removed'",
+    '}',
+  ].join('\n');
 }
 
 // ---------------------------------------------------------------- hotkey: Windows / WSL
@@ -707,11 +919,12 @@ async function installHotkey(info, nodePath, binPath, combo = null) {
 /**
  * Install Claude Anywhere for the current user.
  * `hotkeyKey` ("Ctrl+Alt+F12") replaces the platform's default shortcut and implies `hotkey`.
- * @param {{electron?:boolean, mcp?:boolean, hotkey?:boolean, hotkeyKey?:string, skillDir?:string, quiet?:boolean, print?:(line:string)=>void}} [opts]
+ * `cliLink` false skips linking the `anywhere` command.
+ * @param {{electron?:boolean, mcp?:boolean, hotkey?:boolean, hotkeyKey?:string, skillDir?:string, quiet?:boolean, print?:(line:string)=>void, cliLink?:boolean}} [opts]
  * @returns {Promise<{ok:boolean, version:string, packageRoot:string, skillDir:string, installInfoPath:string,
- *   skill:object, mcp:object, electron:object, hotkey:object, nextSteps:string[], warnings:string[]}>}
+ *   skill:object, mcp:object, electron:object, hotkey:object, cli:object, nextSteps:string[], warnings:string[]}>}
  */
-async function install({ electron = false, mcp = true, hotkey = false, hotkeyKey, skillDir, quiet = false, print } = {}) {
+async function install({ electron = false, mcp = true, hotkey = false, hotkeyKey, skillDir, quiet = false, print, cliLink = true } = {}) {
   const out = quiet ? () => {} : typeof print === 'function' ? print : defaultPrint;
   const combo = hotkeyKey ? parseHotkeyCombo(hotkeyKey) : null;
   if (combo) hotkey = true;
@@ -815,9 +1028,28 @@ async function install({ electron = false, mcp = true, hotkey = false, hotkeyKey
     for (const line of hotkeyRes.instructions || []) out(`               ${line}`);
   }
 
+  // 6. The `anywhere` command for the user's own terminals (TUI over SSH, doctor, show, restart)
+  let cliRes = { linked: false, skipped: true };
+  const nodeForm = process.platform === 'win32' ? `node "${BIN_JS}"` : `node ${shQuote(BIN_JS)}`;
+  if (cliLink && info.platform !== 'win32' && process.env.ANYWHERE_NO_LINK !== '1') {
+    cliRes = linkCli();
+    if (cliRes.linked) {
+      record.cliLink = cliRes.link;
+      if (cliRes.onPath) out(`  ✓ Command    anywhere → ${cliRes.link}`);
+      else {
+        out(`  ✓ Command    ${cliRes.link} (its folder is not on your PATH; add it to use "anywhere" in a terminal:`);
+        out(`               echo 'export PATH="${path.dirname(cliRes.link)}:$PATH"' >> ~/.profile   (zsh: ~/.zshrc))`);
+      }
+    } else {
+      out(`  - Command    not linked (${cliRes.reason}); in a terminal run: ${nodeForm}`);
+    }
+  } else if (info.platform === 'win32' && process.env.ANYWHERE_NO_LINK !== '1' && !proc.which('anywhere')) {
+    out(`  - Command    "anywhere" is not on your PATH; in a terminal run: ${nodeForm}   (or add ${path.dirname(BIN_JS)} to your PATH)`);
+  }
+
   writeJson(paths.installInfoPath(), record);
 
-  const binHint = process.platform === 'win32' ? `node "${BIN_JS}"` : `node ${shQuote(BIN_JS)}`;
+  const binHint = cliRes.linked && cliRes.onPath ? 'anywhere' : nodeForm;
   const nextSteps = [
     'Restart Claude Code (or open a new session) so it loads the skill and the MCP tools.',
     'In any project, type /anywhere to open the dialog, or /anywhere <task>, e.g. /anywhere deploy this repo to Cloud Run.',
@@ -838,18 +1070,22 @@ async function install({ electron = false, mcp = true, hotkey = false, hotkeyKey
     mcp: mcpRes,
     electron: electronRes,
     hotkey: hotkeyRes,
+    cli: cliRes,
     nextSteps,
     warnings,
   };
 }
 
 /**
- * Undo `install`. With `purge`, also delete the state directory (settings, logs, Electron).
- * @param {{purge?:boolean, quiet?:boolean, print?:(line:string)=>void, skillDir?:string, mcp?:boolean}} [opts]
+ * Undo `install` (and install.sh's command link and install.ps1's user PATH entry). With `purge`,
+ * also delete the state directory (settings, logs, Electron).
+ * `platformInfo` and `runPowerShell` replace the platform probe and the PowerShell runner (tests).
+ * @param {{purge?:boolean, quiet?:boolean, print?:(line:string)=>void, skillDir?:string, mcp?:boolean,
+ *   platformInfo?:object, runPowerShell?:(info:object, script:string)=>Promise<object>}} [opts]
  */
-async function uninstall({ purge = false, quiet = false, print, skillDir, mcp = true } = {}) {
+async function uninstall({ purge = false, quiet = false, print, skillDir, mcp = true, platformInfo, runPowerShell = runPs } = {}) {
   const out = quiet ? () => {} : typeof print === 'function' ? print : defaultPrint;
-  const info = platformMod.info();
+  const info = platformInfo || platformMod.info();
   const rec = readInstallInfo() || {};
   const removed = [];
   const notes = [];
@@ -900,17 +1136,64 @@ async function uninstall({ purge = false, quiet = false, print, skillDir, mcp = 
   removed.push(...hk.removed);
   out(`  ${hk.removed.length ? '✓' : '-'} Launcher   ${hk.removed.length ? `removed ${hk.removed.join(', ')}` : 'none installed'}`);
 
-  // Electron and install.json
   const sd = paths.stateDir();
+
+  // The `anywhere` command: the POSIX link (install.js or install.sh), or install.ps1's user PATH entry
+  if (info.platform === 'win32' && !info.isWSL) {
+    const binDir = path.join(sd, 'app', 'bin');
+    let r;
+    try {
+      r = await runPowerShell(info, windowsPathRemoveScript(binDir));
+    } catch (err) {
+      r = { code: null, stdout: '', stderr: '', error: err };
+    }
+    if (r && !r.error && !r.timedOut && r.code === 0) {
+      if (/\bremoved\b/.test(String(r.stdout || ''))) {
+        removed.push(`user PATH entry ${binDir}`);
+        out(`  ✓ Command    removed ${binDir} from your user PATH`);
+      }
+    } else {
+      const why = (r && (firstLine(r.stderr) || (r.error && r.error.message))) || `exit ${r && r.code}`;
+      notes.push(`Could not check your user PATH for ${binDir} (${why}). If it is listed, remove it in Settings > System > About > Advanced system settings > Environment Variables.`);
+    }
+  } else if (info.platform !== 'win32') {
+    for (const link of [...new Set([rec.cliLink, path.join(cliBinDir(), 'anywhere')].filter(Boolean))]) {
+      if (!isOurCliLink(link, rec.cliLink)) continue;
+      try {
+        fs.unlinkSync(link);
+        removed.push(link);
+        out(`  ✓ Command    removed ${link}`);
+      } catch (err) {
+        notes.push(`Could not remove ${link}: ${err.message}`);
+      }
+    }
+  }
+
+  // Electron (and leftovers of interrupted downloads) and install.json
   const electronDir = path.join(sd, 'electron');
   if (exists(electronDir)) {
     rmrf(electronDir);
     removed.push(electronDir);
     out(`  ✓ Electron   removed ${electronDir}`);
   }
+  removed.push(...removeElectronLeftovers(sd));
   if (exists(paths.installInfoPath())) {
     fs.unlinkSync(paths.installInfoPath());
     removed.push(paths.installInfoPath());
+  }
+
+  // CLI screenshots (`anywhere computer screenshot` without --out) can show anything that was on screen.
+  try {
+    for (const n of fs.readdirSync(paths.runDir())) {
+      if (!/^screenshot-.*\.png$/.test(n)) continue;
+      try {
+        fs.unlinkSync(path.join(paths.runDir(), n));
+      } catch {
+        /* in use or already gone */
+      }
+    }
+  } catch {
+    /* no run dir */
   }
 
   if (purge) {
@@ -1003,6 +1286,12 @@ module.exports = {
   otherDesktopInstructions,
   manualMcpCommand,
   claudeSpawnSpec,
+  linkCli,
+  isOurCliLink,
+  cliBinDir,
+  windowsPathRemoveScript,
+  removeElectronLeftovers,
+  installElectron,
   isOurSkill,
   isInside,
   isGnomeLike,

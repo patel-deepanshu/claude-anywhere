@@ -970,7 +970,7 @@ test('Wayland/sway: outputs, grim per output, windows, focus, pointer and keys',
 
   await d.moveMouse(100, 200);
   assert.equal(f.calls.at(-1).line, 'swaymsg seat - cursor set 100 200');
-  assert.deepEqual(await d.cursorPosition(), { x: 100, y: 200 });
+  assert.deepEqual(await d.cursorPosition(), { x: 100, y: 200, estimated: true }, 'sway cannot report the pointer: the last move is an estimate');
   await d.click(null, null, { clicks: 2 });
   assert.equal(f.calls.at(-1).args[0], 'seat - cursor press button1; seat - cursor release button1; seat - cursor press button1; seat - cursor release button1');
   await d.scroll(null, null, 0, 2);

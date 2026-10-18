@@ -268,7 +268,8 @@ test('macOS AppleScript launcher and MCP registration commands', () => {
   assert.deepEqual(JSON.parse(json), { type: 'stdio', command: '/usr/bin/node', args: ['/a b/src/mcp/server.js'] });
   assert.equal(installer.manualMcpCommand(json, 'linux'), `claude mcp add-json --scope user anywhere '${json}'`);
   const win = installer.manualMcpCommand(installer.mcpServerJson('C:\\node.exe', 'C:\\a\\server.js'), 'win32');
-  assert.ok(win.startsWith('claude mcp add-json --scope user anywhere "{\\"type\\"'));
+  // No embedded quotes on Windows (cmd.exe and PowerShell both mangle them): `mcp add <name> <cmd> <args>`.
+  assert.equal(win, 'claude mcp add --scope user anywhere "C:\\node.exe" "C:\\a\\server.js"');
   const spec = installer.claudeSpawnSpec('C:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd', ['mcp', 'add-json', 'anywhere', '{"a":1}'], 'win32');
   assert.equal(spec.shell, true);
   assert.equal(spec.args[3], '"{\\"a\\":1}"');
