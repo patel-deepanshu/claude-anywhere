@@ -505,6 +505,14 @@ function makeJxa(opts = {}) {
     deepUnwrap: (o) => o.__deep,
     castRefToObject: (r) => r,
   };
+  // C functions the bridge metadata lacks, which ObjC.bindFunction can bind by name.
+  if (opts.bindable) {
+    ObjC.bindFunction = (name, sig) => {
+      log.push(['bindFunction', name, sig]);
+      if (!Object.prototype.hasOwnProperty.call(opts.bindable, name)) throw new Error(`no symbol ${name}`);
+      $[name] = opts.bindable[name];
+    };
+  }
 
   function axWindow(pid, w) {
     const attr = (name) => ({
@@ -940,6 +948,14 @@ test('helper: perms, ping, clipboard and errors', () => {
   // CGPreflightScreenCaptureAccess missing (old bridge) -> unknown.
   const old = makeJxa({ perms: { accessibility: true } });
   assert.equal(old.call('perms', {}).result.screenRecording, null);
+  // Not bridged, but bindable by name (macOS 26's JXA bridge lacks it).
+  const bound = makeJxa({ perms: { accessibility: true }, bindable: { CGPreflightScreenCaptureAccess: () => false, CGRequestScreenCaptureAccess: () => true } });
+  assert.equal(bound.call('perms', {}).result.screenRecording, false);
+  assert.equal(JSON.stringify(bound.log.find((l) => l[0] === 'bindFunction')), JSON.stringify(['bindFunction', 'CGPreflightScreenCaptureAccess', ['bool', []]]));
+  assert.equal(bound.call('perms', {}).result.screenRecording, false);
+  assert.equal(bound.log.filter((l) => l[0] === 'bindFunction').length, 1, 'bound once');
+  assert.equal(bound.call('requestPerms', { accessibility: false }).result.screenRecording, true);
+  assert.equal(makeJxa({ perms: { accessibility: true }, bindable: {} }).call('perms', {}).result.screenRecording, null);
   assert.equal(makeJxa({ perms: null }).call('perms', {}).result.accessibility, null);
   const ping = makeJxa().call('ping', {}).result;
   assert.equal(ping.pong, true);
