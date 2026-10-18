@@ -904,6 +904,24 @@ function cmdPing() {
   return { pong: true, version: HELPER_VERSION, pid: pid, os: osVersion, importErrors: IMPORT_ERRORS };
 }
 
+/**
+ * Call CGPreflightScreenCaptureAccess or CGRequestScreenCaptureAccess (CoreGraphics, macOS
+ * 10.15+). The bridge metadata (BridgeSupport) that JXA reads lacks both, even on macOS 26, so
+ * `$.CGPreflightScreenCaptureAccess` is undefined there: bind the C function by name instead.
+ * @returns {boolean|null} null when the function cannot be called
+ */
+function screenCaptureAccess(name) {
+  if (typeof $[name] === 'undefined' && typeof ObjC.bindFunction === 'function') {
+    try {
+      ObjC.bindFunction(name, ['bool', []]);
+    } catch (e) {
+      return null;
+    }
+  }
+  if (typeof $[name] === 'undefined') return null;
+  return Boolean($[name]());
+}
+
 function cmdPerms() {
   var accessibility = null;
   var screenRecording = null;
@@ -913,9 +931,7 @@ function cmdPerms() {
     accessibility = null;
   }
   try {
-    if (typeof $.CGPreflightScreenCaptureAccess !== 'undefined') {
-      screenRecording = Boolean($.CGPreflightScreenCaptureAccess());
-    }
+    screenRecording = screenCaptureAccess('CGPreflightScreenCaptureAccess');
   } catch (e) {
     screenRecording = null;
   }
@@ -937,9 +953,7 @@ function cmdRequestPerms(a) {
   }
   if (a.screenRecording !== false) {
     try {
-      if (typeof $.CGRequestScreenCaptureAccess !== 'undefined') {
-        out.screenRecording = Boolean($.CGRequestScreenCaptureAccess());
-      }
+      out.screenRecording = screenCaptureAccess('CGRequestScreenCaptureAccess');
     } catch (e) {
       out.screenRecordingError = errMessage(e);
     }

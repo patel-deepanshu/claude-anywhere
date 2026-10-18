@@ -171,15 +171,73 @@ function textEditRunning() {
   return sh('pgrep', ['-x', 'TextEdit']).code === 0;
 }
 
+// TextEdit's automatic text changes (capitalizing the first word, spelling correction, smart
+// dashes and quotes, completions) would change what the tests type. They are turned off for
+// TextEdit only, and the user's TextEdit preferences are put back afterwards.
+const TEXTEDIT_OFF = [
+  'NSAutomaticCapitalizationEnabled',
+  'NSAutomaticSpellingCorrectionEnabled',
+  'NSAutomaticPeriodSubstitutionEnabled',
+  'NSAutomaticDashSubstitutionEnabled',
+  'NSAutomaticQuoteSubstitutionEnabled',
+  'NSAutomaticTextReplacementEnabled',
+  'NSAutomaticTextCompletionEnabled',
+  'NSAutomaticInlinePredictionEnabled',
+  'CorrectSpellingAutomatically',
+  'CheckSpellingWhileTyping',
+  'SmartDashes',
+  'SmartQuotes',
+  'TextReplacement',
+];
+let textEditPrefs = null;
+
+function quietTextEdit() {
+  if (textEditPrefs) return;
+  const file = path.join(HOME, 'textedit-prefs.plist');
+  textEditPrefs = { file, saved: sh('defaults', ['export', 'com.apple.TextEdit', file]).code === 0 };
+  for (const key of TEXTEDIT_OFF) sh('defaults', ['write', 'com.apple.TextEdit', key, '-bool', 'false']);
+}
+
+function restoreTextEdit() {
+  if (!textEditPrefs) return;
+  if (textEditPrefs.saved) sh('defaults', ['import', 'com.apple.TextEdit', textEditPrefs.file]);
+  else sh('defaults', ['delete', 'com.apple.TextEdit']);
+  textEditPrefs = null;
+}
+
 after(async () => {
   if (!LIVE) return;
   try {
     if (textEditRunning()) sh('killall', ['TextEdit']);
+    await waitFor(() => !textEditRunning(), 5000);
+    restoreTextEdit();
   } catch {
     /* best effort */
   }
   await require('../src/os/index').resetDriver();
 });
+
+/** TEMPORARY diagnostics: who has keyboard focus, and what TextEdit's text view holds. */
+async function focusDiag(d, label) {
+  let act = null;
+  try {
+    act = await d._call('active', { axTitles: false });
+  } catch (err) {
+    act = { error: err.message };
+  }
+  const se = sh('osascript', ['-e', 'tell application "System Events" to get {name, unix id} of first application process whose frontmost is true'], { timeoutMs: 10000 });
+  const te = sh(
+    'osascript',
+    ['-e', 'tell application "System Events" to tell process "TextEdit" to get {value, value of attribute "AXSelectedText"} of text area 1 of scroll area 1 of window 1'],
+    { timeoutMs: 10000 },
+  );
+  note(`DIAG ${label}:`, {
+    helperPid: d._transport.pid,
+    front: act && (act.error || `${act.app} pid ${act.pid}`),
+    systemEventsFront: (se.stdout || se.stderr).trim(),
+    textEdit: (te.stdout || te.stderr).trim(),
+  });
+}
 
 // ---------------------------------------------------------------- a. capabilities
 
@@ -224,6 +282,8 @@ test('live-desktop darwin a: capabilities() report the macOS permission state', 
     pid = Number(m[1]);
   }
   note('process ancestry:', chain.join(' <- '));
+  const bridged = sh('osascript', ['-l', 'JavaScript', '-e', "ObjC.import('CoreGraphics'); [typeof $.CGPreflightScreenCaptureAccess, typeof $.CGRequestScreenCaptureAccess, typeof $.CGEventPost].join(',')"]);
+  note('DIAG bridged CG functions (preflight, request, CGEventPost):', (bridged.stdout || bridged.stderr).trim());
 });
 
 // ---------------------------------------------------------------- b. displays
@@ -369,6 +429,7 @@ test('live-desktop darwin f: open TextEdit, find its window with listWindows and
     sh('killall', ['TextEdit']);
     await waitFor(() => !textEditRunning(), 10000);
   }
+  quietTextEdit();
   const doc = path.join(HOME, 'anywhere-live.txt');
   fs.writeFileSync(doc, '');
   const opened = sh('open', ['-a', 'TextEdit', doc], { timeoutMs: 30000 });
@@ -430,9 +491,22 @@ test('live-desktop darwin h: typeText, then Cmd+A / Cmd+C put the typed text on 
   const t0 = Date.now();
   await d.typeText(TYPED);
   note(`typeText(${JSON.stringify(TYPED)}) took ${Date.now() - t0} ms; automation consent: ${JSON.stringify(d._automation)}`);
+  await focusDiag(d, 'after typeText');
   await sleep(300);
-  const copied = await selectAllAndCopy(d, 'sentinel-1');
+  await d.clipboardSet('sentinel-1');
+  await d.keyCombo(['meta', 'a']);
+  await sleep(250);
+  await focusDiag(d, 'after Cmd+A');
+  await d.keyCombo(['meta', 'c']);
+  const copied = await clipboardAfterCopy(d, 'sentinel-1');
   note('clipboard after Cmd+A, Cmd+C:', JSON.stringify(copied));
+  if (copied !== TYPED) {
+    await focusDiag(d, 'copy failed');
+    await d.focusWindow(state.textEdit.id);
+    await sleep(300);
+    note('DIAG retry after focusWindow:', JSON.stringify(await selectAllAndCopy(d, 'sentinel-1b')));
+    await focusDiag(d, 'after retry');
+  }
   assert.equal(copied, TYPED);
 
   // Non-ASCII text goes through the paste path; it replaces the selection.
@@ -452,7 +526,9 @@ test('live-desktop darwin j: Computer screenshot coordinates click into TextEdit
   const d = await drv();
   assert.ok(state.textEdit, 'TextEdit is open (test f)');
   const { Computer } = require('../src/os/computer');
-  const comp = new Computer({ driver: d, config: { actionDelayMs: 80 } });
+  // A screenshot smaller than the display, so screenshot pixels and points differ even on a
+  // non-Retina display (CI runners have a 1024x768 virtual display at scale 1).
+  const comp = new Computer({ driver: d, config: { actionDelayMs: 80, maxWidth: 800, maxHeight: 600 } });
   state.computer = comp;
   const disp = state.display || (await d.displays())[0];
   if (state.perms.screenRecording === false) {
@@ -464,6 +540,14 @@ test('live-desktop darwin j: Computer screenshot coordinates click into TextEdit
   }
   assert.equal(await d.focusWindow(state.textEdit.id), true);
   await sleep(300);
+  // Select all: a click into the text must clear the selection, so typing then appends.
+  await d.clipboardSet('sentinel-3');
+  await comp.key({ combo: 'primary+a' });
+  await sleep(200);
+  await comp.key({ combo: 'primary+c' });
+  const before = await clipboardAfterCopy(d, 'sentinel-3');
+  note('document text before the click:', JSON.stringify(before));
+  assert.notEqual(before, 'sentinel-3', 'Cmd+A, Cmd+C copied the document');
   const win = (await d.listWindows()).find((w) => w.id === state.textEdit.id) || state.textEdit;
   const lx = Math.round(win.x + win.width / 2);
   const ly = Math.round(win.y + win.height * 0.65);
@@ -474,7 +558,7 @@ test('live-desktop darwin j: Computer screenshot coordinates click into TextEdit
     note('Computer.screenshot():', { width: shot.width, height: shot.height, scale: shot.scale, native: shot.native, cursor: shot.cursor });
     assertPng(shot.png, 'Computer.screenshot()');
     fs.writeFileSync(path.join(OUT, 'darwin-2-computer-textedit.png'), shot.png);
-    assert.ok(shot.width <= 1366 && shot.height <= 768, 'downscaled to fit 1366x768');
+    assert.ok(shot.width <= 800 && shot.height <= 600, 'downscaled to fit 800x600');
     assert.ok(Math.abs(shot.native.width - Math.round(disp.width * disp.scale)) <= 2, 'native size is points x backing scale');
     assert.ok(Math.abs(shot.scale - disp.width / shot.width) < 1e-9);
     shotW = shot.width;
@@ -517,13 +601,13 @@ test('live-desktop darwin j: Computer screenshot coordinates click into TextEdit
   const typed = await comp.typeText({ text: CLICKED });
   note('Computer.typeText():', typed);
   await sleep(300);
-  await d.clipboardSet('sentinel-3');
+  await d.clipboardSet('sentinel-4');
   await comp.key({ combo: 'primary+a' });
   await sleep(200);
   await comp.key({ combo: 'primary+c' });
-  const copied = await clipboardAfterCopy(d, 'sentinel-3');
+  const copied = await clipboardAfterCopy(d, 'sentinel-4');
   note('clipboard after the click and typing:', JSON.stringify(copied));
-  assert.equal(copied, `${UNICODE}${CLICKED}`, 'the click deselected the text and typing appended to it');
+  assert.equal(copied, `${before}${CLICKED}`, 'the click cleared the selection and typing appended to the text');
 });
 
 // ---------------------------------------------------------------- k. scroll and drag
