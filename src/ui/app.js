@@ -387,6 +387,31 @@ async function api(method, path, body, { timeoutMs = 30000, contentType } = {}) 
   return data;
 }
 
+// ------------------------------------------------------------------ visibility
+
+/** This page load's id for POST /api/ui/visibility (several dialog pages can be connected). */
+const PAGE_ID = (() => {
+  try {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+  } catch {
+    /* not a secure context */
+  }
+  return `page-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+})();
+
+/** Tell the daemon whether this page can be seen (after a 'show' event, and when that changes). */
+function reportVisibility() {
+  if (!state.token) return;
+  let focused = false;
+  try {
+    focused = document.hasFocus();
+  } catch {
+    /* ignore */
+  }
+  // An older daemon has no such route: it keeps trusting the connection.
+  api('POST', '/api/ui/visibility', { page: PAGE_ID, visible: !document.hidden, focused }, { timeoutMs: 5000 }).catch(() => {});
+}
+
 // ------------------------------------------------------------------ connection
 
 let es = null;
@@ -622,6 +647,9 @@ const handlers = {
     } catch {
       /* ignore */
     }
+    // The daemon waits for this to tell a dialog in front from a minimized or hidden one, which
+    // window.focus() cannot bring back (it then opens a window).
+    reportVisibility();
     focusInput();
     if (!document.hidden) speaker.claim();
   },
@@ -1211,21 +1239,39 @@ function buildApprovalCard(card) {
     'aria-label': 'Reason for denying',
     maxlength: '2000',
   });
-  // Critical actions need a deliberate click: Enter on the card never allows them.
+  // Critical actions need a deliberate click: Enter on the card never allows them, nor does a
+  // spoken "yes" (handleVoiceText).
   const allow =
     risk === 'critical'
       ? h('button', { type: 'button', class: 'btn btn-primary', title: 'Critical actions need a click to allow' }, 'Allow once')
       : h('button', { type: 'button', class: 'btn btn-primary' }, 'Allow once', h('kbd', null, '↵'));
+  // "Always (session)" adds the card's session rule, shown as text so the user sees what it
+  // covers. A card whose sessionRule is null (critical actions; delete, disable and IAM verbs;
+  // sensitive files; edits with no path) would only be allowed once, so the button is disabled.
+  const noRule = risk === 'critical' || card.sessionRule === null;
+  const rule = !noRule && typeof card.sessionRule === 'string' && card.sessionRule ? card.sessionRule : null;
   const always = h(
     'button',
     {
       type: 'button',
       class: 'btn',
-      disabled: risk === 'critical',
-      title: risk === 'critical' ? 'Critical actions always ask' : card.sessionRule ? `Allow ${card.sessionRule} for the rest of this session` : 'Allow this for the rest of this session',
+      disabled: noRule,
+      title:
+        risk === 'critical'
+          ? 'Critical actions always ask'
+          : rule
+            ? `Allow ${rule} for the rest of this session`
+            : noRule
+              ? 'This action always asks: no session rule covers it'
+              : 'Allow this for the rest of this session',
     },
     'Always (session)'
   );
+  const ruleNote = rule
+    ? h('div', { class: 'card-rule' }, 'Always (session) allows ', h('code', null, rule), ' until the session ends.')
+    : noRule && risk !== 'critical'
+      ? h('div', { class: 'card-rule' }, 'This action always asks: no session rule covers it.')
+      : null;
   const deny = h('button', { type: 'button', class: 'btn btn-danger' }, 'Deny', h('kbd', null, 'Esc'));
   const details = h('details', { class: 'card-details' }, h('summary', null, 'Details'), h('pre', { class: 'tool-pre' }, prettyJson(card.input, DETAIL_LIMIT)));
   const node = h(
@@ -1236,12 +1282,13 @@ function buildApprovalCard(card) {
     card.reason ? h('div', { class: 'card-reason' }, card.reason) : null,
     card.input != null ? details : null,
     reason,
-    h('div', { class: 'card-actions' }, allow, always, deny)
+    h('div', { class: 'card-actions' }, allow, always, deny),
+    ruleNote
   );
-  const decide = (decision) => resolveApproval(card.id, decision, decision === 'deny' ? reason.value.trim() : '');
-  allow.addEventListener('click', () => decide('allow'));
-  always.addEventListener('click', () => decide('allow_session'));
-  deny.addEventListener('click', () => decide('deny'));
+  const decide = (decision, via) => resolveApproval(card.id, decision, decision === 'deny' ? reason.value.trim() : '', via);
+  allow.addEventListener('click', () => decide('allow', 'click'));
+  always.addEventListener('click', () => decide('allow_session', 'click'));
+  deny.addEventListener('click', () => decide('deny', 'click'));
   const ignoreKey = armCard(node);
   node.addEventListener('keydown', (e) => {
     if (e.isComposing || e.keyCode === 229) return;
@@ -1255,15 +1302,15 @@ function buildApprovalCard(card) {
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
-      decide('deny');
+      decide('deny', 'key');
     } else if (e.key === 'Enter' && !e.shiftKey && !e.altKey) {
       const t = e.target;
       if (t === reason) {
         e.preventDefault();
-        decide('deny');
+        decide('deny', 'key');
       } else if (t === node) {
         e.preventDefault();
-        if (risk !== 'critical') decide('allow');
+        if (risk !== 'critical') decide('allow', 'key');
       }
     }
   });
@@ -1312,11 +1359,17 @@ function buildQuestionCard(q) {
   return node;
 }
 
-async function resolveApproval(id, decision, message) {
+/**
+ * @param {string} id
+ * @param {'allow'|'allow_session'|'deny'} decision
+ * @param {string} [message] the deny reason
+ * @param {'click'|'key'|'voice'} [via] how the user decided (for the daemon's audit and policy)
+ */
+async function resolveApproval(id, decision, message, via) {
   const n = cardNodes.get(id);
   if (n) n.classList.add('busy');
   try {
-    await api('POST', '/api/approval', message ? { id, decision, message } : { id, decision });
+    await api('POST', '/api/approval', { id, decision, ...(message ? { message } : {}), ...(via ? { via } : {}) });
     removeCard(id, 'approval');
   } catch (err) {
     if (n) n.classList.remove('busy');
@@ -1450,6 +1503,7 @@ function renderMode() {
   el.modeBadge.setAttribute('aria-label', `Working style: ${tip}`);
   el.modeNote.textContent = bridge ? (listening ? 'Terminal listening.' : 'No terminal is listening yet. Run “/anywhere here” in Claude Code.') : '';
   for (const b of el.modePop.querySelectorAll('.pop-option')) b.setAttribute('aria-current', String(b.dataset.mode === state.mode));
+  renderFooter();
 }
 
 const PROVIDER_LABELS = { browser: 'Browser', off: 'Off', none: 'Unavailable', groq: 'Groq', openai: 'OpenAI', custom: 'Custom', 'whisper.cpp': 'whisper.cpp', server: 'Server', system: 'System' };
@@ -1459,10 +1513,20 @@ function providerLabel(name) {
 }
 
 function renderFooter() {
-  const engineModel = state.config && state.config.engine && state.config.engine.model;
-  const model = state.session.model || engineModel || 'Default model';
-  el.sbModel.textContent = model;
-  el.sbModel.title = `Model: ${model}`;
+  // In bridge mode your Claude Code terminal does the work: the daemon knows neither its model
+  // nor its cost, so the companion session's (idle) model and cost would mislead.
+  const bridge = state.mode === 'bridge';
+  el.sbCost.hidden = bridge;
+  el.sbCostSep.hidden = bridge;
+  if (bridge) {
+    el.sbModel.textContent = 'Claude Code terminal';
+    el.sbModel.title = 'Commands run in your Claude Code terminal; its model and cost show there';
+  } else {
+    const engineModel = state.config && state.config.engine && state.config.engine.model;
+    const model = state.session.model || engineModel || 'Default model';
+    el.sbModel.textContent = model;
+    el.sbModel.title = `Model: ${model}`;
+  }
   el.sbCost.textContent = fmtCost(state.session.costUsd);
   const turns = Number(state.session.turns) || 0;
   el.sbCost.title = `Cost of this session (${turns} turn${turns === 1 ? '' : 's'})`;
@@ -1612,6 +1676,18 @@ async function openProjects() {
 }
 
 /**
+ * Bridge commands that only wait for a terminal (none is listening, none took a command, no
+ * card is open): nothing runs, so a switch drops them (a mode switch moves them to the dialog's
+ * own session). @returns {number} how many (0: not that state)
+ */
+function waitingForTerminal() {
+  if (state.mode !== 'bridge' || state.status !== 'queued') return 0;
+  const b = state.bridge || {};
+  if (b.listening || state.approvals.size || state.questions.size) return 0;
+  return Math.max(1, Number(b.queued) || 0);
+}
+
+/**
  * POST a project or mode switch. The daemon refuses one that would stop a running task (409):
  * ask first, then retry with force. Resolves null when the user keeps the task.
  */
@@ -1621,7 +1697,11 @@ async function postSwitch(path, body, opts) {
   } catch (err) {
     if (!err || err.status !== 409) throw err;
     const what = path === '/api/project' ? 'switch the project' : 'change the mode';
-    if (!window.confirm(`A task is running. Stop it and ${what}?`)) return null;
+    const n = waitingForTerminal();
+    const ask = n
+      ? `${n === 1 ? 'A command is' : `${n} commands are`} waiting for a Claude Code terminal (none is listening). ${path === '/api/project' ? `Switching the project drops ${n === 1 ? 'it' : 'them'}` : `Changing the mode moves ${n === 1 ? 'it' : 'them'} to the dialog's own session, or drops ${n === 1 ? 'it' : 'them'}`}. ${what[0].toUpperCase()}${what.slice(1)} anyway?`
+      : `A task is running. Stop it and ${what}?`;
+    if (!window.confirm(ask)) return null;
     return api('POST', path, { ...body, force: true }, opts);
   }
 }
@@ -1644,10 +1724,14 @@ async function setMode(mode) {
   closePopover(true);
   if (mode === state.mode) return;
   try {
-    if (!(await postSwitch('/api/mode', { mode }))) return;
+    const res = await postSwitch('/api/mode', { mode });
+    if (!res) return;
     state.mode = mode;
     renderMode();
-    toast(mode === 'bridge' ? 'Bridge mode: commands go to your Claude Code terminal' : 'Companion mode', 'success');
+    // Bridge commands that waited for a terminal now run in the dialog's own session.
+    const moved = Number(res.moved) > 0 ? Number(res.moved) : 0;
+    const movedNote = moved ? `: ${moved === 1 ? 'the waiting command runs' : `the ${moved} waiting commands run`} here now` : '';
+    toast(mode === 'bridge' ? 'Bridge mode: commands go to your Claude Code terminal' : `Companion mode${movedNote}`, 'success');
   } catch (err) {
     toast(`Couldn't change mode: ${err.message}`, 'error');
   }
@@ -2309,16 +2393,37 @@ function handleVoiceText(text) {
       }
       return;
     case 'approve':
-      if (approval) {
-        resolveApproval(approval.id, intent.decision, intent.message || '');
-        toast(intent.decision === 'deny' ? 'Denied' : intent.decision === 'allow_session' ? 'Allowed for this session' : 'Allowed', intent.decision === 'deny' ? 'warning' : 'success', { timeout: 2000 });
+      if (!approval) return;
+      // Critical actions need a deliberate click, as with Enter on the card: a heard "yes" (or a
+      // mishearing, or someone else in the room) never allows one. Voice can still deny.
+      if (approval.risk === 'critical' && intent.decision !== 'deny') {
+        showCriticalCard(approval);
+        return;
       }
+      // "Always" adds the card's session rule; a card without one would only be allowed once.
+      if (intent.decision === 'allow_session' && approval.sessionRule === null) {
+        toast('This action always asks: no session rule covers it. Say “yes” to allow it once, or “no”.', 'warning');
+        return;
+      }
+      resolveApproval(approval.id, intent.decision, intent.message || '', 'voice');
+      toast(
+        intent.decision === 'deny' ? 'Denied' : intent.decision === 'allow_session' ? (approval.sessionRule ? `Allowed for this session: ${approval.sessionRule}` : 'Allowed for this session') : 'Allowed',
+        intent.decision === 'deny' ? 'warning' : 'success',
+        { timeout: intent.decision === 'allow_session' ? 4000 : 2000 }
+      );
       return;
     case 'answer':
       if (question) answerQuestion(question.id, intent.text);
       return;
     case 'unmatched_approval':
-      toast('Claude is waiting for your approval. Say “yes”, “always” or “no”.', 'warning');
+      toast(
+        approval && approval.risk === 'critical'
+          ? 'Claude is waiting for your approval of a critical action. Click “Allow once” on the card, or say “no”.'
+          : approval && approval.sessionRule === null
+            ? 'Claude is waiting for your approval. Say “yes” or “no”.'
+            : 'Claude is waiting for your approval. Say “yes”, “always” or “no”.',
+        'warning'
+      );
       if (!el.input.value.trim()) {
         el.input.value = t;
         autosize();
@@ -2338,6 +2443,18 @@ function handleVoiceText(text) {
     renderComposerButtons();
     focusInput();
   }
+}
+
+/** Voice tried to allow a critical card: point at the card's Allow button instead. */
+function showCriticalCard(approval) {
+  toast('Critical actions need a click: press “Allow once” on the card (or say “no” to deny).', 'warning');
+  const n = cardNodes.get(approval.id);
+  if (n) {
+    n.scrollIntoView({ block: 'nearest' });
+    maybeFocusCard(n);
+  }
+  const v = (state.config && state.config.voice) || {};
+  if (speaker.active && v.speakResponses !== false && v.tts !== 'off') voice.speak('Critical actions need a click. Press Allow once on the card.');
 }
 
 function onResult(d) {
@@ -2701,6 +2818,7 @@ function bindUi() {
     connect();
   });
   document.addEventListener('visibilitychange', () => {
+    reportVisibility();
     if (!document.hidden && pendingRenders.size && !rafId) scheduleRender([...pendingRenders][0]);
   });
 
@@ -2739,7 +2857,7 @@ function grabElements() {
     suggestions: 'suggestions', items: 'items', typing: 'typing', jump: 'jump', cards: 'cards', toasts: 'toasts',
     composer: 'composer', voiceLine: 'voice-line', meter: 'meter', voiceText: 'voice-text', voiceCancel: 'voice-cancel',
     attachments: 'attachments', input: 'input', screenToggle: 'screen-toggle', composerHint: 'composer-hint', mic: 'mic',
-    send: 'send', sendIcon: 'send-icon', sbModel: 'sb-model', sbCost: 'sb-cost', sbVoice: 'sb-voice', sbStt: 'sb-stt',
+    send: 'send', sendIcon: 'send-icon', sbModel: 'sb-model', sbCost: 'sb-cost', sbCostSep: 'sb-cost-sep', sbVoice: 'sb-voice', sbStt: 'sb-stt',
     sbTts: 'sb-tts', projectPop: 'project-pop', projectList: 'project-list', projectForm: 'project-form',
     projectPath: 'project-path', modePop: 'mode-pop', modeNote: 'mode-note', drawerBackdrop: 'drawer-backdrop',
     drawer: 'drawer', closeSettings: 'close-settings', settingsForm: 'settings-form', permHelp: 'perm-help',

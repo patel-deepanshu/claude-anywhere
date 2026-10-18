@@ -9,7 +9,9 @@
  *   4. optionally downloads Electron into the state directory,
  *   5. optionally adds an OS launcher with a keyboard shortcut,
  *   6. links the `anywhere` command into ~/.local/bin (POSIX; ANYWHERE_BIN_DIR, ANYWHERE_NO_LINK=1),
- *      or on Windows says how to run it when it is not on PATH,
+ *      or on Windows says how to run it when it is not on PATH. A Claude Code plugin lives in a
+ *      versioned folder that each plugin update replaces, so for a plugin the link and the hotkey run
+ *      a stable launcher in <state>/launcher, which finds the installed version at run time,
  * and reverses all of it on uninstall (plus install.ps1's user PATH entry on Windows).
  *
  * Usage: node scripts/install.js [--electron] [--no-mcp] [--hotkey] [--hotkey-key=Ctrl+Alt+F12] [--quiet]
@@ -553,7 +555,49 @@ function linkCli({ binDir = cliBinDir(), target = path.join(PACKAGE_ROOT, 'bin',
   return { linked: true, link, target, onPath: dirOnPath(binDir) };
 }
 
-/** Is `link` a symlink to this package's shim or into the state directory's app (install.sh)? */
+// ---------------------------------------------------------------- plugin installs
+
+/** The Claude Code plugins folder when this package is an installed plugin's copy, else null. */
+function pluginsDirOf(root = PACKAGE_ROOT) {
+  const pluginsDir = path.join(paths.claudeHome(), 'plugins');
+  if (isInside(realpathOr(root), realpathOr(pluginsDir)) || isInside(root, pluginsDir)) return pluginsDir;
+  return null;
+}
+
+/** <state>/launcher: the stable launcher of a plugin install (see writePluginLauncher). */
+function pluginLauncherDir() {
+  return path.join(paths.stateDir(), 'launcher');
+}
+
+/**
+ * Write the stable launcher a plugin install needs: <state>/launcher/anywhere (the POSIX shim),
+ * anywhere.cmd (Windows) and anywhere.js, a copy of the skill's run.js. The plugin's own folder
+ * (~/.claude/plugins/cache/<marketplace>/anywhere/<version>) changes with every plugin update,
+ * so the `anywhere` link and the hotkey run this launcher, which reads install.json's pluginsDir
+ * and installed_plugins.json at run time and runs the version Claude Code has installed now.
+ * @returns {{dir:string, sh:string, cmd:string, js:string}}
+ */
+function writePluginLauncher(dir = pluginLauncherDir()) {
+  fs.mkdirSync(dir, { recursive: true });
+  const out = { dir, sh: path.join(dir, 'anywhere'), cmd: path.join(dir, 'anywhere.cmd'), js: path.join(dir, 'anywhere.js') };
+  fs.copyFileSync(path.join(PACKAGE_ROOT, 'bin', 'anywhere'), out.sh);
+  fs.copyFileSync(path.join(PACKAGE_ROOT, 'bin', 'anywhere.cmd'), out.cmd);
+  fs.copyFileSync(path.join(SKILL_SRC, 'run.js'), out.js);
+  try {
+    fs.chmodSync(out.sh, 0o755);
+  } catch {
+    /* windows */
+  }
+  return out;
+}
+
+// A link that an earlier version made straight into a plugin's versioned folder.
+const PLUGIN_SHIM_RE = /[\\/]plugins[\\/]cache[\\/][^\\/]+[\\/]anywhere[\\/][^\\/]+[\\/]bin[\\/]anywhere$/;
+
+/**
+ * Is `link` a symlink to this package's shim, into the state directory's app (install.sh) or
+ * launcher (plugin installs), or into an anywhere plugin's versioned folder?
+ */
 function isOurCliLink(link, recorded) {
   let st = null;
   try {
@@ -565,6 +609,7 @@ function isOurCliLink(link, recorded) {
   const target = linkTarget(link);
   if (!target) return false;
   if (target === path.join(PACKAGE_ROOT, 'bin', 'anywhere') || isInside(target, path.join(paths.stateDir(), 'app'))) return true;
+  if (target === path.join(pluginLauncherDir(), 'anywhere') || PLUGIN_SHIM_RE.test(target)) return true;
   return Boolean(recorded) && path.resolve(recorded) === path.resolve(link) && !exists(target);
 }
 
@@ -972,15 +1017,32 @@ async function install({ electron = false, mcp = true, hotkey = false, hotkeyKey
     nodePath,
     skillDir: target,
   };
+  // A plugin's folder is versioned: run.js (the skill's and the stable launcher's) looks up the
+  // installed version in <pluginsDir>/installed_plugins.json first.
+  const pluginsDir = pluginsDirOf();
+  let launcher = null;
+  if (pluginsDir) {
+    record.pluginsDir = pluginsDir;
+    try {
+      launcher = writePluginLauncher();
+      record.launcher = launcher.dir;
+    } catch (err) {
+      delete record.launcher;
+      warnings.push(`Could not write the stable launcher in ${pluginLauncherDir()}: ${err.message}`);
+    }
+  } else {
+    delete record.pluginsDir;
+    delete record.launcher;
+  }
+  // What the hotkey and the `anywhere` command run: the stable launcher for a plugin.
+  const cliJs = launcher ? launcher.js : BIN_JS;
   // Launchers (WSL hotkey, macOS applet, .desktop entries) start without the login shell's PATH;
   // the CLI adds these directories back when it starts the daemon (nvm, Homebrew, ~/.local/bin).
   if (info.platform !== 'win32' && process.env.PATH) record.envPath = process.env.PATH;
 
   // 3. MCP server (a plugin install already provides it as plugin:anywhere:anywhere)
   let mcpRes = { registered: false, skipped: true };
-  const pluginsDir = path.join(paths.claudeHome(), 'plugins');
-  const fromPlugin = isInside(realpathOr(PACKAGE_ROOT), realpathOr(pluginsDir)) || isInside(PACKAGE_ROOT, pluginsDir);
-  if (mcp && fromPlugin) {
+  if (mcp && pluginsDir) {
     mcpRes = { registered: false, skipped: true, reason: 'provided by the anywhere plugin' };
     out('  - MCP tools  provided by the anywhere plugin (not registered again)');
   } else if (mcp) {
@@ -1014,7 +1076,7 @@ async function install({ electron = false, mcp = true, hotkey = false, hotkeyKey
   let hotkeyRes = { installed: false, skipped: true };
   if (hotkey) {
     try {
-      hotkeyRes = await installHotkey(info, nodePath, BIN_JS, combo);
+      hotkeyRes = await installHotkey(info, nodePath, cliJs, combo);
     } catch (err) {
       hotkeyRes = { installed: false, reason: err.message };
     }
@@ -1030,9 +1092,9 @@ async function install({ electron = false, mcp = true, hotkey = false, hotkeyKey
 
   // 6. The `anywhere` command for the user's own terminals (TUI over SSH, doctor, show, restart)
   let cliRes = { linked: false, skipped: true };
-  const nodeForm = process.platform === 'win32' ? `node "${BIN_JS}"` : `node ${shQuote(BIN_JS)}`;
+  const nodeForm = process.platform === 'win32' ? `node "${cliJs}"` : `node ${shQuote(cliJs)}`;
   if (cliLink && info.platform !== 'win32' && process.env.ANYWHERE_NO_LINK !== '1') {
-    cliRes = linkCli();
+    cliRes = linkCli(launcher ? { target: launcher.sh } : undefined);
     if (cliRes.linked) {
       record.cliLink = cliRes.link;
       if (cliRes.onPath) out(`  ✓ Command    anywhere → ${cliRes.link}`);
@@ -1044,7 +1106,7 @@ async function install({ electron = false, mcp = true, hotkey = false, hotkeyKey
       out(`  - Command    not linked (${cliRes.reason}); in a terminal run: ${nodeForm}`);
     }
   } else if (info.platform === 'win32' && process.env.ANYWHERE_NO_LINK !== '1' && !proc.which('anywhere')) {
-    out(`  - Command    "anywhere" is not on your PATH; in a terminal run: ${nodeForm}   (or add ${path.dirname(BIN_JS)} to your PATH)`);
+    out(`  - Command    "anywhere" is not on your PATH; in a terminal run: ${nodeForm}   (or add ${path.dirname(cliJs)} to your PATH)`);
   }
 
   writeJson(paths.installInfoPath(), record);
@@ -1169,6 +1231,13 @@ async function uninstall({ purge = false, quiet = false, print, skillDir, mcp = 
     }
   }
 
+  // The stable launcher of a plugin install (after the link and the hotkey that ran it)
+  const launcherDir = rec.launcher ? path.resolve(rec.launcher) : pluginLauncherDir();
+  if (isInside(launcherDir, sd) && exists(launcherDir)) {
+    rmrf(launcherDir);
+    removed.push(launcherDir);
+  }
+
   // Electron (and leftovers of interrupted downloads) and install.json
   const electronDir = path.join(sd, 'electron');
   if (exists(electronDir)) {
@@ -1288,6 +1357,9 @@ module.exports = {
   claudeSpawnSpec,
   linkCli,
   isOurCliLink,
+  pluginsDirOf,
+  pluginLauncherDir,
+  writePluginLauncher,
   cliBinDir,
   windowsPathRemoveScript,
   removeElectronLeftovers,

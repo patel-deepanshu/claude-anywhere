@@ -7,10 +7,16 @@
  * and the exit code.
  *
  * Package resolution, first match wins:
- *   1. ../../bin/anywhere.js next to this file (repository checkout or plugin install)
- *   2. packageRoot from install.json in the state directory
- *      (ANYWHERE_HOME, default ~/.claude-anywhere), written by `anywhere install`
+ *   1. ../../bin/anywhere.js when this file is <package>/skills/anywhere/run.js (repository
+ *      checkout or plugin install)
+ *   2. install.json in the state directory (ANYWHERE_HOME, default ~/.claude-anywhere), written by
+ *      `anywhere install`: for a plugin install (pluginsDir), the version Claude Code has installed
+ *      now, from <pluginsDir>/installed_plugins.json (each plugin update moves the plugin to a new
+ *      versioned folder); else, or when that finds nothing, packageRoot
  *   3. `anywhere` on PATH
+ *
+ * A copy of this file is also the stable launcher of plugin installs (<state>/launcher/anywhere.js,
+ * which the `anywhere` link and the hotkey run).
  *
  * Kept free of syntax newer than Node 10 so outdated Node versions get upgrade
  * instructions instead of a SyntaxError.
@@ -46,6 +52,52 @@ function stateDir(env, homedir) {
   return env.ANYWHERE_HOME ? path.resolve(env.ANYWHERE_HOME) : path.join(homedir, '.claude-anywhere');
 }
 
+function realOr(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch (e) {
+    return path.resolve(p);
+  }
+}
+
+/**
+ * The anywhere plugin's current install folder, from Claude Code's installed_plugins.json
+ * ("anywhere@<marketplace>": version 2 keeps a list of installs, version 1 one entry), or null.
+ * An install from the same marketplace as `previousRoot` (…/cache/<marketplace>/anywhere/<v>) and
+ * a user-scope one come first.
+ * @param {string} pluginsDir
+ * @param {string} [previousRoot]
+ * @returns {string|null}
+ */
+function currentPluginRoot(pluginsDir, previousRoot) {
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(pluginsDir, 'installed_plugins.json'), 'utf8'));
+  } catch (e) {
+    return null;
+  }
+  if (!manifest || typeof manifest !== 'object') return null;
+  const plugins = manifest.plugins && typeof manifest.plugins === 'object' ? manifest.plugins : manifest;
+  const m = /[\\/]cache[\\/]([^\\/]+)[\\/]anywhere[\\/][^\\/]+[\\/]?$/.exec(String(previousRoot || ''));
+  const market = m ? m[1] : null;
+  const found = [];
+  Object.keys(plugins).forEach(function (key) {
+    const parts = key.split('@');
+    if (parts[0] !== 'anywhere') return;
+    const entries = Array.isArray(plugins[key]) ? plugins[key] : [plugins[key]];
+    entries.forEach(function (e) {
+      const dir = e && typeof e.installPath === 'string' ? e.installPath : null;
+      if (!dir || !isFile(path.join(dir, 'bin', 'anywhere.js'))) return;
+      const rank = (market && parts[1] === market ? 0 : 2) + (e.scope && e.scope !== 'user' ? 1 : 0);
+      found.push({ dir: dir, rank: rank });
+    });
+  });
+  found.sort(function (a, b) {
+    return a.rank - b.rank;
+  });
+  return found.length ? found[0].dir : null;
+}
+
 /**
  * Find an executable on PATH (honours PATHEXT on Windows).
  * @param {string} name
@@ -78,8 +130,9 @@ function findOnPath(name, env, platform) {
 
 /**
  * Work out how to run the CLI.
- * @param {{skillDir?:string, env?:object, homedir?:string, platform?:string}} [opts]
- * @returns {{kind:'script', script:string, root:string, via:'relative'|'install.json'|'path'} |
+ * @param {{skillDir?:string, env?:object, homedir?:string, platform?:string, self?:string}} [opts]
+ *   `self`: this launcher's own file (default __filename), never run again through PATH
+ * @returns {{kind:'script', script:string, root:string, via:'relative'|'plugin'|'install.json'|'path'} |
  *           {kind:'command', command:string, via:'path'} | null}
  */
 function resolveLauncher(opts) {
@@ -89,18 +142,26 @@ function resolveLauncher(opts) {
   const homedir = o.homedir || os.homedir();
   const platform = o.platform || process.platform;
 
+  // Only inside a package (<root>/skills/anywhere): a copy elsewhere, such as the stable launcher in
+  // the state directory, must not pick up an unrelated ../../bin/anywhere.js.
+  const inPackage = path.basename(skillDir) === 'anywhere' && path.basename(path.dirname(skillDir)) === 'skills';
   const local = path.resolve(skillDir, '..', '..', 'bin', 'anywhere.js');
-  if (isFile(local)) return { kind: 'script', script: local, root: path.dirname(path.dirname(local)), via: 'relative' };
+  if (inPackage && isFile(local)) return { kind: 'script', script: local, root: path.dirname(path.dirname(local)), via: 'relative' };
 
   const infoFile = path.join(stateDir(env, homedir), 'install.json');
+  let info = null;
   try {
-    const info = JSON.parse(fs.readFileSync(infoFile, 'utf8'));
-    if (info && typeof info.packageRoot === 'string' && info.packageRoot) {
-      const script = path.join(info.packageRoot, 'bin', 'anywhere.js');
-      if (isFile(script)) return { kind: 'script', script: script, root: info.packageRoot, via: 'install.json' };
-    }
+    info = JSON.parse(fs.readFileSync(infoFile, 'utf8'));
   } catch (e) {
-    /* not installed that way */
+    info = null; // not installed that way
+  }
+  if (info && typeof info === 'object') {
+    const root = typeof info.packageRoot === 'string' ? info.packageRoot : '';
+    if (typeof info.pluginsDir === 'string' && info.pluginsDir) {
+      const current = currentPluginRoot(info.pluginsDir, root);
+      if (current) return { kind: 'script', script: path.join(current, 'bin', 'anywhere.js'), root: current, via: 'plugin' };
+    }
+    if (root && isFile(path.join(root, 'bin', 'anywhere.js'))) return { kind: 'script', script: path.join(root, 'bin', 'anywhere.js'), root: root, via: 'install.json' };
   }
 
   const onPath = findOnPath('anywhere', env, platform);
@@ -113,6 +174,8 @@ function resolveLauncher(opts) {
       real = onPath;
     }
     const sibling = path.join(path.dirname(real), 'anywhere.js');
+    // The stable launcher (this file, or this launcher's copy) would only come back here.
+    if (realOr(sibling) === realOr(o.self || __filename)) return null;
     if (isFile(sibling)) return { kind: 'script', script: sibling, root: path.dirname(path.dirname(sibling)), via: 'path' };
     return { kind: 'command', command: onPath, via: 'path' };
   }
@@ -217,4 +280,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { resolveLauncher, spawnSpec, findOnPath, nodeMajor, quoteWinArg, notFoundMessage, stateDir };
+module.exports = { resolveLauncher, currentPluginRoot, spawnSpec, findOnPath, nodeMajor, quoteWinArg, notFoundMessage, stateDir };

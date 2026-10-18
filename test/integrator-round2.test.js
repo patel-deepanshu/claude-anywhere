@@ -409,7 +409,7 @@ test('TUI: a restarted daemon is reported once; a refused switch asks for --swit
   out.on('data', (d) => {
     text += d.toString();
   });
-  const tui = new T.Tui({ client, input, output: out, env: { NO_COLOR: '1' }, platform: 'linux', cwd: '/w', homedir: '/h' });
+  const tui = new T.Tui({ client, input, output: out, env: { NO_COLOR: '1', LANG: 'en_US.UTF-8' }, platform: 'linux', cwd: '/w', homedir: '/h' });
   const done = tui.run();
   await sleep(10);
   client.emit('snapshot', { version: '1', mode: 'companion', status: 'queued', project: { dir: '/w', name: 'w' }, messages: [] });

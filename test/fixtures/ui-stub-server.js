@@ -322,13 +322,15 @@ async function createStubServer(opts = {}) {
     questions: new Map(scenario.questions.map((q) => [q.id, q])),
     bridge: { listening: false },
     screenshot: scenario.messages.length ? { dataUrl: shotUrl, width: 480, height: 300, ts: ago(220000) } : null,
-    // What the dialog sent, for tests: command bodies (without images), approval decisions,
-    // question answers, interrupts and config updates.
+    // What the dialog sent, for tests: command bodies (without images), approval decisions
+    // (and the full request bodies, with `via`), question answers, interrupts and config updates.
     commands: [],
     decisions: [],
+    approvalBodies: [],
     answers: [],
     interrupts: 0,
     configPosts: [],
+    visibility: [], // POST /api/ui/visibility reports {page, visible, focused}
   };
 
   const later = (ms, fn) => {
@@ -553,6 +555,7 @@ async function createStubServer(opts = {}) {
       if (!['allow', 'allow_session', 'deny'].includes(body.decision)) throw fail(400, 'decision must be allow, allow_session or deny');
       if (!st.approvals.has(body.id)) throw fail(404, 'No pending approval with that id (it may have timed out or been cancelled)');
       st.approvals.delete(body.id);
+      st.approvalBodies.push(JSON.parse(JSON.stringify(body)));
       st.decisions.push({ id: body.id, decision: body.decision, ...(body.message ? { message: body.message } : {}) });
       broadcast('approval_resolved', { id: body.id, decision: body.decision, by: 'user', ...(body.message ? { message: body.message } : {}) });
       setStatus(st.questions.size ? 'waiting_answer' : 'acting', st.questions.size ? 'Claude asked you a question' : 'Run command');
@@ -636,6 +639,12 @@ async function createStubServer(opts = {}) {
     'POST /api/show': () => {
       broadcast('show', {});
       return { ok: true, host: 'browser' };
+    },
+    'POST /api/ui/visibility': ({ body }) => {
+      if (typeof body.page !== 'string' || !body.page) throw fail(400, 'page is required');
+      if (typeof body.visible !== 'boolean') throw fail(400, 'visible must be true or false');
+      st.visibility.push({ page: body.page, visible: body.visible, focused: body.focused === true });
+      return { ok: true };
     },
     'POST /api/shutdown': ({ res }) => {
       json(res, 200, { ok: true });

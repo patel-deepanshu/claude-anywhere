@@ -684,9 +684,12 @@ const SITES = [
 
 /**
  * Recognise a browser window; returns the tab title without the browser suffix.
+ * Only the window title is known, so `url` is always null. For the Google Cloud
+ * console, `consoleProjectName` is the project's display name as the title shows it
+ * ("Dashboard – My First Project – Google Cloud console"), which is often not its id.
  * @param {string} title
  * @param {string} [app]
- * @returns {{app:string,title:string,url:null,site?:string,consoleProject?:string}|null}
+ * @returns {{app:string,title:string,url:null,site?:string,consoleProjectName?:string}|null}
  */
 function parseBrowserTitle(title, app = '') {
   let t = cleanTitle(title);
@@ -708,8 +711,12 @@ function parseBrowserTitle(title, app = '') {
     if (s.re.test(t)) {
       out.site = s.site;
       if (s.gcp) {
-        const parts = t.split(/\s[-\u2013\u2014|]\s/).map((x) => x.trim()).filter(Boolean);
-        if (parts.length >= 3) out.consoleProject = parts[parts.length - 2];
+        // The console separates "<page> \u2013 <project name> \u2013 Google Cloud console" with
+        // en dashes; a display name may itself contain " - ", so split on en dashes
+        // whenever the title has one and on any separator only otherwise.
+        const sep = /\s\u2013\s/.test(t) ? /\s\u2013\s/ : /\s[-\u2013\u2014|]\s/;
+        const parts = t.split(sep).map((x) => x.trim()).filter(Boolean);
+        if (parts.length >= 3) out.consoleProjectName = parts[parts.length - 2];
       }
       break;
     }
@@ -1608,7 +1615,7 @@ function render(ctx, lim) {
   if (browsers.length) {
     const items = browsers.map((b) => {
       let s = `${sanitize(b.app, 30)} \u2014 "${sanitize(b.title || '(new tab)', lim.title)}"`;
-      if (b.site) s += ` [${b.site}${b.consoleProject ? `: ${sanitize(b.consoleProject, 60)}` : ''}]`;
+      if (b.site) s += ` [${b.site}${b.consoleProjectName ? `, project name "${sanitize(b.consoleProjectName, 60)}"` : ''}]`;
       if (b.active) s += ' [active]';
       return s;
     });

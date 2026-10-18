@@ -78,8 +78,9 @@ class Hub extends EventEmitter {
       res.end(JSON.stringify({ error: 'daemon is shutting down' }));
       return null;
     }
-    // ?client=ui marks a dialog page (src/ui/app.js), so UiHost can count open dialogs apart from
-    // TUIs and CLI watchers.
+    // ?client=ui marks a dialog page (src/ui/app.js), ?client=tui a terminal dialog and ?client=cli
+    // a watcher (`anywhere send --wait`), so UiHost can count open dialog windows and the daemon
+    // can tell whether anyone sees cards and notifications (dialogCount()).
     let kind = null;
     try {
       kind = new URL((req && req.url) || '/', 'http://x').searchParams.get('client') || null;
@@ -209,6 +210,16 @@ class Hub extends EventEmitter {
     let n = 0;
     for (const c of this.clients) if (c.kind === kind) n += 1;
     return n;
+  }
+
+  /**
+   * Clients that show approval and question cards and notifications to the user: dialog pages
+   * (?client=ui) and terminal dialogs (?client=tui). Watchers such as `anywhere send --wait`
+   * (?client=cli, or no kind) show neither, so they do not count.
+   * @returns {number}
+   */
+  dialogCount() {
+    return this.clientCount('ui') + this.clientCount('tui');
   }
 
   /** End every stream and stop the heartbeat. */

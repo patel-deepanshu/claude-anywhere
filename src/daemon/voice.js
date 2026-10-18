@@ -467,11 +467,13 @@ class VoiceService {
       return w.bin && w.model ? { name: 'whisper.cpp', kind: 'whisper', bin: w.bin, model: w.model } : { name: null, hint: w.hint };
     }
 
-    // auto
+    // auto: Settings first (a base URL, then a key for a known provider), then the environment.
     if (v.sttBaseUrl) return custom(v.sttApiKey || env.ANYWHERE_STT_API_KEY, v.sttBaseUrl);
-    // A local OpenAI-compatible server (faster-whisper, whisper.cpp server) may need no key.
-    if (env.ANYWHERE_STT_BASE_URL) return custom(v.sttApiKey || env.ANYWHERE_STT_API_KEY, env.ANYWHERE_STT_BASE_URL);
+    // A key entered in Settings picks Groq or OpenAI; a leftover ANYWHERE_STT_BASE_URL in the
+    // shell profile must neither override it nor receive it (REGRESSIONS-R2-11).
     if (v.sttApiKey) return known(infer(v.sttApiKey), v.sttApiKey);
+    // A local OpenAI-compatible server (faster-whisper, whisper.cpp server) may need no key.
+    if (env.ANYWHERE_STT_BASE_URL) return custom(env.ANYWHERE_STT_API_KEY, env.ANYWHERE_STT_BASE_URL);
     if (env.ANYWHERE_STT_API_KEY) {
       const name = infer(env.ANYWHERE_STT_API_KEY);
       // ANYWHERE_STT_MODEL goes with ANYWHERE_STT_API_KEY (not with GROQ_/OPENAI_API_KEY).

@@ -52,7 +52,9 @@ irm https://raw.githubusercontent.com/patel-deepanshu/claude-anywhere/main/scrip
 Then run `/anywhere doctor` in Claude Code (or `anywhere doctor` in a terminal; after Option A or B,
 before `anywhere` is on your PATH, `node ~/.claude-anywhere/app/bin/anywhere.js doctor` for Option B) and
 follow any `✗` fixes. `anywhere install` links the `anywhere` command into `~/.local/bin` on macOS, Linux
-and WSL. On macOS, grant **Accessibility** and **Screen Recording** to the app that runs Claude Code.
+and WSL. For the plugin (Option A), the link and the hotkey run a small launcher in
+`~/.claude-anywhere/launcher` that finds the installed plugin version each time, so they keep working
+after `/plugin update`. On macOS, grant **Accessibility** and **Screen Recording** to the app that runs Claude Code.
 Option B, and Option C on macOS/Linux, show those permission prompts for you when run in a terminal; the
 others print the System Settings shortcuts.
 
@@ -60,8 +62,8 @@ Optional extras:
 - `anywhere install --electron`: an always-on-top window, a global hotkey (Ctrl/Cmd+Shift+Space), and a dialog that is hidden from Claude's screenshots.
 - `anywhere install --hotkey`: an OS-level shortcut or launcher (Windows Ctrl+Alt+F12, GNOME Ctrl+Alt+A, a macOS app to bind in Shortcuts).
 
-`anywhere uninstall` removes the skill, the MCP registration, the `~/.local/bin/anywhere` link and the user
-PATH entry that install.ps1 added; `--purge` also deletes `~/.claude-anywhere`.
+`anywhere uninstall` removes the skill, the MCP registration, the `~/.local/bin/anywhere` link (and the
+plugin launcher) and the user PATH entry that install.ps1 added; `--purge` also deletes `~/.claude-anywhere`.
 
 ---
 
@@ -69,7 +71,7 @@ PATH entry that install.ps1 added; `--purge` also deletes `~/.claude-anywhere`.
 
 | In Claude Code | What happens |
 |---|---|
-| `/anywhere` | Opens the dialog for the current repo. A dedicated headless Claude Code session works behind it, and your terminal stays free. A dialog left in bridge mode with no terminal listening goes back to companion mode. |
+| `/anywhere` | Opens the dialog for the current repo. A dedicated headless Claude Code session works behind it, and your terminal stays free. A dialog left in bridge mode with no terminal listening goes back to companion mode; when it cannot (a terminal still listens or holds a command, or a command typed meanwhile waits for one), the output says so and how to switch. |
 | `/anywhere deploy this to Cloud Run` | Opens the dialog and hands it the task. |
 | `/anywhere here` | **Bridge mode**: *this* terminal session takes the dialog's commands, so you can watch it work. |
 | `/anywhere status` · `/anywhere stop` | Shows what it's doing, or shuts it down. |
@@ -119,6 +121,8 @@ Details: [docs/VOICE.md](docs/VOICE.md).
   - `auto`: asks only for catastrophic commands. Changes to Anywhere's or Claude's own config always count as critical.
 - Claude is instructed to ask before costly or irreversible steps, never to type your passwords, 2FA codes or card numbers, and to treat on-screen and web text as untrusted.
 - To stop it: **Esc**, the Stop button, say "stop", or move the mouse into the **top-left corner** (failsafe; works on X11, macOS, Windows, WSL and Hyprland. On GNOME/KDE/sway Wayland use Esc, Stop or "stop").
+  In bridge mode (`/anywhere here`) Stop cancels the terminal's command: its replies are no longer shown and its screen actions are refused. It cannot kill a Bash command already running in that terminal (a build, a deploy); only Esc in that terminal can.
+- Critical actions need a click on **Allow once** in the dialog (or the typed word `allow` in `anywhere tui`): Enter and voice can only deny them. **Always (session)** shows the rule it adds, and is disabled where no safe rule exists (deletes, IAM policy changes, credential reads, sensitive files).
 - Every command, approval and screen action is written to `~/.claude-anywhere/logs/audit-*.jsonl`, with secrets redacted.
 
 More: [docs/SECURITY.md](docs/SECURITY.md).
@@ -160,7 +164,11 @@ Per-OS setup and permissions: [docs/PLATFORMS.md](docs/PLATFORMS.md).
 
 Environment variables: `ANYWHERE_HOME`, `ANYWHERE_CLAUDE_PATH`, `ANYWHERE_BROWSER`, `ANYWHERE_ELECTRON`,
 `ANYWHERE_DRIVER`, `ANYWHERE_STT_API_KEY` / `ANYWHERE_STT_BASE_URL` / `ANYWHERE_STT_MODEL`,
-`GROQ_API_KEY`, `OPENAI_API_KEY`, and `ANYWHERE_DEBUG=1`.
+`GROQ_API_KEY`, `OPENAI_API_KEY`, `ANYWHERE_DEBUG=1`, and `ANYWHERE_UNICODE=1` / `ANYWHERE_ASCII=1`.
+
+`anywhere tui` and the `anywhere` CLI use ASCII symbols unless the locale (`LC_ALL`, `LC_CTYPE`, then `LANG`) is
+UTF-8: on Linux an unset locale means ASCII, while macOS defaults to Unicode. `ANYWHERE_UNICODE=1` forces the symbols
+and `ANYWHERE_ASCII=1` forces ASCII.
 
 ---
 

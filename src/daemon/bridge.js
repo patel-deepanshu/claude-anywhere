@@ -10,6 +10,10 @@
  *   'enqueued' (cmd), 'dequeued' (cmd), 'requeued' (cmd),
  *   'reply' ({text, final, speak, commandId}), 'listening' (bool), 'stop'.
  * Hub broadcasts: `bridge` {listening, queued} whenever listening changes.
+ *
+ * Stop in the dialog cancels the command the terminal is working on (cancelCurrent()): until
+ * the terminal listens again, its replies are refused ({stopped:true}) and never shown, so the
+ * terminal learns that the user stopped it.
  */
 
 const { EventEmitter } = require('events');
@@ -40,6 +44,7 @@ class Bridge extends EventEmitter {
     this.lastPollAt = 0;
     this.stopped = false;
     this.current = null; // the command the terminal is working on
+    this.cancelledId = null; // the command the user stopped while the terminal had it (until the next listen)
     this.graceTimer = null;
     this.lastListening = false;
   }
@@ -64,6 +69,25 @@ class Bridge extends EventEmitter {
     if (this.stopped) return;
     this.lastPollAt = Date.now();
     this.updateListening();
+  }
+
+  /**
+   * The user stopped the command the terminal is working on: forget it, and refuse the
+   * terminal's replies until it listens again.
+   * @returns {string|null} the cancelled command's id, or null when the terminal had none
+   */
+  cancelCurrent() {
+    if (!this.current) return null;
+    const { id } = this.current;
+    this.current = null;
+    this.cancelledId = id;
+    this.updateListening();
+    return id;
+  }
+
+  /** @returns {boolean} the terminal's command was stopped by the user and it has not listened since */
+  get commandStopped() {
+    return !this.stopped && !this.current && Boolean(this.cancelledId);
   }
 
   /** @returns {number} queued commands */
@@ -139,6 +163,8 @@ class Bridge extends EventEmitter {
     if (!cmd) return;
     if (this.current && this.current.id === cmd.id) this.current = null;
     if (this.stopped) return; // enqueue() would drop it anyway
+    // The user stopped it while its listen response was failing: it must not run later.
+    if (cmd.id === this.cancelledId) return;
     log.info(`re-queueing bridge command ${cmd.id}: the listener disconnected before receiving it`);
     this.emit('requeued', cmd);
     this.enqueue(cmd, { front: true });
@@ -153,6 +179,8 @@ class Bridge extends EventEmitter {
    */
   next(timeoutMs = 540000, { signal } = {}) {
     this.lastPollAt = Date.now();
+    // Listening again: the terminal has left the command the user stopped.
+    this.cancelledId = null;
     if (this.stopped) {
       this.updateListening();
       return Promise.resolve({ stop: true });
@@ -201,9 +229,15 @@ class Bridge extends EventEmitter {
   /**
    * The terminal session reports progress or its final answer.
    * @param {{text:string, final?:boolean, speak?:boolean}} reply
-   * @returns {{ok:true}}
+   * @returns {{ok:true}|{ok:false, stopped:true, commandId:string}} stopped: the user stopped the
+   *   terminal's command, so the reply is not shown (nothing is emitted)
    */
   reply({ text, final = false, speak } = {}) {
+    if (this.commandStopped) {
+      this.lastPollAt = Date.now();
+      this.updateListening();
+      return { ok: false, stopped: true, commandId: this.cancelledId };
+    }
     const body = text == null ? '' : String(text);
     const commandId = this.current ? this.current.id : null;
     if (final) this.current = null;
@@ -225,6 +259,7 @@ class Bridge extends EventEmitter {
     this.stopped = true;
     for (const w of [...this.waiters]) w.finish({ stop: true });
     this.current = null;
+    this.cancelledId = null;
     this.emit('stop');
     this.updateListening();
   }
@@ -232,6 +267,7 @@ class Bridge extends EventEmitter {
   /** Accept listeners again (back in bridge mode). */
   resume() {
     this.stopped = false;
+    this.cancelledId = null;
     this.updateListening();
   }
 

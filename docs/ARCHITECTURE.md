@@ -91,7 +91,8 @@ PACKAGE_ROOT                 // absolute repo/package root
 stateDir()                   // env ANYWHERE_HOME || ~/.claude-anywhere (mkdir -p, 0700)
 configPath()                 // stateDir()/config.json
 daemonStatePath()            // stateDir()/daemon.json
-sessionsPath()               // stateDir()/sessions.json   { [projectDir]: {sessionId, updatedAt} }
+sessionsPath()               // stateDir()/sessions.json   { [projectDir]: {sessionId, updatedAt, lastTotalCostUsd?} }
+                             //   lastTotalCostUsd: the CLI's cumulative cost, the base for the next turn after --resume
 installInfoPath()            // stateDir()/install.json    { packageRoot, version, installedAt }
 logsDir()                    // stateDir()/logs (mkdir -p)
 auditLogPath(date?)          // logsDir()/audit-YYYY-MM-DD.jsonl
@@ -231,7 +232,7 @@ Driver {
   async typeText(text)                  // literal unicode text into the focused window
   async keyCombo(keys)                  // normalized names from keys.js, e.g. ['ctrl','shift','t']
   async listWindows() -> [{ id, app, title, pid, x, y, width, height, focused, minimized, stackIndex? }]
-  async activeWindow() -> { id, app, title, pid } | null
+  async activeWindow() -> { id, app, title, pid, process? } | null   // process: executable name (cmd.exe, conhost) when known
   async focusWindow(id) -> bool
   async minimizeWindow(id) -> bool
   async setTopmost(id, on) -> bool      // best effort (false if unsupported)
@@ -398,8 +399,12 @@ UI, handle SIGINT/SIGTERM/SIGHUP (stop engine, close UI host, clear state, exit 
 
 ### hub.js
 ```js
-class Hub { addClient(req, res); broadcast(type, data); clientCount(); close() }  // SSE with 15 s heartbeat comments
+class Hub { addClient(req, res); broadcast(type, data); clientCount(kind?); dialogCount(); close() }  // SSE with 15 s heartbeat comments
 ```
+Clients say what they are with `GET /api/events?client=ui|tui|cli` (the dialog page, `anywhere tui`, and watchers
+such as `anywhere send --wait`; `DaemonClient.subscribe(onEvent, {kind})` adds it). `dialogCount()` = ui + tui
+clients: `notify_user` reports `delivered` from it, and an approval or question reopens the dialog window (or
+shows an OS notification) only when it is 0. A CLI watcher does not count.
 
 ### server.js — HTTP API
 Bind `127.0.0.1` only. Security on **every** request:
@@ -427,13 +432,13 @@ Bind `127.0.0.1` only. Security on **every** request:
 | GET `/api/state` | | snapshot |
 | POST `/api/command` | `{text, attachScreenshot?, images?:[{mediaType,data}], source?:'text'|'voice'|'cli'|'skill'}` | `{ok, id, mode, bridge:{listening}}` |
 | POST `/api/interrupt` | | `{ok}` |
-| POST `/api/approval` | `{id, decision:'allow'|'allow_session'|'deny', message?}` | `{ok}` |
+| POST `/api/approval` | `{id, decision:'allow'|'allow_session'|'deny', message?, via?:'click'|'key'|'typed'|'voice'}` | `{ok}`; 409 `{code:'CRITICAL_NEEDS_CLICK'}` for an allow of a critical card sent by voice or key (the card stays). `via` is how the user answered: the dialog sends click or key (Enter/Esc on the card) or voice, the TUI typed or voice; other values are ignored, and older clients send none |
 | POST `/api/answer` | `{id, text}` | `{ok}` |
 | POST `/api/session/new` | | `{ok, sessionId}` |
-| POST `/api/project` | `{dir, force?}` | `{ok, project}` (restarts engine in the new cwd); 409 while a task runs unless `force:true`, which stops it first |
+| POST `/api/project` | `{dir, force?}` | `{ok, project}` (restarts engine in the new cwd); 409 while a task runs unless `force:true`, which stops it first. Bridge commands that only wait for a terminal get their own 409 text ("A command is waiting for a Claude Code terminal…"); forced, they are dropped (`commands_cancelled` reason `reset`) |
 | GET `/api/projects` | | `{projects:[…]}` |
 | GET `/api/config` · POST `/api/config` | partial config | public config |
-| POST `/api/mode` | `{mode, force?}` | `{ok, mode}`; 409 while a task runs unless `force:true` |
+| POST `/api/mode` | `{mode, force?}` | `{ok, mode, moved?}`; 409 while a task runs unless `force:true`. Bridge commands that only wait for a terminal (none listens, none took a command, no card is open) do not make it busy: a switch to companion mode sends them to the dialog's own session under their ids (`moved`: how many) |
 | POST `/api/stt` | raw `audio/wav` (also webm/ogg/mp4 pass-through) `?language=` | `{text, provider}` |
 | POST `/api/tts` | `{text}` | `{ok, provider}` |
 | POST `/api/tts/stop` | | `{ok}` |
@@ -441,12 +446,13 @@ Bind `127.0.0.1` only. Security on **every** request:
 | POST `/api/show` | | `{ok, host}` |
 | POST `/api/shutdown` | | `{ok}` then exit |
 | POST `/api/mcp/permission` | `{tool_name, input, tool_use_id}` | `{behavior, updatedInput?, message?}` (blocks) |
-| POST `/api/mcp/ask` | `{question, options?, timeoutSec?}` | `{id, answer}`, `{id, timeout:true}` or `{id, cancelled:true, reason}` (blocks; `cancelled` when the user stops the turn, the caller disconnects or the daemon shuts down) |
+| POST `/api/mcp/ask` | `{question, options?, timeoutSec?}` | `{id, answer}`, `{id, timeout:true}` or `{id, cancelled:true, reason}` (blocks; `cancelled` when the user stops the turn, the caller disconnects or the daemon shuts down). Bridge mode: 409 `{code:'COMMAND_STOPPED'}` after Stop cancelled the terminal's command, until its next listen (`anywhere ask` prints STOPPED and exits 5; the MCP `ask_user` tells Claude to abandon the command) |
 | POST `/api/mcp/notify` | `{message, level?, speak?}` | `{ok, delivered}` |
 | POST `/api/mcp/activity` | `{tool, summary?, ok?, error?, warning?, image?, width?, height?}` | `{ok}` |
-| GET `/api/mcp/guard` | | `{allowed, reason?}` |
+| GET `/api/mcp/guard` | | `{allowed, reason?}`; bridge mode refuses the screen actions of a command the user stopped until the terminal listens again (at most 10 min) |
 | POST `/api/bridge/listen` | `{timeoutSec ≤ 590}` | `{command:{id,text,images:[path],context,source}}` or `{timeout:true}` or `{stop:true}` |
-| POST `/api/bridge/reply` | `{text, final?, speak?}` | `{ok}`; 409 (with a hint) when the dialog is in companion mode: `anywhere reply` then prints STOP and exits 3 |
+| POST `/api/bridge/reply` | `{text, final?, speak?}` | `{ok}`; 409 (with a hint) when the dialog is in companion mode: `anywhere reply` then prints STOP and exits 3. 409 `{code:'COMMAND_STOPPED'}` after Stop cancelled the terminal's command, until its next listen: the reply is not shown, and `anywhere reply` prints STOPPED and exits 5 |
+| POST `/api/ui/visibility` | `{page, visible, focused?}` | `{ok}`: a dialog page (its own id per page load) reports whether it can be seen, after a `show` event and on `visibilitychange`; `UiHost.show()` opens a window when every page reports hidden |
 
 ### SSE events (server → UI): `event: <type>` + `data: <json>`
 - `snapshot` `{version, mode, status, statusDetail, project:{dir,name,git}, session:{id, model, costUsd, turns}, messages:[…], pending:{approvals:[…], questions:[…]}, config:<public>, voice:{serverStt, sttProvider, serverTts, ttsProvider}, bridge:{listening, queued}, platform:{platform, displayServer, driver}, screenshot:{dataUrl,width,height,ts}|null}`
@@ -454,14 +460,16 @@ Bind `127.0.0.1` only. Security on **every** request:
   (`queued`: bridge commands wait for a terminal to run `/anywhere here`; Stop drops them)
 - `message` (transcript item; see below), `delta` `{id, text}` (append to an assistant item)
 - `tool_update` `{toolUseId, status:'ok'|'error', output?, image?}`
-- `approval_request` `{id, toolName, displayName, summary, input, risk, reason, ts}` · `approval_resolved` `{id, decision}`
+- `approval_request` `{id, toolName, displayName, summary, input, risk, reason, sessionRule, ts}` · `approval_resolved` `{id, decision, by?, via?, message?}`
 - `question` `{id, question, options, ts}` · `question_resolved` `{id, answer}`
 - `notify` `{text, level, speak}` · `result` `{text, costUsd, totalCostUsd, durationMs, isError, sessionId, numTurns, commandIds, interrupted?}`
   (`commandIds`: the commands this result answers, so a command queued during a turn waits for the next result;
-  `interrupted` marks a turn the user stopped)
-- `commands_cancelled` `{commandIds, reason:'stopped'|'reset'|'cancelled'|'engine_exit'|'failed'}`: these commands will
-  get no `result` (Stop, a new session, a project or mode switch dropped them, or Claude Code exited); `anywhere send
-  --wait` ends on it
+  `interrupted` marks a turn the user stopped; `engineInitiated:true` with `commandIds: []` marks a turn Claude Code
+  started by itself after a background task finished)
+- `commands_cancelled` `{commandIds, reason:'stopped'|'reset'|'cancelled'|'interrupted'|'engine_exit'|'failed'}`: these
+  commands will get no `result` (Stop, a new session, a project or mode switch dropped them, or Claude Code exited);
+  `interrupted`: Claude had the command, so it may have partly run. `anywhere send --wait` ends on it (exit 130 for
+  stopped and interrupted)
 - `screenshot` `{dataUrl, width, height, ts}` · `project` `{dir, name, git}` · `session` `{id, model}`
 - `config` `<public config>` · `mode` `{mode}` · `bridge` `{listening}` · `show` `{}` · `error` `{message}`
 
@@ -512,7 +520,8 @@ Env: `process.env` minus `engine.stripEnv` and minus any `ANYWHERE_ENGINE_CHILD`
 unused: the MCP server always serves its tools); on POSIX the directory of `process.execPath` is prepended to `PATH`
 when missing, so `#!/usr/bin/env node` shims resolve; `MCP_TOOL_TIMEOUT` raised to at least 3600000 (an inherited
 larger value is kept, a smaller or invalid one is replaced, since approvals and `ask_user` block inside MCP calls) and
-`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` (blocking `ask_user` calls must not be auto-backgrounded after 2 min).
+`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` (blocking `ask_user` calls must not be auto-backgrounded after 2 min);
+`BASH_DEFAULT_TIMEOUT_MS=600000` (deploys and builds outlast the 2-minute default; a larger inherited value is kept).
 MCP config file: `{"mcpServers":{"anywhere":{"type":"stdio","command":<process.execPath>,"args":[<PACKAGE_ROOT>/src/mcp/server.js],
 "env":{"ANYWHERE_DAEMON_URL":"http://127.0.0.1:<port>","ANYWHERE_TOKEN":<token>,"ANYWHERE_ROLE":"engine"},"alwaysLoad":true,
 "timeout":86460000}}}`. The per-server `timeout` (86400 s + 60 s) overrides `MCP_TOOL_TIMEOUT` for this server only, so
@@ -561,6 +570,17 @@ class SessionManager extends EventEmitter {
 - A result that arrives before init (resume of an unknown id) is not reported. Only "No conversation found…" stderr
   triggers the fresh-session retry; other early exits keep `sessions.json`.
 - New session and project switch clear the broker's session allow rules and cancel commands still being prepared.
+  `session.engineAddDirs` holds the `--add-dir` folders of the running engine (reset when it stops or the project
+  changes); main.js hands them to the broker (`getExtraDirs`).
+- Settings: only engine settings (model, effort, Chrome, extra args… see `signature()`) restart the engine, with the
+  next command (the conversation resumes); while Claude Code runs background tasks the restart waits, with a notice.
+  Prompt-only settings (approval mode, spoken replies…) reach Claude as a `<settings>` block with the next message.
+- Approval and question cards are announced with their content: `createAttentionHandler()` in main.js reopens the
+  dialog when no dialog page or TUI is connected (`dialogCount()` is 0), posts an OS notification (both throttled),
+  and, with spoken replies on, says `attentionSpeech(info)` aloud: the action and its summary, or the question and
+  its options, with secret-looking values left out. A card answered before its turn to be spoken is skipped.
+- Bridge mode, mode switch: commands that only wait for a terminal move to the companion session (same ids, their
+  context and images); a terminal's command in progress is announced `interrupted`.
 - The transcript keeps at most 12 screenshots and 8 MB of image data; older images are dropped from the items.
 - main.js: `run/daemon.lock` is the start lock. Ports are tried in this order: the one recorded in
   `run/last-port.json` for the configured port, the configured port, its 19 neighbours in an order rotated by a hash of
@@ -573,16 +593,26 @@ class SessionManager extends EventEmitter {
 
 ### permissions.js
 ```js
-classify(toolName, input, { projectDir, platform?, homeDir?, focusedApp? }) -> { risk: 'low'|'medium'|'high'|'critical', reason, summary }
+classify(toolName, input, { projectDir, platform?, homeDir?, extraDirs?, focusedApp?, focusedProcess? })
+  -> { risk: 'low'|'medium'|'high'|'critical', reason, summary, parts?, sensitive? }   // sensitive: true for an edit of a sensitive file
+sessionRuleFor(toolName, input, cls, opts) -> string | null   // null: no "Always (session)" rule is safe (the card disables it)
 class PermissionBroker {
-  constructor({ config, hub, onNeedAttention, projectDir?, getProjectDir?, activeWindow? })  // activeWindow: the driver's, for type_text
+  constructor({ config, hub, onNeedAttention, projectDir?, getProjectDir?, getExtraDirs?, activeWindow? })
+    // getExtraDirs: the engine's --add-dir folders (session.engineAddDirs); activeWindow: the driver's, for type_text
   async request({ tool_name, input, tool_use_id }) -> { behavior:'allow', updatedInput } | { behavior:'deny', message }
-  resolve(id, decision, message) -> bool
+  resolve(id, decision, message, { via? }) -> bool   // throws 409 CRITICAL_NEEDS_CLICK: critical allow by voice or key
   cancelAll(reason)
-  pending() -> [...]
+  pending() -> [...]   // cards carry sessionRule (string, or null when "Always" is not offered)
   setMode(mode)
 }
 ```
+`extraDirs` (from `getExtraDirs`, the VS Code workspaces passed to the engine with `--add-dir`) are judged like
+the project folder for edits. `focusedProcess` is the focused window's process name when the driver reports
+`process`. Session rules are scoped: cloud CLIs get the verb plus the resource (`Bash(gcloud run deploy shop-api*)`),
+other commands their first two words, a command whose second word is an option the exact command, file edits their
+folder (`Write(<folder>/**)`). Delete, disable and IAM-policy verbs, commands that read or send credentials, sensitive files
+and edits with no path get none (`sessionRule: null`), and a session rule never covers a credential read, a
+sensitive file or settings. `resolve()` records `via` in the audit entry and the `approval_resolved` event.
 Policy: `ask` allows only `low`; `smart` (default) allows `low` and `medium`; `auto` allows everything except `critical`.
 `alwaysAsk` patterns force a prompt. Session `allow_session` rules and config `alwaysAllow` (`"ToolName"` or
 `"Bash(prefix*)"`) allow, except for `critical`. Timeout → deny with "No response from the user within N s"
@@ -591,8 +621,9 @@ Every decision is written to the audit log. The anywhere `open` tool with `args`
 runs (`{target:'bash', args:['-c', …]}` gets the verdict of that `bash -c`): at least high for shells, interpreters,
 PowerShell, cmd/osascript/wscript/cscript/mshta, and terminal emulators given a command (`-e`, `--`, `-x`,
 `--command`); its summary shows the arguments. `type_text` is judged by where it lands (the broker asks the
-driver for the focused window): in a terminal, with a Return, or with unknown focus it gets full command scrutiny;
-in an app that is not a terminal it stays at most high, and a plain sentence stays medium there.
+driver for the focused window): command-shaped text keeps its full verdict in any app (focus never lowers it);
+only known non-terminal apps (chat, mail, office, notes) relax a plain sentence to medium; in a terminal, with a
+Return, or in an unknown app the text gets full scrutiny.
 
 ### questions.js · bridge.js
 ```js
@@ -716,11 +747,12 @@ hidden on close (tray menu with Show and Quit). `preload.js` exposes `window.any
 ## 10. CLI (`bin/anywhere.js`)
 ```
 anywhere start [--project DIR] [--mode companion|bridge] [--ui HOST] [--no-open] [--foreground] [--json]
-anywhere stop | status [--json] | show | url
+anywhere stop | status [--json] [--show-token] | show | url   # only `url` (and start/show when no window opens) print the token
 anywhere send <text…> [--screenshot | --no-screenshot]   # neither = context.attachScreenshotByDefault
 anywhere listen [--timeout SEC] [--json]      # exit 0 command printed, 2 timeout, 3 stop
-anywhere reply <text…> [--final] [--no-speak] # prints STOP and exits 3 when the dialog left bridge mode (HTTP 409)
-anywhere ask <question…> [--options a,b,c] [--timeout SEC]
+anywhere reply <text…> [--final] [--no-speak] # prints STOP and exits 3 when the dialog left bridge mode (HTTP 409);
+                                             # STOPPED and exit 5 when the user stopped this command (409 COMMAND_STOPPED)
+anywhere ask <question…> [--options a,b,c] [--timeout SEC]   # STOPPED / exit 5 likewise
 anywhere notify <text…> [--speak]
 anywhere computer <op> …                     # screenshot [--display N] [--out FILE] | click X Y [--button B] [--double]
                                              # | move X Y | drag X1 Y1 X2 Y2 | scroll DIR [AMOUNT] [--at X Y]
@@ -736,7 +768,9 @@ anywhere mcp                                  # MCP stdio server
 anywhere daemon [--project DIR] [--mode M] [--ui HOST] [--no-open]   # foreground daemon (internal)
 anywhere version | help
 ```
-`start` reuses a running daemon (it switches the project and mode if they differ, then calls `show`); otherwise it
+`start` reuses a running daemon (it switches the project and mode if they differ, then calls `show`; without
+`--mode` it hands a bridge dialog that no terminal listens to back to companion mode, and says "still in bridge mode"
+with the reason when it does not; bridge commands that only wait for a terminal are not "a task is running"); otherwise it
 spawns `node bin/anywhere.js daemon …` detached (logs to `daemonLogPath()`), waits up to 15 s for `/api/health`, and
 prints a human summary (or JSON with `--json`). A spawned daemon that exits 0 (ALREADY_RUNNING: it lost the start-lock
 race) is not a failure; `start` keeps polling for the winner until the deadline. No CLI path starts a browser or
@@ -752,7 +786,13 @@ other process with the token URL: `show` posts `/api/show`, so the daemon's UiHo
 
 ## 11. Skill and plugin
 - `skills/anywhere/run.js` resolves the package root in this order: `../../bin/anywhere.js` relative to itself
-  (repo or plugin layout), then `install.json`'s `packageRoot`, then `anywhere` on PATH. It forwards argv and the exit code.
+  when it sits at `<package>/skills/anywhere/` (repo or plugin layout); then `install.json`: for a plugin install
+  (`pluginsDir`, recorded by `anywhere install` when it runs from `<claudeHome>/plugins/`) the `anywhere@*` install
+  path in `<pluginsDir>/installed_plugins.json` (same marketplace and user scope first), because every plugin update
+  moves the plugin to a new versioned folder, else `packageRoot`; then `anywhere` on PATH (never itself again).
+  It forwards argv and the exit code. A plugin install also copies it to `<state>/launcher/anywhere.js` with the
+  `bin/anywhere` and `anywhere.cmd` shims beside it: the stable launcher that the `~/.local/bin/anywhere` link and the
+  hotkey run (`install.json` `launcher`), removed by `uninstall`.
 - `SKILL.md` invokes `node "${CLAUDE_SKILL_DIR}/run.js" …` (`${CLAUDE_SKILL_DIR}` is substituted by Claude Code in
   skill content; `${CLAUDE_PLUGIN_ROOT}` is also available for plugin skills). Frontmatter: `name: anywhere`,
   `description`, `argument-hint`, `allowed-tools: Bash(node "${CLAUDE_SKILL_DIR}/run.js"*)` plus the read-only MCP

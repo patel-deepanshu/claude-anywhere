@@ -602,12 +602,15 @@ test('matchRule', () => {
   assert.equal(matchRule(null, 'Bash', B('ls')), false);
 });
 
-test('sessionRuleFor uses the first two words of the riskiest part', () => {
+test('sessionRuleFor uses the first two words of the riskiest part (cloud CLIs: up to the verb)', () => {
+  // Round 3 (HEADLINE-SCENARIO-2): `Bash(gcloud run*)` also approved deletes; cloud rules now
+  // stop at the verb and its resource, and a bare command gets an exact rule.
   const cls = classify('Bash', { command: 'cd app && gcloud run deploy api --source .' }, LINUX);
-  assert.equal(sessionRuleFor('Bash', {}, cls), 'Bash(gcloud run*)');
-  assert.equal(sessionRuleFor('Bash', {}, classify('Bash', { command: 'vercel' }, LINUX)), 'Bash(vercel*)');
+  assert.equal(sessionRuleFor('Bash', {}, cls), 'Bash(gcloud run deploy api*)');
+  assert.equal(sessionRuleFor('Bash', {}, classify('Bash', { command: 'vercel' }, LINUX)), 'Bash(vercel)');
+  assert.equal(sessionRuleFor('Bash', {}, classify('Bash', { command: 'git push origin main' }, LINUX)), 'Bash(git push*)');
   assert.equal(sessionRuleFor('mcp__anywhere__click', { x: 1, y: 1 }, {}), 'mcp__anywhere__click');
-  assert.equal(sessionRuleFor('Edit', {}, {}), 'Edit');
+  assert.equal(sessionRuleFor('Edit', {}, {}), null, 'no path: no rule (a bare "Edit" would allow every edit)');
 });
 
 test('secretLike and normalizeKeyCombo', () => {
@@ -775,14 +778,18 @@ test('broker: allow_session adds a session rule', async () => {
   const { broker, audits } = makeBroker();
   const p = broker.request({ tool_name: 'Bash', input: { command: 'gcloud run deploy a --source .' } });
   const [card] = await waitForPending(broker);
-  assert.equal(card.sessionRule, 'Bash(gcloud run*)');
+  assert.equal(card.sessionRule, 'Bash(gcloud run deploy a*)');
   broker.resolve(card.id, 'allow_session');
   assert.equal((await p).behavior, 'allow');
-  assert.deepEqual(broker.getSessionRules(), ['Bash(gcloud run*)']);
+  assert.deepEqual(broker.getSessionRules(), ['Bash(gcloud run deploy a*)']);
   assert.equal(audits[audits.length - 1].decision, 'allow_session');
-  assert.equal(audits[audits.length - 1].rule, 'Bash(gcloud run*)');
+  assert.equal(audits[audits.length - 1].rule, 'Bash(gcloud run deploy a*)');
 
-  assert.equal((await broker.request({ tool_name: 'Bash', input: { command: 'gcloud run deploy b' } })).behavior, 'allow');
+  assert.equal((await broker.request({ tool_name: 'Bash', input: { command: 'gcloud run deploy a --region us-east1' } })).behavior, 'allow');
+  const otherSvc = broker.request({ tool_name: 'Bash', input: { command: 'gcloud run deploy b' } });
+  const [cb] = await waitForPending(broker);
+  broker.resolve(cb.id, 'deny');
+  assert.equal((await otherSvc).behavior, 'deny');
   const other = broker.request({ tool_name: 'Bash', input: { command: 'gcloud services enable x' } });
   const [c2] = await waitForPending(broker);
   broker.resolve(c2.id, 'deny');
@@ -802,8 +809,9 @@ test('broker: allow_session adds a session rule', async () => {
 
 test('broker: allow_session also settles other pending cards it covers', async () => {
   const { broker } = makeBroker();
-  const a = broker.request({ tool_name: 'Bash', input: { command: 'kubectl delete pod a' } });
-  const b = broker.request({ tool_name: 'Bash', input: { command: 'kubectl delete pod b' } });
+  // (Round 3: a delete gets no session rule at all, so this uses scale.)
+  const a = broker.request({ tool_name: 'Bash', input: { command: 'kubectl scale deployment a --replicas=2' } });
+  const b = broker.request({ tool_name: 'Bash', input: { command: 'kubectl scale deployment b --replicas=3' } });
   const cards = await waitForPending(broker, 2);
   broker.resolve(cards[0].id, 'allow_session');
   assert.equal((await a).behavior, 'allow');

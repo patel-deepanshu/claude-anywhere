@@ -32,7 +32,8 @@ test('palette wraps only when enabled; unicode fallback for legacy consoles', ()
   assert.equal(T.createPalette(false).red('x'), 'x');
   assert.equal(T.createPalette(true).red('x'), '\x1b[31mx\x1b[39m');
   assert.equal(T.stripAnsi(T.createPalette(true).bold(T.createPalette(true).cyan('hi'))), 'hi');
-  assert.equal(T.unicodeSupported({}, 'linux'), true);
+  assert.equal(T.unicodeSupported({ LANG: 'en_US.UTF-8' }, 'linux'), true);
+  assert.equal(T.unicodeSupported({}, 'linux'), false, 'no locale: the C library runs in "C" (ASCII)');
   assert.equal(T.unicodeSupported({}, 'win32'), false);
   assert.equal(T.unicodeSupported({ WT_SESSION: 'x' }, 'win32'), true);
   assert.equal(T.unicodeSupported({ ANYWHERE_ASCII: '1' }, 'darwin'), false);
@@ -296,7 +297,7 @@ async function startTui(opts = {}) {
   const client = opts.client || fakeClient(opts.responses);
   const input = new PassThrough();
   const cap = capture();
-  const tui = new T.Tui({ client, input, output: cap.out, env: { NO_COLOR: '1' }, platform: 'linux', cwd: '/home/me/work', homedir: '/home/me', ...(opts.deps || {}) });
+  const tui = new T.Tui({ client, input, output: cap.out, env: { NO_COLOR: '1', LANG: 'en_US.UTF-8' }, platform: 'linux', cwd: '/home/me/work', homedir: '/home/me', ...(opts.deps || {}) });
   const done = tui.run();
   await tick();
   return { tui, client, input, cap, done };
@@ -370,9 +371,9 @@ test('TUI: approvals and questions are answered from the prompt', async () => {
   await done;
   const posts = client.calls.filter((c) => c.method === 'POST');
   assert.deepEqual(posts, [
-    { method: 'POST', path: '/api/approval', body: { id: 'ap1', decision: 'allow' } },
+    { method: 'POST', path: '/api/approval', body: { id: 'ap1', decision: 'allow', via: 'typed' } },
     { method: 'POST', path: '/api/answer', body: { id: 'q1', text: 'europe-west1' } },
-    { method: 'POST', path: '/api/approval', body: { id: 'ap2', decision: 'deny', message: 'not that directory' } },
+    { method: 'POST', path: '/api/approval', body: { id: 'ap2', decision: 'deny', message: 'not that directory', via: 'typed' } },
   ]);
   const t = cap.text;
   assert.match(t, /⚠ Approval needed · HIGH risk · Run command\n {2}gcloud run deploy\n {2}Why: deploys\n {2}\[y\]es \/ \[a\]lways \/ \[n\]o/);
@@ -569,7 +570,7 @@ test('TUI: a spoken answer resolves a pending approval; missing recorder gives a
   await tick();
   input.write('/quit\n');
   await done;
-  assert.deepEqual(client.calls.find((c) => c.path === '/api/approval').body, { id: 'ap9', decision: 'allow' });
+  assert.deepEqual(client.calls.find((c) => c.path === '/api/approval').body, { id: 'ap9', decision: 'allow', via: 'voice' });
   assert.match(cap.text, /No audio recorder found\. Install one with: sudo apt install sox/);
 });
 
@@ -591,7 +592,7 @@ test('TUI: TTY mode rewrites a finished tool row in place and shows a prompt', a
   const cap = capture();
   cap.out.isTTY = true;
   cap.out.columns = 100;
-  const tui = new T.Tui({ client, input, output: cap.out, env: { NO_COLOR: '1' }, platform: 'linux' });
+  const tui = new T.Tui({ client, input, output: cap.out, env: { NO_COLOR: '1', LANG: 'en_US.UTF-8' }, platform: 'linux' });
   const done = tui.run();
   await tick();
   client.emit('snapshot', SNAPSHOT);

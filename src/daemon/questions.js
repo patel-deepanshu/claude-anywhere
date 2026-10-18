@@ -121,7 +121,8 @@ class QuestionBroker extends EventEmitter {
       this.emit('question', card);
       if (this.onNeedAttention) {
         try {
-          this.onNeedAttention({ kind: 'question', id, summary: card.question });
+          // The question and its options, so a voice user hears what is asked (HEADLINE-SCENARIO-12).
+          this.onNeedAttention({ kind: 'question', id, summary: card.question, question: card.question, options: card.options.slice() });
         } catch (err) {
           log.warn('onNeedAttention failed:', err && err.message);
         }

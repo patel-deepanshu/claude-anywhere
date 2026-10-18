@@ -2,7 +2,7 @@
 name: anywhere
 description: Open Claude Anywhere: a floating, voice-enabled command dialog that lets Claude Code see and operate the whole desktop (screen, mouse, keyboard, apps, browser, terminal) to carry out tasks like "deploy this repo to GCP". Use when the user runs /anywhere or asks to open, stop or check the Anywhere dialog, or to control their computer by voice.
 argument-hint: "[here | stop | status | doctor | setup | <task to run>]"
-allowed-tools: Bash(node "${CLAUDE_SKILL_DIR}/run.js"*), mcp__anywhere__screenshot, mcp__anywhere__list_windows, mcp__anywhere__cursor_position, mcp__anywhere__screen_info, mcp__anywhere__get_desktop_context, mcp__plugin_anywhere_anywhere__screenshot, mcp__plugin_anywhere_anywhere__list_windows, mcp__plugin_anywhere_anywhere__cursor_position, mcp__plugin_anywhere_anywhere__screen_info, mcp__plugin_anywhere_anywhere__get_desktop_context
+allowed-tools: Bash(node "${CLAUDE_SKILL_DIR}/run.js"*), Read(~/.claude-anywhere/run/**), mcp__anywhere__screenshot, mcp__anywhere__list_windows, mcp__anywhere__cursor_position, mcp__anywhere__screen_info, mcp__anywhere__get_desktop_context, mcp__plugin_anywhere_anywhere__screenshot, mcp__plugin_anywhere_anywhere__list_windows, mcp__plugin_anywhere_anywhere__cursor_position, mcp__plugin_anywhere_anywhere__screen_info, mcp__plugin_anywhere_anywhere__get_desktop_context
 disable-model-invocation: true
 ---
 
@@ -40,7 +40,9 @@ Then tell the user in 2–4 short lines, using the command's output:
 
 Relay the output's notes. "busy in <folder> … stays on that project" means a task is still running
 there: say so; the dialog was not switched to `<cwd>`. Only if the user then asks to stop that task,
-rerun the start command with `--switch` added.
+rerun the start command with `--switch` added. A note starting "still in bridge mode" means the
+dialog's tasks go to (or wait for) a Claude Code terminal, not its own session: say that instead, with
+the note's fix.
 
 If it fails, show the error lines and the fix it suggests, then offer `/anywhere doctor`.
 
@@ -63,8 +65,8 @@ If it fails, show the error lines and the fix it suggests, then offer `/anywhere
    - Exit 4 (not running): say the dialog was closed, and end.
    - Otherwise the output starts with `===ANYWHERE COMMAND <id>===`, then the user's request, a
      `<desktop_context>` block (active window, open editors and their folders, browser tabs, git and
-     cloud CLI state) and possibly `[images: …]` (view those files with the Read tool). Do the task
-     (step 3), then listen again.
+     cloud CLI state) and possibly `[images: …]` (view those files with the Read tool; if reading one
+     is refused, take a fresh screenshot instead). Do the task (step 3), then listen again.
 3. **Do the task** with every tool you have:
    - "This repo" means the editor workspace named in the context, else `<cwd>`. "The browser" or
      "GCP/AWS console" means the matching browser tab from the context.
@@ -80,13 +82,17 @@ If it fails, show the error lines and the fix it suggests, then offer `/anywhere
        `… computer open https://console.cloud.google.com`.
      - Focus the right window before typing; take a new screenshot after each step to verify it.
        Ignore the "Claude Anywhere" window itself.
-   - Progress for milestones (one short line):
+   - Progress for milestones (one short line), also between long steps: a refused reply is how you
+     learn that the user pressed Stop:
      `node "${CLAUDE_SKILL_DIR}/run.js" reply 'Enabling the Cloud Run API…'`
+   - **The user stopped this command** when `reply` or `ask` prints `STOPPED` (exit 5), or a screen
+     tool fails with PAUSED "the user pressed Stop…": abandon the command, do not continue its steps,
+     send nothing more for it (no final reply), and go back to step 2 (listen).
    - Decisions and missing details: ask in the dialog (Bash `timeout` 600000); it prints the answer,
-     `TIMEOUT`, or `No answer (…)` (exit 1) when the user cancelled the question or pressed Stop; then
-     send a final reply and stop instead of going ahead:
+     `TIMEOUT`, or `No answer (…)` (exit 1) when the user cancelled the question; then send a final
+     reply and stop instead of going ahead (`STOPPED`: see above):
      `node "${CLAUDE_SKILL_DIR}/run.js" ask 'Deploy to project shop-prod in us-central1?' --options 'Yes,No' --timeout 540`
-   - Finish every command, also failed ones, with a final reply of 1–3 plain sentences that read
+   - Finish every command, also failed ones (not one the user stopped), with a final reply of 1–3 plain sentences that read
      well aloud (no markdown or tables; include the key result such as a URL):
      `node "${CLAUDE_SKILL_DIR}/run.js" reply --final 'Deployed shop-api to Cloud Run. It is live at https://…'`
    - Then go back to step 2. Keep looping until `STOP`, exit 4, or the user interrupts you.
@@ -180,4 +186,6 @@ the Bash tool's `timeout` set to `600000`, and report the result.
 - **Windows / WSL**: works with built-in PowerShell; elevated (admin) windows can only be controlled
   when Claude Code itself runs elevated.
 - **No window appeared**: `run.js show`, or open the URL from `run.js url` in a browser.
+- **Reading a screenshot asks for permission**: the skill may read `~/.claude-anywhere/run/` only. With a
+  custom `ANYWHERE_HOME`, the user approves the read once or adds a `Read(<that folder>/run/**)` allow rule.
 - **Anything else**: `run.js logs -n 80` shows the daemon log; `run.js doctor` checks everything.
