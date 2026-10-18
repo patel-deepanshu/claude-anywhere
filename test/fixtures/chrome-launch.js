@@ -18,6 +18,29 @@ const { spawn } = require('child_process');
 
 const START_MS = Number(process.env.ANYWHERE_TEST_CHROME_START_MS) || 60000;
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Kill the browser and remove its profile. On Windows the browser's helper processes keep
+ * profile files (such as "Account Web Data") open for a moment after the main process is
+ * killed, so this waits for the exit and retries EBUSY/EPERM with a growing delay (about 12 s in
+ * all). A profile that still cannot be removed is reported, never thrown: it is only a temp dir.
+ * Never rejects.
+ */
+async function removeProfile(proc, dir, exited) {
+  try {
+    proc.kill('SIGKILL');
+  } catch {
+    /* already gone */
+  }
+  for (let waited = 0; !exited() && proc.exitCode === null && proc.signalCode === null && waited < 5000; waited += 50) await sleep(50);
+  try {
+    await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 12, retryDelay: 150 });
+  } catch (err) {
+    process.stderr.write(`chrome-launch: could not remove the temporary profile ${dir}: ${err.message}\n`);
+  }
+}
+
 function startOnce(chrome, extraArgs, prefix) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   const proc = spawn(
@@ -39,13 +62,10 @@ function startOnce(chrome, extraArgs, prefix) {
   proc.on('error', (err) => {
     exited = err.message;
   });
+  let cleaning = null;
   const cleanup = () => {
-    try {
-      proc.kill('SIGKILL');
-    } catch {
-      /* already gone */
-    }
-    setTimeout(() => fs.rmSync(dir, { recursive: true, force: true }), 500).unref();
+    if (!cleaning) cleaning = removeProfile(proc, dir, () => exited);
+    return cleaning;
   };
   return new Promise((resolve, reject) => {
     const started = Date.now();
@@ -59,7 +79,7 @@ function startOnce(chrome, extraArgs, prefix) {
       if (port) return resolve({ proc, port, dir, cleanup });
       const waited = Date.now() - started;
       if (exited || waited > START_MS) {
-        cleanup();
+        cleanup(); // never rejects
         const why = exited ? `exited (${exited})` : `did not open its DevTools port within ${Math.round(waited / 1000)} s`;
         const tail = stderr.trim() ? `; stderr: ${stderr.trim().split('\n').slice(-5).join(' | ')}` : '';
         return reject(new Error(`Chromium did not start: ${why}${tail}`));
@@ -70,7 +90,10 @@ function startOnce(chrome, extraArgs, prefix) {
   });
 }
 
-/** Resolves {proc, port, dir, cleanup}; cleanup() kills the browser and removes its profile. */
+/**
+ * Resolves {proc, port, dir, cleanup}; cleanup() kills the browser and removes its profile, and
+ * returns a promise (that never rejects) for when that is done.
+ */
 async function launchChrome(chrome, { extraArgs = [], prefix = 'anywhere-chrome-' } = {}) {
   try {
     return await startOnce(chrome, extraArgs, prefix);

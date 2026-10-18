@@ -162,7 +162,7 @@ async function openPage(chrome, { width, height, scheme }) {
     } catch {
       /* ignore */
     }
-    cleanup();
+    return cleanup();
   };
   return { send, evaluate, problems, close };
 }

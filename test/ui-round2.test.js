@@ -150,7 +150,7 @@ async function openPage(chrome, { width = 440, height = 720 } = {}) {
     } catch {
       /* ignore */
     }
-    cleanup();
+    return cleanup();
   };
   return { send, evaluate, press, problems, close };
 }

@@ -288,7 +288,9 @@ test('Electron downloads into a temporary prefix and moves into place only when 
   const ok = await installer.installElectron({ npm: fakeNpm(sb.base) });
   assert.equal(ok.installed, true, ok.reason);
   assert.equal(ok.prefix, prefix);
-  assert.equal(ok.binary, path.join(prefix, 'node_modules', 'electron', 'dist', 'electron'));
+  // The electron package names its binary from its own (real) path: on macOS the temp dir under
+  // /var/folders is reached through the /var -> /private/var link, so compare real paths.
+  assert.equal(fs.realpathSync(ok.binary), fs.realpathSync(path.join(prefix, 'node_modules', 'electron', 'dist', 'electron')));
   assert.deepEqual(fs.readdirSync(sb.state).filter((n) => n.startsWith('electron')), ['electron']);
 
   // Reinstalling replaces the old prefix.
