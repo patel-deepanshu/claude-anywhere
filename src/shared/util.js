@@ -100,6 +100,29 @@ function debounce(fn, ms) {
   };
 }
 
+/**
+ * Whether the terminal can show symbols like ⚙ ✓ ✗ … ·. ANYWHERE_ASCII=1 forces the ASCII set
+ * and ANYWHERE_UNICODE=1 forces Unicode. Otherwise never with TERM=dumb or on the Linux console
+ * (TERM=linux: its fonts lack most of these glyphs). On Windows only in terminals known to
+ * draw them (legacy consoles often cannot). Elsewhere only under a UTF-8 locale, or the bytes
+ * show as mojibake ("â€¦"): the effective locale is the first non-empty of LC_ALL, LC_CTYPE
+ * and LANG. With none set the C library runs in the "C"/"POSIX" locale, so Linux and the other
+ * Unixes get ASCII (always readable; set LANG=C.UTF-8 or ANYWHERE_UNICODE=1 for the symbols),
+ * while macOS terminals are UTF-8 whatever the environment says.
+ * @param {object} [env]
+ * @param {string} [platform]
+ */
+function unicodeSupported(env = process.env, platform = process.platform) {
+  if (env.ANYWHERE_ASCII === '1') return false;
+  if (env.ANYWHERE_UNICODE === '1') return true;
+  const term = String(env.TERM || '');
+  if (term === 'dumb' || term === 'linux') return false;
+  if (platform === 'win32') return Boolean(env.WT_SESSION || env.TERM_PROGRAM || env.ConEmuANSI === 'ON' || /xterm|256color/i.test(term));
+  const locale = env.LC_ALL || env.LC_CTYPE || env.LANG || '';
+  if (!locale) return platform === 'darwin';
+  return /utf-?8/i.test(locale);
+}
+
 module.exports = {
   uuid,
   randomToken,
@@ -112,4 +135,5 @@ module.exports = {
   escapeRegExp,
   nowIso,
   debounce,
+  unicodeSupported,
 };

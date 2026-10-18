@@ -13,8 +13,10 @@
  *
  * One process serves many turns: each send() writes a JSONL user message,
  * interrupt() sends a control_request and the process stays alive. The engine
- * tracks whether a turn is running (send/init → active, result → idle) so an
- * interrupt of an idle CLI ends on its control_response instead of a kill.
+ * tracks whether a turn is running (send/init/assistant output → active,
+ * result → idle; a turn the CLI starts itself after a background task counts
+ * too) so an interrupt of an idle CLI ends on its control_response instead of a
+ * kill.
  *
  * Events: 'spawn' ({pid}), 'message' (parsed stdout JSON), 'stderr' (line),
  *         'exit' ({code, signal, stderrTail, error, expected, sawInit, uptimeMs}).
@@ -41,6 +43,10 @@ const PERMISSION_TOOL = 'mcp__anywhere__permission_prompt';
 // The CLI's ask-first mode ("default"; 2.1.x also calls it "manual"), so the user's own
 // permissions.defaultMode (acceptEdits, bypassPermissions, …) cannot bypass the dialog's approvals.
 const DEFAULT_PERMISSION_MODE = 'default';
+// Claude Code moves a Bash command to the background when it outlives its timeout (default 120 s)
+// and ends the turn; a first Cloud Run build takes 2–5 min. 10 min (the CLI's usual maximum) keeps
+// deploys and sign-ins in the user's turn, where Stop and the result belong to them.
+const BASH_DEFAULT_TIMEOUT_MS = 600000;
 
 const DEFAULT_STRIP_ENV = [
   'CLAUDECODE',
@@ -256,6 +262,10 @@ function buildEnv(base = process.env, { stripEnv = DEFAULT_STRIP_ENV, extra, nod
   const inherited = Number(env.MCP_TOOL_TIMEOUT);
   if (!Number.isFinite(inherited) || inherited < 3600000) env.MCP_TOOL_TIMEOUT = '3600000';
   env.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS = '0';
+  // Not CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: the timeout would then kill a deploy halfway (an
+  // image built but never released).
+  const bashTimeout = Number(env.BASH_DEFAULT_TIMEOUT_MS);
+  if (!Number.isFinite(bashTimeout) || bashTimeout < BASH_DEFAULT_TIMEOUT_MS) env.BASH_DEFAULT_TIMEOUT_MS = String(BASH_DEFAULT_TIMEOUT_MS);
   if (extra && typeof extra === 'object') {
     for (const [k, v] of Object.entries(extra)) {
       if (v == null) delete env[k];
@@ -263,6 +273,18 @@ function buildEnv(base = process.env, { stripEnv = DEFAULT_STRIP_ENV, extra, nod
     }
   }
   return env;
+}
+
+/**
+ * An empty, successful, zero-turn result with no assistant output since the last init: what a
+ * resumed CLI emits for a pending task notification before it starts the turn it was sent.
+ * @param {object} msg a `result` message
+ * @param {boolean} outputSinceInit
+ * @returns {boolean}
+ */
+function isPreTurnResult(msg, outputSinceInit) {
+  if (!msg || outputSinceInit || msg.is_error || Number(msg.num_turns) !== 0) return false;
+  return !(typeof msg.result === 'string' && msg.result.trim());
 }
 
 /**
@@ -503,7 +525,8 @@ class ClaudeCliEngine extends EventEmitter {
     this.resultWaiters = new Set();
     this.platform = opts.platform || process.platform;
     this.sendCount = 0;
-    this.turnActive = false; // a user message is being worked on (send/init → true, result → false)
+    this.turnActive = false; // a turn is running (send/init/assistant output → true, result → false)
+    this.outputSinceInit = false; // top-level assistant output since the last init
   }
 
   /** @returns {boolean} the process is alive */
@@ -590,10 +613,18 @@ class ClaudeCliEngine extends EventEmitter {
     if (!msg || typeof msg !== 'object') return;
     if (msg.type === 'system' && msg.subtype === 'init') {
       this.sawInit = true;
+      this.outputSinceInit = false;
       // The CLI emits init as a turn starts (a queued message starting its own turn included).
       if (this.sendCount > 0) this.turnActive = true;
     }
-    if (msg.type === 'result') this.turnActive = false;
+    if ((msg.type === 'assistant' || msg.type === 'stream_event') && !msg.parent_tool_use_id) {
+      // Output with no turn running: the CLI started one itself (a background task finished).
+      this.outputSinceInit = true;
+      this.turnActive = true;
+    }
+    // A resumed CLI with a pending task notification first answers with an empty zero-turn result
+    // and then starts the real turn: the message it was sent is still being worked on.
+    if (msg.type === 'result') this.turnActive = this.turnActive && isPreTurnResult(msg, this.outputSinceInit);
     try {
       this.emit('message', msg);
     } catch (e) {
@@ -773,5 +804,7 @@ module.exports = {
   commandTree,
   PERMISSION_TOOL,
   DEFAULT_PERMISSION_MODE,
+  BASH_DEFAULT_TIMEOUT_MS,
+  isPreTurnResult,
   DEFAULT_STRIP_ENV,
 };

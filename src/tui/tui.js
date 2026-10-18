@@ -16,7 +16,7 @@ const path = require('path');
 const readline = require('readline');
 const childProcess = require('child_process');
 const proc = require('../shared/proc');
-const { truncate } = require('../shared/util');
+const { unicodeSupported } = require('../shared/util');
 
 // 'queued': bridge commands wait for a terminal; Esc, Ctrl+C and /stop drop them.
 const BUSY_STATUSES = new Set(['starting', 'thinking', 'acting', 'waiting_approval', 'waiting_answer', 'stopping', 'queued']);
@@ -47,13 +47,7 @@ function colorEnabled(output, env = process.env) {
   return env.TERM !== 'dumb';
 }
 
-/** Whether the terminal can show symbols like ⚙ ✓ ✗ (legacy Windows consoles often cannot). */
-function unicodeSupported(env = process.env, platform = process.platform) {
-  if (env.ANYWHERE_ASCII === '1') return false;
-  if (env.TERM === 'dumb') return false;
-  if (platform !== 'win32') return true;
-  return Boolean(env.WT_SESSION || env.TERM_PROGRAM || env.ConEmuANSI === 'ON' || /xterm|256color/i.test(env.TERM || ''));
-}
+// unicodeSupported(env, platform) lives in src/shared/util.js: the CLI uses the same rule.
 
 /** @param {boolean} enabled */
 function createPalette(enabled) {
@@ -77,8 +71,8 @@ function createPalette(enabled) {
 /** @param {boolean} unicode */
 function createSymbols(unicode) {
   return unicode
-    ? { tool: '⚙', ok: '✓', fail: '✗', ellipsis: '…', warn: '⚠', info: 'ℹ', ask: '?', arrow: '›', rec: '●', bell: '•', dot: '·', stop: '■' }
-    : { tool: '*', ok: 'ok', fail: 'x', ellipsis: '...', warn: '!', info: 'i', ask: '?', arrow: '>', rec: '(rec)', bell: '*', dot: '-', stop: '#' };
+    ? { tool: '⚙', ok: '✓', fail: '✗', ellipsis: '…', warn: '⚠', info: 'ℹ', ask: '?', arrow: '›', rec: '●', bell: '•', dot: '·', dash: '—', stop: '■' }
+    : { tool: '*', ok: 'ok', fail: 'x', ellipsis: '...', warn: '!', info: 'i', ask: '?', arrow: '>', rec: '(rec)', bell: '*', dot: '-', dash: '-', stop: '#' };
 }
 
 /**
@@ -118,9 +112,18 @@ function formatDuration(ms) {
   return `${m}m ${String(sec).padStart(2, '0')}s`;
 }
 
-function firstLine(text, n = 160) {
+/** Shorten to n characters with the theme's ellipsis ("..." in ASCII mode). */
+function clip(str, n, s = PLAIN_THEME.s) {
+  if (str == null) return '';
+  const text = String(str);
+  if (text.length <= n) return text;
+  const ell = s.ellipsis;
+  return n <= ell.length ? text.slice(0, n) : `${text.slice(0, n - ell.length)}${ell}`;
+}
+
+function firstLine(text, n = 160, s = PLAIN_THEME.s) {
   const line = String(text == null ? '' : text).split(/\r?\n/).find((l) => l.trim()) || '';
-  return truncate(line.trim(), n);
+  return clip(line.trim(), n, s);
 }
 
 function optionLabel(o) {
@@ -155,7 +158,7 @@ function toolName(item) {
 /** "⚙ Click (512,300) …" */
 function renderToolHead(item, t = PLAIN_THEME) {
   const { c, s } = t;
-  const summary = item && item.summary ? ` ${truncate(String(item.summary).replace(/\s+/g, ' '), 100)}` : '';
+  const summary = item && item.summary ? ` ${clip(String(item.summary).replace(/\s+/g, ' '), 100, s)}` : '';
   return `${c.gray(s.tool)} ${c.bold(toolName(item))}${summary} ${c.gray(s.ellipsis)}`;
 }
 
@@ -164,7 +167,7 @@ function renderToolMark(status, output, t = PLAIN_THEME) {
   const { c, s } = t;
   if (status === 'ok') return c.green(s.ok);
   if (status === 'error') {
-    const why = firstLine(typeof output === 'string' ? output : output == null ? '' : JSON.stringify(output), 120);
+    const why = firstLine(typeof output === 'string' ? output : output == null ? '' : JSON.stringify(output), 120, s);
     return c.red(why ? `${s.fail} ${why}` : s.fail);
   }
   return '';
@@ -211,7 +214,7 @@ function renderResult(data, t = PLAIN_THEME) {
   const meta = parts.length ? c.dim(` ${s.dot} ${parts.join(` ${s.dot} `)}`) : '';
   if (d.interrupted) return `${c.yellow('Stopped')}${meta}`;
   if (d.isError) {
-    const why = d.text ? `: ${firstLine(d.text, 300)}` : '';
+    const why = d.text ? `: ${firstLine(d.text, 300, s)}` : '';
     return `${c.red(`${s.fail} Failed${why}`)}${meta}`;
   }
   return `${c.green(`${s.ok} Done`)}${meta}`;
@@ -228,12 +231,17 @@ function statusColor(status, t) {
 function renderStatusLine(status, detail, t = PLAIN_THEME) {
   const { c, s } = t;
   const label = String(status || 'unknown').replace(/_/g, ' ');
-  return `${c.dim(s.dot)} ${statusColor(status, t)(label)}${detail ? c.dim(` — ${detail}`) : ''}`;
+  return `${c.dim(s.dot)} ${statusColor(status, t)(label)}${detail ? c.dim(` ${s.dash} ${detail}`) : ''}`;
+}
+
+/** A critical card is allowed only by typing the whole word "allow" (see criticalRefusal). */
+function isCriticalApproval(req) {
+  return String((req && req.risk) || '').toLowerCase() === 'critical';
 }
 
 /**
  * Approval card. With `withHint` the "[y]es / [a]lways / [n]o" line is included (non-TTY;
- * in a TTY the readline prompt shows it).
+ * in a TTY the readline prompt shows it). A critical card always says how to allow it.
  */
 function renderApproval(req, t = PLAIN_THEME, { withHint = true } = {}) {
   const { c, s } = t;
@@ -251,10 +259,16 @@ function renderApproval(req, t = PLAIN_THEME, { withHint = true } = {}) {
     }
   }
   if (summary) {
-    for (const l of truncate(String(summary), 600).split(/\r?\n/).slice(0, 8)) lines.push(`  ${l}`);
+    for (const l of clip(String(summary), 600, s).split(/\r?\n/).slice(0, 8)) lines.push(`  ${l}`);
   }
   if (r.reason) lines.push(c.dim(`  Why: ${r.reason}`));
-  if (withHint) lines.push(`  ${c.yellow('[y]es / [a]lways / [n]o')}`);
+  if (risk === 'critical') lines.push(`  ${c.yellow('Critical action: type allow (the whole word) to allow it once; y and voice are not enough. n denies.')}`);
+  else {
+    // "always" adds the card's session rule: say what it covers, or that there is none (null).
+    if (typeof r.sessionRule === 'string' && r.sessionRule) lines.push(c.dim(`  Always (session) allows ${r.sessionRule}`));
+    else if (r.sessionRule === null) lines.push(c.dim('  This action always asks: no session rule covers it.'));
+    if (withHint) lines.push(`  ${c.yellow(r.sessionRule === null ? '[y]es / [n]o' : '[y]es / [a]lways / [n]o')}`);
+  }
   return lines.join('\n');
 }
 
@@ -281,11 +295,12 @@ function renderHeader(snap, t = PLAIN_THEME) {
 }
 
 function renderStatusSummary(snap, t = PLAIN_THEME) {
-  const { c } = t;
+  const { c, s } = t;
+  const sep = ` ${s.dot} `;
   const d = snap || {};
   const row = (k, v) => `${c.dim(`${k}:`.padEnd(10))}${v}`;
   const lines = [];
-  lines.push(row('Status', `${statusColor(d.status, t)(String(d.status || 'unknown').replace(/_/g, ' '))}${d.statusDetail ? c.dim(` — ${d.statusDetail}`) : ''}`));
+  lines.push(row('Status', `${statusColor(d.status, t)(String(d.status || 'unknown').replace(/_/g, ' '))}${d.statusDetail ? c.dim(` ${s.dash} ${d.statusDetail}`) : ''}`));
   lines.push(row('Mode', d.mode || 'companion'));
   const p = d.project || {};
   if (p.dir || p.name) {
@@ -298,15 +313,15 @@ function renderStatusSummary(snap, t = PLAIN_THEME) {
   if (ses.model) sesParts.push(ses.model);
   if (ses.costUsd != null) sesParts.push(formatCost(ses.costUsd));
   if (ses.turns != null) sesParts.push(`${ses.turns} turn${Number(ses.turns) === 1 ? '' : 's'}`);
-  lines.push(row('Session', sesParts.length ? sesParts.join(' · ') : c.dim('not started')));
+  lines.push(row('Session', sesParts.length ? sesParts.join(sep) : c.dim('not started')));
   const v = d.voice || {};
   const voiceParts = [];
   voiceParts.push(v.serverStt ? `speech-to-text: ${v.sttProvider || 'server'}` : c.dim('speech-to-text: not configured'));
   voiceParts.push(v.serverTts ? `text-to-speech: ${v.ttsProvider || 'server'}` : c.dim('text-to-speech: off'));
-  lines.push(row('Voice', voiceParts.join(' · ')));
+  lines.push(row('Voice', voiceParts.join(sep)));
   if ((d.mode || '') === 'bridge') lines.push(row('Bridge', d.bridge && d.bridge.listening ? c.green('terminal session listening') : c.yellow('no terminal session listening (run /anywhere here)')));
   const pf = d.platform || {};
-  if (pf.platform) lines.push(row('Platform', [pf.platform, pf.displayServer, pf.driver].filter(Boolean).join(' · ')));
+  if (pf.platform) lines.push(row('Platform', [pf.platform, pf.displayServer, pf.driver].filter(Boolean).join(sep)));
   const pend = d.pending || {};
   const na = Array.isArray(pend.approvals) ? pend.approvals.length : 0;
   const nq = Array.isArray(pend.questions) ? pend.questions.length : 0;
@@ -372,6 +387,24 @@ function parseApprovalAnswer(input) {
   const m = /^(n|no|nope|deny|reject|don't|dont)(?:\s*[,:;.\-—]\s*|\s+)([\s\S]+)$/i.exec(raw);
   if (m && m[2].trim()) return { decision: 'deny', message: m[2].trim() };
   return null;
+}
+
+/**
+ * The TUI's rule for critical cards, matching the dialog's "critical actions need a click":
+ * only the typed word "allow" (or "allow once") allows one. "y", "ok", "always" and anything
+ * spoken are refused; a deny always goes through.
+ * @param {{decision:string}} ans parsed answer
+ * @param {string} input what was typed or transcribed
+ * @param {'typed'|'voice'} via
+ * @returns {string|null} why the answer is refused, or null to send it
+ */
+function criticalRefusal(ans, input, via) {
+  if (!ans || ans.decision === 'deny') return null;
+  if (via === 'voice') return 'Critical actions are not allowed by voice: type allow to allow it once, or n to deny.';
+  if (ans.decision === 'allow_session') return 'Critical actions always ask: they cannot be allowed for the whole session. Type allow to allow it once, or n to deny.';
+  const norm = normalizeAnswer(input);
+  if (norm === 'allow' || norm === 'allow once') return null;
+  return 'This is a critical action: type allow (the whole word) to allow it once, or n to deny.';
 }
 
 /**
@@ -478,6 +511,13 @@ function recorderInstallHint(platform = process.platform) {
   if (platform === 'darwin') return 'Install one with: brew install sox (or brew install ffmpeg).';
   if (platform === 'win32') return 'Install one with: winget install Gyan.FFmpeg (or install SoX).';
   return 'Install one with: sudo apt install sox (or alsa-utils / ffmpeg; dnf and pacman have the same packages).';
+}
+
+/** For a recorder that started and then failed: there is no usable input device. */
+function noInputDeviceHint(platform = process.platform) {
+  if (platform === 'darwin') return 'No working microphone was found, or this terminal may not use it: check System Settings > Privacy & Security > Microphone, and Sound > Input.';
+  if (platform === 'win32') return 'No working microphone was found: check Windows Settings > Privacy > Microphone, and Sound > Input.';
+  return 'No working microphone or input device was found. Check the system sound settings; over SSH there is usually no audio device (set PULSE_SERVER, or use the dialog in a browser).';
 }
 
 /**
@@ -616,8 +656,9 @@ class Tui {
         this._sigint = () => this._onCtrlC();
         process.on('SIGINT', this._sigint);
       }
-      if (this.isTTY) this.line(this.theme.c.dim('Connecting to Claude Anywhere…'));
-      this.sub = this.client.subscribe((type, data) => this.handleEvent(type, data));
+      if (this.isTTY) this.line(this.theme.c.dim(`Connecting to Claude Anywhere${this.theme.s.ellipsis}`));
+      // A terminal dialog: it shows notifications and approval cards (the daemon counts it).
+      this.sub = this.client.subscribe((type, data) => this.handleEvent(type, data), { kind: 'tui' });
     });
   }
 
@@ -661,9 +702,12 @@ class Tui {
 
   _promptText() {
     const { c, s } = this.theme;
-    if (this.recording) return `${c.red(s.rec)} recording… press Enter to stop `;
+    if (this.recording) return `${c.red(s.rec)} recording${s.ellipsis} press Enter to stop `;
     const head = this.prompts[0];
-    if (head && head.kind === 'approval') return `${c.yellow('[y]es / [a]lways / [n]o')} ${s.arrow} `;
+    if (head && head.kind === 'approval') {
+      const hint = isCriticalApproval(head.data) ? 'critical: type allow / [n]o' : head.data && head.data.sessionRule === null ? '[y]es / [n]o' : '[y]es / [a]lways / [n]o';
+      return `${c.yellow(hint)} ${s.arrow} `;
+    }
     if (head && head.kind === 'question') return `${c.cyan('answer')} ${s.arrow} `;
     const busy = BUSY_STATUSES.has(this.state.status) ? c.dim(`(${String(this.state.status).replace(/_/g, ' ')}) `) : '';
     const screen = this.attachNext ? c.magenta('[+screen] ') : '';
@@ -739,7 +783,7 @@ class Tui {
         this._addPrompt('question', data);
         break;
       case 'question_resolved':
-        this._removePrompt(data.id, data.answer != null ? c.dim(`(answered: ${truncate(String(data.answer), 120)})`) : null);
+        this._removePrompt(data.id, data.answer != null ? c.dim(`(answered: ${clip(String(data.answer), 120, s)})`) : null);
         this._checkIdleQuit();
         break;
       case 'notify':
@@ -789,7 +833,7 @@ class Tui {
         this._checkIdleQuit();
         if (!this.disconnectedNotice) {
           this.disconnectedNotice = true;
-          this.line(c.yellow(`${s.warn} Lost connection to Claude Anywhere; reconnecting… (/quit to leave)`));
+          this.line(c.yellow(`${s.warn} Lost connection to Claude Anywhere; reconnecting${s.ellipsis} (/quit to leave)`));
         }
         break;
       case '_daemon_replaced': {
@@ -816,7 +860,7 @@ class Tui {
   }
 
   _onSnapshot(snap) {
-    const { c } = this.theme;
+    const { c, s } = this.theme;
     const first = !this.everConnected;
     this.everConnected = true;
     if (this.disconnectedNotice) {
@@ -842,7 +886,7 @@ class Tui {
     const msgs = Array.isArray(snap.messages) ? snap.messages.filter((m) => m && m.id) : [];
     const unseen = msgs.filter((m) => !this.seen.has(m.id));
     const shown = first ? unseen.slice(-SNAPSHOT_HISTORY) : unseen;
-    if (first && unseen.length > shown.length) this.line(c.dim(`… ${unseen.length - shown.length} earlier messages not shown`));
+    if (first && unseen.length > shown.length) this.line(c.dim(`${s.ellipsis} ${unseen.length - shown.length} earlier messages not shown`));
     for (const m of unseen) {
       if (shown.includes(m)) continue;
       this.seen.add(m.id);
@@ -1046,19 +1090,42 @@ class Tui {
     else this._refreshPrompt();
   }
 
-  async _answerPrompt(head, text) {
+  /**
+   * @param {{kind:string, id:string, data:object}} head the prompt being answered
+   * @param {string} text
+   * @param {{via?:'typed'|'voice'}} [o] how the answer came in (typed by default)
+   */
+  async _answerPrompt(head, text, { via = 'typed' } = {}) {
     const { c, s } = this.theme;
     if (head.kind === 'approval') {
+      const critical = isCriticalApproval(head.data);
       const ans = parseApprovalAnswer(text);
       if (!ans) {
-        this.line(c.yellow('Answer y (allow once), a (always allow this session) or n (deny). Add a reason after n to tell Claude why.'));
+        this.line(
+          c.yellow(
+            critical
+              ? 'Type allow (the whole word) to allow this critical action once, or n to deny. Add a reason after n to tell Claude why.'
+              : 'Answer y (allow once), a (always allow this session) or n (deny). Add a reason after n to tell Claude why.'
+          )
+        );
         return;
       }
-      const label = ans.decision === 'allow' ? 'Allowed once' : ans.decision === 'allow_session' ? 'Allowed for this session' : `Denied${ans.message ? `: ${ans.message}` : ''}`;
+      // "always" adds the card's session rule; without one it would only allow once.
+      const refused = critical
+        ? criticalRefusal(ans, text, via)
+        : ans.decision === 'allow_session' && head.data && head.data.sessionRule === null
+          ? 'This action always asks: no session rule covers it. Answer y to allow it once, or n to deny.'
+          : null;
+      if (refused) {
+        this.line(c.yellow(`${s.warn} ${refused}`));
+        return;
+      }
+      const rule = head.data && typeof head.data.sessionRule === 'string' && head.data.sessionRule ? head.data.sessionRule : '';
+      const label = ans.decision === 'allow' ? 'Allowed once' : ans.decision === 'allow_session' ? `Allowed for this session${rule ? `: ${rule}` : ''}` : `Denied${ans.message ? `: ${ans.message}` : ''}`;
       // Remove first so the resolved event does not print a second note.
       this._dropPrompt(head.id);
       try {
-        await this.client.request('POST', '/api/approval', { id: head.id, decision: ans.decision, ...(ans.message ? { message: ans.message } : {}) });
+        await this.client.request('POST', '/api/approval', { id: head.id, decision: ans.decision, ...(ans.message ? { message: ans.message } : {}), via });
         this.line((ans.decision === 'deny' ? c.red : c.green)(`${s.arrow} ${label}`));
       } catch (err) {
         this.line(c.red(`${s.fail} Could not send the answer: ${err.message}`));
@@ -1206,7 +1273,10 @@ class Tui {
       return await this.client.request('POST', pathName, force ? { ...body, force: true } : body);
     } catch (err) {
       if (err && err.status === 409 && !force) {
-        this.line(c.yellow(`${s.warn} ${err.message}. Wait for it, stop it (/stop), or run ${c.bold(retry)} to stop it and switch now.`));
+        // Bridge commands that only wait for a terminal: nothing runs, so there is nothing to stop.
+        if (/waiting for a Claude Code terminal/i.test(String(err.message))) {
+          this.line(c.yellow(`${s.warn} ${err.message}. Run /anywhere here in Claude Code to pick it up, or run ${c.bold(retry)} to switch anyway.`));
+        } else this.line(c.yellow(`${s.warn} ${err.message}. Wait for it, stop it (/stop), or run ${c.bold(retry)} to stop it and switch now.`));
       } else this.line(c.red(`${s.fail} ${err.message}`));
       return null;
     }
@@ -1217,7 +1287,7 @@ class Tui {
     switch (name) {
       case 'stop':
       case 'interrupt':
-        if (await this._post('/api/interrupt')) this.line(c.yellow(`${s.stop} Interrupting…`));
+        if (await this._post('/api/interrupt')) this.line(c.yellow(`${s.stop} Interrupting${s.ellipsis}`));
         break;
       case 'new':
       case 'reset': {
@@ -1237,6 +1307,8 @@ class Tui {
           this.state.mode = r.mode;
           this.line(`${c.dim('Mode:')} ${c.bold(r.mode)}`);
         }
+        const moved = r && Number(r.moved) > 0 ? Number(r.moved) : 0;
+        if (moved) this.line(c.dim(`${moved === 1 ? 'The command' : `The ${moved} commands`} that waited for a Claude Code terminal now run${moved === 1 ? 's' : ''} in the dialog's own session.`));
         break;
       }
       case 'project':
@@ -1314,7 +1386,7 @@ class Tui {
       return;
     }
     if (BUSY_STATUSES.has(this.state.status) || this.inFlight > 0) {
-      this.line(c.yellow(`${s.stop} Interrupting… (press Ctrl+C again within 2 s to quit)`));
+      this.line(c.yellow(`${s.stop} Interrupting${s.ellipsis} (press Ctrl+C again within 2 s to quit)`));
       this.client.request('POST', '/api/interrupt').catch((err) => this.line(c.red(`${s.fail} ${err.message}`)));
       return;
     }
@@ -1452,11 +1524,14 @@ class Tui {
       clearTimeout(r.timer);
       this.recording = null;
       safeUnlink(file);
-      const why = r.error ? (r.error.code === 'ENOENT' ? `${rec.cmd} was not found` : r.error.message) : `exit code ${r.code}`;
-      const detail = firstLine(r.stderr, 200);
-      this.line(c.red(`${s.fail} Recording with ${rec.name} failed (${why})${detail ? `: ${detail}` : ''}. ${recorderInstallHint(this.platform)}`));
+      const missing = Boolean(r.error && r.error.code === 'ENOENT');
+      const why = r.error ? (missing ? `${rec.cmd} was not found` : r.error.message) : r.signal ? `stopped by ${r.signal}` : `exit code ${r.code}`;
+      const detail = firstLine(r.stderr, 200, s);
+      // The recorder exists but quit on its own: an install hint would be wrong advice.
+      const hint = missing ? recorderInstallHint(this.platform) : r.error ? '' : noInputDeviceHint(this.platform);
+      this.line(c.red(`${s.fail} Recording with ${rec.name} failed (${why})${detail ? `: ${detail}` : ''}.${hint ? ` ${hint}` : ''}`));
     });
-    this.line(`${c.red(s.rec)} Recording with ${rec.name}… press Enter to stop.`);
+    this.line(`${c.red(s.rec)} Recording with ${rec.name}${s.ellipsis} press Enter to stop.`);
   }
 
   _signalRecorder(r, hard) {
@@ -1505,9 +1580,9 @@ class Tui {
       buf = null;
     }
     safeUnlink(r.file);
-    const { c } = this.theme;
+    const { c, s } = this.theme;
     if (!buf || buf.length < MIN_AUDIO_BYTES) {
-      const detail = firstLine(r.stderr, 200);
+      const detail = firstLine(r.stderr, 200, s);
       this.line(c.yellow(`No audio was captured; check that a microphone is connected and allowed.${detail ? ` (${detail})` : ''}`));
       return;
     }
@@ -1517,7 +1592,7 @@ class Tui {
   /** Send WAV audio to /api/stt and use the text as a command or as the pending answer. */
   async transcribeAndSend(wav) {
     const { c, s } = this.theme;
-    this.line(c.dim('Transcribing…'));
+    this.line(c.dim(`Transcribing${s.ellipsis}`));
     const cfgVoice = (this.state.config && this.state.config.voice) || {};
     const lang = cfgVoice.language ? `?language=${encodeURIComponent(cfgVoice.language)}` : '';
     let res;
@@ -1536,11 +1611,11 @@ class Tui {
     this.line(`${c.bold(c.cyan('You'))}${c.dim(' (voice)')}: ${text}`);
     const head = this.prompts[0];
     if (head) {
-      await this._answerPrompt(head, text);
+      await this._answerPrompt(head, text, { via: 'voice' });
       return;
     }
     if (/^(stop|cancel|abort)[.!]?$/i.test(text) && (BUSY_STATUSES.has(this.state.status) || this.inFlight > 0)) {
-      if (await this._post('/api/interrupt')) this.line(c.yellow(`${s.stop} Interrupting…`));
+      if (await this._post('/api/interrupt')) this.line(c.yellow(`${s.stop} Interrupting${s.ellipsis}`));
       return;
     }
     await this._sendCommand(text, 'voice', { echoed: true });
@@ -1602,10 +1677,12 @@ module.exports = {
   renderStatusSummary,
   renderHelp,
   parseApprovalAnswer,
+  criticalRefusal,
   parseQuestionAnswer,
   parseSlash,
   pickRecorder,
   recorderInstallHint,
+  noInputDeviceHint,
   parseDshowAudioDevices,
   fixWavHeader,
   BUSY_STATUSES,

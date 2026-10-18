@@ -168,7 +168,7 @@ test('browser titles', () => {
   assert.equal(b.title, 'Cloud Run \u2013 my-proj \u2013 Google Cloud console');
   assert.equal(b.url, null);
   assert.equal(b.site, 'Google Cloud console');
-  assert.equal(b.consoleProject, 'my-proj');
+  assert.equal(b.consoleProjectName, 'my-proj');
 
   b = p('Pull requests \u00b7 d/shop-api \u00b7 GitHub - Microsoft\u200b Edge', '');
   assert.equal(b.app, 'Microsoft Edge');
@@ -545,7 +545,7 @@ test('gatherContext with editors, browsers, storage mapping and cloud', async ()
   assert.match(text, /\n<\/desktop_context>$/);
   assert.match(text, /Active window: Google Chrome \u2014 "Cloud Run/);
   assert.match(text, new RegExp(`Editors: Visual Studio Code \u2014 shop-api \\(${proj.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)`));
-  assert.match(text, /Browsers: Google Chrome \u2014 "Cloud Run \u2013 my-proj \u2013 Google Cloud console" \[Google Cloud console: my-proj\] \[active\]/);
+  assert.match(text, /Browsers: Google Chrome \u2014 "Cloud Run \u2013 my-proj \u2013 Google Cloud console" \[Google Cloud console, project name "my-proj"\] \[active\]/);
   assert.match(text, /Other windows: Slack \u2014 "deploys - Slack"/);
   assert.match(text, /Project \(cwd\): .*Node \(Express\), Docker/);
   assert.match(text, /Cloud: gcloud account d@x\.com project my-proj/);

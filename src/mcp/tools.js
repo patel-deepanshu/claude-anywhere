@@ -814,7 +814,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
   tools.push({
     name: 'get_desktop_context',
     title: 'Desktop context',
-    description: 'Describe what is open on the user\'s desktop right now, as JSON: OS and local time; the active window; every editor window with its workspace folder on disk (VS Code, Cursor, Windsurf, VSCodium, JetBrains IDEs, Zed, Sublime Text, Xcode); browser windows with their tab titles and recognized sites such as the Google Cloud console; other windows; the project directory with git branch, remote, uncommitted changes and detected stack; and the active gcloud, aws, az, kubectl and docker contexts. Use it to resolve "this repo", "the project open in VS Code" or "the GCP console in Chrome".',
+    description: 'Describe what is open on the user\'s desktop right now, as JSON: OS and local time; the active window; every editor window with its workspace folder on disk (VS Code, Cursor, Windsurf, VSCodium, JetBrains IDEs, Zed, Sublime Text, Xcode); browser windows with their active tab\'s title (URLs are not captured) and recognized sites, e.g. the Google Cloud console with its project display name (not necessarily the project id); other windows; the project directory with git branch, remote, uncommitted changes and detected stack; and the active gcloud, aws, az, kubectl and docker contexts. Use it to resolve "this repo", "the project open in VS Code" or "the GCP console in Chrome".',
     inputSchema: objectSchema({}),
     annotations: annotations('Desktop context', { readOnly: true }),
     handler: async () => {
@@ -914,6 +914,10 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
       } catch (err) {
         if (err && err.code === 'ABORTED') throw err;
         if (err && err.status === 404) return fail(NO_DIALOG_MESSAGE);
+        // Bridge mode: the user stopped the command this terminal works on.
+        if (err && err.status === 409 && err.data && err.data.code === 'COMMAND_STOPPED') {
+          return fail('The user pressed Stop in the Anywhere dialog: abandon this command, do not continue its steps, and run "anywhere listen" for the next one.');
+        }
         return fail(`Could not ask through the Anywhere dialog (${oneLine(err && err.message, 200)}). Ask the user in your normal reply instead.`);
       } finally {
         stop();

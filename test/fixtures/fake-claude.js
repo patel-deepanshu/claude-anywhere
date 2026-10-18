@@ -15,11 +15,20 @@
  *   SLOW_TEST        deltas every 300 ms for 15 s, honouring interrupts
  *   CRASH_TEST       exits 1 with a stderr message
  *   NOISE_TEST       prints a non-JSON stdout line before answering
+ *   BGTASK_TEST      a Bash call moved to the background ends the turn; FAKE_CLAUDE_BG_MS (env,
+ *                    default 300) later the task finishes and the CLI starts a turn of its own
+ *                    (task_notification, init, ticks for FAKE_CLAUDE_SELF_MS, default 600,
+ *                    honouring interrupts, result), like claude 2.1.x after its 120 s Bash timeout
  * Startup: --resume missing* → an error result before any init (like claude 2.1.x), then
  *   "No conversation found with session ID" on stderr and exit 1.
  * An interrupt while idle is answered with a control_response only ({still_queued: []}).
  * FAKE_CLAUDE_ARGS_FILE (env) gets one JSON line per launch: {argv, cwd, env}.
  * total_cost_usd is cumulative per process (0.001 per turn), like the real CLI.
+ * FAKE_CLAUDE_STATE_DIR (env): the cumulative cost is kept per session there, and a resumed
+ *   process restores it into total_cost_usd, like claude 2.1.x.
+ * FAKE_CLAUDE_PENDING_TASK=1 (env): a resumed process answers its first message like claude 2.1.x
+ *   with a pending task notification: task_notification, init, an empty zero-turn result, init,
+ *   and only then the real turn.
  */
 
 const fs = require('fs');
@@ -81,6 +90,18 @@ if (opts.resume && opts.resume.startsWith('missing')) {
 
 const sessionId = opts.resume || opts.sessionId || crypto.randomUUID();
 const model = 'fake-model';
+
+// The session's cost before this process (restored on --resume when FAKE_CLAUDE_STATE_DIR is set).
+const stateFile = process.env.FAKE_CLAUDE_STATE_DIR ? require('path').join(process.env.FAKE_CLAUDE_STATE_DIR, `${sessionId}.json`) : null;
+let restoredCost = 0;
+if (stateFile && opts.resume) {
+  try {
+    restoredCost = Number(JSON.parse(fs.readFileSync(stateFile, 'utf8')).total) || 0;
+  } catch {
+    restoredCost = 0;
+  }
+}
+let pendingTask = Boolean(opts.resume) && process.env.FAKE_CLAUDE_PENDING_TASK === '1';
 
 let mcpServers = {};
 if (opts.mcpConfig) {
@@ -262,19 +283,59 @@ function toolResult(id, content, isError = false) {
   out({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content, is_error: isError }] } });
 }
 
-function result(text, { isError = false, subtype = 'success', started }) {
-  turns += 1;
+function totalCost() {
+  return Math.round((restoredCost + turns * 0.001) * 1e6) / 1e6;
+}
+
+function result(text, { isError = false, subtype = 'success', started, numTurns = 1 }) {
+  if (numTurns > 0) turns += 1;
+  const total = totalCost();
   out({
     type: 'result',
     subtype,
     is_error: isError,
     result: text,
-    total_cost_usd: Math.round(turns * 0.001 * 1e6) / 1e6,
+    total_cost_usd: total,
     duration_ms: Date.now() - started,
     duration_api_ms: Date.now() - started,
-    num_turns: 1,
+    num_turns: numTurns,
     session_id: sessionId,
   });
+  if (stateFile) {
+    try {
+      fs.writeFileSync(stateFile, JSON.stringify({ total }));
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/** A turn the CLI starts itself once a background task finished (see BGTASK_TEST). */
+async function selfTurn(started) {
+  out({ type: 'system', subtype: 'task_updated', task_id: 'bfakebg', patch: { status: 'completed' } });
+  out({ type: 'system', subtype: 'task_notification', task_id: 'bfakebg', tool_use_id: 'toolu_fake_bg', status: 'completed', summary: 'deploy' });
+  out({ type: 'system', subtype: 'background_tasks_changed', tasks: [] });
+  emitInit();
+  const id = messageId();
+  out({ type: 'stream_event', event: { type: 'message_start', message: { id, type: 'message', role: 'assistant', model, content: [] } } });
+  out({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } });
+  let text = '';
+  const until = Date.now() + (Number(process.env.FAKE_CLAUDE_SELF_MS) || 600);
+  let n = 0;
+  while (Date.now() < until && !interruptRequested) {
+    const piece = `build ${n} `;
+    n += 1;
+    text += piece;
+    out({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: piece } } });
+    await sleep(100);
+  }
+  out({ type: 'assistant', message: { id, type: 'message', role: 'assistant', model, content: [{ type: 'text', text }] } });
+  if (interruptRequested) {
+    interruptRequested = false;
+    result('', { subtype: 'error_during_execution', isError: true, started });
+    return;
+  }
+  result(`The deploy finished. ${text.trim()}`, { started });
 }
 
 async function slowTurn(started) {
@@ -305,7 +366,18 @@ async function slowTurn(started) {
 
 async function runTurn(msg) {
   const started = Date.now();
-  if (turns > 0) emitInit(); // the real CLI repeats init on every turn
+  if (msg.self) {
+    await selfTurn(started);
+    return;
+  }
+  if (pendingTask) {
+    // claude 2.1.x resuming a conversation whose background task was killed with the old process.
+    pendingTask = false;
+    out({ type: 'system', subtype: 'task_notification', task_id: 'bfakeold', status: 'killed', summary: 'old task' });
+    emitInit();
+    result('', { started, numTurns: 0 });
+    emitInit();
+  } else if (turns > 0) emitInit(); // the real CLI repeats init on every turn
   const content = (msg.message && msg.message.content) || [];
   const texts = (Array.isArray(content) ? content : [{ type: 'text', text: String(content) }]).filter((b) => b && b.type === 'text');
   const last = texts.length ? texts[texts.length - 1].text : '';
@@ -322,6 +394,20 @@ async function runTurn(msg) {
   if (/NOISE_TEST/.test(last)) {
     process.stdout.write('this line is not JSON\n');
     process.stdout.write('{broken json\n');
+  }
+  if (/BGTASK_TEST/.test(last)) {
+    toolUse('toolu_fake_bg', 'Bash', { command: 'gcloud run deploy shop --source .' });
+    out({ type: 'system', subtype: 'task_started', task_id: 'bfakebg', tool_use_id: 'toolu_fake_bg', description: 'deploy' });
+    out({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'bfakebg', task_type: 'local_bash', status: 'running', description: 'deploy' }] });
+    out({ type: 'system', subtype: 'task_updated', task_id: 'bfakebg', patch: { is_backgrounded: true } });
+    toolResult('toolu_fake_bg', 'Command did not complete within its 120s timeout and was moved to the background (ID: bfakebg).');
+    streamText('The deploy is still building in the background.');
+    result('The deploy is still building in the background.', { started });
+    setTimeout(() => {
+      queue.unshift({ self: true });
+      pump();
+    }, Number(process.env.FAKE_CLAUDE_BG_MS) || 300);
+    return;
   }
   if (/TOOL_TEST/.test(last)) {
     toolUse('toolu_fake_ls', 'Bash', { command: 'ls' });

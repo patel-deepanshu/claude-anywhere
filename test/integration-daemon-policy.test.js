@@ -137,9 +137,10 @@ test('POST /api/mcp/permission: policy allow, approval card, allow_session', asy
   assert.equal(ok.status, 200);
   const res = await pending;
   assert.deepEqual(res.json, { behavior: 'allow', updatedInput: { command: 'gcloud run deploy api --source .' } });
-  assert.deepEqual(permissions.getSessionRules(), ['Bash(gcloud run*)']);
+  // Round 3 (HEADLINE-SCENARIO-2): the rule covers redeploying this service, not all of `gcloud run`.
+  assert.deepEqual(permissions.getSessionRules(), ['Bash(gcloud run deploy api*)']);
 
-  const again = await api('POST', '/api/mcp/permission', { tool_name: 'Bash', input: { command: 'gcloud run deploy web' } });
+  const again = await api('POST', '/api/mcp/permission', { tool_name: 'Bash', input: { command: 'gcloud run deploy api --region us-east1' } });
   assert.equal(again.json.behavior, 'allow');
 
   const denied = api('POST', '/api/mcp/permission', { tool_name: 'Bash', input: { command: 'rm -rf ~' } });

@@ -109,7 +109,8 @@ test('SECURITY-ADVERSARIAL-3: commands named at run time, and eval/source of unk
   assert.equal(bash('cd $(git rev-parse --show-toplevel) && npm test'), 'medium');
   assert.equal(bash('echo $HOME'), 'low');
   // PowerShell variables are statements, not commands, unless called with &.
-  assert.equal(ps('$x = Get-Date'), 'medium');
+  // Round 3: an assignment is judged by the command whose value it stores.
+  assert.equal(ps('$x = Get-Date'), 'low');
   assert.equal(ps('& "C:\\tools\\a.exe" x'), 'medium');
 });
 
@@ -209,8 +210,9 @@ test('REGRESSIONS-7: typed text is judged by where it lands', () => {
   assert.equal(T('rm -rf ~\n'), 'critical');
   assert.equal(T('halt'), 'critical');
   assert.equal(T('Reboot the router if the light is red.\n', 'iTerm2'), 'critical');
-  // Outside a terminal a command-shaped line is at most high (it cannot run there).
-  assert.equal(T('rm -rf ~', 'Slack'), 'high');
+  // Round 3 (REGRESSIONS-R2-1): focus never lowers a command-shaped critical line, since a
+  // terminal the app list misses would then run it in auto mode without a card.
+  assert.equal(T('rm -rf ~', 'Slack'), 'critical');
   // Self-escalation stays critical anywhere, but only when it is command or config shaped.
   assert.equal(T('anywhere config set permissions.mode auto', 'Slack'), 'critical');
   assert.equal(T('{"defaultMode": "bypassPermissions"}', 'TextEdit'), 'critical');

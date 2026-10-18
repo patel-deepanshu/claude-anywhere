@@ -50,7 +50,8 @@ test('SKILL.md frontmatter has the required fields', () => {
     for (const tool of ['screenshot', 'list_windows', 'cursor_position', 'screen_info', 'get_desktop_context']) assert.ok(allowed.includes(server + tool), server + tool);
     for (const tool of ['click', 'type_text', 'key', 'clipboard_get', 'open']) assert.ok(!allowed.includes(server + tool), `${server}${tool} is not pre-approved`);
   }
-  assert.equal(allowed.length, 11);
+  assert.ok(allowed.includes('Read(~/.claude-anywhere/run/**)'), 'the skill may read the bridge images and CLI screenshots');
+  assert.equal(allowed.length, 12);
   assert.equal(fields['disable-model-invocation'], 'true');
 });
 

@@ -544,7 +544,7 @@ async function startTui({ idleQuitMs = 40, responses } = {}) {
   out.on('data', (d) => {
     text += d.toString();
   });
-  const tui = new T.Tui({ client, input, output: out, env: { NO_COLOR: '1' }, platform: 'linux', cwd: '/w', homedir: '/home/me', idleQuitMs });
+  const tui = new T.Tui({ client, input, output: out, env: { NO_COLOR: '1', LANG: 'en_US.UTF-8' }, platform: 'linux', cwd: '/w', homedir: '/home/me', idleQuitMs });
   const done = tui.run();
   let finished = false;
   done.then(() => {

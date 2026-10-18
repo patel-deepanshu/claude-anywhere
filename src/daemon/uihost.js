@@ -46,6 +46,10 @@ const TOPMOST_WAIT_MS = 6000;
 const BROWSER_WAIT_MS = 1500;
 const PID_WAIT_MS = 3000;
 const DRIVER_TIMEOUT_MS = 5000;
+// Where windows cannot be listed: how long show() waits for a dialog page to answer the 'show'
+// event with "visible" before it opens a window (a minimized window answers hidden, or not at all).
+const VISIBLE_WAIT_MS = 1500;
+const MAX_VISIBILITY_PAGES = 20;
 /** err.code of a withTimeout rejection: the operation may still be running. */
 const TIMEOUT_CODE = 'ETIMEDOUT';
 // Background window searches: on macOS, skip reading blank titles through System Events, which
@@ -843,9 +847,10 @@ class UiHost {
    *   KDE on Wayland), show() relies on it instead of opening another window.
    * @param {boolean} [opts.cleanupLeftovers] default true: before the first window search or
    *   launch, stop dialog browsers a previous daemon left running with our profile.
+   * Dialog pages report whether they can be seen through noteVisibility() (POST /api/ui/visibility).
    * Test seams: which, exists, spawn, run, env, getuid, kill, homedir, realpath, readHead,
    * resolveModule, loadModule, profileDir, stateDir, logFile, earlyExitMs, topmostWaitMs,
-   * browserWaitMs, pidWaitMs, driverTimeoutMs.
+   * browserWaitMs, pidWaitMs, driverTimeoutMs, visibleWaitMs.
    */
   constructor({ config, platformInfo, driver, ...deps } = {}) {
     this.config = config || {};
@@ -872,6 +877,10 @@ class UiHost {
     this.browserWaitMs = deps.browserWaitMs != null ? deps.browserWaitMs : BROWSER_WAIT_MS;
     this.pidWaitMs = deps.pidWaitMs != null ? deps.pidWaitMs : PID_WAIT_MS;
     this.driverTimeoutMs = deps.driverTimeoutMs != null ? deps.driverTimeoutMs : DRIVER_TIMEOUT_MS;
+    this.visibleWaitMs = deps.visibleWaitMs != null ? deps.visibleWaitMs : VISIBLE_WAIT_MS;
+    this._visibility = new Map(); // dialog page id → {visible, focused, seq}, from noteVisibility()
+    this._visibilitySeq = 0; // numbers the reports, so show() can tell the ones that answer it
+    this._visibilityWaiters = new Set();
     this._launchUrlFn = typeof deps.launchUrl === 'function' ? deps.launchUrl : null;
     this._clientCountFn = typeof deps.clientCount === 'function' ? deps.clientCount : null;
     this._cleanupLeftovers = deps.cleanupLeftovers !== false;
@@ -1409,6 +1418,47 @@ class UiHost {
     }
   }
 
+  /**
+   * A dialog page reports whether it can be seen: after a 'show' event and whenever that changes
+   * (document.hidden is true for a minimized window or a background tab).
+   * @param {{page:string, visible:boolean, focused?:boolean}} report
+   */
+  noteVisibility({ page, visible, focused } = {}) {
+    if (typeof page !== 'string' || !page) return;
+    this._visibilitySeq += 1;
+    const entry = { visible: Boolean(visible), focused: Boolean(focused), seq: this._visibilitySeq };
+    this._visibility.delete(page);
+    this._visibility.set(page, entry);
+    while (this._visibility.size > MAX_VISIBILITY_PAGES) this._visibility.delete(this._visibility.keys().next().value);
+    for (const w of [...this._visibilityWaiters]) w(entry);
+  }
+
+  /**
+   * Whether a dialog page reports itself visible after report number `since`, waiting up to `ms`
+   * for one (less once every connected page has answered hidden).
+   * @returns {Promise<boolean>}
+   */
+  _waitForVisiblePage(since, ms) {
+    const fresh = () => [...this._visibility.values()].filter((e) => e.seq > since);
+    if (fresh().some((e) => e.visible)) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let timer = null;
+      const done = (v) => {
+        clearTimeout(timer);
+        this._visibilityWaiters.delete(onReport);
+        resolve(v);
+      };
+      const onReport = (e) => {
+        if (e.seq <= since) return;
+        if (e.visible) done(true);
+        else if (fresh().length >= Math.max(1, this._clientCount())) done(false);
+      };
+      // Not unref'd: show() is waiting on it (1.5 s at most).
+      timer = setTimeout(() => done(false), Math.max(0, ms));
+      this._visibilityWaiters.add(onReport);
+    });
+  }
+
   /** Connected dialog pages, from the daemon (0 when it did not say). */
   _clientCount() {
     if (!this._clientCountFn) return 0;
@@ -1570,12 +1620,14 @@ class UiHost {
   /**
    * Bring the dialog to the front: focus the existing "Claude Anywhere" window through the
    * driver, otherwise reopen it. The daemon has already broadcast a 'show' event, which an open
-   * page answers with window.focus().
+   * page answers with window.focus() and a visibility report (noteVisibility()).
    * @param {string} [url]
    * @returns {Promise<{host:string}>}
    */
   show(url) {
     if (this._closed) return Promise.resolve({ host: 'none' });
+    // Pages answer the 'show' event broadcast just before this call: reports from now on.
+    const since = this._visibilitySeq;
     return this._serialize(async () => {
       // A show queued behind close() (daemon shutdown) must not launch a new window.
       if (this._closed) return { host: 'none' };
@@ -1598,8 +1650,14 @@ class UiHost {
       }
       if (!target) return { host: this._host || 'none' };
       if (!listed && this._dialogLikelyOpen()) {
-        log.info('windows cannot be listed here, but the dialog is open; asking it to come forward instead of opening another window');
-        return { host: this._host };
+        // window.focus() cannot bring back a minimized window (Chromium, Wayland compositors). Pages
+        // that report their visibility say whether it worked; a hidden or silent one gets a new
+        // window: a duplicate beats a dialog the user cannot reach.
+        if (!this._visibility.size || (await this._waitForVisiblePage(since, this.visibleWaitMs))) {
+          log.info('windows cannot be listed here, but the dialog is open; asking it to come forward instead of opening another window');
+          return { host: this._host };
+        }
+        log.info('the dialog page is connected but not visible (minimized or hidden); opening a window');
       }
       const live = this._ownedLive();
       if (this._host === 'electron' && live.some((o) => o.host === 'electron')) {

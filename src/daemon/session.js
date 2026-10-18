@@ -36,6 +36,12 @@ const INPUT_STRING_LIMIT = 2000;
 const GUARD_PAUSE_MS = 3000;
 const EARLY_EXIT_MS = 5000;
 const HELD_RESULT_MS = 3000;
+// A resumed CLI with a pending task notification first answers with an empty zero-turn result,
+// then starts the real turn (init) at once. If no init follows this soon, the result was real.
+const PRE_TURN_HOLD_MS = 5000;
+// After Stop in bridge mode, the terminal's screen actions are refused until it listens again
+// (it learns of the Stop from its next reply), for at most this long.
+const BRIDGE_STOP_GUARD_MS = 10 * 60 * 1000;
 const CONTEXT_TIMEOUT_MS = 6000;
 // Approvals and ask_user block inside the anywhere server's calls for up to
 // permissions.approvalTimeoutSec (read live; the broker caps it at 86400 s). A per-server
@@ -66,6 +72,9 @@ const READ_ONLY_TOOLS = [
 
 /** Tool prefix of the Claude Anywhere plugin's own MCP server ("anywhere" in plugin "anywhere"). */
 const PLUGIN_COPY_SERVER = 'mcp__plugin_anywhere_anywhere';
+
+/** The snapshot's voice info before the voice service answers (setVoiceInfo replaces it whole). */
+const DEFAULT_VOICE_INFO = Object.freeze({ serverStt: false, sttProvider: null, serverTts: false, ttsProvider: null });
 
 // ------------------------------------------------------------------ display helpers
 
@@ -460,8 +469,10 @@ class SessionManager extends EventEmitter {
    * @param {()=>Promise<object>} [opts.getDriver]
    * @param {{gatherContext?:Function, formatContext?:Function, detectProjects?:Function, projectInfo?:Function}} [opts.context]
    * @param {Function} [opts.buildSystemPrompt]
+   * @param {Function} [opts.settingsNotes] (config) → the settings section of buildSystemPrompt's text
    * @param {object} [opts.platformInfo]
    * @param {Function} [opts.Engine] engine class (tests)
+   * @param {number} [opts.preTurnHoldMs] how long an empty pre-turn result is held (tests)
    */
   constructor(opts = {}) {
     super();
@@ -477,6 +488,8 @@ class SessionManager extends EventEmitter {
     this.platformInfo = opts.platformInfo || platformMod.info();
     this.context = opts.context || {};
     this.buildSystemPrompt = typeof opts.buildSystemPrompt === 'function' ? opts.buildSystemPrompt : null;
+    // The settings section of that prompt (approval mode, speech…): it changes without an engine restart.
+    this.settingsNotesFn = typeof opts.settingsNotes === 'function' ? opts.settingsNotes : null;
     this.Engine = opts.Engine || ClaudeCliEngine;
     this._computer = opts.computer || null;
     this._driver = opts.driver || null;
@@ -493,7 +506,7 @@ class SessionManager extends EventEmitter {
     this.baseDetail = '';
     this.status = 'idle';
     this.statusDetail = '';
-    this.voiceInfo = { serverStt: false, sttProvider: null, serverTts: false, ttsProvider: null };
+    this.voiceInfo = { ...DEFAULT_VOICE_INFO };
     this.latestScreenshot = null;
     this.pauseUntil = 0;
 
@@ -501,14 +514,29 @@ class SessionManager extends EventEmitter {
     this.costUsd = 0;
     this.turns = 0;
     this.engine = null;
+    // The folders the running engine was given with --add-dir (VS Code workspaces): the approval
+    // policy treats edits there as in-project (PermissionBroker getExtraDirs). [] without an engine.
+    this.engineAddDirs = [];
+    // total_cost_usd the CLI reports is cumulative for the conversation, and a resumed CLI restores
+    // it: a turn costs (total - engineCostBase). null: resumed with no known total (first result is the baseline).
     this.engineCostBase = 0;
+    this.lastEngineTotal = 0; // the last total_cost_usd seen for this.sessionId (kept in sessions.json)
     this.engineSent = [];
     this.turnCommandIds = []; // ids of the commands the current turn answers (in the `result` payload)
     this.detachedEngines = new WeakSet(); // engines of a previous conversation or project: output ignored
     this.engineSignature = null;
     this.engineStale = false;
+    this.staleNoticeShown = false; // restartForSettings() told the user it waits for background tasks
     this.engineStopping = null; // promise while stopEngine() waits for the CLI to exit
     this.turnActive = false; // a user message is with the CLI and its result has not arrived
+    this.engineTurn = false; // the current turn was started by Claude Code itself (a background task finished)
+    this.engineTurnHint = false; // a task_notification arrived while idle: the CLI may start a turn of its own
+    this.sendingNow = false; // inside engine.send(): output now belongs to the user's turn
+    this.outputSinceInit = false; // top-level assistant output since the last init
+    this.preTurnHold = null; // {engine, msg, timer}: an empty zero-turn result that may precede the real turn
+    this.preTurnHoldMs = Number.isFinite(opts.preTurnHoldMs) ? opts.preTurnHoldMs : PRE_TURN_HOLD_MS;
+    this.backgroundTasks = 0; // Claude Code's running background tasks (background_tasks_changed)
+    this.engineSettingsNotes = null; // the settings notes the running engine knows (prompt file or last <settings> block)
     this.pendingFollowUps = []; // [{item, blocks}] commands waiting for the current turn to end
     this.interrupting = null; // promise while interrupt() waits for the CLI
     this.heldResult = null; // an error result that arrived before init (startup failure)
@@ -520,8 +548,8 @@ class SessionManager extends EventEmitter {
     this.submitChain = Promise.resolve();
     this.closed = false;
     this.bridgeFiles = [];
-    this.bridgeBusy = false;
     this.bridgeStartedAt = 0;
+    this.bridgeStoppedAt = 0; // Stop cancelled the terminal's command at this time (see guard())
     this.generation = 0; // bumped by interrupt(), newSession(), setProject(), setMode(): commands still being prepared are dropped
 
     this.streamItems = new Map(); // `${msgId}:${index}` → item
@@ -572,9 +600,13 @@ class SessionManager extends EventEmitter {
     if (saved && typeof saved.sessionId === 'string' && saved.sessionId) {
       this.sessionId = saved.sessionId;
       this.resumeNext = true;
+      // Unknown in a sessions.json from an older version: the first result is then the baseline.
+      const total = Number(saved.lastTotalCostUsd);
+      this.lastEngineTotal = saved.lastTotalCostUsd != null && Number.isFinite(total) && total >= 0 ? total : null;
     } else {
       this.sessionId = uuid();
       this.resumeNext = false;
+      this.lastEngineTotal = 0;
     }
   }
 
@@ -582,7 +614,9 @@ class SessionManager extends EventEmitter {
   persistSession() {
     if (!this.sessionId) return;
     const all = readSessions();
-    all[this.projectDir] = { sessionId: this.sessionId, updatedAt: nowIso() };
+    const entry = { sessionId: this.sessionId, updatedAt: nowIso() };
+    if (Number.isFinite(this.lastEngineTotal)) entry.lastTotalCostUsd = this.lastEngineTotal;
+    all[this.projectDir] = entry;
     writeSessions(all);
   }
 
@@ -619,7 +653,8 @@ class SessionManager extends EventEmitter {
 
   /** @param {object} info voice capabilities for the snapshot */
   setVoiceInfo(info) {
-    if (info && typeof info === 'object') this.voiceInfo = { ...this.voiceInfo, ...info };
+    // Replaced, not merged: a hint (sttHint, ttsHint) from before a provider was configured must go.
+    if (info && typeof info === 'object') this.voiceInfo = { ...DEFAULT_VOICE_INFO, ...info };
   }
 
   /** @param {string} name the desktop driver's name, once known */
@@ -705,7 +740,9 @@ class SessionManager extends EventEmitter {
 
   /**
    * Tell `anywhere send --wait` (and other watchers) that these commands will get no `result`:
-   * dropped before they reached Claude, or their turn ended without one.
+   * dropped before they reached Claude, or their turn ended without one. Reasons: 'stopped',
+   * 'reset', 'cancelled' (never handed to Claude), 'interrupted' (Claude had it, so it may have
+   * partly run), 'engine_exit', 'failed'.
    * @private
    */
   cancelCommands(ids, reason) {
@@ -760,6 +797,11 @@ class SessionManager extends EventEmitter {
     const left = this.pauseUntil - Date.now();
     if (left > 0) return { allowed: false, reason: `the user pressed Stop; actions resume in ${Math.ceil(left / 1000)} s` };
     if (this.status === 'stopping') return { allowed: false, reason: 'the user is stopping Claude' };
+    // Bridge mode: the terminal keeps working on a command the user stopped until it learns of
+    // the Stop (its next reply is refused) and listens again.
+    if (this.mode === 'bridge' && this.bridge && this.bridge.commandStopped && Date.now() - this.bridgeStoppedAt < BRIDGE_STOP_GUARD_MS) {
+      return { allowed: false, reason: 'the user pressed Stop in the dialog, so this command was cancelled; abandon it and run "anywhere listen" for the next one' };
+    }
     return { allowed: true };
   }
 
@@ -892,9 +934,65 @@ class SessionManager extends EventEmitter {
     return fallbackSystemPrompt({ platformInfo: this.platformInfo, mode: this.mode });
   }
 
-  /** @private */
+  /** @private the settings section of the system prompt for the current config ('' when unknown) */
+  settingsNotesText() {
+    if (!this.settingsNotesFn) return '';
+    try {
+      const text = this.settingsNotesFn(this.config);
+      return typeof text === 'string' ? text.trim() : '';
+    } catch (err) {
+      log.warn(`settingsNotes failed: ${err.message}`);
+      return '';
+    }
+  }
+
+  /**
+   * What a running engine depends on: its CLI arguments (the engine settings) and the system
+   * prompt, apart from the settings section (approval mode, speech, desktop context). Those
+   * change by message instead (settingsBlock()): a restart would stop Claude's background tasks
+   * and re-cache the whole conversation for a few lines of advice. engine.resumeLast only
+   * matters when the daemon starts.
+   * @private
+   */
   signature() {
-    return JSON.stringify({ engine: this.config.engine || {}, prompt: this.systemPromptText() });
+    const { resumeLast, ...engine } = this.config.engine || {};
+    let prompt = this.systemPromptText();
+    const notes = this.settingsNotesText();
+    if (notes && prompt.includes(notes)) prompt = prompt.replace(notes, '');
+    return JSON.stringify({ engine, prompt });
+  }
+
+  /**
+   * A <settings> block for the next user message when the settings section changed since the
+   * engine started (or since the last block), else null.
+   * @private
+   */
+  settingsBlock() {
+    const notes = this.settingsNotesText();
+    if (!notes || this.engineSettingsNotes == null || notes === this.engineSettingsNotes) return null;
+    return {
+      type: 'text',
+      text: `<settings>\nThe user changed the settings. These replace the "Current settings" section of your instructions:\n${notes}\n</settings>`,
+    };
+  }
+
+  /**
+   * engine.send() with the settings block when needed; output emitted during the call belongs
+   * to this message's turn.
+   * @private
+   */
+  sendToEngine(engine, blocks) {
+    const note = this.settingsBlock();
+    const notes = note ? this.settingsNotesText() : null;
+    this.sendingNow = true;
+    try {
+      engine.send(note ? [note, ...blocks] : blocks);
+    } finally {
+      this.sendingNow = false;
+    }
+    if (note) this.engineSettingsNotes = notes;
+    // An init from now on starts this message's turn, not one of the engine's own.
+    this.engineTurnHint = false;
   }
 
   /** @private write the MCP config and system prompt files (0600) */
@@ -997,6 +1095,7 @@ class SessionManager extends EventEmitter {
       throw e;
     }
     this.writeRunFiles();
+    const promptNotes = this.settingsNotesText(); // as written into the system prompt file
     const addDirs = await this.vsCodeDirs();
     this.checkStartCurrent(epoch, projectDir);
     const engineCfg = this.config.engine || {};
@@ -1031,11 +1130,21 @@ class SessionManager extends EventEmitter {
       env: { ANYWHERE_ENGINE_CHILD: null },
     });
     this.engine = engine;
-    this.engineCostBase = 0;
+    this.engineAddDirs = addDirs.slice();
+    // A resumed CLI restores the conversation's cumulative cost: measure turns from it.
+    if (!resume) this.lastEngineTotal = 0;
+    this.engineCostBase = resume ? (Number.isFinite(this.lastEngineTotal) ? this.lastEngineTotal : null) : 0;
     this.engineSent = [];
     this.turnCommandIds = [];
     this.engineStale = false;
     this.engineSignature = this.signature();
+    this.engineSettingsNotes = promptNotes;
+    this.staleNoticeShown = false;
+    this.engineTurn = false;
+    this.engineTurnHint = false;
+    this.outputSinceInit = false;
+    this.backgroundTasks = 0;
+    this.clearPreTurnHold();
     this.warnedMcp = false;
     engine.on('message', (msg) => {
       if (engine !== this.engine || this.detachedEngines.has(engine)) return;
@@ -1071,7 +1180,10 @@ class SessionManager extends EventEmitter {
       } catch (err) {
         log.warn(`engine stop failed: ${err.message}`);
       }
-      if (this.engine === engine) this.engine = null;
+      if (this.engine === engine) {
+        this.engine = null;
+        this.engineAddDirs = [];
+      }
     })();
     this.engineStopping = done;
     try {
@@ -1135,6 +1247,7 @@ class SessionManager extends EventEmitter {
   async onEngineExit(engine, info) {
     if (engine !== this.engine) return;
     this.engine = null;
+    this.engineAddDirs = [];
     if (this.heldResult && this.heldResult.engine === engine) this.heldResult = null;
     // A previous conversation's or project's engine: newSession()/setProject() already reset the turn state.
     if (this.detachedEngines.has(engine)) return;
@@ -1143,11 +1256,16 @@ class SessionManager extends EventEmitter {
     const sentIds = this.turnCommandIds.splice(0);
     const hadTurns = this.turnActive;
     this.turnActive = false;
+    this.engineTurn = false;
+    this.engineTurnHint = false;
+    this.backgroundTasks = 0;
+    this.clearPreTurnHold();
     this.finalizeTurnItems('Interrupted: Claude Code stopped');
     // Only resume ids that refer to a real conversation.
     this.resumeNext = Boolean(this.sessionId) && (info.sawInit || engine.resume);
     if (info.expected) {
-      this.cancelCommands(sentIds, 'stopped');
+      // Claude had them: they may have partly run.
+      this.cancelCommands(sentIds, 'interrupted');
       const dropped = this.dropFollowUps('stopped');
       if (dropped) this.system(`${dropped} queued command${dropped === 1 ? ' was' : 's were'} not sent because Claude Code stopped.`, 'warning');
       if (this.baseStatus !== 'stopping' && this.baseStatus !== 'error' && this.mode === 'companion') this.setBase('idle');
@@ -1165,6 +1283,7 @@ class SessionManager extends EventEmitter {
       this.system(engine.resume ? 'Could not resume the previous conversation, so a new one was started.' : 'Started a new conversation.', 'warning');
       this.sessionId = uuid();
       this.resumeNext = false;
+      this.lastEngineTotal = 0;
       this.forgetSession();
       this.clearSessionRules();
       this.broadcast('session', { id: this.sessionId, model: this.model });
@@ -1181,7 +1300,7 @@ class SessionManager extends EventEmitter {
           return;
         }
         if (blocks.length) {
-          next.send(blocks);
+          this.sendToEngine(next, blocks);
           this.engineSent.push(blocks);
           this.turnCommandIds.push(...sentIds);
           this.turnActive = true;
@@ -1217,9 +1336,21 @@ class SessionManager extends EventEmitter {
 
   /** @private */
   onEngineMessage(msg) {
+    const topOutput = (msg.type === 'stream_event' || msg.type === 'assistant') && !msg.parent_tool_use_id;
+    if (topOutput || (msg.type === 'system' && msg.subtype === 'init')) {
+      // The turn really started: an empty result held before it was not its answer.
+      this.clearPreTurnHold();
+      this.outputSinceInit = topOutput;
+    }
+    // Output with no turn running: Claude Code started a turn of its own, after a background task
+    // it started (a long build moved to the background) finished. An init counts only after such
+    // a task_notification, since one also precedes every turn the daemon starts.
+    if (!this.turnActive && (topOutput || (msg.type === 'system' && msg.subtype === 'init' && this.engineTurnHint))) this.beginEngineTurn();
     switch (msg.type) {
       case 'system':
         if (msg.subtype === 'init') this.onInit(msg);
+        else if (msg.subtype === 'task_notification' && !this.turnActive) this.engineTurnHint = true;
+        else if (msg.subtype === 'background_tasks_changed') this.onBackgroundTasks(msg);
         break;
       case 'stream_event':
         this.onStreamEvent(msg);
@@ -1236,6 +1367,71 @@ class SessionManager extends EventEmitter {
       default:
         break;
     }
+  }
+
+  /**
+   * Claude Code started a turn nobody sent a message for (see onEngineMessage): track it like a
+   * user's turn, so Stop interrupts it, new commands queue behind it, and its result does not
+   * answer a command sent meanwhile.
+   * @private
+   */
+  beginEngineTurn() {
+    const engine = this.engine;
+    if (this.sendingNow || this.mode !== 'companion' || this.closed || this.interrupting || this.engineStopping) return;
+    if (this.baseStatus === 'stopping' || !engine || !engine.running) return;
+    this.turnActive = true;
+    this.engineTurn = true;
+    this.engineTurnHint = false;
+    log.info('Claude Code started a turn of its own (a background task finished)');
+    this.system('A background task finished, so Claude is continuing on its own. Stop works as usual.', 'info');
+    this.setBase('thinking', 'Following up on a background task');
+  }
+
+  /** @private background_tasks_changed: the CLI's running background tasks */
+  onBackgroundTasks(msg) {
+    const tasks = Array.isArray(msg.tasks) ? msg.tasks : [];
+    this.backgroundTasks = tasks.filter((t) => !t || !t.status || t.status === 'running' || t.status === 'pending').length;
+    // A settings restart waited for them (applyConfig).
+    if (!this.backgroundTasks && this.engineStale && !this.turnActive && this.engine) this.restartForSettings();
+  }
+
+  /** @private drop an empty pre-turn result held by onResult (the real turn started, or it no longer matters) */
+  clearPreTurnHold() {
+    if (!this.preTurnHold) return;
+    clearTimeout(this.preTurnHold.timer);
+    this.preTurnHold = null;
+  }
+
+  /**
+   * An empty zero-turn result while a sent message waits for its turn, before any output: a
+   * resumed CLI with a pending task notification (e.g. a background task killed when the engine
+   * restarted) emits one, and then starts the real turn.
+   * @private
+   */
+  isPreTurnResult(msg) {
+    if (!this.turnActive || this.engineTurn || !this.turnCommandIds.length || this.outputSinceInit) return false;
+    if (msg.is_error || Number(msg.num_turns) !== 0) return false;
+    return !(typeof msg.result === 'string' && msg.result.trim());
+  }
+
+  /** @private keep a pre-turn result: dropped when the turn starts, reported if none follows */
+  holdPreTurn(engine, msg) {
+    const total = Number(msg.total_cost_usd);
+    // It reports the conversation's restored total: a baseline, not a cost of this turn.
+    if (Number.isFinite(total) && total >= 0 && (this.engineCostBase == null || total >= this.engineCostBase)) {
+      this.engineCostBase = total;
+      this.lastEngineTotal = total;
+    }
+    this.clearPreTurnHold();
+    log.info('holding an empty result that arrived before the turn started');
+    const hold = { engine, msg, timer: null };
+    hold.timer = setTimeout(() => {
+      if (this.preTurnHold !== hold) return;
+      this.preTurnHold = null;
+      if (engine === this.engine && engine.running && !this.detachedEngines.has(engine)) this.onResult(msg, { held: true });
+    }, this.preTurnHoldMs);
+    if (hold.timer.unref) hold.timer.unref();
+    this.preTurnHold = hold;
   }
 
   /** @private */
@@ -1401,11 +1597,21 @@ class SessionManager extends EventEmitter {
       this.holdResult(engine, msg);
       return;
     }
+    if (!held && this.isPreTurnResult(msg)) {
+      this.holdPreTurn(engine, msg);
+      return;
+    }
+    this.clearPreTurnHold();
     this.finalizeTurnItems('Interrupted before it finished');
     const total = Number(msg.total_cost_usd) || 0;
-    // The CLI reports a cumulative cost per process; fall back gracefully if it ever reports per turn.
-    const turnCost = total >= this.engineCostBase ? total - this.engineCostBase : total;
+    // The CLI reports a cumulative cost for the conversation (restored on resume); fall back
+    // gracefully if it ever reports per turn. Resumed without a known total, this result's total
+    // is the baseline: counting it would add the whole earlier conversation again.
+    let turnCost;
+    if (this.engineCostBase == null) turnCost = 0;
+    else turnCost = total >= this.engineCostBase ? total - this.engineCostBase : total;
     this.engineCostBase = total;
+    this.lastEngineTotal = total;
     this.costUsd += turnCost;
     this.turns += 1;
     if (typeof msg.session_id === 'string' && msg.session_id && msg.session_id !== this.sessionId) {
@@ -1416,6 +1622,10 @@ class SessionManager extends EventEmitter {
     // A turn the user stopped ends with an error_during_execution result: that is the Stop
     // working, not a failure worth an error line (interrupt() adds "Stopped." itself).
     const interrupted = this.baseStatus === 'stopping' && isError && msg.subtype === 'error_during_execution';
+    // A turn Claude Code started itself answers none of the commands (they queue behind it).
+    const engineTurn = this.engineTurn;
+    this.engineTurn = false;
+    this.engineTurnHint = false;
     const payload = {
       text: typeof msg.result === 'string' ? msg.result : '',
       costUsd: round6(turnCost),
@@ -1426,9 +1636,10 @@ class SessionManager extends EventEmitter {
       numTurns: Number(msg.num_turns) || 0,
       subtype: msg.subtype || null,
       // The commands this result answers: a command queued during a turn gets the next one.
-      commandIds: this.turnCommandIds.splice(0),
+      commandIds: engineTurn ? [] : this.turnCommandIds.splice(0),
     };
     if (interrupted) payload.interrupted = true;
+    if (engineTurn) payload.engineInitiated = true;
     this.broadcast('result', payload);
     this.emit('result', payload);
     if (isError && !interrupted) {
@@ -1443,10 +1654,7 @@ class SessionManager extends EventEmitter {
     // A Stop in progress drops the queue and finishes the status itself.
     if (this.baseStatus !== 'stopping' && this.flushFollowUps()) return;
     if (this.baseStatus !== 'stopping' && this.mode === 'companion') this.setBase('idle');
-    if (this.engineStale) {
-      log.info('engine settings changed; restarting Claude Code before the next command');
-      this.stopEngine().catch(() => {});
-    }
+    if (this.engineStale) this.restartForSettings();
   }
 
   /**
@@ -1475,7 +1683,7 @@ class SessionManager extends EventEmitter {
     const queued = this.pendingFollowUps.splice(0);
     const blocks = [].concat(...queued.map((q) => q.blocks));
     try {
-      engine.send(blocks);
+      this.sendToEngine(engine, blocks);
     } catch (err) {
       this.engineFailed(err, queued.map((q) => q.item.id));
       return true;
@@ -1530,17 +1738,21 @@ class SessionManager extends EventEmitter {
     this.addMessage(item);
     audit({ type: 'command', id: item.id, text: finalText, source: src, mode: this.mode, images: item.images });
     const gen = this.generation;
-    const job = () => {
+    this.chain(() => {
       if (gen !== this.generation) return this.dropCancelled(item);
       return this.mode === 'bridge' ? this.processBridge(item, imgs, wantShot, gen) : this.processCompanion(item, imgs, wantShot, gen);
-    };
+    });
+    return { id: item.id };
+  }
+
+  /** @private run a command job after the ones before it (commands reach Claude in the order typed) */
+  chain(job) {
     const run = this.submitChain.then(job, job);
     this.submitChain = run.catch((err) => {
       log.error('command failed:', err);
       this.system(`Could not run the command: ${err.message}`, 'error');
       this.setBase('error', 'Command failed');
     });
-    return { id: item.id };
   }
 
   /** @returns {Promise<void>} resolves when submitted commands have been handed to the engine or bridge, queued behind the current turn, or dropped */
@@ -1601,6 +1813,51 @@ class SessionManager extends EventEmitter {
     }
     for (const img of imgs) blocks.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.data } });
     blocks.push({ type: 'text', text: item.text });
+    return this.deliverCompanion(item, blocks, gen, enginePromise);
+  }
+
+  /**
+   * Hand bridge commands that no terminal took to the companion session (a switch to
+   * companion mode), in order and under their own ids, so `anywhere send --wait` still gets
+   * their results. Their context and images are the ones gathered when they were sent.
+   * @private
+   * @param {object[]} cmds bridge queue entries {id, text, images (files), context, source}
+   */
+  moveToCompanion(cmds) {
+    const gen = this.generation;
+    for (const cmd of cmds) {
+      const item = { id: cmd.id, text: cmd.text };
+      audit({ type: 'command_moved', id: cmd.id, from: 'bridge', to: 'companion', source: cmd.source });
+      this.chain(() => {
+        if (gen !== this.generation || this.mode !== 'companion') return this.dropCancelled(item);
+        return this.processMoved(cmd, item, gen);
+      });
+    }
+  }
+
+  /** @private a moved bridge command (see moveToCompanion) on its way to Claude Code */
+  async processMoved(cmd, item, gen) {
+    const running = this.engine && this.engine.running && !this.engineStopping;
+    if (!this.turnActive && !this.interrupting) this.setBase(running ? 'thinking' : 'starting', running ? '' : 'Starting Claude Code…');
+    const enginePromise = this.ensureEngine();
+    enginePromise.catch(() => {}); // handled in deliverCompanion()
+    const blocks = [];
+    if (cmd.context) blocks.push({ type: 'text', text: String(cmd.context) });
+    const types = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
+    for (const file of Array.isArray(cmd.images) ? cmd.images : []) {
+      try {
+        const data = fs.readFileSync(file).toString('base64');
+        blocks.push({ type: 'image', source: { type: 'base64', media_type: types[path.extname(file).toLowerCase()] || 'image/png', data } });
+      } catch (err) {
+        this.system(`Could not attach ${path.basename(String(file))}: ${err.message}`, 'warning');
+      }
+    }
+    blocks.push({ type: 'text', text: String(cmd.text || '') });
+    return this.deliverCompanion(item, blocks, gen, enginePromise);
+  }
+
+  /** @private send a prepared companion command (blocks) once the engine runs, or queue it behind the current turn */
+  async deliverCompanion(item, blocks, gen, enginePromise) {
     const cancelled = () => {
       this.dropCancelled(item);
       // After a switch to bridge mode the bridge owns the status.
@@ -1648,7 +1905,7 @@ class SessionManager extends EventEmitter {
         return;
       }
       try {
-        engine.send(blocks);
+        this.sendToEngine(engine, blocks);
         break;
       } catch (err) {
         if (err.code === 'ENGINE_NOT_RUNNING' && attempt === 0) {
@@ -1709,8 +1966,7 @@ class SessionManager extends EventEmitter {
     // for a while (a long deploy), and that command's status stays.
     const working = this.bridge.current && this.bridge.listening ? this.bridge.current.id : null;
     this.bridge.enqueue({ id: item.id, text: item.text, images: files, context, source: item.source });
-    if (!this.bridgeBusy || !working) this.bridgeStartedAt = Date.now();
-    this.bridgeBusy = true;
+    if (!working) this.bridgeStartedAt = Date.now();
     const handedOver = this.bridge.current && this.bridge.current.id === item.id;
     if (working && !handedOver) {
       this.system('Queued: the terminal picks this up after its current task.', 'info');
@@ -1733,6 +1989,33 @@ class SessionManager extends EventEmitter {
     const n = this.bridge.clear();
     this.cancelCommands(ids, reason);
     return n;
+  }
+
+  /**
+   * Cancel the command the terminal is working on: its later replies are refused (the terminal
+   * learns of the Stop from them) and it is announced as interrupted (it may have partly run).
+   * @private
+   * @returns {string|null} its id
+   */
+  cancelBridgeCurrent() {
+    if (!this.bridge || typeof this.bridge.cancelCurrent !== 'function') return null;
+    const id = this.bridge.cancelCurrent();
+    if (!id) return null;
+    this.bridgeStoppedAt = Date.now();
+    this.cancelCommands([id], 'interrupted');
+    return id;
+  }
+
+  /**
+   * Bridge mode has work in progress: queued commands, or one the terminal took and has not
+   * answered (while it still counts as connected). Read from the bridge itself, so nothing goes
+   * stale when the queue is dropped or a command cancelled.
+   * @returns {boolean}
+   */
+  get bridgeBusy() {
+    const b = this.bridge;
+    if (!b || this.mode !== 'bridge') return false;
+    return b.queueLength() > 0 || Boolean(b.current && b.listening);
   }
 
   /** @private terminal activity in bridge mode (a tool call, notification, question) counts as a sign of life */
@@ -1767,10 +2050,11 @@ class SessionManager extends EventEmitter {
           speak: speak !== false,
           commandIds: commandId ? [commandId] : [],
         };
-        this.bridgeBusy = this.bridge.queueLength() > 0;
         this.broadcast('result', payload);
         this.emit('result', payload);
         if (!this.bridgeBusy) this.setBase('idle');
+        // More commands wait: Stop stays available until the terminal takes the next one.
+        else if (!this.bridge.current) this.setBase('queued', 'Waiting for the terminal');
       } else {
         if (speak === true && text) this.broadcast('notify', { text, level: 'info', speak: true });
         this.setBase('acting', 'Claude Code (terminal) is working');
@@ -1835,7 +2119,19 @@ class SessionManager extends EventEmitter {
     this.broadcast('notify', { text, level: lvl, speak: Boolean(speak) });
     audit({ type: 'notify', text, level: lvl });
     this.touchBridge();
-    return { ok: true, delivered: Boolean(this.hub && this.hub.clientCount && this.hub.clientCount() > 0) };
+    return { ok: true, delivered: this.dialogsOpen() > 0 };
+  }
+
+  /** @private connected clients that show notifications and cards: dialog pages and TUIs, not CLI watchers */
+  dialogsOpen() {
+    const h = this.hub;
+    if (!h) return 0;
+    try {
+      if (typeof h.dialogCount === 'function') return Number(h.dialogCount()) || 0;
+      return typeof h.clientCount === 'function' ? Number(h.clientCount()) || 0 : 0;
+    } catch {
+      return 0;
+    }
   }
 
   /**
@@ -1860,8 +2156,12 @@ class SessionManager extends EventEmitter {
     }
     if (this.mode === 'bridge') {
       const dropped = this.clearBridge('stopped');
-      this.bridgeBusy = false;
-      this.system(`Stopped.${dropped ? ` Dropped ${dropped} queued command${dropped === 1 ? '' : 's'}.` : ''} Screen actions are paused for a moment.`, 'info');
+      const current = this.cancelBridgeCurrent();
+      const droppedNote = dropped ? ` Dropped ${dropped} queued command${dropped === 1 ? '' : 's'}.` : '';
+      const note = current
+        ? ' The terminal\'s command was cancelled: its replies are no longer shown and its screen actions are refused. A command already running in that terminal (a build, a deploy) only stops with Esc there.'
+        : ' Screen actions are paused for a moment.';
+      this.system(`Stopped.${droppedNote}${note}`, 'info');
       this.setBase('idle');
       return { ok: true };
     }
@@ -1885,8 +2185,11 @@ class SessionManager extends EventEmitter {
         log.warn(`interrupt failed: ${err.message}`);
       }
       this.turnActive = false;
-      // Normally the interrupted result took them; without one they get no answer.
-      this.cancelCommands(this.turnCommandIds.splice(0), 'stopped');
+      this.engineTurn = false;
+      this.clearPreTurnHold();
+      // Normally the interrupted result took them; without one they get no answer (Claude had
+      // them, so they may have partly run).
+      this.cancelCommands(this.turnCommandIds.splice(0), 'interrupted');
       this.finalizeTurnItems('Stopped by the user');
       if (res.killed) {
         this.resumeNext = Boolean(this.sessionId);
@@ -1915,7 +2218,11 @@ class SessionManager extends EventEmitter {
     this.generation += 1;
     this.resetEpoch += 1;
     this.dropFollowUps('reset');
-    this.cancelCommands(this.turnCommandIds.splice(0), 'reset');
+    // Claude had these: they may have partly run.
+    this.cancelCommands(this.turnCommandIds.splice(0), 'interrupted');
+    this.engineTurn = false;
+    this.engineTurnHint = false;
+    this.clearPreTurnHold();
     if (this.engine) this.detachedEngines.add(this.engine);
   }
 
@@ -1949,16 +2256,45 @@ class SessionManager extends EventEmitter {
   }
 
   /**
-   * @private a switch that would stop work in progress needs force (HTTP 409 otherwise).
-   * Forced, the open cards are cancelled and the caller notes that the task was stopped.
-   * @returns {boolean} whether running work is being stopped
+   * Bridge mode holds only commands that wait for a terminal: none is listening, none took a
+   * command, and no card is open. Nothing has run yet (REGRESSIONS-R2-2, LIVE-E2E-R3-8).
+   * @returns {number} how many commands wait (0: not that state)
    */
-  guardSwitch(force, what) {
+  bridgeWaitingOnly() {
+    const b = this.bridge;
+    if (this.mode !== 'bridge' || !b || b.current || b.listening) return 0;
+    const n = b.queueLength();
+    if (!n || this.turnActive || this.pendingFollowUps.length || this.startingPromise) return 0;
+    if (this.pendingCount(this.permissions) || this.pendingCount(this.questions)) return 0;
+    return n;
+  }
+
+  /**
+   * @private a switch that would stop work in progress needs force (HTTP 409 otherwise).
+   * Forced, the open cards are cancelled and the caller notes what was stopped.
+   * opts.movesWaiting: the switch takes bridge commands that only wait for a terminal along
+   * (setMode('companion')), so they do not make the dialog busy.
+   * @returns {false|'stopped'|'dropped'} 'stopped': running work is being stopped; 'dropped':
+   *   only commands that waited for a terminal were dropped (nothing ran)
+   */
+  guardSwitch(force, what, { movesWaiting = false } = {}) {
+    const waiting = this.bridgeWaitingOnly();
+    if (waiting && movesWaiting) return false;
     if (!this.isBusy()) return false;
     if (!force) {
+      if (waiting) {
+        const one = waiting === 1;
+        throw httpError(409, `${one ? 'A command is' : `${waiting} commands are`} waiting for a Claude Code terminal (none is listening); the ${what} drops ${one ? 'it' : 'them'}`, {
+          hint: `Run "/anywhere here" in Claude Code to pick ${one ? 'it' : 'them'} up, or confirm the ${what} to drop ${one ? 'it' : 'them'} (anywhere: --switch).`,
+        });
+      }
       throw httpError(409, `A task is running in ${this.project.name || this.projectDir}; stop it first`, {
         hint: `Stop it (Esc or the Stop button), or confirm the ${what} to stop it (anywhere: --switch).`,
       });
+    }
+    if (waiting) {
+      this.clearBridge('reset');
+      return 'dropped';
     }
     const reason = `Stopped for a ${what}`;
     for (const src of [this.permissions, this.questions]) {
@@ -1968,7 +2304,23 @@ class SessionManager extends EventEmitter {
         log.warn(`cancelling cards failed: ${err.message}`);
       }
     }
-    return true;
+    // Bridge mode: the terminal's work is stopped too, not only announced as stopped.
+    if (this.mode === 'bridge') this.stopBridgeWork('stopped');
+    return 'stopped';
+  }
+
+  /** @private the system note for a forced switch (see guardSwitch), or '' */
+  switchNote(stopped, n = 0) {
+    if (stopped === 'stopped') return 'The running task was stopped.';
+    if (stopped !== 'dropped') return '';
+    if (n === 1) return 'The command that waited for a Claude Code terminal was dropped.';
+    return `${n > 1 ? `The ${n} commands` : 'The commands'} that waited for a Claude Code terminal were dropped.`;
+  }
+
+  /** @private drop the bridge's queue and cancel the terminal's command */
+  stopBridgeWork(reason) {
+    this.clearBridge(reason);
+    this.cancelBridgeCurrent();
   }
 
   /** @private an empty transcript for a new conversation */
@@ -1990,8 +2342,9 @@ class SessionManager extends EventEmitter {
     this.costUsd = 0;
     this.turns = 0;
     this.resetTranscript();
+    this.lastEngineTotal = 0;
     this.forgetSession();
-    if (this.mode === 'bridge') this.clearBridge('reset');
+    if (this.mode === 'bridge') this.stopBridgeWork('reset');
     const { sessionId } = this;
     audit({ type: 'new_session', sessionId, project: this.projectDir });
     this.setBase('idle');
@@ -2020,11 +2373,14 @@ class SessionManager extends EventEmitter {
     }
     if (!st.isDirectory()) throw httpError(400, `Not a directory: ${abs}`);
     if (abs === this.projectDir) return this.project;
+    const waitingBefore = this.bridgeWaitingOnly();
     const stopped = this.guardSwitch(force, 'project switch');
     this.beginSwitch();
     // Folder and conversation change together, before any await, so an engine start never
     // sees one without the other (and a command typed meanwhile runs in the new folder).
     this.projectDir = abs;
+    // The old engine's --add-dir folders belonged to the old project.
+    this.engineAddDirs = [];
     this.initSessionId();
     this.project = { dir: abs, name: path.basename(abs) || abs, git: null };
     this.freshRetried = false;
@@ -2033,8 +2389,8 @@ class SessionManager extends EventEmitter {
     this.resetTranscript();
     this.located = null;
     audit({ type: 'project', project: abs });
-    this.setBase('idle');
-    if (stopped) this.system('The running task was stopped.', 'warning');
+    this.settleStatus();
+    if (stopped) this.system(this.switchNote(stopped, waitingBefore), 'warning');
     this.system(`Switched to ${this.project.name} (${abs}).`, 'info');
     // Announced now (the approval policy judges paths against it); again below with git details.
     this.broadcast('project', this.project);
@@ -2060,7 +2416,10 @@ class SessionManager extends EventEmitter {
   async setMode(mode, { force = false } = {}) {
     if (mode !== 'companion' && mode !== 'bridge') throw httpError(400, 'mode must be "companion" or "bridge"');
     if (mode === this.mode) return { mode };
-    if (this.guardSwitch(force, 'mode switch')) this.system('The running task was stopped.', 'warning');
+    // Bridge commands that only wait for a terminal move to the companion session (nothing ran).
+    const stopped = this.guardSwitch(force, 'mode switch', { movesWaiting: mode === 'companion' });
+    if (stopped) this.system(this.switchNote(stopped), 'warning');
+    let moving = [];
     this.mode = mode;
     this.generation += 1;
     this.resetEpoch += 1; // an engine start in progress gives up
@@ -2075,12 +2434,16 @@ class SessionManager extends EventEmitter {
       this.setBase('idle', this.bridge && this.bridge.listening ? 'Terminal connected' : 'Waiting for the terminal');
     } else {
       if (this.bridge) {
-        if (this.bridge.current) this.cancelCommands([this.bridge.current.id], 'reset');
-        this.clearBridge('reset');
+        // The terminal had it: it may have partly run.
+        if (this.bridge.current) this.cancelCommands([this.bridge.current.id], 'interrupted');
+        // Commands no terminal took (nothing ran) are sent to the companion session instead.
+        moving = this.bridge.queue.slice();
+        this.bridge.clear();
         this.bridge.stop();
       }
-      this.bridgeBusy = false;
-      this.system('Companion mode: commands run in a dedicated Claude Code session.', 'info');
+      const n = moving.length;
+      const movedNote = n ? ` ${n === 1 ? 'The command' : `The ${n} commands`} that waited for a Claude Code terminal now run${n === 1 ? 's' : ''} here.` : '';
+      this.system(`Companion mode: commands run in a dedicated Claude Code session.${movedNote}`, 'info');
       this.setBase('idle');
     }
     this.broadcast('mode', { mode });
@@ -2089,8 +2452,20 @@ class SessionManager extends EventEmitter {
       // A companion session left running would keep operating the desktop next to the terminal.
       if (this.startingPromise) await this.startingPromise.catch(() => {});
       if (this.mode === 'bridge') await this.stopEngine();
+      return { mode };
     }
-    return { mode };
+    if (moving.length) this.moveToCompanion(moving);
+    return { mode, moved: moving.length };
+  }
+
+  /** @private the resting status after a switch: idle, or (bridge mode) what the bridge still holds */
+  settleStatus() {
+    if (this.mode === 'bridge' && this.bridgeBusy) {
+      if (this.bridge.current) this.setBase('thinking', 'Claude Code (terminal) is working');
+      else this.setBase('queued', 'Waiting for the terminal');
+      return;
+    }
+    this.setBase('idle');
   }
 
   /**
@@ -2101,13 +2476,34 @@ class SessionManager extends EventEmitter {
   applyConfig(config) {
     if (config) this.config = config;
     if (!this.engine) return;
+    // Settings that only change the prompt's settings section reach Claude with the next
+    // message (settingsBlock()); only engine settings need a restart.
     if (this.signature() !== this.engineSignature) {
       this.engineStale = true;
-      if (!this.turnActive) {
-        log.info('engine settings changed; Claude Code restarts with the next command');
-        this.stopEngine().catch(() => {});
-      }
+      if (!this.turnActive) this.restartForSettings();
     }
+  }
+
+  /**
+   * Stop the idle engine so the next command starts it with new engine settings (the
+   * conversation resumes). Waits while Claude Code runs background tasks (a dev server, a
+   * build), which a restart would kill.
+   * @private
+   */
+  restartForSettings() {
+    if (!this.engineStale || !this.engine || this.turnActive || this.engineStopping) return;
+    if (this.backgroundTasks > 0) {
+      if (!this.staleNoticeShown) {
+        this.staleNoticeShown = true;
+        const n = this.backgroundTasks;
+        this.system(`The new engine settings apply once Claude's ${n} background task${n === 1 ? '' : 's'} finish${n === 1 ? 'es' : ''}: restarting Claude Code now would stop ${n === 1 ? 'it' : 'them'}. New session applies them right away.`, 'info');
+      }
+      return;
+    }
+    this.staleNoticeShown = false;
+    log.info('engine settings changed; Claude Code restarts with the next command');
+    this.system('Settings changed: Claude Code restarts with your next command, and the conversation continues.', 'info');
+    this.stopEngine().catch(() => {});
   }
 
   /** Stop everything and remove this instance's run files. */

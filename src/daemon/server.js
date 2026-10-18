@@ -26,6 +26,8 @@ const AUDIO_LIMIT = 25 * 1024 * 1024;
 const LISTEN_MAX_SEC = 590;
 const LISTEN_DEFAULT_SEC = 540;
 const LAUNCH_CODE_TTL_MS = 60000;
+// POST /api/approval `via`: how the user answered (same list as permissions.js APPROVAL_VIA).
+const APPROVAL_VIA = ['click', 'key', 'typed', 'voice'];
 const MAX_LAUNCH_CODES = 64;
 const DEFAULT_UI_DIR = path.join(paths.PACKAGE_ROOT, 'src', 'ui');
 
@@ -347,6 +349,7 @@ class DaemonServer {
     add('GET', '/api/context', this.context, { noBody: true });
     add('GET', '/api/permissions', this.osPermissions, { noBody: true });
     add('POST', '/api/show', this.show, { notWhileStopping: true });
+    add('POST', '/api/ui/visibility', this.uiVisibility);
     add('POST', '/api/shutdown', this.shutdown);
     add('POST', '/api/mcp/permission', this.mcpPermission);
     add('POST', '/api/mcp/ask', this.mcpAsk);
@@ -585,7 +588,10 @@ class DaemonServer {
     if (!['allow', 'allow_session', 'deny'].includes(decision)) throw httpError(400, 'decision must be allow, allow_session or deny');
     const perms = this.deps.permissions;
     if (!perms) throw httpError(503, 'Approvals are not available');
-    const ok = perms.resolve(id, decision, typeof message === 'string' ? message : undefined);
+    // How the user answered (optional: older clients send none). The broker records it and
+    // refuses a critical allow that came by voice or key (409 CRITICAL_NEEDS_CLICK).
+    const via = APPROVAL_VIA.includes(body.via) ? body.via : undefined;
+    const ok = perms.resolve(id, decision, typeof message === 'string' ? message : undefined, via ? { via } : {});
     if (!ok) throw httpError(404, 'No pending approval with that id (it may have timed out or been cancelled)');
     return { ok: true };
   }
@@ -681,8 +687,9 @@ class DaemonServer {
 
   /** @private */
   async mode({ body }) {
-    const { mode } = await this.session.setMode(body.mode, { force: body.force === true });
-    return { ok: true, mode };
+    const r = await this.session.setMode(body.mode, { force: body.force === true });
+    // moved: bridge commands that waited for a terminal and now run in the companion session.
+    return Number.isFinite(r && r.moved) ? { ok: true, mode: r.mode, moved: r.moved } : { ok: true, mode: r.mode };
   }
 
   /** @private */
@@ -757,6 +764,20 @@ class DaemonServer {
       log.warn(`showing the dialog failed: ${err.message}`);
       return { ok: false, host: 'none', error: err.message };
     }
+  }
+
+  /**
+   * @private POST /api/ui/visibility {page, visible, focused}: a dialog page reports whether it
+   * can be seen (after a 'show' event, and when that changes), so show() can tell a minimized or
+   * hidden dialog from one in front where windows cannot be listed.
+   */
+  uiVisibility({ body }) {
+    const page = typeof body.page === 'string' ? body.page.slice(0, 100) : '';
+    if (!page) throw httpError(400, 'page is required');
+    if (typeof body.visible !== 'boolean') throw httpError(400, 'visible must be true or false');
+    const ui = this.deps.uihost;
+    if (ui && typeof ui.noteVisibility === 'function') ui.noteVisibility({ page, visible: body.visible, focused: body.focused === true });
+    return { ok: true };
   }
 
   /** @private */
@@ -844,8 +865,21 @@ class DaemonServer {
     return decision;
   }
 
+  /**
+   * @private 409 COMMAND_STOPPED: the bridge terminal is still on a command the user stopped, so
+   * what it sends now belongs to cancelled work (`anywhere reply`/`ask` print STOPPED for it)
+   */
+  stoppedCommandError(what) {
+    return httpError(409, `The user pressed Stop in the dialog, so this command was cancelled and ${what}`, {
+      code: 'COMMAND_STOPPED',
+      hint: 'Abandon this command: do not continue its steps or send more replies. Run "anywhere listen" for the next command.',
+    });
+  }
+
   /** @private POST /api/mcp/ask (long poll) */
   async mcpAsk({ res, body }) {
+    const bridge = this.deps.bridge;
+    if (this.session && this.session.mode === 'bridge' && bridge && bridge.commandStopped) throw this.stoppedCommandError('this question was not shown');
     const ac = new AbortController();
     const onClose = () => {
       if (!res.writableFinished) ac.abort();
@@ -946,7 +980,9 @@ class DaemonServer {
         hint: 'Stop the listen loop. Run "/anywhere here" again after switching the dialog back to bridge mode.',
       });
     }
-    return bridge.reply({ text: body.text, final: Boolean(body.final), speak: body.speak !== false });
+    const out = bridge.reply({ text: body.text, final: Boolean(body.final), speak: body.speak !== false });
+    if (out && out.stopped) throw this.stoppedCommandError('this reply was not shown');
+    return out;
   }
 }
 

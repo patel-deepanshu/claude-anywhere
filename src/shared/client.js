@@ -213,9 +213,13 @@ class DaemonClient {
    * whose daemon was replaced emits '_daemon_replaced' ({pid, port, instanceId}) and reconnects
    * to the new daemon at once.
    * @param {(type:string, data:any)=>void} onEvent
+   * @param {{kind?:'ui'|'tui'|'cli'}} [opts] kind: what this client is (?client=<kind>). The daemon
+   *   counts dialogs (ui, tui) for notify_user delivery and to decide whether an approval card
+   *   needs the dialog window reopened; watchers (cli) do not count.
    * @returns {{close:()=>void}}
    */
-  subscribe(onEvent) {
+  subscribe(onEvent, { kind } = {}) {
+    const clientParam = typeof kind === 'string' && /^[a-z]{1,16}$/.test(kind) ? `&client=${kind}` : '';
     let closed = false;
     let ctrl = null;
     let delay = 1000;
@@ -224,7 +228,7 @@ class DaemonClient {
         ctrl = new AbortController();
         const sentTo = this.target();
         try {
-          const res = await fetch(`${this.baseUrl}/api/events?token=${encodeURIComponent(this.token)}`, {
+          const res = await fetch(`${this.baseUrl}/api/events?token=${encodeURIComponent(this.token)}${clientParam}`, {
             headers: { Accept: 'text/event-stream' },
             signal: ctrl.signal,
           });

@@ -22,7 +22,7 @@ const state = require('../shared/state');
 const platformMod = require('../shared/platform');
 const { spawnDetached } = require('../shared/proc');
 const { uuid, randomToken, sleep, nowIso, truncate } = require('../shared/util');
-const { createLogger, audit, applyPrivacyConfig } = require('../shared/log');
+const { createLogger, audit, applyPrivacyConfig, redact } = require('../shared/log');
 const { Hub } = require('./hub');
 const { QuestionBroker } = require('./questions');
 const { Bridge } = require('./bridge');
@@ -32,6 +32,7 @@ const { createServer, homeId, currentUid } = require('./server');
 const log = createLogger('daemon');
 
 const ATTENTION_THROTTLE_MS = 3000;
+const MAX_QUEUED_SPEECH = 4; // cards announced aloud one after another; more than this are only shown
 const SHUTDOWN_HARD_MS = 8000;
 const FALLBACK_PORTS = 19; // a busy configured port N falls back to N+1..N+19 before a random port
 const DYING_DAEMON_WAIT_MS = SHUTDOWN_HARD_MS + 2000; // how long a start waits for our previous daemon to free its port
@@ -153,22 +154,22 @@ class BasicPermissionBroker {
     });
   }
 
-  finish(id, decision, message, why) {
+  finish(id, decision, message, why, via) {
     const e = this.entries.get(id);
     if (!e) return false;
     this.entries.delete(id);
     clearTimeout(e.timer);
     const allow = decision === 'allow' || decision === 'allow_session';
     if (decision === 'allow_session') this.sessionAllow.add(e.card.toolName);
-    audit({ type: 'permission', tool: e.card.toolName, summary: e.card.summary, decision, by: why || 'user' });
-    this.hub.broadcast('approval_resolved', { id, decision });
+    audit({ type: 'permission', tool: e.card.toolName, summary: e.card.summary, decision, by: why || 'user', ...(via ? { via } : {}) });
+    this.hub.broadcast('approval_resolved', { id, decision, ...(via ? { via } : {}) });
     e.resolve(allow ? { behavior: 'allow', updatedInput: e.card.input } : { behavior: 'deny', message: message || 'The user denied this action' });
     return true;
   }
 
-  resolve(id, decision, message) {
+  resolve(id, decision, message, { via } = {}) {
     if (!['allow', 'allow_session', 'deny'].includes(decision)) return false;
-    return this.finish(id, decision, message, 'user');
+    return this.finish(id, decision, message, 'user', typeof via === 'string' ? via : undefined);
   }
 
   cancelAll(reason = 'Cancelled') {
@@ -194,6 +195,163 @@ function isDir(p) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Text that is safe and pleasant to read aloud: secrets masked (never spoken), whitespace
+ * collapsed, cut to `max` characters.
+ * @param {*} text
+ * @param {number} max
+ * @param {(word:string)=>any} [secretLike] flags a word that looks like a password or token
+ * @returns {string}
+ */
+function speakable(text, max, secretLike) {
+  let s = redact(String(text == null ? '' : text));
+  if (typeof secretLike === 'function') {
+    s = s
+      .split(/(\s+)/)
+      .map((w) => {
+        try {
+          return w.trim() && secretLike(w) ? 'hidden' : w;
+        } catch {
+          return w;
+        }
+      })
+      .join('');
+  }
+  s = s
+    .replace(/\*{3}/g, 'hidden')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return truncate(s, max);
+}
+
+/** The risk notes of an approval card: card.notes, else the clauses after the first ";" of its reason. */
+function riskNotes(card) {
+  if (Array.isArray(card.notes)) return card.notes.filter((n) => typeof n === 'string' && n.trim());
+  if (typeof card.notes === 'string' && card.notes.trim()) return [card.notes];
+  if (typeof card.reason !== 'string' || !['high', 'critical'].includes(card.risk)) return [];
+  return card.reason
+    .split(';')
+    .slice(1)
+    .map((n) => n.replace(/\s*\([^)]*\)/g, '').trim())
+    .filter(Boolean);
+}
+
+/**
+ * What the daemon says aloud for a new card (HEADLINE-SCENARIO-12): a hands-free user must hear
+ * which action they approve, or the question and its options, not only that something waits.
+ * @param {{kind?:string, summary?:string, displayName?:string, toolName?:string, reason?:string,
+ *   risk?:string, notes?:string[]|string, question?:string, options?:string[]}} info
+ * @param {{secretLike?:(word:string)=>any}} [opts]
+ * @returns {string}
+ */
+function attentionSpeech(info = {}, { secretLike } = {}) {
+  const i = info && typeof info === 'object' ? info : {};
+  const sentence = (t) => (t ? `${t[0].toUpperCase()}${t.slice(1)}` : t);
+  if (i.kind === 'question') {
+    const q = speakable(i.question || i.summary, 220, secretLike);
+    if (!q) return 'Claude has a question for you';
+    const options = (Array.isArray(i.options) ? i.options : []).map((o) => speakable(o, 50, secretLike)).filter(Boolean);
+    const some = options.slice(0, 3);
+    let tail = '';
+    if (some.length === 1) tail = ` Option: ${some[0]}.`;
+    else if (some.length > 1) tail = ` Options: ${some.slice(0, -1).join(', ')}${options.length > 3 ? ', ' : ' or '}${some[some.length - 1]}${options.length > 3 ? ', or another' : ''}.`;
+    return `Claude asks: ${/[?.!…]$/.test(q) ? q : `${q}?`}${tail}`;
+  }
+  // "Run: gcloud run deploy shop-api --region us-central1" → "gcloud run deploy shop-api region us-central1".
+  const action = String(i.summary || i.displayName || i.toolName || '')
+    .replace(/^Run:\s*/, '')
+    .replace(/(^|\s)--?(?=[A-Za-z])/g, '$1');
+  const what = speakable(action, 120, secretLike).replace(/[?.!:;,]+$/, '');
+  if (!what) return 'Claude needs your approval';
+  const notes = riskNotes(i)
+    .map((n) => speakable(n, 90, secretLike).replace(/[.;,]+$/, ''))
+    .filter(Boolean)
+    .slice(0, 2);
+  return `Approve: ${what}?${notes.length ? ` ${notes.map(sentence).join('. ')}.` : ''}`;
+}
+
+/**
+ * React to a new approval or question card (the brokers' onNeedAttention): reopen the dialog when
+ * nothing that shows cards is connected (a dialog page or TUI; `anywhere send --wait` watchers do
+ * not count), post an OS notification, and say the card aloud for voice users. Reopening and
+ * notifications are throttled; announcements queue, and one whose card was answered meanwhile
+ * is skipped.
+ * @param {object} deps
+ * @param {object} deps.config the live config (voice section)
+ * @param {()=>number} deps.clientCount connected clients that show cards: dialog pages and TUIs
+ * @param {()=>object|null} [deps.getUihost]
+ * @param {()=>string|null} [deps.getUrl] the dialog URL
+ * @param {(title:string, body:string)=>Promise<any>} [deps.notifyOS]
+ * @param {()=>object|null} [deps.getVoice]
+ * @param {(kind:string, id:string)=>object|null|undefined} [deps.findCard] the pending card (null once
+ *   it is resolved, undefined when unknown)
+ * @param {(word:string)=>any} [deps.secretLike]
+ * @param {()=>boolean} [deps.isShuttingDown]
+ * @returns {(info:object)=>void}
+ */
+function createAttentionHandler({
+  config,
+  clientCount,
+  getUihost = () => null,
+  getUrl = () => null,
+  notifyOS = null,
+  getVoice = () => null,
+  findCard = null,
+  secretLike = null,
+  isShuttingDown = () => false,
+  throttleMs = ATTENTION_THROTTLE_MS,
+  now = Date.now,
+} = {}) {
+  let lastAttention = -Infinity;
+  let speech = Promise.resolve();
+  let queued = 0;
+  const lookup = (kind, id) => {
+    if (typeof findCard !== 'function' || !id) return undefined;
+    try {
+      return findCard(kind, id);
+    } catch {
+      return undefined;
+    }
+  };
+  return (info = {}) => {
+    if (isShuttingDown()) return; // a window opened now would outlive the daemon
+    const kind = info && info.kind === 'question' ? 'question' : 'approval';
+    const card = lookup(kind, info && info.id);
+    // The broker's info, completed from its card (an approval's reason and risk notes).
+    const full = { ...(card || {}), ...(info || {}), kind };
+    const t = now();
+    if (t - lastAttention >= throttleMs) {
+      lastAttention = t;
+      const detail = truncate(String(full.summary || full.question || full.displayName || full.toolName || ''), 200);
+      const uihost = getUihost();
+      const url = getUrl();
+      if (clientCount() === 0 && uihost && url) {
+        Promise.resolve()
+          .then(() => uihost.show(url))
+          .catch((err) => log.warn(`could not show the dialog: ${err.message}`));
+      }
+      if (notifyOS) {
+        Promise.resolve()
+          .then(() => notifyOS('Claude needs your input', detail || (kind === 'question' ? 'Claude has a question for you.' : 'Claude is waiting for your approval.')))
+          .catch((err) => log.debug(`OS notification failed: ${err.message}`));
+      }
+    }
+    const v = config.voice || {};
+    const voice = getVoice();
+    if (!voice || !v.speakResponses || v.tts === 'off' || queued >= MAX_QUEUED_SPEECH) return;
+    const text = attentionSpeech(full, { secretLike });
+    queued += 1;
+    speech = speech
+      .then(() => {
+        queued -= 1;
+        // Answered while earlier cards were announced: nothing to say any more.
+        if (lookup(kind, info && info.id) === null) return null;
+        return voice.speak(text, { rate: v.ttsRate, voice: v.ttsVoice || undefined });
+      })
+      .catch((err) => log.debug(`speaking the attention prompt failed: ${err.message}`));
+  };
 }
 
 function alreadyRunningError(existing, detail) {
@@ -589,31 +747,23 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
   }
   const notifyOS = commonMod ? (title, body) => commonMod.notify(title, body) : null;
 
-  let lastAttention = 0;
-  const onNeedAttention = (info = {}) => {
-    if (shuttingDown) return; // a window opened now would outlive the daemon
-    const now = Date.now();
-    if (now - lastAttention < ATTENTION_THROTTLE_MS) return;
-    lastAttention = now;
-    const kind = info && info.kind === 'question' ? 'question' : 'approval';
-    const detail = truncate(String((info && (info.summary || info.question || info.displayName || info.toolName)) || ''), 200);
-    if (hub.clientCount() === 0 && uihost && server) {
-      Promise.resolve()
-        .then(() => uihost.show(server.url))
-        .catch((err) => log.warn(`could not show the dialog: ${err.message}`));
-    }
-    if (notifyOS) {
-      Promise.resolve()
-        .then(() => notifyOS('Claude needs your input', detail || (kind === 'question' ? 'Claude has a question for you.' : 'Claude is waiting for your approval.')))
-        .catch((err) => log.debug(`OS notification failed: ${err.message}`));
-    }
-    const v = config.voice || {};
-    if (voice && v.speakResponses && v.tts !== 'off') {
-      Promise.resolve()
-        .then(() => voice.speak(kind === 'question' ? 'Claude has a question for you' : 'Claude needs your approval', { rate: v.ttsRate, voice: v.ttsVoice || undefined }))
-        .catch((err) => log.debug(`speaking the attention prompt failed: ${err.message}`));
-    }
-  };
+  // `permissions` and `questions` are created below with this handler; it looks their cards up later.
+  const onNeedAttention = createAttentionHandler({
+    config,
+    // Dialog pages and TUIs show cards; a CLI watcher (`anywhere send --wait`) does not.
+    clientCount: () => hub.dialogCount(),
+    getUihost: () => uihost,
+    getUrl: () => (server ? server.url : null),
+    notifyOS,
+    getVoice: () => voice,
+    findCard: (kind, id) => {
+      const broker = kind === 'question' ? questions : permissions;
+      if (!broker || typeof broker.pending !== 'function') return undefined;
+      return broker.pending().find((c) => c && c.id === id) || null;
+    },
+    secretLike: permMod && typeof permMod.secretLike === 'function' ? permMod.secretLike : null,
+    isShuttingDown: () => Boolean(shuttingDown),
+  });
 
   let permissions = null;
   if (permMod) {
@@ -626,6 +776,9 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
         onNeedAttention,
         projectDir,
         getProjectDir: () => (session ? session.projectDir : projectDir),
+        // Edits in the folders the engine was given with --add-dir (VS Code workspaces) count as
+        // in-project (HEADLINE-SCENARIO-10).
+        getExtraDirs: () => (session ? session.engineAddDirs || [] : []),
         // type_text is judged by where it lands: a terminal runs it, an email does not (REGRESSIONS-7).
         activeWindow: () => lazyDriver.activeWindow(),
       });
@@ -781,6 +934,8 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     getDriver,
     context,
     buildSystemPrompt: promptMod ? promptMod.buildSystemPrompt : null,
+    // Its settings section reaches a running engine by message, without a restart (LIVE-E2E-R3-4).
+    settingsNotes: promptMod && typeof promptMod.settingsNotes === 'function' ? promptMod.settingsNotes : null,
     platformInfo,
   });
   server.session = session;
@@ -820,6 +975,10 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
         project: session.projectDir,
         mode: session.mode,
         url,
+        // What this process runs, so `anywhere stop` can match the OS's command line for this pid
+        // (Windows CIM CommandLine) against it, whatever launched the daemon.
+        execPath: process.execPath,
+        argv: process.argv.slice(1),
       });
     } catch (err) {
       log.error(`could not write ${paths.daemonStatePath()}: ${err.message}`);
@@ -862,7 +1021,10 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
 
   // ---- open the dialog
   const printUrl = (why) => {
-    process.stderr.write(`Claude Anywhere is running. Open this URL to use the dialog${why ? ` (${why})` : ''}:\n  ${url}\nOr run: anywhere tui\n`);
+    // A detached daemon's stderr is daemon.log: the access token stays out of it (`anywhere url`
+    // prints the full link). A terminal running the daemon in the foreground gets the link itself.
+    const link = process.stderr.isTTY ? url : `http://127.0.0.1:${boundPort}/  (run "anywhere url" for the link with its access token)`;
+    process.stderr.write(`Claude Anywhere is running. Open this URL to use the dialog${why ? ` (${why})` : ''}:\n  ${link}\nOr run: anywhere tui\n`);
   };
   const wantOpen = open && (config.ui || {}).openOnStart !== false && (config.ui || {}).host !== 'none';
   if (wantOpen) {
@@ -1025,4 +1187,6 @@ module.exports = {
   isOwnDaemon,
   candidatePorts,
   lastPortPath,
+  createAttentionHandler,
+  attentionSpeech,
 };
