@@ -361,9 +361,10 @@ function withTimeout(promise, ms, fallback) {
   ]);
 }
 
-function httpError(status, message) {
+function httpError(status, message, extra) {
   const err = new Error(message);
   err.status = status;
+  if (extra) Object.assign(err, extra);
   return err;
 }
 
@@ -1927,6 +1928,49 @@ class SessionManager extends EventEmitter {
     this.clearSessionRules();
   }
 
+  /**
+   * Whether a project or mode switch would stop work in progress: a turn with Claude Code,
+   * queued follow-ups, an engine start or a command being prepared, an open approval or
+   * question card, or (bridge mode) a command in the terminal's hands.
+   * @returns {boolean}
+   */
+  isBusy() {
+    if (this.turnActive || this.pendingFollowUps.length || this.startingPromise) return true;
+    if (this.mode === 'bridge' && this.bridgeBusy) return true;
+    if (this.mode === 'companion' && ['starting', 'thinking', 'acting'].includes(this.baseStatus)) return true;
+    for (const src of [this.permissions, this.questions]) {
+      try {
+        if (src && typeof src.pending === 'function' && src.pending().length) return true;
+      } catch {
+        /* treat as not pending */
+      }
+    }
+    return false;
+  }
+
+  /**
+   * @private a switch that would stop work in progress needs force (HTTP 409 otherwise).
+   * Forced, the open cards are cancelled and the caller notes that the task was stopped.
+   * @returns {boolean} whether running work is being stopped
+   */
+  guardSwitch(force, what) {
+    if (!this.isBusy()) return false;
+    if (!force) {
+      throw httpError(409, `A task is running in ${this.project.name || this.projectDir}; stop it first`, {
+        hint: `Stop it (Esc or the Stop button), or confirm the ${what} to stop it (anywhere: --switch).`,
+      });
+    }
+    const reason = `Stopped for a ${what}`;
+    for (const src of [this.permissions, this.questions]) {
+      try {
+        if (src && typeof src.cancelAll === 'function') src.cancelAll(reason);
+      } catch (err) {
+        log.warn(`cancelling cards failed: ${err.message}`);
+      }
+    }
+    return true;
+  }
+
   /** @private an empty transcript for a new conversation */
   resetTranscript() {
     this.messages = [];
@@ -1958,11 +2002,13 @@ class SessionManager extends EventEmitter {
   }
 
   /**
-   * Switch the working project (restarts the engine there).
+   * Switch the working project (restarts the engine there). Refused with 409 while a task is
+   * running (see isBusy) unless opts.force, which stops it.
    * @param {string} dir
+   * @param {{force?:boolean}} [opts]
    * @returns {Promise<{dir:string,name:string,git:object|null}>}
    */
-  async setProject(dir) {
+  async setProject(dir, { force = false } = {}) {
     if (typeof dir !== 'string' || !dir.trim()) throw httpError(400, 'dir must be a directory path');
     const expanded = dir.trim().replace(/^~(?=$|[\\/])/, os.homedir());
     const abs = path.resolve(expanded);
@@ -1974,6 +2020,7 @@ class SessionManager extends EventEmitter {
     }
     if (!st.isDirectory()) throw httpError(400, `Not a directory: ${abs}`);
     if (abs === this.projectDir) return this.project;
+    const stopped = this.guardSwitch(force, 'project switch');
     this.beginSwitch();
     // Folder and conversation change together, before any await, so an engine start never
     // sees one without the other (and a command typed meanwhile runs in the new folder).
@@ -1987,6 +2034,7 @@ class SessionManager extends EventEmitter {
     this.located = null;
     audit({ type: 'project', project: abs });
     this.setBase('idle');
+    if (stopped) this.system('The running task was stopped.', 'warning');
     this.system(`Switched to ${this.project.name} (${abs}).`, 'info');
     // Announced now (the approval policy judges paths against it); again below with git details.
     this.broadcast('project', this.project);
@@ -2004,12 +2052,15 @@ class SessionManager extends EventEmitter {
   /**
    * Switch between companion and bridge mode. Commands still being prepared or queued for the
    * old mode are dropped; switching to bridge mode stops the companion Claude Code session.
+   * Refused with 409 while a task is running (see isBusy) unless opts.force, which stops it.
    * @param {'companion'|'bridge'} mode
+   * @param {{force?:boolean}} [opts]
    * @returns {Promise<{mode:string}>}
    */
-  async setMode(mode) {
+  async setMode(mode, { force = false } = {}) {
     if (mode !== 'companion' && mode !== 'bridge') throw httpError(400, 'mode must be "companion" or "bridge"');
     if (mode === this.mode) return { mode };
+    if (this.guardSwitch(force, 'mode switch')) this.system('The running task was stopped.', 'warning');
     this.mode = mode;
     this.generation += 1;
     this.resetEpoch += 1; // an engine start in progress gives up

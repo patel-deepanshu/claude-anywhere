@@ -31,7 +31,9 @@ const EDGE_TOLERANCE = 2; // px of slack outside the shot that is clamped instea
 const FAILSAFE_RADIUS = 3; // logical px around the primary display's top-left corner
 const DISPLAY_TTL_MS = 2000;
 const PASTE_SETTLE_MS = 40;
-const PASTE_RESTORE_MS = 400;
+// Apps read the clipboard after the paste keystroke arrives, some of them well after it: restoring
+// the old contents sooner can paste those instead (the macOS helper's own paste waits 1 s too).
+const PASTE_RESTORE_MS = 1000;
 const REPEAT_GAP_MS = 25;
 const MAX_REPEAT = 100;
 const MAX_SCROLL = 100;
@@ -342,6 +344,7 @@ class Computer {
       return; // cursor position unknown (e.g. some Wayland setups): cannot apply the failsafe
     }
     if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y)) return;
+    if (pos.estimated) return; // the driver could not read the real pointer (most Wayland compositors): the failsafe cannot apply
     const primary = displays.find((d) => d.primary) || displays[0];
     if (Math.abs(pos.x - primary.x) > FAILSAFE_RADIUS || Math.abs(pos.y - primary.y) > FAILSAFE_RADIUS) return;
     // Don't trip over our own move: only a pointer the user put there pauses us.
@@ -404,6 +407,8 @@ class Computer {
       let cursorLogical = null;
       try {
         cursorLogical = await this.driver.cursorPosition();
+        // A made-up position (Wayland) is not the user's cursor: leave it out of the metadata.
+        if (cursorLogical && cursorLogical.estimated) cursorLogical = null;
       } catch {
         cursorLogical = null;
       }
@@ -644,16 +649,19 @@ class Computer {
     const displays = await this._getDisplays();
     const pos = await this.driver.cursorPosition();
     const logical = { x: pos.x, y: pos.y };
+    // estimated: the driver could not read the pointer (Wayland) and reports where Claude last put it.
+    const est = pos.estimated === true ? { estimated: true } : {};
     const idx = displayAt(displays, pos.x, pos.y);
-    if (idx < 0) return { x: null, y: null, display: null, logical };
+    if (idx < 0) return { x: null, y: null, display: null, logical, ...est };
     const m = this._mapping(idx);
     const s = this.toShot(idx, pos.x, pos.y);
-    if (m.identity) return { ...s, display: idx, logical };
+    if (m.identity) return { ...s, display: idx, logical, ...est };
     return {
       x: Math.min(m.shotW - 1, Math.max(0, s.x)),
       y: Math.min(m.shotH - 1, Math.max(0, s.y)),
       display: idx,
       logical,
+      ...est,
     };
   }
 

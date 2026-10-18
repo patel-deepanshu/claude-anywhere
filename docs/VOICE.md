@@ -5,14 +5,15 @@
 The dialog picks a provider automatically (`voice.stt = auto`):
 
 1. **Browser speech** (Web Speech API) in Chrome, Edge and Safari. It needs no setup, shows a live transcript,
-   and the browser sends the audio to its vendor's speech service. It's not used inside Electron, where it
-   has no API key.
+   and the browser sends the audio to its vendor's speech service. It is unavailable inside Electron (Electron
+   has no key for that service), so the Electron window needs one of the server providers below; or use the
+   Chrome/Edge app window (`anywhere config set ui.host app`).
 2. **Server speech**: the dialog records 16 kHz WAV, stops on silence, and posts it to the daemon, which uses
    the first available of:
 
    | Provider | How to enable |
    |---|---|
-   | Custom OpenAI-compatible endpoint | `anywhere config set voice.sttBaseUrl https://host/v1`, plus `voice.sttApiKey` and `voice.sttModel`. Or set `ANYWHERE_STT_API_KEY`, `ANYWHERE_STT_BASE_URL` and `ANYWHERE_STT_MODEL`. |
+   | Custom OpenAI-compatible endpoint | `anywhere config set voice.sttBaseUrl https://host/v1`, plus `voice.sttApiKey` (if the server needs a key) and `voice.sttModel`. Or set `ANYWHERE_STT_BASE_URL`, plus `ANYWHERE_STT_API_KEY` and `ANYWHERE_STT_MODEL` as needed; a local server such as faster-whisper needs no key. `ANYWHERE_STT_API_KEY` alone uses Groq or OpenAI (by the key's form) with `ANYWHERE_STT_MODEL` if set. |
    | Groq (fast, cheap) | `export GROQ_API_KEY=…` (model `whisper-large-v3-turbo`) |
    | OpenAI | `export OPENAI_API_KEY=…` (model `gpt-4o-mini-transcribe`) |
    | whisper.cpp (fully local) | Install `whisper-cli` (e.g. `brew install whisper-cpp`) and put a `ggml-*.bin` model in `~/.claude-anywhere/models/`, or set `voice.whisperCppPath` and `voice.whisperModel`. |
@@ -21,7 +22,9 @@ If browser speech fails (offline, permission denied, or a browser without the AP
 server speech when a provider is available. `voice.stt = server` forces server speech.
 
 Environment variables must be set in the environment the **daemon** starts in. Restart it with
-`anywhere restart` after changing them.
+`anywhere restart` after changing them (where `anywhere` is not on your PATH, run
+`node <install dir>/bin/anywhere.js restart`; `/anywhere doctor` prints the exact command, and
+`anywhere install` links `~/.local/bin/anywhere` on macOS, Linux and WSL).
 
 ## Talking to the dialog
 

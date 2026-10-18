@@ -573,6 +573,12 @@ class PsHost {
       log.debug(`ignoring host response for id ${JSON.stringify(msg.id)}`);
       return;
     }
+    // A late answer to a timed-out job comes from a host that is being killed: keep the job in
+    // flight until _handleExit, so the queue moves on to a fresh host, not the dying one.
+    if (job.timedOut) {
+      log.debug(`ignoring late host response for id ${msg.id} ("${job.cmd}" timed out)`);
+      return;
+    }
     clearTimeout(job.timer);
     this._inflight = null;
     if (msg.ok) job.resolve(msg.result == null ? {} : msg.result);
@@ -604,6 +610,8 @@ class PsHost {
     const child = target || this._child;
     if (!child) return;
     log.debug(`stopping PowerShell host (${reason})`);
+    // Nothing more may be written to a host being killed; the next command starts a fresh one.
+    if (child === this._child) this._ready = false;
     try {
       child.stdin.end();
     } catch {

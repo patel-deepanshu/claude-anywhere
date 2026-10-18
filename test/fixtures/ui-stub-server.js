@@ -322,10 +322,13 @@ async function createStubServer(opts = {}) {
     questions: new Map(scenario.questions.map((q) => [q.id, q])),
     bridge: { listening: false },
     screenshot: scenario.messages.length ? { dataUrl: shotUrl, width: 480, height: 300, ts: ago(220000) } : null,
-    // What the dialog sent, for tests: command bodies (without images), approval decisions, interrupts.
+    // What the dialog sent, for tests: command bodies (without images), approval decisions,
+    // question answers, interrupts and config updates.
     commands: [],
     decisions: [],
+    answers: [],
     interrupts: 0,
+    configPosts: [],
   };
 
   const later = (ms, fn) => {
@@ -504,7 +507,8 @@ async function createStubServer(opts = {}) {
     'GET /api/state': () => snapshot(),
     'GET /api/events': ({ req, res }) => {
       res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'text/event-stream; charset=utf-8', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-      res.write(': connected\n\n');
+      // Like the daemon's hub: the browser retries a dropped stream every 2 s.
+      res.write(': connected\nretry: 2000\n\n');
       clients.add(res);
       send(res, 'snapshot', snapshot());
       if (stream && opts.scenario !== 'empty' && !st.introPlayed) {
@@ -557,6 +561,7 @@ async function createStubServer(opts = {}) {
     'POST /api/answer': ({ body }) => {
       if (!st.questions.has(body.id)) throw fail(404, 'No pending question with that id (it may have timed out or been cancelled)');
       st.questions.delete(body.id);
+      st.answers.push({ id: body.id, text: String(body.text || '') });
       broadcast('question_resolved', { id: body.id, answer: String(body.text || '') });
       setStatus(st.approvals.size ? 'waiting_approval' : 'thinking', st.approvals.size ? 'Waiting for your approval' : '');
       return { ok: true };
@@ -594,6 +599,7 @@ async function createStubServer(opts = {}) {
         if (!partial.voice.sttApiKey) delete partial.voice.sttApiKey;
       }
       for (const k of Object.keys(partial)) if (!(k in DEFAULT_CONFIG)) throw fail(400, `Unknown setting "${k}"`);
+      st.configPosts.push(JSON.parse(JSON.stringify(body)));
       st.config = deepMerge(st.config, partial);
       const pub = publicConfig(st.config);
       broadcast('config', pub);

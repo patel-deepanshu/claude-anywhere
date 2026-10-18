@@ -6,6 +6,7 @@
  *
  * Backends are loaded lazily so a broken or missing backend degrades to an
  * "unsupported" driver (with the load error in its hint) instead of crashing.
+ * A start-up failure a retry may fix (a timed-out PowerShell host) is not cached.
  */
 
 const platform = require('../shared/platform');
@@ -322,7 +323,17 @@ function createMockDriver(opts = {}) {
 
 // ---------------------------------------------------------------- selection
 
+// Start-up failures that a later attempt may not repeat: a first PowerShell start slowed by
+// antivirus (TIMEOUT), a host that exited while its files were locked (HOST_EXITED), or a host
+// that kept exiting for a while (HOST_CRASH_LOOP). They reject instead of becoming a cached
+// unsupported driver, so callers can try again.
+const TRANSIENT_LOAD_CODES = new Set(['TIMEOUT', 'HOST_EXITED', 'HOST_CRASH_LOOP']);
+// How long a transient failure is reused before getDriver() tries to load the driver again,
+// so a burst of actions does not start a new host each.
+const LOAD_RETRY_MS = 5000;
+
 let driverPromise = null;
+let driverRetryAt = 0;
 
 async function loadDriver() {
   const sel = selectBackend();
@@ -338,6 +349,14 @@ async function loadDriver() {
     return driver;
   } catch (err) {
     log.warn(`the ${sel.backend} desktop driver failed to load:`, err && err.message);
+    if (err && TRANSIENT_LOAD_CODES.has(err.code)) {
+      const e = new Error(`the ${sel.backend} desktop driver did not start (${err.message}); it is started again on a later action`);
+      e.code = err.code;
+      e.hint = err.hint || 'Run "anywhere doctor" to check the required system tools.';
+      e.transient = true;
+      e.cause = err;
+      throw e;
+    }
     const extra = err && err.hint ? ` ${err.hint}` : '';
     return createUnsupportedDriver({
       reason: `the ${sel.backend} driver failed to load (${err && err.message})`,
@@ -347,11 +366,24 @@ async function loadDriver() {
 }
 
 /**
- * The desktop driver for this machine (cached singleton).
+ * The desktop driver for this machine (cached singleton). Rejects (err.transient)
+ * when the backend failed to start in a way a retry may fix; the next call after
+ * LOAD_RETRY_MS loads it again. Permanent failures resolve to an unsupported driver.
  * @returns {Promise<object>} Driver
  */
 function getDriver() {
-  if (!driverPromise) driverPromise = loadDriver();
+  if (driverPromise && driverRetryAt && Date.now() >= driverRetryAt) {
+    driverPromise = null;
+    driverRetryAt = 0;
+  }
+  if (!driverPromise) {
+    const p = loadDriver();
+    driverPromise = p;
+    driverRetryAt = 0;
+    p.catch(() => {
+      if (driverPromise === p) driverRetryAt = Date.now() + LOAD_RETRY_MS;
+    });
+  }
   return driverPromise;
 }
 
@@ -362,6 +394,7 @@ function getDriver() {
 function resetDriver() {
   const prev = driverPromise;
   driverPromise = null;
+  driverRetryAt = 0;
   if (!prev) return Promise.resolve();
   return prev
     .then((d) => (d && typeof d.close === 'function' ? d.close() : undefined))
@@ -377,4 +410,5 @@ module.exports = {
   createUnsupportedDriver,
   unsupportedError,
   DRIVER_METHODS,
+  LOAD_RETRY_MS,
 };

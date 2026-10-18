@@ -17,7 +17,17 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         node: [18, 22]
     steps:
+      # Keep the runner's git defaults: windows-latest, like a default Git for Windows install,
+      # has core.autocrlf=true, so this checkout gets the same line endings as users' clones and
+      # plugin installs. .gitattributes must pin LF for shell scripts (Git Bash runs bin/anywhere)
+      # and CRLF for .cmd; test/shared-docs-round2.test.js fails if a checkout gets that wrong.
       - uses: actions/checkout@v4
+      - name: Line endings as checked out
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git config --show-origin --get core.autocrlf || echo "core.autocrlf is not set"
+          git ls-files --eol bin/anywhere bin/anywhere.cmd scripts/install.sh skills/anywhere/SKILL.md
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}

@@ -145,16 +145,18 @@ test('openTarget on Linux: gio fallback, missing tools and failures', async (t) 
 test('openTarget on macOS uses open / open -a', async (t) => {
   const calls = fake(t, {
     platform: 'darwin',
-    exists: (p) => p === '/Applications/Visual Studio Code.app',
+    exists: (p) => p === '/Applications/Visual Studio Code.app' || p === '/repo',
     run: (cmd, args) => (args.includes('Nope') ? { code: 1, stderr: "Unable to find application named 'Nope'" } : {}),
   });
   assert.deepEqual(await common.openTarget('https://example.com'), { opened: true, kind: 'url', how: 'open', target: 'https://example.com' });
   assert.deepEqual(calls.run[0], { cmd: 'open', args: ['https://example.com'], opts: calls.run[0].opts });
+  // Chromium browsers: a new instance hands its command line to the user's own browser instance.
   const r = await common.openTarget('Google Chrome', { args: ['--new-window', 'https://a.b'] });
-  assert.deepEqual([r.kind, r.how], ['app', 'open -a']);
-  assert.deepEqual(calls.run[1].args, ['-a', 'Google Chrome', '--args', '--new-window', 'https://a.b']);
+  assert.deepEqual([r.kind, r.how], ['app', 'open -n -a']);
+  assert.deepEqual(calls.run[1].args, ['-n', '-a', 'Google Chrome', '--args', '--new-window', 'https://a.b']);
+  // Existing files are documents: handed over positionally, so a running app gets them too.
   await common.openTarget('/Applications/Visual Studio Code.app', { args: ['/repo'] });
-  assert.deepEqual(calls.run[2].args, ['-a', '/Applications/Visual Studio Code.app', '--args', '/repo']);
+  assert.deepEqual(calls.run[2].args, ['-a', '/Applications/Visual Studio Code.app', '/repo']);
   await assert.rejects(common.openTarget('Nope', { kind: 'app' }), (e) => e.code === 'NOT_FOUND' && /mdfind/.test(e.hint));
 });
 

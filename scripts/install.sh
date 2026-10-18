@@ -96,7 +96,14 @@ main() {
   check_requirements
   fetch_app
   step "Installing the /anywhere skill and MCP tools"
-  node "$APP_DIR/bin/anywhere.js" install "$@"
+  # link_cli below makes the 'anywhere' link (honouring ANYWHERE_BIN_DIR), so the installer skips it.
+  # Under `curl | bash` stdin is the script itself: give the installer the terminal, so it can
+  # show the macOS permission prompts (it skips them without one).
+  if [ -r /dev/tty ] && (exec </dev/tty) 2>/dev/null; then
+    ANYWHERE_NO_LINK=1 node "$APP_DIR/bin/anywhere.js" install "$@" </dev/tty
+  else
+    ANYWHERE_NO_LINK=1 node "$APP_DIR/bin/anywhere.js" install "$@"
+  fi
   link_cli
   say ""
   say "Done. Restart Claude Code, then type /anywhere in any project."

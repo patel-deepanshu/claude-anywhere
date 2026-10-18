@@ -125,9 +125,12 @@ test('toMacKeyCodes: layout-dependent keys carry the character to resolve agains
   assert.deepEqual(keys.toMacKeyCodes(['meta', 'z']).chars, ['z']);
   assert.deepEqual(keys.toMacKeyCodes(['meta', ',']).chars, [',']);
   assert.deepEqual(keys.toMacKeyCodes(['meta', '1']).chars, ['1']);
-  // Shifted punctuation resolves the unshifted character and keeps Shift in the flags.
+  // Shifted punctuation carries the real target character ('?' is not on the "/" key on every
+  // layout; Cmd++ on German is the unshifted "+" key). The US key code and Shift stay as the fallback.
   const q = keys.toMacKeyCodes(['meta', '?']);
-  assert.deepEqual([q.chars, q.keyCodes, q.flags], [['/'], [0x2c], 0x100000 | 0x20000]);
+  assert.deepEqual([q.chars, q.keyCodes, q.flags], [['?'], [0x2c], 0x100000 | 0x20000]);
+  const plus = keys.toMacKeyCodes(['meta', '+']);
+  assert.deepEqual([plus.chars, plus.keyCodes, plus.flags], [['+'], [0x18], 0x100000 | 0x20000]);
   // Position-independent keys keep their fixed codes.
   for (const k of ['enter', 'tab', 'space', 'escape', 'backspace', 'delete', 'left', 'up', 'home', 'pageup', 'f5']) {
     assert.deepEqual(keys.toMacKeyCodes([k]).chars, [null], k);

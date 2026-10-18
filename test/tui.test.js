@@ -466,7 +466,7 @@ test('TUI: send errors are reported; daemon echo of piped input is printed', asy
 });
 
 test('TUI: piped input waits for the result before exiting', async () => {
-  const { client, input, cap, done } = await startTui();
+  const { client, input, cap, done } = await startTui({ deps: { idleQuitMs: 200 } });
   client.emit('snapshot', SNAPSHOT);
   input.end('open the GCP console\n');
   await tick(30);
@@ -478,6 +478,8 @@ test('TUI: piped input waits for the result before exiting', async () => {
   assert.equal(finished, false, 'still waiting for the result');
   client.emit('status', { status: 'thinking' });
   client.emit('result', { costUsd: 0.02, numTurns: 1 });
+  // LIFECYCLE-10: the daemon going idle ends it, not the result count.
+  client.emit('status', { status: 'idle' });
   await done;
   assert.match(cap.text, /✓ Done/);
 });

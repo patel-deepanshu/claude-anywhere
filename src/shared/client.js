@@ -32,6 +32,7 @@ class DaemonClient {
     this.token = token;
     this.fromState = Boolean(fromState);
     this.refreshing = null;
+    this.replacedBy = null; // the daemon refresh() last switched to
   }
 
   /** Connect via env (ANYWHERE_DAEMON_URL + ANYWHERE_TOKEN) or daemon.json. */
@@ -63,10 +64,27 @@ class DaemonClient {
           if (baseUrl === this.baseUrl && st.token === this.token) return null;
           this.baseUrl = baseUrl;
           this.token = st.token;
-          return { pid: st.pid || null, port: st.port, instanceId: st.instanceId || null };
+          this.replacedBy = { pid: st.pid || null, port: st.port, instanceId: st.instanceId || null };
+          return this.replacedBy;
         });
     }
     return this.refreshing;
+  }
+
+  /**
+   * After a call sent to `target` (a target() value) failed: the daemon to switch to, if any.
+   * Another call may already have switched; otherwise daemon.json is read again.
+   * @private
+   */
+  async movedSince(target) {
+    if (!this.fromState) return null;
+    if (this.target() !== target) return this.replacedBy || {};
+    return this.refresh();
+  }
+
+  /** @private where calls go now: base URL and token */
+  target() {
+    return `${this.baseUrl} ${this.token}`;
   }
 
   headers(extra = {}) {
@@ -126,16 +144,16 @@ class DaemonClient {
    * @returns {Promise<{status:number, text:string}>}
    */
   async send(method, path, payload, extraHeaders, opts) {
+    const sentTo = this.target();
+    const attempt = () => this.raw(method, path, payload, this.headers(extraHeaders), opts);
     let res;
     try {
-      res = await this.raw(method, path, payload, this.headers(extraHeaders), opts);
+      res = await attempt();
     } catch (err) {
-      if (!this.fromState || !connectionRefused(err) || !(await this.refresh())) throw err;
-      return this.raw(method, path, payload, this.headers(extraHeaders), opts);
+      if (!connectionRefused(err) || !(await this.movedSince(sentTo))) throw err;
+      return attempt();
     }
-    if (res.status === 401 && this.fromState && (await this.refresh())) {
-      return this.raw(method, path, payload, this.headers(extraHeaders), opts);
-    }
+    if (res.status === 401 && (await this.movedSince(sentTo))) return attempt();
     return res;
   }
 
@@ -204,6 +222,7 @@ class DaemonClient {
     const loop = async () => {
       while (!closed) {
         ctrl = new AbortController();
+        const sentTo = this.target();
         try {
           const res = await fetch(`${this.baseUrl}/api/events?token=${encodeURIComponent(this.token)}`, {
             headers: { Accept: 'text/event-stream' },
@@ -248,7 +267,7 @@ class DaemonClient {
         } catch {
           /* ignore */
         }
-        const moved = await this.refresh();
+        const moved = await this.movedSince(sentTo);
         if (closed) return;
         if (moved) {
           try {

@@ -319,6 +319,24 @@ function buildTtsCommand(tts, text, { rate = 1, voice = '', language = '' } = {}
   }
 }
 
+// Engines that fail on a voice they do not have (SAPI ignores it, spd-say falls back itself).
+const VOICE_CHECKED_ENGINES = new Set(['say', 'espeak-ng', 'espeak']);
+// Voices that exist only in a browser (Chrome's "Google …", Edge's "… Online (Natural)").
+const BROWSER_ONLY_VOICE = /^Google\b|\bOnline\b|\(online\)|\(Natural\)/i;
+
+/**
+ * `say -v ?` lines: "Alex                en_US    # Most people recognize me by my voice.".
+ * @returns {{name:string, locale:string}[]}
+ */
+function parseSayVoices(stdout) {
+  const out = [];
+  for (const line of String(stdout || '').split('\n')) {
+    const m = /^(.+?)\s+([a-z]{2,3}[_-][A-Za-z0-9]+)\s+#/.exec(line);
+    if (m) out.push({ name: m[1].trim(), locale: m[2] });
+  }
+  return out;
+}
+
 /**
  * Server speech-to-text and text-to-speech for the dialog (POST /api/stt, /api/tts).
  * The runner, fetch, env, which and platformInfo can be injected for tests.
@@ -340,6 +358,7 @@ class VoiceService {
     this.modelsDirOverride = modelsDir || null;
     this.cache = null;
     this.whisperProbe = new Map();
+    this.localVoices = null; // `say -v ?`, read once when a voice must be replaced
     this.current = null;
     this.sttTimeoutMs = STT_TIMEOUT_MS;
   }
@@ -450,11 +469,13 @@ class VoiceService {
 
     // auto
     if (v.sttBaseUrl) return custom(v.sttApiKey || env.ANYWHERE_STT_API_KEY, v.sttBaseUrl);
+    // A local OpenAI-compatible server (faster-whisper, whisper.cpp server) may need no key.
+    if (env.ANYWHERE_STT_BASE_URL) return custom(v.sttApiKey || env.ANYWHERE_STT_API_KEY, env.ANYWHERE_STT_BASE_URL);
     if (v.sttApiKey) return known(infer(v.sttApiKey), v.sttApiKey);
     if (env.ANYWHERE_STT_API_KEY) {
-      return env.ANYWHERE_STT_BASE_URL
-        ? custom(env.ANYWHERE_STT_API_KEY, env.ANYWHERE_STT_BASE_URL)
-        : known(infer(env.ANYWHERE_STT_API_KEY), env.ANYWHERE_STT_API_KEY);
+      const name = infer(env.ANYWHERE_STT_API_KEY);
+      // ANYWHERE_STT_MODEL goes with ANYWHERE_STT_API_KEY (not with GROQ_/OPENAI_API_KEY).
+      return { ...known(name, env.ANYWHERE_STT_API_KEY), model: v.sttModel || env.ANYWHERE_STT_MODEL || HTTP_PROVIDERS[name].model };
     }
     if (env.GROQ_API_KEY) return known('groq', env.GROQ_API_KEY);
     if (env.OPENAI_API_KEY) return known('openai', env.OPENAI_API_KEY);
@@ -766,11 +787,14 @@ class VoiceService {
     if (!clean) return { ok: false, provider: null, error: 'Nothing to speak' };
     const { tts } = await this.resolveAll();
     if (!tts.name) throw voiceError(503, 'No text-to-speech engine was found', tts.hint);
-    const cmd = buildTtsCommand(tts, clean, {
-      rate: rate != null ? rate : v.ttsRate,
-      voice: voice || v.ttsVoice || '',
-      language: v.language,
-    });
+    const ttsRate = rate != null ? rate : v.ttsRate;
+    let ttsVoice = voice || v.ttsVoice || '';
+    // The dialog's voice list is the browser's: "Google US English" or an "Online" voice exists
+    // only there, and say/espeak-ng fail on it (MACOS-2-9). Use a local voice for the language.
+    if (ttsVoice && VOICE_CHECKED_ENGINES.has(tts.name) && BROWSER_ONLY_VOICE.test(ttsVoice)) {
+      ttsVoice = await this.localVoiceFor(tts, v.language);
+    }
+    let cmd = buildTtsCommand(tts, clean, { rate: ttsRate, voice: ttsVoice, language: v.language });
     this.stop();
     const ac = new AbortController();
     const current = { ac, tts, winPid: null };
@@ -788,6 +812,24 @@ class VoiceService {
     let r;
     try {
       r = await this.runner(cmd.cmd, cmd.args, { input: cmd.input, timeoutMs: SPEAK_TIMEOUT_MS, signal: ac.signal, onStdout });
+      // An unknown voice (say: "Voice `X' not found", espeak-ng: "does not exist"): speak with the
+      // language's local voice, or the default, rather than lose the announcement.
+      if (
+        r &&
+        !r.error &&
+        !r.aborted &&
+        !ac.signal.aborted &&
+        r.code !== 0 &&
+        ttsVoice &&
+        VOICE_CHECKED_ENGINES.has(tts.name) &&
+        /not found|does not exist|invalid voice|unknown voice/i.test(String(r.stderr || ''))
+      ) {
+        log.info(`${tts.name} has no voice "${ttsVoice}"; using ${tts.name === 'say' ? 'a local voice for the language' : 'the language default'}`);
+        const fallback = await this.localVoiceFor(tts, v.language);
+        ttsVoice = fallback && fallback !== ttsVoice ? fallback : '';
+        cmd = buildTtsCommand(tts, clean, { rate: ttsRate, voice: ttsVoice, language: v.language });
+        if (!ac.signal.aborted) r = await this.runner(cmd.cmd, cmd.args, { input: cmd.input, timeoutMs: SPEAK_TIMEOUT_MS, signal: ac.signal, onStdout });
+      }
     } finally {
       if (this.current === current) this.current = null;
     }
@@ -803,6 +845,28 @@ class VoiceService {
       throw voiceError(502, `${tts.name} failed (exit ${r.code}): ${tail(r.stderr) || 'no output'}`, hint);
     }
     return { ok: true, provider: tts.name };
+  }
+
+  /**
+   * A voice of this engine for the dialog's language: for say, the first installed voice whose
+   * locale matches (`say -v ?`, read once); '' for the engine's default (espeak-ng then picks the
+   * language with -v <lang>).
+   * @private
+   */
+  async localVoiceFor(tts, language) {
+    if (tts.name !== 'say') return '';
+    if (!this.localVoices) {
+      this.localVoices = Promise.resolve()
+        .then(() => this.runner(tts.bin, ['-v', '?'], { timeoutMs: 5000 }))
+        .then((r) => (r && r.code === 0 ? parseSayVoices(r.stdout) : []))
+        .catch(() => []);
+    }
+    const voices = await this.localVoices;
+    const want = String(language || '').trim().replace('-', '_').toLowerCase();
+    const lang = languageCode(language);
+    const exact = voices.find((x) => x.locale.toLowerCase() === want);
+    const sameLang = voices.find((x) => languageCode(x.locale) === lang);
+    return (exact || sameLang || { name: '' }).name;
   }
 
   /** @private */
@@ -843,6 +907,7 @@ class VoiceService {
 module.exports = {
   VoiceService,
   buildTtsCommand,
+  parseSayVoices,
   parseWavHeader,
   languageCode,
   audioFileName,

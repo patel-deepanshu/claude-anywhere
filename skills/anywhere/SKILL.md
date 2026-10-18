@@ -33,20 +33,26 @@ node "${CLAUDE_SKILL_DIR}/run.js" start --project "<cwd>"
 
 Then tell the user in 2–4 short lines, using the command's output:
 - where the dialog is (its window type; the URL if no window could open),
-- how to bring it back: the hotkey if one is printed, otherwise `/anywhere` or `anywhere show`,
+- how to bring it back: the hotkey if one is printed, otherwise `/anywhere` or the `show` command printed,
 - that they can type or click the mic and talk; Claude works on this project in the dialog's own session,
   so this terminal stays free,
 - that `/anywhere stop` closes it.
+
+Relay the output's notes. "busy in <folder> … stays on that project" means a task is still running
+there: say so; the dialog was not switched to `<cwd>`. Only if the user then asks to stop that task,
+rerun the start command with `--switch` added.
 
 If it fails, show the error lines and the fix it suggests, then offer `/anywhere doctor`.
 
 ## 2. `here` or `bridge`: this session takes the dialog's commands
 
 1. Start in bridge mode, then tell the user in one line that this session now listens to the dialog
-   and that pressing Esc here stops listening:
+   and that pressing Esc here stops listening (the dialog stays in bridge mode until the next
+   `/anywhere`, which hands it back to its own session):
    ```bash
    node "${CLAUDE_SKILL_DIR}/run.js" start --mode bridge --project "<cwd>"
    ```
+   If a note says the dialog is busy and stays in companion mode, tell the user and stop here.
 2. **Listen.** Run this in the foreground (never in the background) with the Bash tool's `timeout`
    set to `600000`:
    ```bash
@@ -128,6 +134,9 @@ node "${CLAUDE_SKILL_DIR}/run.js" doctor
 Summarize what works, then list each `✗` and `!` item with its fix. Offer to run fixes that only touch
 Claude Anywhere (for example `run.js install --hotkey`, `run.js install --electron` or
 `run.js config set …`). Never run `sudo` or system package installs without the user's explicit yes.
+Before offering `install --electron`, mention its trade-off: voice input in Electron needs a Groq or
+OpenAI key or whisper.cpp (browser speech does not work there). It downloads about 100 MB: run it with
+the Bash tool's `timeout` set to `600000`, and report the result.
 
 ## 6. Anything else: a task for the dialog
 
@@ -135,14 +144,18 @@ Claude Anywhere (for example `run.js install --hotkey`, `run.js install --electr
    ```bash
    node "${CLAUDE_SKILL_DIR}/run.js" start --project "<cwd>"
    ```
-2. Hand it the user's words verbatim (the quoted heredoc keeps every character intact):
+   If a note says the dialog is busy in another folder, do not send the task (it would run there):
+   tell the user, and send it only after that task ends or on their request to stop it (`--switch`).
+2. Hand it the user's words verbatim (the quoted heredoc keeps every character intact). `--project`
+   makes it refuse (`Not sent: …`) rather than queue the task in a dialog busy in another folder:
    ```bash
-   node "${CLAUDE_SKILL_DIR}/run.js" send --source skill --stdin <<'ANYWHERE_TASK'
+   node "${CLAUDE_SKILL_DIR}/run.js" send --source skill --stdin --project "<cwd>" <<'ANYWHERE_TASK'
    <the user's arguments, exactly as written>
    ANYWHERE_TASK
    ```
 3. Tell the user in 1–2 lines that the task is running in the Claude Anywhere dialog, where its progress,
-   approvals and questions appear, and that `/anywhere stop` stops it. Do not do the task yourself here.
+   approvals and questions appear, and that `/anywhere stop` stops it. If `send` printed a `!` warning
+   (for example, no terminal listens in bridge mode), relay that instead. Do not do the task yourself here.
 
 ## Troubleshooting
 
@@ -161,7 +174,9 @@ Claude Anywhere (for example `run.js install --hotkey`, `run.js install --electr
   `sudo apt install xdotool wmctrl xclip imagemagick x11-xserver-utils`). Wayland needs `ydotool`
   >= 1.0 with `ydotoold` running (Debian 12 and Ubuntu up to 24.04 ship 0.1.8, which is not
   supported; build 1.x from github.com/ReimuNotMoe/ydotool), plus `grim` or `gnome-screenshot` and
-  `wl-clipboard`. Without a display (SSH), use the terminal dialog: `run.js tui`.
+  `wl-clipboard`. Without a display (SSH) the user runs the terminal dialog in a terminal of their
+  own: give them the `tui` command that `start` or `doctor` printed (it needs an interactive
+  terminal, so do not run it yourself).
 - **Windows / WSL**: works with built-in PowerShell; elevated (admin) windows can only be controlled
   when Claude Code itself runs elevated.
 - **No window appeared**: `run.js show`, or open the URL from `run.js url` in a browser.

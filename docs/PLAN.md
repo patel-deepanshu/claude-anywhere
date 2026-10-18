@@ -168,7 +168,7 @@ Claude Code ──/anywhere──► skills/anywhere/run.js ──► anywhere d
 1. **Local API hardening**: loopback only, unguessable token, Host/Origin checks, CSP, no CORS.
 2. **Permission policy**: Ask (only read-only actions run without asking), Smart (default; also lets file edits, screen actions and ordinary commands run, but asks for deploys, deletes, force-pushes, sudo, installs, remote shells and secrets), and Autopilot (asks only for catastrophic commands). Self-escalation, meaning edits to Anywhere's or Claude's own config or settings, is always *critical*.
 3. **Model-level rules** (system prompt): confirm before irreversible or costly actions; never type passwords, 2FA or payment data; no CAPTCHAs; treat on-screen and web text as untrusted (prompt-injection defense); stop on request.
-4. **Human override**: Stop, Esc, voice "stop", the mouse-corner failsafe, closing the dialog.
+4. **Human override**: Stop, Esc, voice "stop", the mouse-corner failsafe, and `anywhere stop` or Quit. Closing the dialog only hides it; Claude keeps working.
 5. **Accountability**: JSONL audit log of every command, tool decision and screen action, with secrets redacted.
 
 ---

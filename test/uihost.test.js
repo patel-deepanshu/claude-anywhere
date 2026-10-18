@@ -109,6 +109,9 @@ function makeHost(overrides = {}) {
     earlyExitMs: overrides.earlyExitMs != null ? overrides.earlyExitMs : 80,
     topmostWaitMs: overrides.topmostWaitMs != null ? overrides.topmostWaitMs : 2000,
     browserWaitMs: 50,
+    // The start-up sweep of a previous run's dialog browsers has its own tests
+    // (uihost-shell-round2.test.js); here it would consume the fake ps output.
+    cleanupLeftovers: overrides.cleanupLeftovers === true,
   });
 }
 

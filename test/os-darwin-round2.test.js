@@ -616,6 +616,8 @@ test('round 2: keys.js combos land on the right keys of each layout', () => {
   assert.deepEqual(combo(de(), ['@']), [[0x25, ALT]]);
   assert.deepEqual(combo(de(), ['meta', 'shift', '3']), [[0x14, CMD | SHIFT]]);
   assert.deepEqual(combo(de(), ['meta', 'z']), [[0x10, CMD]]);
+  // Cmd++ (zoom in) is Cmd and the German "+" key, not Cmd+Shift+0 (Cmd+=).
+  assert.deepEqual(combo(de(), ['meta', '+']), [[0x1e, CMD]]);
   const fr = () => world({ layers: AZERTY_LAYERS, tis: LAYOUT_TIS('com.apple.keylayout.French', true) });
   assert.deepEqual(combo(fr(), ['1']), [[0x12, SHIFT]]);
   assert.deepEqual(combo(fr(), ['meta', 'a']), [[0x0c, CMD]]);

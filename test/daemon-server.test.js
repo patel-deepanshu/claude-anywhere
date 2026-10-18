@@ -737,7 +737,11 @@ test('bridge reply after the switch to companion mode is refused with 409; quest
     assert.ok(Date.now() - s.bridge.lastPollAt < 1000);
     await ask;
 
-    await s.api('POST', '/api/mode', { mode: 'companion' });
+    // The terminal is still working on the command: the switch needs force (LIFECYCLE-4).
+    const refused = await s.api('POST', '/api/mode', { mode: 'companion' });
+    assert.equal(refused.status, 409);
+    assert.match(refused.json.error, /A task is running/);
+    assert.equal((await s.api('POST', '/api/mode', { mode: 'companion', force: true })).status, 200);
     const r = await s.api('POST', '/api/bridge/reply', { text: 'Done', final: true });
     assert.equal(r.status, 409);
     assert.match(r.json.error, /Bridge mode is off/);

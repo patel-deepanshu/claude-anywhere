@@ -490,7 +490,8 @@ test('switching to bridge mode while Claude Code starts: the command is dropped 
   try {
     await s.submit({ text: 'hello one' });
     await sleep(10);
-    const switching = s.setMode('bridge');
+    await assert.rejects(s.setMode('bridge'), (e) => e.status === 409, 'a busy dialog keeps its mode unless forced');
+    const switching = s.setMode('bridge', { force: true });
     g.release();
     await switching;
     await s.drain();
@@ -510,7 +511,7 @@ test('switching to bridge mode while Claude Code starts: the command is dropped 
     s.config.context.attachDesktopContext = true;
     await s.submit({ text: 'second' });
     await sleep(10);
-    await s.setMode('bridge');
+    await s.setMode('bridge', { force: true });
     ctx.release();
     await s.drain();
     await sleep(20);

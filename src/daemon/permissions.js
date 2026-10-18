@@ -424,6 +424,7 @@ function splitDetailed(command, shell = 'bash') {
         }
         if (shell === 'powershell' && !part.text.trim()) {
           // the call operator: & "C:\path\tool.exe" args
+          part.callOp = true;
           i += 1;
           continue;
         }
@@ -827,6 +828,8 @@ function classifyContext(opts = {}) {
     claudeReal: claudeHome && real ? realish(claudeHome) : claudeHome,
     tmpDir: opts.tmpDir || (platform === process.platform ? os.tmpdir() : null),
     real,
+    // The app of the focused window (type_text), when the broker could tell; null when unknown.
+    focusedApp: typeof opts.focusedApp === 'string' && opts.focusedApp.trim() ? opts.focusedApp.trim() : null,
     shell: 'bash',
     cwd: projectDir,
     depth: 0,
@@ -854,6 +857,84 @@ function realish(p) {
 const NULL_DEVICE_RE = /^(\/dev\/(null|zero|stdout|stderr|stdin|tty|fd\/\d+)|nul:?|\$null|con:?)$/i;
 const DISK_DEVICE_RE =
   /^(\/dev\/(sd[a-z]|hd[a-z]|nvme\d|mmcblk\d|xvd[a-z]|vd[a-z]|disk\d|rdisk\d|md\d|dm-\d|mapper\/|loop\d|sr\d)|\\\\\.\\(physicaldrive\d|[a-z]:))/i;
+
+/**
+ * The plain form of a Windows path written through an alias Win32 accepts (WINDOWS-2-2):
+ * `\\?\C:\x` and `\\.\C:\x` are `C:\x`, `\\?\UNC\h\s` is `\\h\s`, the loopback admin share
+ * `\\localhost\C$\x` is `C:\x`, and trailing dots and spaces of a component are dropped (Win32
+ * strips them). null when it cannot be known: other device paths (`\\?\GLOBALROOT`, volume GUIDs,
+ * pipes) and alternate data streams (`file:stream`).
+ * @param {string} s a path with backslashes
+ * @returns {string|null}
+ */
+function win32Canonical(s) {
+  let p = s;
+  const dev = /^\\\\[?.]\\(.*)$/.exec(p);
+  if (dev) {
+    const rest = dev[1];
+    if (/^[a-zA-Z]:(\\|$)/.test(rest)) p = rest;
+    else if (/^unc\\/i.test(rest)) p = `\\\\${rest.slice(4)}`;
+    else return null;
+  }
+  const loop = /^\\\\([^\\]+)\\([a-zA-Z])\$(\\.*)?$/.exec(p);
+  if (loop) {
+    const host = loop[1].toLowerCase().replace(/^\[|\]$/g, '');
+    let self = false;
+    try {
+      self = process.platform === 'win32' && host === os.hostname().toLowerCase();
+    } catch {
+      self = false;
+    }
+    if (host === 'localhost' || host === '::1' || /^127\.\d+\.\d+\.\d+$/.test(host) || host === '0:0:0:0:0:0:0:1' || self) {
+      p = `${loop[2].toUpperCase()}:${loop[3] || '\\'}`;
+    }
+  }
+  // An alternate data stream (a ":" after the drive) names data the path checks cannot see.
+  if (/:/.test(p.replace(/^[a-zA-Z]:/, ''))) return null;
+  const head = /^([a-zA-Z]:\\?|\\\\[^\\]+\\[^\\]+\\?)/.exec(p);
+  const prefix = head ? head[0] : '';
+  const parts = p
+    .slice(prefix.length)
+    .split('\\')
+    .map((c) => (c === '.' || c === '..' ? c : c.replace(/[. ]+$/, '')));
+  return prefix + parts.join('\\');
+}
+
+/**
+ * A credential folder named in a path that could not be resolved ($VAR, %VAR%, a device path):
+ * judged by its segments alone, wherever the home folder is.
+ */
+function credentialSegments(raw) {
+  const segs = String(raw || '')
+    .toLowerCase()
+    .split(/[\\/]+/)
+    .map((x) => x.replace(/[. ]+$/, '') || x);
+  for (let i = 0; i < segs.length; i += 1) {
+    const sg = segs[i];
+    if (sg === '.ssh') return { what: 'your SSH keys and config', env: false };
+    if (sg === '.aws') return { what: 'your AWS credentials', env: false };
+    if (sg === '.azure') return { what: 'your Azure credentials', env: false };
+    if (sg === '.kube') return { what: 'your Kubernetes credentials', env: false };
+    if (sg === '.gnupg' || sg === '.password-store') return { what: 'your GPG keys or password store', env: false };
+    if (sg === '.config' && (segs[i + 1] === 'gcloud' || segs[i + 1] === 'gh')) return { what: 'CLI login tokens', env: false };
+  }
+  return null;
+}
+
+/**
+ * credentialKind for a path being read: the path as written, where it really points (symlinks,
+ * 8.3 short names on Windows), and, when it cannot be resolved, its folder names.
+ */
+function readCredentialKind(raw, ctx, cwd) {
+  const t = resolveTarget(raw, ctx, cwd);
+  if (!t) return credentialSegments(raw);
+  const cred = credentialKind(t, ctx);
+  if (cred || !ctx.real) return cred;
+  const real = realOf(t, ctx);
+  if (real === t.abs) return null;
+  const roots = { ...ctx, homeDir: ctx.homeReal ?? ctx.homeDir, anywhereHome: ctx.anywhereReal ?? ctx.anywhereHome };
+  return credentialKind({ ...t, abs: real }, roots);
+}
 
 /**
  * Resolve a path argument the way the shell would (~, $HOME, %USERPROFILE%,
@@ -896,12 +977,16 @@ function resolveTarget(raw, ctx, cwd) {
       break;
     }
   }
+  // NTFS: "file::$DATA" is the file itself (WINDOWS-2-2).
+  if ((W0 || /^([a-zA-Z]:|\\\\|\/\/)/.test(s)) && /::?\$DATA$/i.test(s)) s = s.replace(/::?\$DATA$/i, '');
   if (/\$[A-Za-z_{(]|%[A-Za-z_]+%|`|…/.test(s)) return null;
   if (W0 && /^\/[a-zA-Z](\/|$)/.test(s)) s = `${s[1].toUpperCase()}:\\${s.slice(3)}`;
   const W = W0 || /^[a-zA-Z]:([\\/]|$)/.test(s) || s.startsWith('\\\\');
   let abs;
   if (W) {
     s = s.replace(/\//g, '\\');
+    s = win32Canonical(s);
+    if (s == null) return null;
     if (/^[a-zA-Z]:$/.test(s)) s += '\\';
     if (/^([a-zA-Z]:\\|\\\\)/.test(s)) abs = path.win32.normalize(s);
     else {
@@ -1518,6 +1603,78 @@ const DOWNLOADERS = new Set([
 ]);
 const STDIN_EXECUTORS =
   /^(bash|sh|zsh|dash|ksh|mksh|fish|ash|python[0-9.]*|py|node|perl|ruby|php|pwsh|powershell|iex|invoke-expression|cmd|sudo|doas)$/;
+
+/**
+ * A pipeline stage that turns its input into text the classifier never sees: base64/xxd/openssl
+ * decoding, decompression, reversing. Fed to a shell, the script is uninspectable (SECURITY-ADVERSARIAL-1).
+ */
+function isDecoder(prog, args) {
+  const has = (re) => args.some((a) => re.test(a));
+  switch (prog) {
+    case 'base64':
+    case 'base32':
+    case 'basenc':
+    case 'gbase64':
+      return has(/^(-[a-ce-zA-CE-Z]*[dD][a-zA-Z]*|--decode)$/);
+    case 'xxd':
+      return has(/^(-r|-revert|-[a-z]*r[a-z]*)$/);
+    case 'openssl':
+      return has(/^-(d|base64|a)$/) && (has(/^-d$/) || args[0] === 'base64');
+    case 'gzip':
+    case 'bzip2':
+    case 'xz':
+    case 'lzma':
+    case 'zstd':
+    case 'lz4':
+    case 'brotli':
+      return has(/^(-[a-zA-Z]*d[a-zA-Z]*|--decompress|--uncompress)$/);
+    case 'gunzip':
+    case 'zcat':
+    case 'gzcat':
+    case 'bzcat':
+    case 'bunzip2':
+    case 'unxz':
+    case 'xzcat':
+    case 'lzcat':
+    case 'unlzma':
+    case 'zstdcat':
+    case 'unzstd':
+    case 'lz4cat':
+    case 'unlz4':
+    case 'uudecode':
+    case 'rev':
+    case 'certutil':
+      return prog !== 'certutil' || has(/^[-/]decode(hex)?$/i);
+    default:
+      return false;
+  }
+}
+
+/**
+ * A command whose program is only known at run time: `$X args`, `$(…) args`, `${X}`, a backtick
+ * substitution, cmd `%X%`/`!X!`, or PowerShell `& $x` / `& ([scriptblock]::Create(...))`.
+ * A variable directory with a literal program name ("$VENV/bin/python") is not computed.
+ */
+function computedCommandName(word, shell, tk) {
+  const w = String(word || '');
+  if (!w) return false;
+  if (shell === 'powershell') return Boolean(tk && tk.callOp) && (/^[$(]/.test(w) || /\[scriptblock\]::create/i.test(w));
+  const name = progName(w);
+  if (shell === 'cmd') return /%[^%\s]+%|![^!\s]+!/.test(name);
+  return /[$`…]/.test(name);
+}
+
+// `eval "$(...)"` / `source <(...)` generators that print shell setup code: common, and
+// trusted as much as running the tool itself.
+const EVAL_GENERATORS =
+  /^(ssh-agent( -[sc])?|(pyenv|rbenv|nodenv|goenv|jenv|plenv|phpenv|swiftenv|scalaenv|tfenv)( virtualenv-)? init( -| -[-\w]+)*|direnv (hook|export) \w+|brew shellenv|conda shell\.\w+ hook|fnm env( --[-\w=]+)*|starship init \w+|zoxide init \w+|mise (activate|hook-env)( \w+)*|rtx activate \w+|atuin init \w+|dircolors( -[bc])?( \S+)?|opam env( --[-\w=]+)*|keychain( --?[-\w]+)*( \S+)*|(kubectl|helm|gh|docker|minikube|kind|npm|pip|rustup|poetry|deno|bun|uv|glab|flux|argocd|k9s|stern|terraform|gcloud|az) completion( \w+)*)$/;
+
+function isEvalGenerator(text) {
+  const words = String(text || '').trim().split(/\s+/);
+  if (!words[0]) return false;
+  words[0] = progName(words[0]);
+  return EVAL_GENERATORS.test(words.join(' '));
+}
 const NETWORK_PROGS = new Set([
   'curl',
   'wget',
@@ -2086,6 +2243,27 @@ const GIT_READ_ONLY_SUBS = new Set([
   'archive',
 ]);
 
+// git config keys whose value is run as a command (or loads more config that can be): setting one
+// in the repository config runs it on later, ordinary git commands (SECURITY-ADVERSARIAL-5).
+const GIT_EXEC_CONFIG_KEY =
+  /^(core\.(hookspath|fsmonitor|pager|editor|sshcommand|askpass|gitproxy)|sequence\.editor|pager\.[^.]+|credential\.(helper|[^\n]+\.helper)|diff\.(external|[^.]+\.(command|textconv))|difftool\.[^.]+\.cmd|mergetool\.[^.]+\.cmd|merge\.[^.]+\.driver|filter\.[^.]+\.(clean|smudge|process)|gpg\.(program|[^.]+\.program)|uploadpack\.packobjectshook|remote\.[^\n]+\.(uploadpack|receivepack)|protocol\.[^\n]*allow|include\.path|includeif\.[^\n]+\.path|web\.browser|browser\.[^.]+\.(cmd|path)|man\.[^.]+\.(cmd|path)|alias\.[^.]+|init\.templatedir)$/i;
+
+/** The key a `git config` write sets (after its options and the set/unset/add subcommand), else null. */
+function gitConfigKey(rest) {
+  const VALUE_OPTS = /^(--file|-f|--blob|--type|--default|--comment|--value|--fixed-value)$/;
+  for (let i = 0; i < rest.length; i += 1) {
+    const a = rest[i];
+    if (VALUE_OPTS.test(a)) {
+      i += 1;
+      continue;
+    }
+    if (a.startsWith('-')) continue;
+    if (/^(set|unset|add|replace-all|rename-section|remove-section)$/.test(a)) continue;
+    return a.toLowerCase();
+  }
+  return null;
+}
+
 /** Options that make an otherwise read-only git subcommand run a command or write recovered objects. */
 function gitExecOptionVerdict(sub, rest) {
   const has = (...names) => rest.some((a) => names.includes(a));
@@ -2205,6 +2383,19 @@ function classifyGit(args, ctx) {
       return done(V('low', 'Reads git config'));
     }
     if (rest.includes('--global') || rest.includes('--system')) return done(V('high', 'Changes global git configuration'));
+    // --file names the config file written: ~/.gitconfig or .git/config by another name.
+    const fi = rest.findIndex((a) => a === '--file' || a === '-f' || a.startsWith('--file='));
+    const file = fi === -1 ? null : rest[fi].startsWith('--file=') ? rest[fi].slice(7) : rest[fi + 1];
+    if (file) {
+      const tv = targetVerdict(file, ctx, 'Writes git config to');
+      if (tv) return done(maxVerdict(tv, V('high', 'Changes a git config file outside the repository')));
+    }
+    const key = gitConfigKey(rest);
+    const unsetting = rest.some((a) => /^(--unset|--unset-all|unset)$/.test(a));
+    // An alias runs a command only when its value starts with "!".
+    if (key && !unsetting && GIT_EXEC_CONFIG_KEY.test(key) && (!key.startsWith('alias.') || rest.some((a) => a.startsWith('!')))) {
+      return done(V('high', `Sets the git config key ${key}, which can run commands`));
+    }
     return done(V('medium', 'Changes repository git config'));
   }
   if (sub === 'remote') {
@@ -2766,6 +2957,41 @@ function writeTargets(p, args, tk) {
   return out.filter((x) => x != null && x !== '');
 }
 
+// cmd.exe builtins (and xcopy/robocopy) that write files. Their switches are /x, never -x.
+const CMD_WRITERS = new Set(['copy', 'xcopy', 'robocopy', 'move', 'ren', 'rename', 'md', 'mkdir']);
+
+/**
+ * Paths a cmd.exe builtin writes, as raw strings: copy/move write their last path (copy's
+ * destination defaults to the current folder), xcopy and robocopy their second, ren the file it
+ * renames, md every folder. `/y`-style switches are dropped first.
+ */
+function cmdWriteTargets(p, args, tk) {
+  const out = [];
+  for (const r of tk.redirects) if (r.write && r.target) out.push(r.target);
+  const pos = args.filter((a) => a && !/^\/[A-Za-z0-9?-]+(:\S*)?$/.test(a) && a !== '+');
+  switch (p) {
+    case 'copy':
+    case 'move':
+      if (pos.length >= 2) out.push(pos[pos.length - 1]);
+      break;
+    case 'xcopy':
+    case 'robocopy':
+      if (pos.length >= 2) out.push(pos[1]);
+      break;
+    case 'ren':
+    case 'rename':
+      if (pos.length) out.push(pos[0]);
+      break;
+    case 'md':
+    case 'mkdir':
+      out.push(...pos);
+      break;
+    default:
+      break;
+  }
+  return out.filter((x) => x != null && x !== '');
+}
+
 /**
  * Check a written path: device, self-escalation, sensitive, outside project.
  * @returns {{risk:string, reason:string}|null}
@@ -2807,7 +3033,10 @@ function classifyArgv(u, tk, ctx, raw) {
   if (ctx.shell === 'cmd' && ['rd', 'rmdir', 'del', 'erase'].includes(prog))
     prog = `cmd-${prog === 'erase' ? 'del' : prog === 'rmdir' ? 'rd' : prog}`;
   const args = argv.slice(1);
-  let v = baseVerdict(prog, args, u, tk, ctx, raw);
+  const computed = computedCommandName(argv[0], ctx.shell, tk);
+  let v = computed
+    ? { ...V('high', `Runs a command whose name is only known at run time (${truncate(argv[0], 40)})`), stdinExecutor: true }
+    : baseVerdict(prog, args, u, tk, ctx, raw);
   const extra = { stdinExecutor: false, downloader: DOWNLOADERS.has(prog), cwd: undefined };
   if (v && v.stdinExecutor) extra.stdinExecutor = true;
   if (v && v.cwd !== undefined) extra.cwd = v.cwd;
@@ -2829,7 +3058,8 @@ function classifyArgv(u, tk, ctx, raw) {
   // prog is already PowerShell-aliased when the shell is PowerShell; using psProg here would
   // wrongly alias bash programs too (e.g. `sort` → `sort-object`), hiding their output files.
   const targetProg = prog.startsWith('cmd-') ? prog.slice(4) : prog;
-  const writes = writeTargets(targetProg, args, tk);
+  // cmd.exe's copy/move/ren/md take /switches and write their own targets (REGRESSIONS-1).
+  const writes = ctx.shell === 'cmd' && CMD_WRITERS.has(prog) ? cmdWriteTargets(prog, args, tk) : writeTargets(targetProg, args, tk);
   for (const target of writes) {
     v = maxVerdict(v, targetVerdict(target, ctx, verb));
   }
@@ -2853,7 +3083,8 @@ function classifyArgv(u, tk, ctx, raw) {
       PS_HOSTS.test(prog) ||
       /^(sed|awk|gawk|ed|ex|vi|vim|nvim|nano|emacs|sponge|xargs|cp|mv|ln|install|tee|truncate|rm|uniq|xxd|tree|base64|sort|shuf|iconv|set-content|add-content|out-file|copy-item|move-item|remove-item|new-item)$/.test(
         prog,
-      ))
+      ) ||
+      (ctx.shell === 'cmd' && CMD_WRITERS.has(prog)))
   ) {
     v = maxVerdict(v, V('critical', 'Modifies Claude Code or Claude Anywhere settings (self-escalation)'));
   }
@@ -2881,8 +3112,7 @@ function classifyArgv(u, tk, ctx, raw) {
   ) {
     for (const a of args) {
       if (a.startsWith('-')) continue;
-      const t = resolveTarget(a, ctx, ctx.cwd);
-      const cred = t && credentialKind(t, ctx);
+      const cred = readCredentialKind(a, ctx, ctx.cwd);
       if (cred && !cred.env) {
         v = maxVerdict(v, V('high', `Reads ${cred.what}`));
         break;
@@ -3322,12 +3552,35 @@ function baseVerdict(prog, args, u, tk, ctx, raw) {
   }
   if (prog === 'cmd') {
     const ci = args.findIndex((a) => /^\/[ck]$/i.test(a));
-    if (ci !== -1) return recurse(args.slice(ci + 1).join(' '), 'cmd', ctx);
+    if (ci !== -1) {
+      // `cmd /c "copy a b"` passes one command line; `cmd /c copy a "C:\Start Menu\x"` passes
+      // words, and a word with spaces must stay one path.
+      const rest = args.slice(ci + 1);
+      const line = rest.length === 1 ? rest[0] : rest.map((a) => (/\s/.test(a) && !/"/.test(a) ? `"${a}"` : a)).join(' ');
+      return recurse(line, 'cmd', ctx);
+    }
     return { ...V('medium', 'Starts cmd.exe'), stdinExecutor: true };
   }
-  if (prog === 'eval') return recurse(args.join(' '), ctx.shell === 'powershell' ? 'powershell' : 'bash', ctx);
+  if (prog === 'eval') {
+    // `eval "$(cmd)"` runs cmd's output: classifyShellCommand judges it from cmd (see there).
+    const literal = args.filter((a) => !/^(\$\(…\)|`…`)$/.test(a));
+    const inner = literal.length
+      ? recurse(literal.join(' '), ctx.shell === 'powershell' ? 'powershell' : 'bash', ctx)
+      : V('medium', 'Evaluates the output of a command');
+    // A variable's value is unknown here; a substitution is judged in classifyShellCommand,
+    // which sees the command it runs (known generators such as `ssh-agent -s` stay as they are).
+    if (args.some((a) => /\$[A-Za-z_{]/.test(a.replace(/\$\(…\)/g, '')))) {
+      return maxVerdict(inner, V('high', 'Evaluates a command that is only known at run time (eval of a variable)'));
+    }
+    return inner;
+  }
   if (prog === 'invoke-expression') return V('high', 'Runs a dynamically built PowerShell command (Invoke-Expression)');
   if (prog === 'source' || (prog === '.' && ctx.shell !== 'powershell') || prog === 'dot-source') {
+    // A bare variable names a script nobody can see here ("$X"); "$VENV/bin/activate" is a path.
+    if (args[0] && /^\$(\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)$/.test(args[0])) {
+      return V('high', `Runs a script whose path is only known at run time (${truncate(args[0], 40)}) in the current shell`);
+    }
+    if (!args[0] && /<\(…\)/.test(raw || '')) return V('medium', 'Runs the output of a command in the current shell');
     return V('medium', `Runs the script ${truncate(args[0] || '', 80)} in the current shell`);
   }
   if (prog === 'su') {
@@ -3528,12 +3781,20 @@ function baseVerdict(prog, args, u, tk, ctx, raw) {
         if (cmd.length) {
           const inner = recurseArgv(cmd, ctx);
           v = maxVerdict(v, V(maxRisk(inner.risk, 'medium'), `find runs: ${inner.reason}`));
+          // The payload acts on every file find visits, so its scope is find's start paths, not
+          // the "{}" it is given (SECURITY-ADVERSARIAL-4): find recurses whatever rm's flags say.
           const ip = progName(cmd[0]);
-          if ((ip === 'rm' || ip === 'shred') && cmd.some((x) => /^-[a-zA-Z]*[rR]/.test(x) || x === '--recursive')) {
+          const deletes = /^(rm|unlink|shred|srm|trash|trash-put|rmdir|del|remove-item)$/.test(ip);
+          const writes =
+            /^(mv|cp|ln|install|chmod|chown|chgrp|truncate|tee|dd|touch|rsync|set-content|out-file)$/.test(ip) ||
+            (/^(sed|perl|ruby)$/.test(ip) && cmd.some((x) => x.startsWith('--in-place') || /^-[a-zA-Z]*i/.test(x)));
+          if (deletes || writes) {
             for (const s0 of starts.length ? starts : ['.']) {
               const t = resolveTarget(s0, ctx, ctx.cwd);
               const what = t && rootLike(t, ctx);
-              if (what) return V('critical', `Deletes files throughout ${what}`);
+              if (what) return V(deletes ? 'critical' : 'high', `${deletes ? 'Deletes' : 'Changes'} files throughout ${what}`);
+              const tv = targetVerdict(s0, ctx, deletes ? 'Deletes files under' : 'Changes files under');
+              if (tv) v = maxVerdict(v, tv);
             }
           }
         }
@@ -4085,6 +4346,26 @@ function argv0Of(u) {
 }
 
 /**
+ * The text an echo/printf prints when it holds only literal words (no substitution or variable),
+ * else null. Leading echo flags are dropped; printf's format escapes are applied roughly.
+ */
+function echoedText(argv) {
+  const prog = progName(argv[0] || '');
+  let args = argv.slice(1);
+  if (args.some((a) => /\$|`|…/.test(a))) return null;
+  if (prog === 'echo') {
+    while (args.length && /^-[neE]+$/.test(args[0])) args = args.slice(1);
+    return args.join(' ').replace(/\\n/g, '\n');
+  }
+  if (prog === 'printf') {
+    if (args[0] === '--') args = args.slice(1);
+    if (!args.length || /%[^%]/.test(args[0])) return args.length ? args.slice(1).join(' ') || null : null;
+    return args[0].replace(/\\n/g, '\n').replace(/%%/g, '%');
+  }
+  return null;
+}
+
+/**
  * Classify a full shell command line.
  * @returns {{risk:string, reason:string, parts:{command:string, normalized:string, risk:string, reason:string}[]}}
  */
@@ -4100,6 +4381,7 @@ function classifyShellCommand(command, shell, ctx) {
   for (const part of parts) {
     const tk = tokenize(part.text, shell, ctx.platform);
     tk.heredocBodies = part.heredocs.map((h) => h.body);
+    if (part.callOp) tk.callOp = true;
     const u = unwrap(tk.argv, shell);
     let r;
     try {
@@ -4120,6 +4402,7 @@ function classifyShellCommand(command, shell, ctx) {
         ['invoke-expression', 'iex'].includes(progName(u.argv[0] || '')) ||
         (Boolean(u.sudo) && u.argv.length === 0),
       downloader: Boolean(r.downloader),
+      decoder: isDecoder(progName(u.argv[0] || ''), u.argv.slice(1)),
       part,
       u,
     });
@@ -4140,16 +4423,64 @@ function classifyShellCommand(command, shell, ctx) {
   for (const list of byPipeline.values()) {
     list.sort((a, b) => a.part.pipeIndex - b.part.pipeIndex);
     let seenDownload = false;
-    for (const r of list) {
-      if (seenDownload && (r.stdinExecutor || STDIN_EXECUTORS.test(r.prog)) && RANK[r.risk] < RANK.high) {
+    let seenDecoder = false;
+    for (let i = 0; i < list.length; i += 1) {
+      const r = list[i];
+      const executes = r.stdinExecutor || STDIN_EXECUTORS.test(r.prog);
+      if (seenDownload && executes && RANK[r.risk] < RANK.high) {
         r.risk = 'high';
         r.reason = 'Runs a script downloaded from the internet (download piped into a shell)';
+      } else if (seenDecoder && executes && RANK[r.risk] < RANK.high) {
+        r.risk = 'high';
+        r.reason = 'Runs decoded data that cannot be inspected (piped into a shell)';
+      }
+      // `echo "rm -rf ~" | sh` runs that text: judge it like the command it is.
+      const prev = i > 0 ? list[i - 1] : null;
+      if (r.stdinExecutor && (SHELLS.test(r.prog) || PS_HOSTS.test(r.prog)) && prev && /^(echo|printf)$/.test(prev.prog)) {
+        const literal = echoedText(prev.u.argv);
+        if (literal == null && RANK[r.risk] < RANK.high) {
+          r.risk = 'high';
+          r.reason = 'Runs text that is only known at run time (a variable or command output piped into a shell)';
+        } else if (literal != null && literal.trim()) {
+          const inner = classifyShellCommand(literal, PS_HOSTS.test(r.prog) ? 'powershell' : 'bash', { ...ctx, cwd, depth: ctx.depth + 1 });
+          if (RANK[inner.risk] > RANK[r.risk]) {
+            r.risk = inner.risk;
+            r.reason = `Text piped into ${r.prog}: ${inner.reason}`;
+          }
+        }
       }
       if (r.downloader) seenDownload = true;
+      if (r.decoder) seenDecoder = true;
+    }
+  }
+  // eval/source of command output: the command that prints the script decides. Known setup
+  // generators (ssh-agent -s, pyenv init -, brew shellenv…) are trusted like running them.
+  for (let i = 0; i < results.length; i += 1) {
+    const r = results[i];
+    if (!(r.prog === 'eval' || r.prog === 'source' || (r.prog === '.' && shell !== 'powershell'))) continue;
+    if (!/<\(…\)|\$\(…\)|`…`/.test(r.command) || RANK[r.risk] >= RANK.high) continue;
+    const inner = [];
+    for (let j = i + 1; j < results.length && results[j].part.nested && results[j].part.start > r.part.start; j += 1) inner.push(results[j]);
+    const byPipe = new Map();
+    for (const x of inner) byPipe.set(x.part.pipeline, (byPipe.get(x.part.pipeline) || []).concat(x));
+    const trusted = inner.length > 0 && [...byPipe.values()].every((pl) => pl.length === 1 && isEvalGenerator(pl[0].command));
+    if (!trusted) {
+      r.risk = 'high';
+      r.reason = `Runs a script made at run time (${r.prog} of command output) that cannot be inspected`;
     }
   }
   const anyDownloader = results.some((r) => r.downloader);
+  const anyDecoder = results.some((r) => r.decoder);
   for (const r of results) {
+    if (
+      anyDecoder &&
+      /<\(…\)|\$\(…\)|`…`/.test(r.command) &&
+      (SHELLS.test(r.prog) || INTERPRETERS.test(r.prog) || PS_HOSTS.test(r.prog)) &&
+      RANK[r.risk] < RANK.high
+    ) {
+      r.risk = 'high';
+      r.reason = 'Runs decoded data that cannot be inspected';
+    }
     if (
       anyDownloader &&
       /<\(…\)|\$\(…\)|`…`/.test(r.command) &&
@@ -4311,27 +4642,78 @@ function pt(x, y) {
   return x == null || y == null ? '' : `(${Math.round(Number(x))}, ${Math.round(Number(y))})`;
 }
 
-// Typed/pasted text that changes Claude Code or Claude Anywhere settings (self-escalation).
+// Typed/pasted text that changes Claude Code or Claude Anywhere settings (self-escalation). Only
+// command- or config-shaped text counts: "Set defaultMode in the docs" is prose (REGRESSIONS-7).
 const SELF_ESCALATION_TYPED =
-  /\b(claude-)?anywhere\s+config\b|\bclaude\s+config\b|permissions\.mode|defaultMode|bypassPermissions|dangerously-skip-permissions/i;
+  /(^|[\n;&|(`]\s*|\bsudo\s+)(claude-)?anywhere(\.js)?\s+config\s+(set|unset|reset|edit|add|remove|rm|delete)\b|(^|[\n;&|(`]\s*|\bsudo\s+)claude\s+config\s+(set|add|remove|unset|rm)\b|["']?defaultMode["']?\s*[:=]|\bpermissions\.mode\s*[:=]|\bconfig\s+set\s+permissions\.|bypassPermissions|dangerously-skip-permissions/im;
+
+// Apps where typed text runs as a command once Return is pressed.
+const TERMINAL_APP_RE =
+  /terminal|iterm|\bwarp\b|\bhyper\b|ghostty|konsole|xterm|alacritty|kitty|wezterm|tilix|terminator|rxvt|\bfoot\b|guake|yakuake|termite|sakura|qterminal|ptyxis|blackbox|st-256color|conhost|^cmd(\.exe)?$|powershell|pwsh|windowsterminal|mintty|putty|mobaxterm|termius|tabby|cool-retro-term|\bssh\b/i;
+// Apps that may be showing a terminal (integrated terminals, cloud shells in a browser).
+const MAYBE_TERMINAL_APP_RE =
+  /code|cursor|windsurf|vscodium|idea|pycharm|webstorm|goland|clion|rider|phpstorm|rubymine|datagrip|android studio|fleet|\bzed\b|sublime|emacs|n?vim|neovide|chrome|chromium|firefox|safari|edge|brave|opera|vivaldi|\barc\b|electron|java/i;
+
+/** true: a terminal; false: an app that is not one; null: unknown, or one that may host a terminal. */
+function focusIsTerminal(app) {
+  if (!app) return null;
+  if (TERMINAL_APP_RE.test(app)) return true;
+  if (MAYBE_TERMINAL_APP_RE.test(app)) return null;
+  return false;
+}
+
+/**
+ * A sentence, not a command: four or more words, a capitalised first word, no shell syntax,
+ * options or paths ("Reboot the router if the light is red."). A trailing newline is ignored.
+ */
+function looksLikeProse(text) {
+  const t = String(text || '').replace(/\r?\n$/, '');
+  if (/[\r\n]/.test(t)) return false;
+  const words = t.trim().split(/\s+/);
+  if (words.length < 4 || !/^[A-Z][a-z]/.test(words[0])) return false;
+  if (/[|;&<>$`\\{}()*=~]/.test(t)) return false;
+  return !words.some((w) => w.startsWith('-') || w.includes('/'));
+}
+
+function capVerdict(v, max, why) {
+  if (!v || RANK[v.risk] <= RANK[max]) return v;
+  return V(max, `${why}: ${v.reason}`);
+}
 
 /**
  * type_text and clipboard_set can drive a terminal: a trailing newline runs the
  * line, and a paste is the same. So the text gets the same scrutiny as Bash, and
- * self-escalation payloads are critical. Returns a verdict to maxVerdict with the
- * base (never lowers it), or null when the text is empty.
+ * self-escalation payloads are critical. For type_text (`typed`), the focused app
+ * (ctx.focusedApp) and the text's shape decide how far that goes; see below.
+ * Returns a verdict to maxVerdict with the base (never lowers it), or null when
+ * the text is empty.
  */
-function typedTextVerdict(text, ctx) {
+function typedTextVerdict(text, ctx, { typed = false } = {}) {
   const t = str(text);
   if (!t.trim()) return null;
   if (selfEscalationText(t) || SELF_ESCALATION_TYPED.test(t))
     return V('critical', 'Types a command that changes Claude Code/Anywhere settings (self-escalation)');
+  let v;
   try {
-    return recurse(t.replace(/\r?\n$/, ''), ctx.platform === 'win32' ? 'powershell' : 'bash', ctx);
+    v = recurse(t.replace(/\r?\n$/, ''), ctx.platform === 'win32' ? 'powershell' : 'bash', ctx);
   } catch {
     // prose does not always parse as a command; fall back to the medium base.
     return null;
   }
+  // Command scrutiny matters where the text can run: a terminal, or text that presses Return.
+  // Typed into an app known not to be a terminal, or as a sentence, it stays below critical, so
+  // writing an email in auto mode does not ask about "Reboot the router…" (REGRESSIONS-7).
+  // Unknown focus keeps full scrutiny: "type `reboot`, then press Return" must not slip through.
+  const term = typed ? focusIsTerminal(ctx.focusedApp) : null;
+  const newline = /[\r\n]/.test(t);
+  if (term === true) return v;
+  if (looksLikeProse(t)) {
+    if (term === false) return capVerdict(v, 'medium', 'Ordinary text typed outside a terminal');
+    if (!newline) return capVerdict(v, 'high', 'Looks like a sentence, not a command');
+    return v;
+  }
+  if (term === false) return capVerdict(v, 'high', `Typed into ${truncate(ctx.focusedApp, 40)}, not a terminal`);
+  return v;
 }
 
 const OPEN_RUNNERS = /^(cmd|osascript|wscript|cscript|mshta)$/i;
@@ -4368,7 +4750,7 @@ function anywhereToolVerdict(tool, input, ctx) {
   if (tool === 'type_text') {
     const why = secretLike(input.text);
     let v = why ? V('high', `Types text that ${why}`) : V('medium', 'Types text into the focused window');
-    return maxVerdict(v, typedTextVerdict(input.text, ctx));
+    return maxVerdict(v, typedTextVerdict(input.text, ctx, { typed: true }));
   }
   if (tool === 'clipboard_set') {
     const why = secretLike(input.text);
@@ -4648,8 +5030,7 @@ function classify(toolName, input, opts = {}) {
     }
     if (READ_TOOLS.has(name) && name !== 'Glob') {
       const raw = str(inp.file_path || inp.notebook_path || inp.path);
-      const t = raw ? resolveTarget(raw, ctx, ctx.projectDir) : null;
-      const cred = t ? credentialKind(t, ctx) : null;
+      const cred = raw ? readCredentialKind(raw, ctx, ctx.projectDir) : null;
       if (cred && !cred.env) return { risk: 'high', reason: `Reads ${cred.what}`, summary };
       if (cred) return { risk: 'medium', reason: `Reads ${cred.what}`, summary };
     }
@@ -4819,9 +5200,11 @@ class PermissionBroker extends EventEmitter {
    *   onNeedAttention?:(info:object)=>void, audit?:(event:object)=>void, now?:()=>number,
    *   projectDir?:string, getProjectDir?:()=>string, platform?:string, homeDir?:string}} [opts]
    */
-  constructor({ config, hub, onNeedAttention, audit, now, projectDir, getProjectDir, platform, homeDir } = {}) {
+  constructor({ config, hub, onNeedAttention, audit, now, projectDir, getProjectDir, platform, homeDir, activeWindow } = {}) {
     super();
     this.config = config || {};
+    // () => Promise<{app?:string}|null>: the focused window, so typed text is judged by where it lands.
+    this.activeWindow = typeof activeWindow === 'function' ? activeWindow : null;
     this.hub = hub || null;
     this.onNeedAttention = typeof onNeedAttention === 'function' ? onNeedAttention : null;
     this.auditFn = typeof audit === 'function' ? audit : logMod.audit;
@@ -4885,6 +5268,26 @@ class PermissionBroker extends EventEmitter {
     return { projectDir: this.currentProjectDir(), platform: this.platform, homeDir: this.homeDir };
   }
 
+  /** @private the focused window's app name, or null (unknown, slow or failing driver) */
+  async focusedApp() {
+    if (!this.activeWindow) return null;
+    let timer;
+    try {
+      const w = await Promise.race([
+        Promise.resolve().then(() => this.activeWindow()),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(null), 1500);
+        }),
+      ]);
+      const app = w && (w.app || w.owner || w.process || w.name);
+      return typeof app === 'string' && app.trim() ? app.trim() : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** @private */
   timeoutSec() {
     const n = Number(this.perms().approvalTimeoutSec);
@@ -4933,7 +5336,9 @@ class PermissionBroker extends EventEmitter {
     const inp = isPlainObject(input) ? input : {};
     let cls;
     try {
-      cls = classify(toolName, inp, this.ctxOpts());
+      const opts = this.ctxOpts();
+      if (/^mcp__(.+_)?anywhere__type_text$/.test(toolName)) opts.focusedApp = await this.focusedApp();
+      cls = classify(toolName, inp, opts);
     } catch (err) {
       log.error(`classify failed for ${toolName}:`, err);
       cls = { risk: 'high', reason: `Could not assess this action (${err.message})`, summary: displayName(toolName) };

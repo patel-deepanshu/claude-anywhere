@@ -567,7 +567,9 @@ class DaemonServer {
       attachScreenshot: body.attachScreenshot,
       source: body.source,
     });
-    return { ok: true, id };
+    const bridge = this.deps.bridge;
+    // `anywhere send` warns from these when the command waits for a terminal that is not there.
+    return { ok: true, id, mode: this.session.mode, bridge: { listening: Boolean(bridge && bridge.listening) } };
   }
 
   /** @private */
@@ -606,7 +608,7 @@ class DaemonServer {
 
   /** @private */
   async project({ body }) {
-    const project = await this.session.setProject(body.dir);
+    const project = await this.session.setProject(body.dir, { force: body.force === true });
     return { ok: true, project };
   }
 
@@ -679,7 +681,7 @@ class DaemonServer {
 
   /** @private */
   async mode({ body }) {
-    const { mode } = await this.session.setMode(body.mode);
+    const { mode } = await this.session.setMode(body.mode, { force: body.force === true });
     return { ok: true, mode };
   }
 
