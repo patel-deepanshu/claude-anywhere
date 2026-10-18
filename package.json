@@ -38,7 +38,7 @@
     "node": ">=18.17"
   },
   "scripts": {
-    "test": "node --test test/",
+    "test": "node scripts/test.js",
     "start": "node bin/anywhere.js start",
     "doctor": "node bin/anywhere.js doctor",
     "lint": "node scripts/check-syntax.js"

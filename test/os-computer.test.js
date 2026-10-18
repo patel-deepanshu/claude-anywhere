@@ -482,3 +482,26 @@ test('mock driver: test pattern PNG with a cursor marker, windows, focus, clipbo
   await d.mouseUp('left');
   assert.ok(d.actions.some((a) => a.type === 'captureDisplay'));
 });
+
+test('input actions pass driver warnings through, without duplicates (win32 UIPI)', async () => {
+  const driver = createMockDriver();
+  const W = 'Your input may not reach Setup: it belongs to another user account (UIPI).';
+  for (const m of ['click', 'drag', 'scroll', 'typeText', 'keyCombo']) {
+    const orig = driver[m].bind(driver);
+    driver[m] = async (...a) => {
+      await orig(...a);
+      return { warnings: [W] };
+    };
+  }
+  const { computer } = make({ driver });
+  await computer.screenshot();
+  assert.deepEqual((await computer.click({ x: 10, y: 10 })).warnings, [W]);
+  assert.deepEqual((await computer.drag({ fromX: 1, fromY: 1, toX: 5, toY: 5 })).warnings, [W]);
+  assert.deepEqual((await computer.scroll({ direction: 'down', x: 3, y: 3 })).warnings, [W]);
+  assert.deepEqual((await computer.typeText({ text: 'hi', method: 'keys' })).warnings, [W]);
+  assert.deepEqual((await computer.typeText({ text: 'pasted text', method: 'paste' })).warnings, [W], 'the paste keyCombo result');
+  assert.deepEqual((await computer.key({ combo: 'down', repeat: 3 })).warnings, [W], 'one copy for every repeat');
+  const plain = make();
+  await plain.computer.screenshot();
+  assert.equal('warnings' in (await plain.computer.click({ x: 10, y: 10 })), false);
+});

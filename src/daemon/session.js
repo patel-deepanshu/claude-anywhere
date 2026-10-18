@@ -5,7 +5,9 @@
  *
  * Companion mode: lazily runs ClaudeCliEngine in the project directory, feeds
  * it the user's commands (desktop context + images + text) and normalizes the
- * stream-json output into transcript items and SSE events.
+ * stream-json output into transcript items and SSE events. One user message is
+ * with the CLI at a time: commands sent during a turn wait in the daemon and go
+ * out together, as one message, when that turn's result arrives (Stop drops them).
  * Bridge mode: queues commands for the interactive Claude Code session (Bridge)
  * and turns its replies into transcript items.
  */
@@ -30,7 +32,13 @@ const TOOL_OUTPUT_LIMIT = 4096;
 const INPUT_STRING_LIMIT = 2000;
 const GUARD_PAUSE_MS = 3000;
 const EARLY_EXIT_MS = 5000;
+const HELD_RESULT_MS = 3000;
 const CONTEXT_TIMEOUT_MS = 6000;
+// Approvals and ask_user block inside the anywhere server's calls for up to
+// permissions.approvalTimeoutSec (read live; the broker caps it at 86400 s). A per-server
+// `timeout` overrides MCP_TOOL_TIMEOUT for that server only, so Claude Code never cancels a
+// pending approval before the broker's own deadline answers it.
+const ENGINE_MCP_TIMEOUT_MS = (86400 + 60) * 1000;
 const PROJECTS_TIMEOUT_MS = 4000;
 const MAX_TEXT = 100000;
 const MAX_IMAGES = 10;
@@ -489,10 +497,14 @@ class SessionManager extends EventEmitter {
     this.engineSent = [];
     this.engineSignature = null;
     this.engineStale = false;
-    this.inFlight = 0;
+    this.engineStopping = null; // promise while stopEngine() waits for the CLI to exit
+    this.turnActive = false; // a user message is with the CLI and its result has not arrived
+    this.pendingFollowUps = []; // [{item, blocks}] commands waiting for the current turn to end
+    this.interrupting = null; // promise while interrupt() waits for the CLI
+    this.heldResult = null; // an error result that arrived before init (startup failure)
+    this.resetEpoch = 0; // bumped by newSession()/setProject(): an engine start in progress gives up
     this.freshRetried = false;
     this.warnedMcp = false;
-    this.warnedToolTimeout = false;
     this.located = null;
     this.startingPromise = null;
     this.submitChain = Promise.resolve();
@@ -500,7 +512,7 @@ class SessionManager extends EventEmitter {
     this.bridgeFiles = [];
     this.bridgeBusy = false;
     this.bridgeStartedAt = 0;
-    this.generation = 0; // bumped by interrupt(): commands still being prepared are dropped
+    this.generation = 0; // bumped by interrupt(), newSession(), setProject(): commands still being prepared are dropped
 
     this.streamItems = new Map(); // `${msgId}:${index}` → item
     this.streamOrder = new Map(); // msgId → [items not yet finalized]
@@ -510,12 +522,16 @@ class SessionManager extends EventEmitter {
     this.runFiles = {
       mcpConfig: path.join(paths.runDir(), `mcp-${this.instanceId}.json`),
       systemPrompt: path.join(paths.runDir(), `system-prompt-${this.instanceId}.md`),
+      settings: path.join(paths.runDir(), `settings-${this.instanceId}.json`),
     };
 
     this.initSessionId();
 
+    this.approvalCards = new Map(); // approval id → card, until it is resolved
     if (this.hub && typeof this.hub.on === 'function') {
-      this.onHubEvent = (type) => {
+      this.onHubEvent = (type, data) => {
+        if (type === 'approval_request' && data && data.id) this.approvalCards.set(data.id, data);
+        if (type === 'approval_resolved' && data && data.id) this.noteApproval(data);
         if (type === 'approval_request' || type === 'approval_resolved' || type === 'question' || type === 'question_resolved') {
           // Next tick: the broker may broadcast before or after updating its pending list.
           this.emitStatus();
@@ -619,6 +635,28 @@ class SessionManager extends EventEmitter {
     return this.addMessage({ id: uuid(), role: 'system', text: String(text), level, ts: nowIso() });
   }
 
+  /**
+   * Leave a line in the transcript for each approval card that was answered, so the
+   * history shows what was allowed or denied after the card itself disappears.
+   * @private
+   */
+  noteApproval(d) {
+    const card = this.approvalCards.get(d.id);
+    this.approvalCards.delete(d.id);
+    if (!card || d.decision === 'cancelled' || d.by === 'cancel') return;
+    const what = truncate(String(card.summary || card.displayName || card.toolName || 'action'), 300);
+    const risk = card.risk === 'high' || card.risk === 'critical' ? ` (${card.risk} risk)` : '';
+    if (d.decision === 'allow' && d.by === 'policy') this.system(`Allowed by your "always" rule: ${what}`, 'info');
+    else if (d.decision === 'allow') this.system(`You allowed${risk}: ${what}`, 'info');
+    else if (d.decision === 'allow_session') this.system(`You allowed for this session${risk}: ${what}`, 'info');
+    else if (d.decision === 'timeout') this.system(`Denied, no answer in time: ${what}`, 'warning');
+    else if (d.decision === 'deny') {
+      const note = typeof d.message === 'string' ? d.message.replace(/^User denied:\s*/, '').trim() : '';
+      const extra = note && !/^User denied this action\.?$/.test(note) ? ` (“${truncate(note, 300)}”)` : '';
+      this.system(`You denied: ${what}${extra}`, 'warning');
+    }
+  }
+
   /** @private keep image data URLs only on the most recent tool items */
   trimImages() {
     let kept = 0;
@@ -637,6 +675,12 @@ class SessionManager extends EventEmitter {
   }
 
   // ---------------------------------------------------------------- status
+
+  /** @private a status change driven by engine output; a Stop in progress keeps "stopping" */
+  engineStatus(status, detail = '') {
+    if (this.baseStatus === 'stopping') return;
+    this.setBase(status, detail);
+  }
 
   /** @private */
   setBase(status, detail = '') {
@@ -841,11 +885,38 @@ class SessionManager extends EventEmitter {
           args: [path.join(paths.PACKAGE_ROOT, 'src', 'mcp', 'server.js')],
           env,
           alwaysLoad: true,
+          timeout: ENGINE_MCP_TIMEOUT_MS,
         },
       },
     };
     writePrivate(this.runFiles.mcpConfig, `${JSON.stringify(mcp, null, 2)}\n`);
     writePrivate(this.runFiles.systemPrompt, `${this.systemPromptText()}\n`);
+    writePrivate(this.runFiles.settings, `${JSON.stringify(this.engineSettings(), null, 2)}\n`);
+  }
+
+  /**
+   * Settings layered over the user's for the engine (--settings): the Claude Anywhere plugin
+   * stays off there, because its desktop tools and /anywhere skill would duplicate the
+   * daemon's own MCP server inside the daemon's own session. Other plugins are untouched.
+   * @private
+   */
+  engineSettings() {
+    const off = { 'anywhere@anywhere-marketplace': false };
+    const files = [
+      path.join(paths.claudeHome(), 'settings.json'),
+      path.join(this.projectDir, '.claude', 'settings.json'),
+      path.join(this.projectDir, '.claude', 'settings.local.json'),
+    ];
+    for (const file of files) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const enabled = parsed && isPlainObject(parsed.enabledPlugins) ? parsed.enabledPlugins : {};
+        for (const key of Object.keys(enabled)) if (/^anywhere@/.test(key)) off[key] = false;
+      } catch {
+        /* missing or unreadable */
+      }
+    }
+    return { enabledPlugins: off };
   }
 
   /** @private */
@@ -860,19 +931,29 @@ class SessionManager extends EventEmitter {
 
   /** @private */
   ensureEngine() {
-    if (this.engine && this.engine.running) return Promise.resolve(this.engine);
+    if (this.engine && this.engine.running && !this.engineStopping) return Promise.resolve(this.engine);
     if (this.startingPromise) return this.startingPromise;
-    this.startingPromise = this.startEngine().finally(() => {
-      this.startingPromise = null;
-    });
+    // An engine being stopped (e.g. settings changed) has already closed its input:
+    // wait for it to exit, then start a fresh one.
+    const stopping = this.engineStopping || Promise.resolve();
+    this.startingPromise = stopping
+      .then(() => (this.engine && this.engine.running ? this.engine : this.startEngine()))
+      .finally(() => {
+        this.startingPromise = null;
+      });
     return this.startingPromise;
   }
 
   /** @private */
   async startEngine() {
     if (this.closed) throw httpError(503, 'The daemon is shutting down');
+    // newSession()/setProject() during the awaits below must not get an engine that mixes
+    // the old conversation with the new folder (or the reverse).
+    const epoch = this.resetEpoch;
+    const projectDir = this.projectDir;
     this.setBase('starting', 'Starting Claude Code…');
     const located = await this.locateClaude();
+    this.checkStartCurrent(epoch, projectDir);
     if (!located) {
       const e = new Error(`Claude Code CLI ("claude") was not found. ${claudeInstallHint()}`);
       e.code = 'CLAUDE_NOT_FOUND';
@@ -885,6 +966,7 @@ class SessionManager extends EventEmitter {
     }
     this.writeRunFiles();
     const addDirs = await this.vsCodeDirs();
+    this.checkStartCurrent(epoch, projectDir);
     const engineCfg = this.config.engine || {};
     const resume = Boolean(this.resumeNext && this.sessionId);
     if (!this.sessionId) this.sessionId = uuid();
@@ -895,6 +977,9 @@ class SessionManager extends EventEmitter {
       resume,
       mcpConfigPath: this.runFiles.mcpConfig,
       systemPromptPath: this.runFiles.systemPrompt,
+      settingsPath: this.runFiles.settings,
+      // The dialog's approval policy decides: never inherit the user's defaultMode (acceptEdits, bypassPermissions…).
+      permissionMode: typeof engineCfg.permissionMode === 'string' && engineCfg.permissionMode ? engineCfg.permissionMode : undefined,
       allowedTools: READ_ONLY_TOOLS,
       model: engineCfg.model,
       fallbackModel: engineCfg.fallbackModel,
@@ -904,6 +989,9 @@ class SessionManager extends EventEmitter {
       maxBudgetUsd: engineCfg.maxBudgetUsd,
       extraArgs: engineCfg.extraArgs,
       stripEnv: engineCfg.stripEnv,
+      // Lets other copies of the anywhere MCP server (a plugin or user-scope install) see they run
+      // under the daemon's engine and stay out of the way.
+      env: { ANYWHERE_ENGINE_CHILD: '1' },
     });
     this.engine = engine;
     this.engineCostBase = 0;
@@ -923,40 +1011,59 @@ class SessionManager extends EventEmitter {
       this.onEngineExit(engine, info).catch((err) => log.error('engine exit handling failed:', err));
     });
     engine.start();
-    this.warnShortToolTimeout(engine);
     audit({ type: 'engine_start', sessionId: this.sessionId, resume, project: this.projectDir, claude: located.path, version: located.version });
     return engine;
   }
 
-  /** @private an inherited MCP_TOOL_TIMEOUT would cut approvals and questions short */
-  warnShortToolTimeout(engine) {
-    if (this.warnedToolTimeout) return;
-    const raw = engine && engine.env ? engine.env.MCP_TOOL_TIMEOUT : undefined;
-    const ms = Number(raw);
-    if (raw === undefined || !Number.isFinite(ms) || ms >= 15 * 60 * 1000) return;
-    this.warnedToolTimeout = true;
-    log.warn(`MCP_TOOL_TIMEOUT=${raw} is set; blocking approvals/questions will fail after ${Math.round(ms / 1000)} s`);
-    this.system(`MCP_TOOL_TIMEOUT=${raw} is set in your environment, so approvals and questions that wait longer than ${Math.round(ms / 1000)} s will fail. Unset it (or raise it to 3600000) and restart Claude Anywhere.`, 'warning');
+  /** @private throws ENGINE_CANCELLED when the project or conversation changed during an engine start */
+  checkStartCurrent(epoch, projectDir) {
+    if (epoch === this.resetEpoch && projectDir === this.projectDir && !this.closed) return;
+    const e = new Error('The project or conversation changed while Claude Code was starting');
+    e.code = 'ENGINE_CANCELLED';
+    throw e;
   }
 
   /** @private */
   async stopEngine() {
     const engine = this.engine;
     if (!engine) return;
+    const done = (async () => {
+      try {
+        await engine.stop();
+      } catch (err) {
+        log.warn(`engine stop failed: ${err.message}`);
+      }
+      if (this.engine === engine) this.engine = null;
+    })();
+    this.engineStopping = done;
     try {
-      await engine.stop();
-    } catch (err) {
-      log.warn(`engine stop failed: ${err.message}`);
+      await done;
+    } finally {
+      if (this.engineStopping === done) this.engineStopping = null;
     }
-    if (this.engine === engine) this.engine = null;
   }
 
   /** @private */
   engineFailed(err) {
     log.error(`engine failed: ${err.message}`);
-    this.inFlight = 0;
-    this.system(err.message, 'error');
+    this.turnActive = false;
+    this.system(`${err.message}${this.dropFollowUpsNote()}`, 'error');
     this.setBase('error', err.code === 'CLAUDE_NOT_FOUND' ? 'Claude Code not found' : 'Claude Code failed to start');
+  }
+
+  /** @private drop the queued follow-ups; returns a sentence for the transcript ('' when there were none) */
+  dropFollowUpsNote() {
+    const n = this.pendingFollowUps.splice(0).length;
+    return n ? ` ${n} queued command${n === 1 ? ' was' : 's were'} not sent.` : '';
+  }
+
+  /** @private "allow for the rest of this session" rules end with the conversation */
+  clearSessionRules() {
+    try {
+      if (this.permissions && typeof this.permissions.clearSessionRules === 'function') this.permissions.clearSessionRules();
+    } catch (err) {
+      log.warn(`clearing session rules failed: ${err.message}`);
+    }
   }
 
   /** @private */
@@ -982,20 +1089,25 @@ class SessionManager extends EventEmitter {
   async onEngineExit(engine, info) {
     if (engine !== this.engine) return;
     this.engine = null;
+    if (this.heldResult && this.heldResult.engine === engine) this.heldResult = null;
     const sent = this.engineSent;
     this.engineSent = [];
-    const hadTurns = this.inFlight > 0;
-    this.inFlight = 0;
+    const hadTurns = this.turnActive;
+    this.turnActive = false;
     this.finalizeTurnItems('Interrupted: Claude Code stopped');
     // Only resume ids that refer to a real conversation.
     this.resumeNext = Boolean(this.sessionId) && (info.sawInit || engine.resume);
     if (info.expected) {
+      const dropped = this.pendingFollowUps.splice(0).length;
+      if (dropped) this.system(`${dropped} queued command${dropped === 1 ? ' was' : 's were'} not sent because Claude Code stopped.`, 'warning');
       if (this.baseStatus !== 'stopping' && this.baseStatus !== 'error') this.setBase('idle');
       return;
     }
     const tail = String(info.stderrTail || '');
     const early = info.uptimeMs < EARLY_EXIT_MS && !info.sawInit;
-    const resumeFailed = engine.resume && (NO_CONVERSATION_RE.test(tail) || early);
+    // Only the CLI's own words mean the conversation is gone: any other early exit (a bad
+    // engine.extraArgs option, a broken install) keeps sessions.json for the next attempt.
+    const resumeFailed = engine.resume && NO_CONVERSATION_RE.test(tail);
     const idInUse = !engine.resume && early && ID_IN_USE_RE.test(tail);
     if ((resumeFailed || idInUse) && !this.freshRetried && !this.closed) {
       this.freshRetried = true;
@@ -1004,17 +1116,30 @@ class SessionManager extends EventEmitter {
       this.sessionId = uuid();
       this.resumeNext = false;
       this.forgetSession();
+      this.clearSessionRules();
       this.broadcast('session', { id: this.sessionId, model: this.model });
+      const gen = this.generation;
+      const blocks = [].concat(...sent);
+      // Reserve the turn so commands submitted meanwhile queue behind the resent one.
+      if (blocks.length) this.turnActive = true;
       try {
         const next = await this.ensureEngine();
-        for (const blocks of sent) {
+        if (gen !== this.generation) {
+          // Stopped (or reset) while the fresh engine started: do not resend.
+          this.turnActive = false;
+          return;
+        }
+        if (blocks.length) {
           next.send(blocks);
           this.engineSent.push(blocks);
-          this.inFlight += 1;
+          this.turnActive = true;
+          this.setBase('thinking');
+        } else if (!this.flushFollowUps()) {
+          this.setBase('idle');
         }
-        if (this.inFlight > 0) this.setBase('thinking');
-        else this.setBase('idle');
       } catch (err) {
+        this.turnActive = false;
+        if (err.code === 'ENGINE_CANCELLED') return;
         this.engineFailed(err);
       }
       return;
@@ -1025,6 +1150,7 @@ class SessionManager extends EventEmitter {
     if (info.errorCode === 'ENOENT') text += ` ${claudeInstallHint()}`;
     if (lines) text += `\n${lines}`;
     if (this.resumeNext) text += '\nYour next command will resume the conversation.';
+    text += this.dropFollowUpsNote();
     this.system(text, 'error');
     audit({ type: 'engine_exit', code: info.code, signal: info.signal, error: info.error, hadTurns });
     this.setBase('error', 'Claude Code stopped unexpectedly');
@@ -1077,7 +1203,7 @@ class SessionManager extends EventEmitter {
         this.warnedMcp = true;
       }
     }
-    if (this.baseStatus === 'starting') this.setBase(this.inFlight > 0 ? 'thinking' : 'idle');
+    if (this.baseStatus === 'starting') this.setBase(this.turnActive ? 'thinking' : 'idle');
   }
 
   /** @private */
@@ -1108,11 +1234,11 @@ class SessionManager extends EventEmitter {
             item.text = cb.text;
             this.broadcast('delta', { id: item.id, text: cb.text });
           }
-          this.setBase('thinking');
+          this.engineStatus('thinking');
         } else if (cb.type === 'tool_use') {
-          this.setBase('acting', displayName(cb.name));
+          this.engineStatus('acting', displayName(cb.name));
         } else if (cb.type === 'thinking') {
-          this.setBase('thinking', 'Thinking…');
+          this.engineStatus('thinking', 'Thinking…');
         }
         break;
       }
@@ -1179,7 +1305,7 @@ class SessionManager extends EventEmitter {
       };
       this.toolItems.set(b.id, item);
       this.addMessage(item);
-      if (!parent) this.setBase('acting', item.displayName);
+      if (!parent) this.engineStatus('acting', item.displayName);
     }
   }
 
@@ -1204,12 +1330,20 @@ class SessionManager extends EventEmitter {
         this.setScreenshot({ dataUrl: res.image, width: size.width, height: size.height });
         this.trimImages();
       }
-      if (!item || !item.parentToolUseId) this.setBase('thinking');
+      if (!item || !item.parentToolUseId) this.engineStatus('thinking');
     }
   }
 
   /** @private */
-  onResult(msg) {
+  onResult(msg, { held = false } = {}) {
+    const engine = this.engine;
+    if (!held && engine && engine.sawInit === false && msg.is_error) {
+      // `--resume <unknown id>` answers with an error result before any init and then exits:
+      // a startup failure for onEngineExit, not a turn to report, count or persist.
+      log.warn(`ignoring a ${msg.subtype || 'error'} result that arrived before init`);
+      this.holdResult(engine, msg);
+      return;
+    }
     this.finalizeTurnItems('Interrupted before it finished');
     const total = Number(msg.total_cost_usd) || 0;
     // The CLI reports a cumulative cost per process; fall back gracefully if it ever reports per turn.
@@ -1222,6 +1356,9 @@ class SessionManager extends EventEmitter {
       this.broadcast('session', { id: this.sessionId, model: this.model });
     }
     const isError = Boolean(msg.is_error);
+    // A turn the user stopped ends with an error_during_execution result: that is the Stop
+    // working, not a failure worth an error line (interrupt() adds "Stopped." itself).
+    const interrupted = this.baseStatus === 'stopping' && isError && msg.subtype === 'error_during_execution';
     const payload = {
       text: typeof msg.result === 'string' ? msg.result : '',
       costUsd: round6(turnCost),
@@ -1232,22 +1369,63 @@ class SessionManager extends EventEmitter {
       numTurns: Number(msg.num_turns) || 0,
       subtype: msg.subtype || null,
     };
+    if (interrupted) payload.interrupted = true;
     this.broadcast('result', payload);
     this.emit('result', payload);
-    if (isError) {
+    if (isError && !interrupted) {
       const why = payload.text || String(msg.subtype || 'error').replace(/_/g, ' ');
       this.system(`Claude Code reported an error: ${truncate(why, 1000)}`, 'error');
     }
     audit({ type: 'result', sessionId: this.sessionId, costUsd: payload.costUsd, durationMs: payload.durationMs, isError, subtype: payload.subtype });
-    this.inFlight = Math.max(0, this.inFlight - 1);
+    // One result ends the turn, however many messages it covered.
+    this.turnActive = false;
+    this.engineSent = [];
     this.persistSession();
-    if (this.inFlight === 0) {
-      if (this.baseStatus !== 'stopping') this.setBase('idle');
-      if (this.engineStale) {
-        log.info('engine settings changed; restarting Claude Code before the next command');
-        this.stopEngine().catch(() => {});
-      }
+    // A Stop in progress drops the queue and finishes the status itself.
+    if (this.baseStatus !== 'stopping' && this.flushFollowUps()) return;
+    if (this.baseStatus !== 'stopping') this.setBase('idle');
+    if (this.engineStale) {
+      log.info('engine settings changed; restarting Claude Code before the next command');
+      this.stopEngine().catch(() => {});
     }
+  }
+
+  /**
+   * Keep a result that arrived before init until the engine exits (onEngineExit takes over);
+   * if the CLI stays alive after all, report it as a normal result.
+   * @private
+   */
+  holdResult(engine, msg) {
+    this.heldResult = { engine, msg };
+    const timer = setTimeout(() => {
+      if (!this.heldResult || this.heldResult.engine !== engine) return;
+      this.heldResult = null;
+      if (engine === this.engine && engine.running) this.onResult(msg, { held: true });
+    }, HELD_RESULT_MS);
+    if (timer.unref) timer.unref();
+  }
+
+  /**
+   * Send the commands queued during the last turn to the CLI as one user message.
+   * @private
+   * @returns {boolean} a new turn started (or failed and was reported)
+   */
+  flushFollowUps() {
+    const engine = this.engine;
+    if (!this.pendingFollowUps.length || this.turnActive || !engine || !engine.running || this.engineStopping) return false;
+    const queued = this.pendingFollowUps.splice(0);
+    const blocks = [].concat(...queued.map((q) => q.blocks));
+    try {
+      engine.send(blocks);
+    } catch (err) {
+      this.engineFailed(err);
+      return true;
+    }
+    this.engineSent.push(blocks);
+    this.turnActive = true;
+    log.info(`sent ${queued.length} queued command${queued.length === 1 ? '' : 's'}`);
+    this.setBase('thinking');
+    return true;
   }
 
   // ---------------------------------------------------------------- commands
@@ -1305,7 +1483,7 @@ class SessionManager extends EventEmitter {
     return { id: item.id };
   }
 
-  /** @returns {Promise<void>} resolves when queued commands have been handed to the engine or bridge */
+  /** @returns {Promise<void>} resolves when submitted commands have been handed to the engine or bridge, queued behind the current turn, or dropped */
   async drain() {
     await this.submitChain;
   }
@@ -1316,10 +1494,28 @@ class SessionManager extends EventEmitter {
     this.system('That command was cancelled before it was sent.', 'info');
   }
 
+  /**
+   * ensureEngine(), starting again when a start was abandoned because the project or
+   * conversation changed meanwhile (the command was submitted after that change).
+   * @private
+   */
+  async engineFor(gen, first) {
+    let promise = first || this.ensureEngine();
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await promise;
+      } catch (err) {
+        if (err.code !== 'ENGINE_CANCELLED' || gen !== this.generation || attempt >= 2) throw err;
+        promise = this.ensureEngine();
+      }
+    }
+  }
+
   /** @private */
   async processCompanion(item, imgs, wantShot, gen) {
-    const running = this.engine && this.engine.running;
-    if (this.inFlight === 0) this.setBase(running ? 'thinking' : 'starting', running ? 'Reading your desktop…' : 'Starting Claude Code…');
+    const running = this.engine && this.engine.running && !this.engineStopping;
+    // A turn in progress, or a Stop still settling, keeps its status.
+    if (!this.turnActive && !this.interrupting) this.setBase(running ? 'thinking' : 'starting', running ? 'Reading your desktop…' : 'Starting Claude Code…');
     const enginePromise = this.ensureEngine();
     enginePromise.catch(() => {}); // handled below
     const blocks = [];
@@ -1337,40 +1533,67 @@ class SessionManager extends EventEmitter {
     }
     for (const img of imgs) blocks.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.data } });
     blocks.push({ type: 'text', text: item.text });
+    const cancelled = () => {
+      this.dropCancelled(item);
+      if (!this.turnActive) this.setBase('idle');
+    };
+    const failed = (err) => {
+      if (gen !== this.generation || err.code === 'ENGINE_CANCELLED') cancelled();
+      else this.engineFailed(err);
+    };
     let engine;
     try {
-      engine = await enginePromise;
+      engine = await this.engineFor(gen, enginePromise);
     } catch (err) {
-      this.engineFailed(err);
+      failed(err);
       return;
     }
-    if (gen !== this.generation) {
-      this.dropCancelled(item);
-      if (this.inFlight === 0) this.setBase('idle');
-      return;
-    }
-    if (engine !== this.engine || !engine.running) {
-      // It died while we were gathering context: start again (resume handles continuity).
+    // Submitted after a Stop that is still settling: run once the CLI is idle again.
+    if (this.interrupting) await this.interrupting.catch(() => {});
+    for (let attempt = 0; ; attempt += 1) {
+      if (gen !== this.generation) {
+        cancelled();
+        return;
+      }
+      if (!engine || engine !== this.engine || !engine.running || this.engineStopping) {
+        // It died, or is being restarted for new settings (its input is already closed), while
+        // we were gathering context: start again (resume handles continuity).
+        try {
+          engine = await this.engineFor(gen);
+        } catch (err) {
+          failed(err);
+          return;
+        }
+        if (gen !== this.generation) {
+          cancelled();
+          return;
+        }
+      }
+      // From here to send() nothing awaits, so no Stop or reset can slip in between.
+      if (this.turnActive) {
+        // One user message at a time: the CLI would fold this one into the running turn
+        // (one result for both) or start a turn of its own after a Stop.
+        this.pendingFollowUps.push({ item, blocks });
+        this.system('Queued: Claude reads this when the current task finishes (Stop cancels both).', 'info');
+        return;
+      }
       try {
-        engine = await this.ensureEngine();
+        engine.send(blocks);
+        break;
       } catch (err) {
+        if (err.code === 'ENGINE_NOT_RUNNING' && attempt === 0) {
+          log.warn('Claude Code closed its input before the command was sent; starting it again');
+          engine = null;
+          continue;
+        }
         this.engineFailed(err);
         return;
       }
     }
-    const wasBusy = this.inFlight > 0;
-    try {
-      engine.send(blocks);
-    } catch (err) {
-      this.engineFailed(err);
-      return;
-    }
     this.engineSent.push(blocks);
-    this.inFlight += 1;
-    if (!wasBusy) {
-      if (engine.sawInit) this.setBase('thinking');
-      else this.setBase('starting', 'Starting Claude Code…');
-    }
+    this.turnActive = true;
+    if (engine.sawInit) this.setBase('thinking');
+    else this.setBase('starting', 'Starting Claude Code…');
   }
 
   /** @private */
@@ -1408,10 +1631,19 @@ class SessionManager extends EventEmitter {
       this.dropCancelled(item);
       return;
     }
+    // The terminal is still on an earlier command: it is connected even when it has not polled
+    // for a while (a long deploy), and that command's status stays.
+    const working = this.bridge.current && this.bridge.listening ? this.bridge.current.id : null;
     this.bridge.enqueue({ id: item.id, text: item.text, images: files, context, source: item.source });
+    if (!this.bridgeBusy || !working) this.bridgeStartedAt = Date.now();
     this.bridgeBusy = true;
-    this.bridgeStartedAt = Date.now();
-    if (this.bridge.listening) {
+    const handedOver = this.bridge.current && this.bridge.current.id === item.id;
+    if (working && !handedOver) {
+      this.system('Queued: the terminal picks this up after its current task.', 'info');
+      if (this.baseStatus === 'idle') this.setBase('thinking', 'Claude Code (terminal) is working');
+    } else if (handedOver) {
+      // 'dequeued' already set the status.
+    } else if (this.bridge.listening) {
       this.setBase('thinking', 'Sent to your Claude Code terminal');
     } else {
       this.setBase('idle', 'Waiting for the terminal');
@@ -1419,13 +1651,24 @@ class SessionManager extends EventEmitter {
     }
   }
 
+  /** @private terminal activity in bridge mode (a tool call, notification, question) counts as a sign of life */
+  touchBridge() {
+    if (this.mode === 'bridge' && this.bridge && typeof this.bridge.touch === 'function') this.bridge.touch();
+  }
+
   /** @private */
   wireBridge() {
     this.bridge.on('dequeued', () => {
       if (this.mode !== 'bridge') return;
+      this.bridgeStartedAt = Date.now();
       this.setBase('thinking', 'Claude Code (terminal) is working');
     });
     this.bridge.on('reply', ({ text, final, speak }) => {
+      // A terminal that missed the switch to companion mode must not end the companion turn.
+      if (this.mode !== 'bridge') {
+        log.info('ignoring a bridge reply: the dialog is in companion mode');
+        return;
+      }
       if (text && text.trim()) this.addMessage({ id: uuid(), role: 'assistant', text, ts: nowIso(), streaming: false });
       if (final) {
         this.turns += 1;
@@ -1456,7 +1699,7 @@ class SessionManager extends EventEmitter {
 
   /**
    * MCP tool activity (POST /api/mcp/activity).
-   * @param {{tool:string, summary?:string, ok?:boolean, error?:string, image?:string, width?:number, height?:number}} a
+   * @param {{tool:string, summary?:string, ok?:boolean, error?:string, warning?:string, image?:string, width?:number, height?:number}} a
    */
   activity(a = {}) {
     const tool = typeof a.tool === 'string' && a.tool ? a.tool.slice(0, 100) : 'tool';
@@ -1470,8 +1713,10 @@ class SessionManager extends EventEmitter {
         this.setScreenshot({ dataUrl, width: Number(a.width) || size.width, height: Number(a.height) || size.height });
       }
     }
-    audit({ type: 'activity', tool, summary: a.summary, ok: a.ok !== false, error: a.error || undefined });
+    const warning = typeof a.warning === 'string' && a.warning ? a.warning : null;
+    audit({ type: 'activity', tool, summary: a.summary, ok: a.ok !== false, error: a.error || undefined, warning: warning || undefined });
     if (this.mode !== 'bridge') return { ok: true };
+    this.touchBridge();
     const name = tool.startsWith('mcp__') ? tool : `mcp__anywhere__${tool}`;
     const item = {
       id: uuid(),
@@ -1482,7 +1727,7 @@ class SessionManager extends EventEmitter {
       summary: truncate(oneLine(a.summary || ''), 80),
       input: null,
       status: a.ok === false ? 'error' : 'ok',
-      output: a.error ? truncate(String(a.error), TOOL_OUTPUT_LIMIT) : null,
+      output: a.error ? truncate(String(a.error), TOOL_OUTPUT_LIMIT) : warning ? truncate(`Warning: ${warning}`, TOOL_OUTPUT_LIMIT) : null,
       image: dataUrl,
       parentToolUseId: null,
       ts: nowIso(),
@@ -1504,10 +1749,15 @@ class SessionManager extends EventEmitter {
     this.system(text, lvl);
     this.broadcast('notify', { text, level: lvl, speak: Boolean(speak) });
     audit({ type: 'notify', text, level: lvl });
+    this.touchBridge();
     return { ok: true, delivered: Boolean(this.hub && this.hub.clientCount && this.hub.clientCount() > 0) };
   }
 
-  /** Stop the current turn, cancel pending cards and pause input actions for 3 s. */
+  /**
+   * Stop the current turn, drop queued follow-ups, cancel pending cards and pause input
+   * actions for 3 s. Decides from the turn state, so a second Stop always reaches the CLI
+   * while a turn is running.
+   */
   async interrupt() {
     this.pauseUntil = Date.now() + GUARD_PAUSE_MS;
     this.generation += 1;
@@ -1530,33 +1780,56 @@ class SessionManager extends EventEmitter {
       this.setBase('idle');
       return { ok: true };
     }
+    const dropped = this.pendingFollowUps.splice(0).length;
+    const droppedNote = dropped ? ` Dropped ${dropped} queued command${dropped === 1 ? '' : 's'}.` : '';
+    // A second Stop while the first still waits for the CLI joins it.
+    if (this.interrupting) return this.interrupting;
     const engine = this.engine;
-    if (!engine || !engine.running || this.inFlight === 0) {
+    if (!engine || !engine.running || !this.turnActive) {
+      this.turnActive = false;
+      if (dropped) this.system(`Stopped.${droppedNote}`, 'info');
       this.setBase('idle');
       return { ok: true };
     }
-    this.setBase('stopping', 'Stopping…');
-    let res = { killed: false };
+    this.interrupting = (async () => {
+      this.setBase('stopping', 'Stopping…');
+      let res = { killed: false };
+      try {
+        res = await engine.interrupt();
+      } catch (err) {
+        log.warn(`interrupt failed: ${err.message}`);
+      }
+      this.turnActive = false;
+      this.finalizeTurnItems('Stopped by the user');
+      if (res.killed) {
+        this.resumeNext = Boolean(this.sessionId);
+        this.system(`Claude Code did not stop in time, so it was restarted. Your next command continues the conversation.${droppedNote}`, 'warning');
+      } else {
+        this.system(`Stopped.${droppedNote}`, 'info');
+      }
+      this.setBase('idle');
+      return { ok: true };
+    })();
     try {
-      res = await engine.interrupt();
-    } catch (err) {
-      log.warn(`interrupt failed: ${err.message}`);
+      return await this.interrupting;
+    } finally {
+      this.interrupting = null;
     }
-    this.inFlight = 0;
-    this.finalizeTurnItems('Stopped by the user');
-    if (res.killed) {
-      this.resumeNext = Boolean(this.sessionId);
-      this.system('Claude Code did not stop in time, so it was restarted. Your next command continues the conversation.', 'warning');
-    } else {
-      this.system('Stopped.', 'info');
-    }
-    this.setBase('idle');
-    return { ok: true };
+  }
+
+  /** @private before a new conversation or project: drop commands in preparation and wait out an engine start */
+  async resetForSwitch() {
+    this.generation += 1;
+    this.resetEpoch += 1;
+    this.pendingFollowUps = [];
+    if (this.startingPromise) await this.startingPromise.catch(() => {});
+    await this.stopEngine();
+    this.clearSessionRules();
   }
 
   /** Stop the engine and start a fresh conversation. */
   async newSession() {
-    await this.stopEngine();
+    await this.resetForSwitch();
     this.sessionId = uuid();
     this.resumeNext = false;
     this.freshRetried = false;
@@ -1566,7 +1839,7 @@ class SessionManager extends EventEmitter {
     this.toolItems.clear();
     this.streamItems.clear();
     this.streamOrder.clear();
-    this.inFlight = 0;
+    this.turnActive = false;
     this.forgetSession();
     if (this.bridge && this.mode === 'bridge') this.bridge.clear();
     audit({ type: 'new_session', sessionId: this.sessionId, project: this.projectDir });
@@ -1593,10 +1866,12 @@ class SessionManager extends EventEmitter {
     }
     if (!st.isDirectory()) throw httpError(400, `Not a directory: ${abs}`);
     if (abs === this.projectDir) return this.project;
-    await this.stopEngine();
+    await this.resetForSwitch();
+    // Folder and conversation change together, before any await, so an engine start never
+    // sees one without the other.
     this.projectDir = abs;
-    this.project = await this.projectInfo(abs);
     this.initSessionId();
+    this.project = { dir: abs, name: path.basename(abs) || abs, git: null };
     this.freshRetried = false;
     this.costUsd = 0;
     this.turns = 0;
@@ -1604,11 +1879,14 @@ class SessionManager extends EventEmitter {
     this.toolItems.clear();
     this.streamItems.clear();
     this.streamOrder.clear();
-    this.inFlight = 0;
+    this.turnActive = false;
     this.located = null;
+    this.setBase('idle');
+    // A command submitted while this runs may already be starting the engine in the new folder.
+    const info = await this.projectInfo(abs);
+    if (this.projectDir === abs) this.project = info;
     audit({ type: 'project', project: abs });
     this.system(`Switched to ${this.project.name} (${abs}).`, 'info');
-    this.setBase('idle');
     this.broadcast('project', this.project);
     this.broadcast('session', { id: this.sessionId, model: this.model });
     this.broadcast('snapshot', this.snapshot());
@@ -1655,7 +1933,7 @@ class SessionManager extends EventEmitter {
     if (!this.engine) return;
     if (this.signature() !== this.engineSignature) {
       this.engineStale = true;
-      if (this.inFlight === 0) {
+      if (!this.turnActive) {
         log.info('engine settings changed; Claude Code restarts with the next command');
         this.stopEngine().catch(() => {});
       }
@@ -1668,7 +1946,7 @@ class SessionManager extends EventEmitter {
     this.closed = true;
     await this.stopEngine();
     if (this.hub && this.onHubEvent) this.hub.removeListener('event', this.onHubEvent);
-    for (const f of [this.runFiles.mcpConfig, this.runFiles.systemPrompt, ...this.bridgeFiles]) {
+    for (const f of [this.runFiles.mcpConfig, this.runFiles.systemPrompt, this.runFiles.settings, ...this.bridgeFiles]) {
       try {
         fs.unlinkSync(f);
       } catch {

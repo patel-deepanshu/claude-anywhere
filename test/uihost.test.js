@@ -176,13 +176,13 @@ test('chromiumArgs: app window switches with our profile', () => {
   assert.ok(!U.chromiumArgs({ url: URL_, profileDir: '/p', width: 1, height: 1 }).some((a) => a.startsWith('--window-position')));
 });
 
-test('electronArgs: main.js first, every switch present; --no-sandbox before the app path', () => {
+test('electronArgs: main.js first, every switch present; --no-sandbox before the app path; no URL', () => {
   const ui = { alwaysOnTop: true, hotkey: 'Alt+Space', hideFromScreenshots: false, width: 500, height: 800, position: 'left' };
   const args = U.electronArgs({ url: URL_, ui });
   assert.equal(args[0], U.ELECTRON_MAIN);
   assert.ok(fs.existsSync(U.ELECTRON_MAIN), 'electron/main.js exists');
+  assert.ok(!args.some((a) => a.includes('token') || a.includes('127.0.0.1')), 'the token URL never reaches the command line');
   assert.deepEqual(args.slice(1), [
-    '--url', URL_,
     '--always-on-top', 'true',
     '--hotkey', 'Alt+Space',
     '--hide-from-screenshots', 'false',
@@ -193,12 +193,15 @@ test('electronArgs: main.js first, every switch present; --no-sandbox before the
   assert.deepEqual(U.electronArgs({ url: URL_, ui, noSandbox: true }).slice(0, 2), ['--no-sandbox', U.ELECTRON_MAIN]);
 });
 
-test('electron main.js parses exactly what uihost passes', () => {
+test('electron main.js parses exactly what uihost passes; the URL travels in the environment', () => {
   const ui = { alwaysOnTop: false, hotkey: 'CommandOrControl+Shift+Space', hideFromScreenshots: true, width: 460, height: 700, position: 'right' };
   const argv = ['/usr/bin/electron', ...U.electronArgs({ url: URL_, ui, noSandbox: true })];
   const parsed = electronMain.parseArgs(argv);
+  assert.equal(U.ELECTRON_URL_ENV, electronMain.URL_ENV, 'uihost and main.js agree on the variable');
+  const env = U.electronEnv({ PATH: '/bin', ELECTRON_RUN_AS_NODE: '1' }, URL_);
+  assert.deepEqual(env, { PATH: '/bin', [U.ELECTRON_URL_ENV]: URL_ });
   assert.deepEqual(parsed, {
-    url: URL_,
+    url: null,
     alwaysOnTop: false,
     hotkey: 'CommandOrControl+Shift+Space',
     hideFromScreenshots: true,
@@ -261,9 +264,10 @@ test('findChromiumCandidates: macOS app bundles in /Applications and ~/Applicati
     profileDir: '/p',
   });
   assert.equal(list.length, 2);
-  assert.deepEqual(list[0], { profileDir: '/p', name: 'Google Chrome', cmd: chrome, prefixArgs: [], kind: 'mac-app', bundle: '/Applications/Google Chrome.app' });
+  assert.deepEqual(list[0], { profileDir: '/p', name: 'Google Chrome', cmd: chrome, prefixArgs: [], kind: 'mac-app', bundle: '/Applications/Google Chrome.app', bundleId: 'com.google.Chrome' });
   assert.equal(list[1].name, 'Microsoft Edge');
   assert.equal(list[1].bundle, '/home/me/Applications/Microsoft Edge.app');
+  assert.equal(list[1].bundleId, 'com.microsoft.edgemac');
 });
 
 test('findChromiumCandidates: Windows Program Files and LocalAppData, Chrome before Edge', () => {
@@ -357,6 +361,8 @@ test('WSL launch script: -EncodedCommand decodes back to the script and the URL 
   assert.match(decoded, /Start-Process -FilePath \$exe -ArgumentList \$line -PassThru/);
   assert.match(decoded, /Join-Path \$env:LOCALAPPDATA 'claude-anywhere\\ui-profile'/);
   assert.match(decoded, /'--window-size=440,720', '--window-position=1456,48'/);
+  // PowerShell's comma binds tighter than '+': unparenthesized, every switch folds into --app.
+  assert.match(decoded, /\$list = @\(\('--app=' \+ \$url\), \('--user-data-dir=' \+ \$profileDir\), '--window-size=/);
   assert.match(decoded, /Microsoft\\Edge\\Application\\msedge\.exe/);
   assert.match(decoded, /ANYWHERE_PID/);
   const b64 = /FromBase64String\('([^']+)'\)/.exec(decoded)[1];
@@ -370,17 +376,33 @@ test('WSL launch script: -EncodedCommand decodes back to the script and the URL 
 
 const PWSH = ['/usr/local/bin/pwsh', '/usr/bin/pwsh'].find((p) => fs.existsSync(p));
 
-test('WSL launch script runs under PowerShell with a fake browser', { skip: !PWSH && 'pwsh is not installed' }, () => {
+test('WSL launch script runs under PowerShell with a fake browser', { skip: !PWSH && 'pwsh is not installed' }, async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-ps-'));
   try {
     const appDir = path.join(root, 'Program Files', 'Microsoft', 'Edge', 'Application');
     fs.mkdirSync(appDir, { recursive: true });
-    fs.writeFileSync(path.join(appDir, 'msedge.exe'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const argsFile = path.join(root, 'args.txt');
+    // The fake browser records its argument count and each argument, one per line.
+    fs.writeFileSync(
+      path.join(appDir, 'msedge.exe'),
+      `#!/bin/sh\n{ echo "$#"; for a in "$@"; do printf '%s\\n' "$a"; done; } > '${argsFile}.tmp' && mv '${argsFile}.tmp' '${argsFile}'\n`,
+      { mode: 0o755 }
+    );
     const env = { ...process.env, ProgramFiles: path.join(root, 'Program Files'), LOCALAPPDATA: path.join(root, 'Local') };
-    const script = U.buildWslLaunchScript({ url: URL_, width: 440, height: 720, x: 1, y: 2 });
+    const url = 'http://127.0.0.1:47120/?launch=a b"c';
+    const script = U.buildWslLaunchScript({ url, width: 440, height: 720, x: 1, y: 2 });
     const out = execFileSync(PWSH, U.psArgs(script), { env, encoding: 'utf8', timeout: 60000 });
     assert.match(out, /ANYWHERE_PID \d+ .*msedge\.exe/);
     assert.ok(fs.existsSync(path.join(root, 'Local', 'claude-anywhere', 'ui-profile')));
+    const end = Date.now() + 20000;
+    while (!fs.existsSync(argsFile) && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+    const [count, ...argv] = fs.readFileSync(argsFile, 'utf8').replace(/\n$/, '').split('\n');
+    const switchCount = U.chromiumArgs({ url, profileDir: '/p', width: 440, height: 720, x: 1, y: 2 }).length;
+    assert.equal(Number(count), switchCount, `one argument per switch, got: ${JSON.stringify(argv)}`);
+    assert.equal(argv[0], `--app=${url}`, 'the URL survives Windows argument quoting');
+    assert.equal(argv[1], `--user-data-dir=${path.join(root, 'Local', 'claude-anywhere', 'ui-profile')}`);
+    assert.deepEqual(argv.slice(2, 4), ['--window-size=440,720', '--window-position=1,2']);
+    assert.equal(argv[argv.length - 1], '--disable-session-crashed-bubble');
 
     const none = spawnSync(PWSH, U.psArgs(script), { env: { ...env, ProgramFiles: path.join(root, 'nothing') }, encoding: 'utf8', timeout: 60000 });
     assert.equal(none.status, 3);
@@ -474,6 +496,8 @@ test('open: electron that exits early falls back to an app window', async () => 
   assert.equal(electronCall.args[0], U.ELECTRON_MAIN);
   assert.equal(electronCall.opts.detached, false);
   assert.equal(electronCall.opts.env.ELECTRON_RUN_AS_NODE, undefined, 'ELECTRON_RUN_AS_NODE is stripped');
+  assert.equal(electronCall.opts.env.ANYWHERE_UI_URL, URL_, 'Electron gets the URL through its environment');
+  assert.ok(!electronCall.args.some((a) => a.includes('token=')), 'never on its command line');
   const chromeCall = spawn.calls[1];
   assert.ok(chromeCall.args.includes(`--app=${URL_}`));
   assert.ok(chromeCall.args.includes(`--user-data-dir=${PROFILE}`));
@@ -730,6 +754,51 @@ test('topmost: polls the driver until the app window appears; ignores unsupporte
   await h2.close();
 });
 
+test('topmost: never polled on macOS or with a driver that reports supportsTopmost false', async () => {
+  const calls = [];
+  const driver = {
+    listWindows: async (...a) => {
+      calls.push(['listWindows', ...a]);
+      return [{ id: '77:5', title: 'Claude Anywhere', pid: 4242 }];
+    },
+    setTopmost: async (...a) => {
+      calls.push(['setTopmost', ...a]);
+      return false;
+    },
+    focusWindow: async () => true,
+  };
+  const mac = makeHost({ ui: { alwaysOnTop: true }, platformInfo: { platform: 'darwin' }, driver });
+  assert.equal(mac._scheduleTopmost(), null);
+  mac._host = 'app';
+  await mac.show();
+  await new Promise((r) => setImmediate(r));
+  assert.ok(!calls.some((c) => c[0] === 'setTopmost'), 'show() does not pin on macOS either');
+  calls.length = 0;
+  const flagged = makeHost({ ui: { alwaysOnTop: true }, driver: { ...driver, supportsTopmost: false } });
+  assert.equal(flagged._scheduleTopmost(), null);
+  assert.deepEqual(calls, []);
+});
+
+test('window searches ask the driver for a background listing ({ axTitles: false })', async () => {
+  const seen = [];
+  const spawn = fakeSpawn(() => ({}));
+  const driver = {
+    listWindows: async (...a) => {
+      seen.push(a);
+      return [{ id: '0x3a00004', title: 'Claude Anywhere', pid: spawn.calls.length ? spawn.calls[0].child.pid : 1 }];
+    },
+    setTopmost: async () => true,
+    focusWindow: async () => true,
+  };
+  const host = makeHost({ ui: { alwaysOnTop: true }, env: { DISPLAY: ':0', ANYWHERE_BROWSER: '/opt/chrome' }, exists: fakeExists(['/opt/chrome']), spawn, driver });
+  await host.open(URL_);
+  await host._topmost.promise;
+  await host.show();
+  assert.ok(seen.length >= 2, `listWindows calls: ${seen.length}`);
+  for (const args of seen) assert.deepEqual(args, [{ axTitles: false }]);
+  await host.close();
+});
+
 test('show: focuses the existing window through the driver', async () => {
   const focused = [];
   const spawn = fakeSpawn(() => ({}));
@@ -884,7 +953,7 @@ Module._load = function load(request, ...rest) {
 };
 const tick = (ms = 5) => new Promise((r) => setTimeout(r, ms));
 setTimeout(async () => {
-  const out = { log };
+  const out = { log, urlEnvAfterStart: process.env.ANYWHERE_UI_URL === undefined ? null : process.env.ANYWHERE_UI_URL };
   if (process.env.FAKE_LOCK === '0') { process.stdout.write(JSON.stringify(out)); process.exit(0); }
   resolveReady();
   await tick(20);
@@ -935,15 +1004,20 @@ test('electron main.js runs against a fake Electron API', () => {
     const hook = path.join(dir, 'hook.js');
     fs.writeFileSync(hook, FAKE_ELECTRON_HOOK);
     const main = path.join(__dirname, '..', 'src', 'electron', 'main.js');
-    const args = ['-r', hook, main, '--url', URL_, '--always-on-top', 'true', '--hotkey', 'Alt+Space', '--hide-from-screenshots', 'true', '--width', '440', '--height', '720'];
-    const env = { ...process.env, ANYWHERE_HOME: dir, FAKE_URL: URL_ };
+    // Exactly what uihost passes: switches on the command line, the URL in the environment.
+    const ui = { alwaysOnTop: true, hotkey: 'Alt+Space', hideFromScreenshots: true, width: 440, height: 720, position: 'right' };
+    const eargs = U.electronArgs({ ui, mainPath: main });
+    assert.ok(!eargs.some((a) => a.includes('token')));
+    const args = ['-r', hook, ...eargs];
+    const env = { ...U.electronEnv({ ...process.env, ANYWHERE_HOME: dir, FAKE_URL: URL_ }, URL_) };
     const r = spawnSync(process.execPath, args, { env, encoding: 'utf8', timeout: 20000 });
     assert.equal(r.status, 0, r.stderr);
     const out = JSON.parse(r.stdout);
     const log = out.log;
     const has = (name, ...vals) => log.some((e) => e[0] === name && vals.every((v, i) => JSON.stringify(e[i + 1]) === JSON.stringify(v)));
     assert.ok(has('setPath', 'userData', path.join(dir, 'electron-data')), 'private userData dir');
-    assert.ok(has('lock', { url: URL_ }));
+    assert.ok(has('lock', { url: URL_ }), 'the URL from ANYWHERE_UI_URL reaches the single-instance hand-off');
+    assert.equal(out.urlEnvAfterStart, null, 'the token is removed from the environment Chromium children inherit');
     assert.equal(out.windowOpts.title, 'Claude Anywhere');
     assert.deepEqual([out.windowOpts.x, out.windowOpts.y, out.windowOpts.width, out.windowOpts.height], [984, 41, 440, 720]);
     assert.equal(out.windowOpts.show, false);
@@ -978,9 +1052,340 @@ test('electron main.js runs against a fake Electron API', () => {
     const second = spawnSync(process.execPath, args, { env: { ...env, FAKE_LOCK: '0' }, encoding: 'utf8', timeout: 20000 });
     assert.equal(second.status, 0, second.stderr);
     const secondLog = JSON.parse(second.stdout).log;
+    assert.ok(secondLog.some((e) => e[0] === 'lock' && e[1] && e[1].url === URL_), 'a second instance hands the URL over');
     assert.ok(secondLog.some((e) => e[0] === 'quit'), 'a second instance quits after handing over');
     assert.ok(!secondLog.some((e) => e[0] === 'loadURL'));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------- review fixes
+
+const MINT_BASE = 'http://127.0.0.1:47120/?launch=';
+
+/** launchUrl stand-in: a fresh single-use code per call. */
+function fakeMinter() {
+  const minted = [];
+  const fn = async (url) => {
+    assert.equal(url, URL_, 'the minter gets the real dialog URL');
+    const code = `c${minted.length + 1}`;
+    minted.push(code);
+    return `${MINT_BASE}${code}`;
+  };
+  fn.minted = minted;
+  return fn;
+}
+
+function makeHostWith(extra, overrides = {}) {
+  const host = makeHost(overrides);
+  Object.assign(host, extra);
+  return host;
+}
+
+test('SECURITY-7: browsers get a fresh single-use launch URL per attempt; the token never reaches argv', async () => {
+  const minter = fakeMinter();
+  const spawn = fakeSpawn((cmd) => (cmd === '/usr/bin/google-chrome' ? { exitAfter: 5, code: 1 } : {}));
+  const host = makeHostWith({ _launchUrlFn: minter }, {
+    which: fakeWhich({ 'google-chrome': '/usr/bin/google-chrome', chromium: '/usr/bin/chromium' }),
+    spawn,
+  });
+  const res = await host.open(URL_);
+  assert.equal(res.host, 'app');
+  assert.deepEqual(spawn.calls.map((c) => c.cmd), ['/usr/bin/google-chrome', '/usr/bin/chromium']);
+  assert.ok(spawn.calls[0].args.includes(`--app=${MINT_BASE}c1`));
+  assert.ok(spawn.calls[1].args.includes(`--app=${MINT_BASE}c2`), 'a failed attempt does not reuse its code');
+  for (const c of spawn.calls) assert.ok(!c.args.some((a) => a.includes('token=')), `no token in ${c.cmd} argv`);
+  assert.equal(host._url, URL_, 'the host keeps the real URL for later launches');
+  await host.close();
+});
+
+test('SECURITY-7: launchUrl is wired through the constructor; Electron gets the real URL in its environment only', async () => {
+  const minter = fakeMinter();
+  const spawn = fakeSpawn(() => ({}));
+  const host = new U.UiHost({
+    config: { ui: { host: 'auto' } },
+    platformInfo: linuxInfo,
+    env: { DISPLAY: ':0', ANYWHERE_ELECTRON: '/opt/electron' },
+    which: fakeWhich({}),
+    exists: fakeExists(['/opt/electron']),
+    spawn,
+    run: async () => ({ code: 1, stdout: '', stderr: '' }),
+    kill: fakeKill,
+    getuid: () => 1000,
+    profileDir: PROFILE,
+    stateDir: TMP_HOME,
+    logFile: false,
+    earlyExitMs: 50,
+    resolveModule: () => {
+      throw new Error('not installed');
+    },
+    launchUrl: minter,
+  });
+  assert.equal((await host.open(URL_)).host, 'electron');
+  assert.equal(minter.minted.length, 0, 'Electron needs no launch code');
+  assert.equal(spawn.calls[0].opts.env[U.ELECTRON_URL_ENV], URL_);
+  assert.ok(!spawn.calls[0].args.some((a) => a.includes('127.0.0.1')));
+  await host.close();
+});
+
+test('SECURITY-7: the default-browser opener and the WSL launch script get launch URLs too', async () => {
+  const minter = fakeMinter();
+  const spawn = fakeSpawn(() => ({ exitAfter: 5, code: 0 }));
+  const browserHost = makeHostWith({ _launchUrlFn: minter }, { ui: { host: 'browser' }, which: fakeWhich({ 'xdg-open': '/usr/bin/xdg-open' }), spawn });
+  assert.equal((await browserHost.open(URL_)).host, 'browser');
+  assert.deepEqual(spawn.calls[0].args, [`${MINT_BASE}c1`]);
+
+  // cmd.exe from WSL: the launch URL is escaped like the real one would be.
+  const wslMinter = async () => 'http://127.0.0.1:1/?launch=x&y';
+  const wslSpawn = fakeSpawn(() => ({ exitAfter: 5, code: 0 }));
+  const wslBrowser = makeHostWith({ _launchUrlFn: wslMinter }, {
+    ui: { host: 'browser' },
+    platformInfo: { platform: 'linux', isWSL: true },
+    env: {},
+    exists: fakeExists(['/mnt/c', '/mnt/c/Windows/System32/cmd.exe']),
+    spawn: wslSpawn,
+  });
+  assert.equal((await wslBrowser.open(URL_)).host, 'browser');
+  assert.deepEqual(wslSpawn.calls[0].args, ['/d', '/c', 'start', '""', 'http://127.0.0.1:1/?launch=x^&y']);
+
+  const scripts = [];
+  const run = async (cmd, args) => {
+    const script = Buffer.from(args[args.length - 1], 'base64').toString('utf16le');
+    scripts.push(script);
+    return { code: 0, stdout: 'ANYWHERE_PID 4242 C:\\Edge\\msedge.exe\r\n', stderr: '', error: null };
+  };
+  const wslMint = fakeMinter();
+  const wsl = makeHostWith({ _launchUrlFn: wslMint }, {
+    platformInfo: { platform: 'linux', isWSL: true, displayServer: 'windows' },
+    env: {},
+    which: fakeWhich({ 'powershell.exe': '/mnt/c/ps.exe' }),
+    exists: fakeExists(['/mnt/c']),
+    run,
+  });
+  assert.equal((await wsl.open(URL_)).host, 'app');
+  const b64 = /FromBase64String\('([^']+)'\)/.exec(scripts[0])[1];
+  assert.equal(Buffer.from(b64, 'base64').toString('utf8'), `${MINT_BASE}c1`);
+  assert.ok(!scripts[0].includes(Buffer.from(URL_, 'utf8').toString('base64')), 'the token URL is not in the PowerShell command line');
+});
+
+test('SECURITY-7: a failing minter still opens the dialog (with the token URL)', async () => {
+  const spawn = fakeSpawn(() => ({}));
+  const host = makeHostWith(
+    {
+      _launchUrlFn: async () => {
+        throw new Error('server not ready');
+      },
+    },
+    { env: { DISPLAY: ':0', ANYWHERE_BROWSER: '/opt/chrome' }, exists: fakeExists(['/opt/chrome']), spawn }
+  );
+  assert.equal((await host.open(URL_)).host, 'app');
+  assert.ok(spawn.calls[0].args.includes(`--app=${URL_}`));
+  await host.close();
+});
+
+test('WINDOWS-11: a global npm electron.cmd resolves to the real electron.exe, else it starts hidden', async () => {
+  const shim = 'C:\\Users\\me\\AppData\\Roaming\\npm\\electron.cmd';
+  const exe = 'C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\electron\\dist\\electron.exe';
+  const tried = [];
+  const resolveModule = (id, opts) => {
+    tried.push(opts.paths);
+    if (opts.paths[0] === 'C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules') return 'C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\electron\\index.js';
+    throw new Error('Cannot find module');
+  };
+  const found = U.resolveElectron({ stateDir: TMP_HOME, packageRoot: '/pkg', platform: 'win32', env: {}, exists: fakeExists([exe]), which: fakeWhich({ electron: shim }), resolveModule, loadModule: () => exe });
+  assert.deepEqual(found, { path: exe, source: 'global-module' });
+  assert.deepEqual(tried[tried.length - 1], ['C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules']);
+  // The package is broken: the shim is the last resort.
+  const broken = U.resolveElectron({ stateDir: TMP_HOME, packageRoot: '/pkg', platform: 'win32', env: {}, exists: fakeExists([]), which: fakeWhich({ electron: shim }), resolveModule, loadModule: () => exe });
+  assert.deepEqual(broken, { path: shim, source: 'path' });
+  // Elsewhere a PATH electron is used as is.
+  assert.deepEqual(U.resolveElectron({ stateDir: TMP_HOME, packageRoot: '/pkg', platform: 'linux', env: {}, exists: fakeExists([]), which: fakeWhich({ electron: '/usr/bin/electron' }), resolveModule: () => { throw new Error('no'); } }), { path: '/usr/bin/electron', source: 'path' });
+
+  const win = { platform: 'win32', isWSL: false, displayServer: 'windows' };
+  const spawn = fakeSpawn(() => ({}));
+  const viaExe = makeHost({ platformInfo: win, env: {}, which: fakeWhich({ electron: shim }), exists: fakeExists([exe]), spawn, resolveModule, loadModule: () => exe });
+  assert.equal((await viaExe.open(URL_)).host, 'electron');
+  assert.equal(spawn.calls[0].cmd, exe);
+  assert.equal(spawn.calls[0].opts.shell, false, 'no cmd.exe in between');
+  assert.equal(spawn.calls[0].opts.env[U.ELECTRON_URL_ENV], URL_);
+
+  const shimSpawn = fakeSpawn(() => ({}));
+  const viaShim = makeHost({ platformInfo: win, env: {}, which: fakeWhich({ electron: shim }), exists: fakeExists([]), spawn: shimSpawn });
+  assert.equal((await viaShim.open(URL_)).host, 'electron');
+  assert.equal(shimSpawn.calls[0].opts.shell, true);
+  assert.equal(shimSpawn.calls[0].opts.windowsHide, true, 'no console window beside the dialog');
+  assert.equal(shimSpawn.calls[0].opts.env[U.ELECTRON_URL_ENV], URL_);
+});
+
+test('MACOS-7: pickWindow matches a blank-titled window of ours by pid', () => {
+  const wins = [
+    { id: 1, title: '', pid: 42 },
+    { id: 2, title: 'Claude Anywhere - Google Chrome', pid: 7 },
+    { id: 3, title: '', pid: 43 },
+  ];
+  assert.equal(U.pickWindow(wins, { pids: [42] }).id, 1);
+  assert.equal(U.pickWindow(wins).id, 2, 'without pids a blank title says nothing');
+  assert.equal(U.pickWindow([{ id: 4, title: '', pid: 42, layer: 25 }], { pids: [42] }), null, 'only normal (layer 0) windows');
+  assert.equal(U.pickWindow([{ id: 1, title: '', pid: 42 }, { id: 5, title: 'Claude Anywhere', pid: 99 }], { pids: [42] }).id, 5, 'an exact title still wins');
+  assert.equal(U.pickWindow([{ id: 1, title: '', pid: 42 }, { id: 6, title: 'Inbox', pid: 42 }], { pids: [42] }).id, 6);
+});
+
+const MAC = { platform: 'darwin', isWSL: false, displayServer: 'quartz' };
+const MAC_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const MAC_EDGE = '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge';
+const macPs = (profile) =>
+  [
+    `  700 ${MAC_CHROME} --app=${MINT_BASE}c1 --user-data-dir=${profile} --window-size=440,720`,
+    `  701 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper --type=renderer --user-data-dir=${profile}`,
+    `  800 ${MAC_CHROME}`,
+  ].join('\n');
+
+/** process.kill stand-in for mac tests: `alive` pids answer signal 0 until they get a signal. */
+function macKill(alive) {
+  const set = new Set(alive);
+  const killed = [];
+  const fn = (pid, sig) => {
+    if (sig === 0) {
+      if (set.has(pid)) return true;
+      throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+    }
+    killed.push([pid, sig]);
+    set.delete(pid);
+    return true;
+  };
+  fn.killed = killed;
+  return fn;
+}
+
+test('MACOS-7: the `open -n` browser is found by its profile pids, so show focuses it instead of opening another', async () => {
+  let psCalls = 0;
+  const run = async (cmd) => {
+    if (cmd === 'ps') {
+      psCalls += 1;
+      return { code: 0, stdout: psCalls === 1 ? '  800 /x' : macPs(PROFILE), stderr: '' };
+    }
+    return { code: 1, stdout: '', stderr: '' };
+  };
+  const focused = [];
+  const driver = {
+    listWindows: async () => [
+      { id: '800:1', title: '', pid: 800 },
+      { id: '700:5', title: '', pid: 700 },
+    ],
+    focusWindow: async (id) => {
+      focused.push(id);
+      return true;
+    },
+  };
+  const spawn = fakeSpawn(() => ({ exitAfter: 5, code: 0 }));
+  const host = makeHost({ platformInfo: MAC, env: {}, which: fakeWhich({ open: '/usr/bin/open' }), exists: fakeExists([MAC_CHROME]), spawn, run, driver, kill: macKill([700, 701, 800]) });
+  assert.equal((await host.open(URL_)).host, 'app');
+  assert.ok(psCalls >= 2, 'polls until the browser shows up');
+  assert.deepEqual([...host._profilePids].sort(), [700, 701]);
+  assert.deepEqual(await host.show(URL_), { host: 'app' });
+  assert.deepEqual(focused, ['700:5'], 'the window of our instance, not the user browser');
+  assert.equal(spawn.calls.length, 1, 'no duplicate dialog');
+});
+
+test('MACOS-4: prefer a browser that is not the default link handler', async () => {
+  const cands = [{ name: 'env', bundle: '/x.app' }, { name: 'Chrome', bundleId: 'com.google.Chrome' }, { name: 'Edge', bundleId: 'com.microsoft.edgemac' }];
+  assert.deepEqual(U.preferNonDefaultBrowser(cands, 'com.google.chrome').map((c) => c.name), ['env', 'Edge', 'Chrome']);
+  assert.deepEqual(U.preferNonDefaultBrowser(cands, null).map((c) => c.name), ['env', 'Chrome', 'Edge']);
+
+  const runCalls = [];
+  const run = async (cmd, args) => {
+    runCalls.push([cmd, args]);
+    if (/osascript$/.test(cmd)) return { code: 0, stdout: 'com.google.Chrome\n', stderr: '' };
+    return { code: 1, stdout: '', stderr: '' };
+  };
+  const spawn = fakeSpawn(() => ({ exitAfter: 5, code: 0 }));
+  const host = makeHost({ platformInfo: MAC, env: {}, which: fakeWhich({ open: '/usr/bin/open', osascript: '/usr/bin/osascript' }), exists: fakeExists([MAC_CHROME, MAC_EDGE]), spawn, run });
+  assert.equal((await host.open(URL_)).host, 'app');
+  assert.deepEqual(spawn.calls[0].args.slice(0, 3), ['-n', '-a', '/Applications/Microsoft Edge.app']);
+  const osa = runCalls.find(([cmd]) => cmd === '/usr/bin/osascript');
+  assert.deepEqual(osa[1].slice(0, 3), ['-l', 'JavaScript', '-e']);
+  assert.match(osa[1][3], /URLForApplicationToOpenURL/);
+});
+
+test('MACOS-4: classifyInstanceWindows tells the dialog from the user windows', () => {
+  const pids = [700, 701];
+  const D = (id, title) => ({ id, title, pid: 700 });
+  assert.equal(U.classifyInstanceWindows([D(1, 'Claude Anywhere')], pids).onlyDialog, true);
+  assert.equal(U.classifyInstanceWindows([D(1, '')], pids).onlyDialog, true, 'a single blank window is the dialog');
+  assert.equal(U.classifyInstanceWindows([D(1, ''), D(2, '')], pids).onlyDialog, false, 'two blank windows: cannot tell');
+  assert.equal(U.classifyInstanceWindows([D(1, 'Claude Anywhere'), D(2, 'Claude Anywhere')], pids).onlyDialog, true);
+  const mixed = U.classifyInstanceWindows([D(1, 'Claude Anywhere'), D(2, 'Inbox - Gmail'), { id: 3, title: 'Docs', pid: 800 }], pids);
+  assert.equal(mixed.onlyDialog, false);
+  assert.deepEqual(mixed.dialog.map((w) => w.id), [1]);
+  assert.deepEqual(mixed.others.map((w) => w.id), [2]);
+  assert.equal(U.classifyInstanceWindows([], pids).onlyDialog, true);
+});
+
+test('MACOS-4: close leaves the dialog browser running when it holds the user windows, and stops it otherwise', async () => {
+  const run = async (cmd) => (cmd === 'ps' ? { code: 0, stdout: macPs(PROFILE), stderr: '' } : { code: 1, stdout: '', stderr: '' });
+  const closed = [];
+  let wins = [
+    { id: '700:5', title: 'Claude Anywhere', pid: 700 },
+    { id: '700:6', title: 'Inbox - Gmail', pid: 700 },
+    { id: '800:1', title: 'Docs', pid: 800 },
+  ];
+  const driver = {
+    listWindows: async () => wins,
+    closeWindow: async (id) => {
+      closed.push(id);
+      return true;
+    },
+  };
+  const kill = macKill([700, 701, 800]);
+  const host = makeHost({ platformInfo: MAC, env: {}, which: fakeWhich({ open: '/usr/bin/open' }), exists: fakeExists([MAC_CHROME]), spawn: fakeSpawn(() => ({ exitAfter: 5, code: 0 })), run, driver, kill });
+  await host.open(URL_);
+  await host.close();
+  assert.deepEqual(kill.killed, [], 'a link window opened in the instance is not killed');
+  assert.deepEqual(closed, ['700:5'], 'only the dialog window is closed');
+  assert.deepEqual(host.status(), { host: 'none', open: false });
+
+  wins = [{ id: '700:5', title: 'Claude Anywhere', pid: 700 }, { id: '800:1', title: 'Docs', pid: 800 }];
+  const kill2 = macKill([700, 701, 800]);
+  const host2 = makeHost({ platformInfo: MAC, env: {}, which: fakeWhich({ open: '/usr/bin/open' }), exists: fakeExists([MAC_CHROME]), spawn: fakeSpawn(() => ({ exitAfter: 5, code: 0 })), run, driver, kill: kill2 });
+  await host2.open(URL_);
+  await host2.close();
+  assert.deepEqual(kill2.killed.filter(([, s]) => s === 'SIGTERM').map(([p]) => p).sort(), [700, 701], 'only the dialog instance; never pid 800');
+});
+
+test('LINUX-CONTEXT-5: x11ScaleFrom reads GDK_SCALE, then Xft.dpi, then GNOME scaling-factor', () => {
+  assert.equal(U.x11ScaleFrom({ env: { GDK_SCALE: '2' }, xrdb: 'Xft.dpi:\t96\n' }), 2);
+  assert.equal(U.x11ScaleFrom({ xrdb: 'Xft.antialias:\t1\nXft.dpi:\t192\nXft.hinting:\t1\n' }), 2);
+  assert.equal(U.x11ScaleFrom({ xrdb: 'Xft.dpi:\t144\n' }), 1.5);
+  assert.equal(U.x11ScaleFrom({ xrdb: 'Xft.dpi:\t96\n' }), 1);
+  assert.equal(U.x11ScaleFrom({ gsettings: 'uint32 2\n' }), 2);
+  assert.equal(U.x11ScaleFrom({ gsettings: 'uint32 0\n' }), null, '0 is automatic');
+  assert.equal(U.x11ScaleFrom({ env: { GDK_SCALE: 'x' }, xrdb: '', gsettings: '' }), null);
+  assert.equal(U.x11ScaleFrom(), null);
+});
+
+test('LINUX-CONTEXT-5: app-window bounds on a 200% X11 session are given to Chromium in DIPs', async () => {
+  const displays = async () => [{ index: 0, x: 0, y: 0, width: 3840, height: 2160, scale: 1, primary: true }];
+  const run = async (cmd) => (cmd === '/usr/bin/xrdb' ? { code: 0, stdout: 'Xft.dpi:\t192\n', stderr: '' } : { code: 1, stdout: '', stderr: '' });
+  const which = fakeWhich({ xrdb: '/usr/bin/xrdb' });
+  const spawn = fakeSpawn(() => ({}));
+  const host = makeHost({ env: { DISPLAY: ':0', ANYWHERE_BROWSER: '/opt/chrome' }, exists: fakeExists(['/opt/chrome']), which, run, spawn, driver: { displays } });
+  await host.open(URL_);
+  assert.ok(spawn.calls[0].args.includes('--window-position=1456,48'), spawn.calls[0].args.join(' '));
+  assert.ok(spawn.calls[0].args.includes('--window-size=440,720'));
+  await host.close();
+
+  // Wayland sessions (XWayland) and unscaled X11 keep the physical numbers.
+  for (const env of [{ DISPLAY: ':0', WAYLAND_DISPLAY: 'wayland-0', ANYWHERE_BROWSER: '/opt/chrome' }]) {
+    const sp = fakeSpawn(() => ({}));
+    const h = makeHost({ env, exists: fakeExists(['/opt/chrome']), which, run, spawn: sp, driver: { displays } });
+    await h.open(URL_);
+    assert.ok(sp.calls[0].args.includes('--window-position=3376,48'));
+    await h.close();
+  }
+  const sp = fakeSpawn(() => ({}));
+  const plain = makeHost({ env: { DISPLAY: ':0', ANYWHERE_BROWSER: '/opt/chrome' }, exists: fakeExists(['/opt/chrome']), which: fakeWhich({}), spawn: sp, driver: { displays } });
+  await plain.open(URL_);
+  assert.ok(sp.calls[0].args.includes('--window-position=3376,48'), 'no scale information: unchanged');
+  await plain.close();
 });

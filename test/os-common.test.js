@@ -33,6 +33,7 @@ function fakeChild(pid = 4242, { fail = false } = {}) {
     if (data != null) child.stdinData += data;
   };
   child.stderr = new EventEmitter();
+  child.stdout = new EventEmitter();
   child.kill = () => {
     child.killed = true;
     setImmediate(() => child.emit('exit', null, 'SIGTERM'));
@@ -226,6 +227,144 @@ test('openTarget on WSL: Linux paths go through wslpath; Linux apps are the fall
   assert.equal(calls.launch[0].cmd, '/usr/bin/gedit');
 });
 
+/** A stand-in for WSL's wslpath: C:\ maps to /mnt/c, Linux paths to \\wsl.localhost\Ubuntu. */
+function fakeWslpath(args) {
+  const [flag, p] = args;
+  if (flag === '-u') {
+    const drive = /^([A-Za-z]):\\?(.*)$/.exec(p);
+    if (drive) return { stdout: `/mnt/${drive[1].toLowerCase()}${drive[2] ? `/${drive[2].replace(/\\/g, '/')}` : ''}\n` };
+    const unc = /^\\\\wsl\.localhost\\Ubuntu(\\.*)?$/i.exec(p);
+    if (unc) return { stdout: `${(unc[1] || '\\').replace(/\\/g, '/')}\n` };
+    return { code: 1, stderr: `wslpath: ${p}: Result not representable\n` };
+  }
+  const mnt = /^\/mnt\/([a-z])(\/.*)?$/.exec(p);
+  if (mnt) return { stdout: `${mnt[1].toUpperCase()}:${(mnt[2] || '/').replace(/\//g, '\\')}\n` };
+  return { stdout: `\\\\wsl.localhost\\Ubuntu${p.replace(/\//g, '\\')}\n` };
+}
+
+const WSL_PS = '/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe';
+
+function fakeWsl(t, { existing = [], notFound = [], ...rest } = {}) {
+  const have = new Set(['/mnt/c', ...existing]);
+  return fake(t, {
+    isWSL: true,
+    which: { 'powershell.exe': WSL_PS, ...(rest.which || {}) },
+    env: rest.env || {},
+    exists: (p) => have.has(p),
+    run: (cmd, args) => {
+      if (cmd === 'wslpath') return fakeWslpath(args);
+      const script = decodePs(args);
+      if (notFound.some((n) => script.includes(`$name = ${common.psString(n)}`))) return { code: 3, stdout: '{"error":"not_found"}' };
+      return { stdout: script.includes('App Paths') ? '{"how":"path","target":"C:\\\\code.cmd"}' : '{"ok":true}' };
+    },
+  });
+}
+
+test('openTarget on WSL: existing Linux paths in app args are converted for the Windows app', async (t) => {
+  const calls = fakeWsl(t, { existing: ['/home/me/repo', '/mnt/c/Users/me/notes.txt'] });
+  const r = await common.openTarget('code', { kind: 'app', args: ['/home/me/repo', '--new-window', '/c', 'rel/x', '/mnt/c/Users/me/notes.txt'] });
+  assert.equal(r.kind, 'app');
+  const wslpathCalls = calls.run.filter((c) => c.cmd === 'wslpath').map((c) => c.args);
+  assert.deepEqual(wslpathCalls, [['-w', '/home/me/repo'], ['-w', '/mnt/c/Users/me/notes.txt']], 'only existing absolute Linux paths are converted');
+  const script = decodePs(calls.run.find((c) => c.cmd === WSL_PS).args);
+  const argLine = '\\\\wsl.localhost\\Ubuntu\\home\\me\\repo --new-window /c rel/x C:\\Users\\me\\notes.txt';
+  assert.ok(script.includes(`$argLine = ${common.psString(argLine)}`), 'VS Code gets the WSL folder, not C:\\home\\me\\repo');
+});
+
+test('openTarget on WSL: paths opened with arguments get converted arguments too', async (t) => {
+  const calls = fakeWsl(t, { existing: ['/home/me/tool.exe', '/home/me/data.csv'] });
+  await common.openTarget('/home/me/tool.exe', { args: ['/home/me/data.csv'] });
+  const script = decodePs(calls.run.find((c) => c.cmd === WSL_PS).args);
+  assert.ok(script.includes(`$target = ${common.psString('\\\\wsl.localhost\\Ubuntu\\home\\me\\tool.exe')}`));
+  assert.ok(script.includes(`$argLine = ${common.psString('\\\\wsl.localhost\\Ubuntu\\home\\me\\data.csv')}`));
+});
+
+test('openTarget on WSL: the WSLg fallback keeps the original Linux arguments', async (t) => {
+  const calls = fakeWsl(t, { existing: ['/home/me/notes.txt'], notFound: ['gedit'], which: { gedit: '/usr/bin/gedit' }, env: { DISPLAY: ':0' } });
+  const r = await common.openTarget('gedit', { args: ['/home/me/notes.txt'] });
+  assert.equal(r.how, 'exec (WSLg)');
+  assert.deepEqual([calls.launch[0].cmd, calls.launch[0].args], ['/usr/bin/gedit', ['/home/me/notes.txt']]);
+});
+
+test('openTarget on WSL: Windows paths are checked via wslpath -u and opened as given', async (t) => {
+  const calls = fakeWsl(t, { existing: ['/mnt/c/Users/me/Downloads/x.pdf', '/mnt/c/Users/me/My Doc.pdf'] });
+  const win = 'C:\\Users\\me\\Downloads\\x.pdf';
+  assert.deepEqual(await common.openTarget(win), { opened: true, kind: 'path', how: 'Start-Process', target: win });
+  assert.deepEqual(calls.run[0], { cmd: 'wslpath', args: ['-u', win], opts: calls.run[0].opts });
+  assert.ok(decodePs(calls.run[1].args).includes(`$target = ${common.psString(win)}`));
+  assert.equal(calls.run.filter((c) => c.cmd === 'wslpath' && c.args[0] === '-w').length, 0, 'no Linux-to-Windows conversion');
+  // Forward slashes and an explicit kind work too.
+  assert.equal((await common.openTarget('C:/Users/me/Downloads/x.pdf', { kind: 'path' })).target, win);
+  // file:///C:/... URIs (WINDOWS-9) decode to the Windows path.
+  assert.equal((await common.openTarget('file:///C:/Users/me/My%20Doc.pdf', { kind: 'path' })).target, 'C:\\Users\\me\\My Doc.pdf');
+  assert.equal((await common.openTarget('file://localhost/C:/Users/me/My%20Doc.pdf', { kind: 'path' })).target, 'C:\\Users\\me\\My Doc.pdf');
+});
+
+test('openTarget on WSL: missing Windows paths are NOT_FOUND; unverifiable ones go to Windows', async (t) => {
+  const calls = fakeWsl(t);
+  await assert.rejects(common.openTarget('C:\\Users\\me\\nope.pdf'), (e) => e.code === 'NOT_FOUND' && e.message.includes('C:\\Users\\me\\nope.pdf'));
+  await assert.rejects(common.openTarget('file:///C:/nope.pdf', { kind: 'path' }), (e) => e.code === 'NOT_FOUND' && e.message.includes('C:\\nope.pdf'));
+  // A mapped network drive is not mounted in WSL, and \\server\share has no Linux form.
+  assert.equal((await common.openTarget('Z:\\share\\a.pdf')).target, 'Z:\\share\\a.pdf');
+  assert.equal((await common.openTarget('\\\\server\\share\\a.pdf')).target, '\\\\server\\share\\a.pdf');
+  assert.equal((await common.openTarget('file://server/share/a%20b.pdf', { kind: 'path' })).target, '\\\\server\\share\\a b.pdf');
+  const targets = calls.run.filter((c) => c.cmd === WSL_PS).map((c) => decodePs(c.args));
+  assert.ok(targets[0].includes(`$target = ${common.psString('Z:\\share\\a.pdf')}`));
+  assert.ok(targets[1].includes(`$target = ${common.psString('\\\\server\\share\\a.pdf')}`));
+});
+
+test('openTarget on WSL: a file:// URL to a Linux file opens the file, not C:\\home\\...', async (t) => {
+  const calls = fakeWsl(t, { existing: ['/home/me/report.html'] });
+  const r = await common.openTarget('file:///home/me/report.html');
+  assert.deepEqual([r.kind, r.target], ['path', '/home/me/report.html']);
+  assert.ok(decodePs(calls.run[1].args).includes(`$target = ${common.psString('\\\\wsl.localhost\\Ubuntu\\home\\me\\report.html')}`));
+  // Windows file URLs are left to Windows, which understands them.
+  const w = await common.openTarget('file:///C:/Users/me/x.html');
+  assert.deepEqual([w.kind, w.target], ['url', 'file:///C:/Users/me/x.html']);
+});
+
+test('openTarget on Windows: file:// URIs with drive letters, localhost and UNC hosts', async (t) => {
+  const seen = [];
+  const existing = new Set(['C:\\Users\\me\\My Doc.pdf', 'C:\\x', '\\\\server\\share\\doc.pdf', 'C:\\work\\README.md']);
+  const calls = fake(t, {
+    platform: 'win32',
+    which: { 'powershell.exe': PS },
+    exists: (p) => {
+      seen.push(p);
+      return existing.has(p);
+    },
+    run: () => ({ stdout: '{"ok":true}' }),
+  });
+  const cases = [
+    ['file:///C:/Users/me/My%20Doc.pdf', 'C:\\Users\\me\\My Doc.pdf'],
+    ['file:///c:/Users/me/My%20Doc.pdf', 'C:\\Users\\me\\My Doc.pdf'],
+    ['file://localhost/C:/x', 'C:\\x'],
+    ['file://C:/x', 'C:\\x'],
+    ['FILE:///C:/x', 'C:\\x'],
+    ['file://server/share/doc.pdf', '\\\\server\\share\\doc.pdf'],
+  ];
+  for (const [uri, want] of cases) {
+    const r = await common.openTarget(uri, { kind: 'path' });
+    assert.equal(r.target, want, uri);
+  }
+  assert.ok(!seen.some((p) => /C:\\C:|localhost/.test(p)), `no C:\\C:\\ or localhost paths: ${seen.join(', ')}`);
+  assert.ok(decodePs(calls.run[0].args).includes(`$target = ${common.psString('C:\\Users\\me\\My Doc.pdf')}`));
+  // Relative paths resolve with Windows semantics.
+  assert.equal((await common.openTarget('README.md', { cwd: 'C:\\work' })).target, 'C:\\work\\README.md');
+});
+
+test('openTarget: file:// URIs on Linux decode percent-escapes and reject remote hosts', async (t) => {
+  const existing = new Set(['/home/tester/My Doc.pdf', '/home/tester/a#b.txt', '/home/tester/page.html']);
+  fake(t, { ...LINUX_OPEN, exists: (p) => existing.has(p) });
+  assert.equal((await common.openTarget('file:///home/tester/My%20Doc.pdf', { kind: 'path' })).target, '/home/tester/My Doc.pdf');
+  assert.equal((await common.openTarget('file://localhost/home/tester/My%20Doc.pdf', { kind: 'path' })).target, '/home/tester/My Doc.pdf');
+  assert.equal((await common.openTarget('file:///home/tester/a%23b.txt', { kind: 'path' })).target, '/home/tester/a#b.txt');
+  assert.equal((await common.openTarget('file:///home/tester/page.html#top', { kind: 'path' })).target, '/home/tester/page.html');
+  await assert.rejects(common.openTarget('file:///home/tester/bad%zz', { kind: 'path' }), (e) => e.code === 'INVALID_INPUT' && /Malformed/.test(e.message));
+  await assert.rejects(common.openTarget('file://fileserver/share/x', { kind: 'path' }), (e) => e.code === 'INVALID_INPUT' && /another host/.test(e.message));
+  await assert.rejects(common.openTarget('file:///C:/Users/me/x.pdf', { kind: 'path' }), (e) => e.code === 'NOT_FOUND');
+});
+
 // ------------------------------------------------------------ openTarget: Linux apps and .desktop files
 
 function writeDesktop(dir, name, content) {
@@ -385,6 +524,31 @@ test('speak on macOS and Windows', async (t) => {
   assert.ok(!script.includes('héllo'), 'text goes over stdin');
   assert.equal(calls.spawn[0].child.stdinData, 'héllo 👋');
   assert.equal(calls.spawn[0].opts.windowsHide, true);
+});
+
+test('speak from WSL: SAPI reports its Windows PID and Stop ends it with taskkill (WINDOWS-5)', async (t) => {
+  const WPS = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe';
+  const calls = fake(t, { platform: 'linux', isWSL: true, which: { 'powershell.exe': WPS }, exists: () => true });
+  const r = await common.speak('hello from wsl');
+  assert.equal(r.engine, 'sapi');
+  const sp = calls.spawn[0];
+  assert.equal(sp.opts.stdio[1], 'pipe', 'stdout is read for the PID line');
+  const script = decodePs(sp.args);
+  assert.ok(script.indexOf("ANYWHERE_PID") < script.indexOf('$s.Speak('), 'PID is printed before speaking');
+  sp.child.stdout.emit('data', Buffer.from('ANYWHERE_PID 5150\r\n'));
+  assert.equal(common.stopSpeaking(), true);
+  assert.equal(sp.child.killed, true);
+  const kill = calls.spawn[1];
+  assert.ok(kill, 'taskkill spawned');
+  assert.equal(kill.cmd, '/mnt/c/Windows/System32/taskkill.exe');
+  assert.deepEqual(kill.args, ['/PID', '5150', '/T', '/F']);
+
+  // Native Windows: stdout stays ignored and Stop does not need taskkill.
+  const win = fake(t, { platform: 'win32', which: { 'powershell.exe': PS } });
+  await common.speak('hello');
+  assert.equal(win.spawn[0].opts.stdio[1], 'ignore');
+  common.stopSpeaking();
+  assert.equal(win.spawn.length, 1);
 });
 
 test('speak errors: no engine, pwsh only, spawn failures; empty text is a no-op', async (t) => {

@@ -40,6 +40,20 @@ const DIRECTIONS = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
 const TERMINAL_RE =
   /terminal|konsole|xterm|alacritty|kitty|wezterm|tilix|terminator|rxvt|\bfoot\b|guake|yakuake|termite|sakura|qterminal|ptyxis|blackbox|st-256color/i;
 
+/**
+ * Input methods may resolve to { warnings: string[] } when the OS may have dropped the input
+ * silently (Windows UIPI: a window of another user account). Merged, without duplicates.
+ * @returns {{warnings?:string[]}} spread into an action result
+ */
+function warningsOf(...results) {
+  const out = [];
+  for (const r of results) {
+    if (!r || !Array.isArray(r.warnings)) continue;
+    for (const w of r.warnings) if (typeof w === 'string' && w && !out.includes(w)) out.push(w);
+  }
+  return out.length ? { warnings: out } : {};
+}
+
 function inputError(message, code = 'INVALID_INPUT', hint) {
   const err = new Error(message);
   err.code = code;
@@ -487,9 +501,9 @@ class Computer {
     return this._act(async (displays) => {
       const t = await this._target(displays, display, x, y, ['x', 'y'], 'click');
       return async () => {
-        await this.driver.click(t.logical.x, t.logical.y, { button: btn, clicks: n, modifiers: mods });
+        const res = await this.driver.click(t.logical.x, t.logical.y, { button: btn, clicks: n, modifiers: mods });
         this._notePointer(t.logical);
-        return { ok: true, action: 'click', x: t.shot.x, y: t.shot.y, display: t.idx, logical: t.logical, button: btn, clicks: n, modifiers: mods };
+        return { ok: true, action: 'click', x: t.shot.x, y: t.shot.y, display: t.idx, logical: t.logical, button: btn, clicks: n, modifiers: mods, ...warningsOf(res) };
       };
     });
   }
@@ -516,9 +530,9 @@ class Computer {
       const a = await this._target(displays, display, fromX, fromY, ['fromX', 'fromY'], 'drag');
       const b = await this._target(displays, display, toX, toY, ['toX', 'toY'], 'drag');
       return async () => {
-        await this.driver.drag(a.logical.x, a.logical.y, b.logical.x, b.logical.y, { button: btn });
+        const res = await this.driver.drag(a.logical.x, a.logical.y, b.logical.x, b.logical.y, { button: btn });
         this._notePointer(b.logical);
-        return { ok: true, action: 'drag', from: a.shot, to: b.shot, display: a.idx, logicalFrom: a.logical, logicalTo: b.logical, button: btn };
+        return { ok: true, action: 'drag', from: a.shot, to: b.shot, display: a.idx, logicalFrom: a.logical, logicalTo: b.logical, button: btn, ...warningsOf(res) };
       };
     });
   }
@@ -533,9 +547,9 @@ class Computer {
       const t = await this._target(displays, display, x, y, ['x', 'y'], 'scroll');
       const [ux, uy] = DIRECTIONS[dir];
       return async () => {
-        await this.driver.scroll(t.logical.x, t.logical.y, ux * n, uy * n);
+        const res = await this.driver.scroll(t.logical.x, t.logical.y, ux * n, uy * n);
         this._notePointer(t.logical);
-        return { ok: true, action: 'scroll', direction: dir, amount: n, x: t.shot.x, y: t.shot.y, display: t.idx, logical: t.logical };
+        return { ok: true, action: 'scroll', direction: dir, amount: n, x: t.shot.x, y: t.shot.y, display: t.idx, logical: t.logical, ...warningsOf(res) };
       };
     });
   }
@@ -550,6 +564,7 @@ class Computer {
     }
   }
 
+  /** @returns {Promise<*>} the driver's keyCombo result (may carry warnings) */
   async _paste(text, terminal) {
     let saved = null;
     try {
@@ -561,9 +576,9 @@ class Computer {
     await sleep(PASTE_SETTLE_MS);
     // Linux terminals paste with ctrl+shift+v; everything else uses primary+v.
     const combo = terminal ? ['ctrl', 'shift', 'v'] : keys.normalizeCombo('primary+v', { platform: this.platform });
-    await this.driver.keyCombo(combo);
+    const pressed = await this.driver.keyCombo(combo);
     await sleep(PASTE_RESTORE_MS);
-    if (typeof saved !== 'string' || saved === text) return;
+    if (typeof saved !== 'string' || saved === text) return pressed;
     try {
       let now = text;
       try {
@@ -576,6 +591,7 @@ class Computer {
     } catch (err) {
       log.warn('could not restore the clipboard:', err.message);
     }
+    return pressed;
   }
 
   /**
@@ -595,9 +611,8 @@ class Computer {
         use = wantsPaste && !terminal ? 'paste' : 'keys';
       }
       return async () => {
-        if (use === 'paste') await this._paste(text, terminal);
-        else await this.driver.typeText(text);
-        return { ok: true, action: 'type', method: use, chars: Array.from(text).length };
+        const res = use === 'paste' ? await this._paste(text, terminal) : await this.driver.typeText(text);
+        return { ok: true, action: 'type', method: use, chars: Array.from(text).length, ...warningsOf(res) };
       };
     });
   }
@@ -610,11 +625,12 @@ class Computer {
     const list = keys.normalizeCombo(combo, { platform: this.platform });
     const n = toInt(repeat == null ? 1 : repeat, 'repeat', 1, MAX_REPEAT);
     return this._act(async () => async () => {
+      const results = [];
       for (let i = 0; i < n; i++) {
         if (i) await sleep(REPEAT_GAP_MS);
-        await this.driver.keyCombo(list);
+        results.push(await this.driver.keyCombo(list));
       }
-      return { ok: true, action: 'key', keys: list, repeat: n };
+      return { ok: true, action: 'key', keys: list, repeat: n, ...warningsOf(...results) };
     });
   }
 

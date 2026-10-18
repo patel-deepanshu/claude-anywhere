@@ -100,7 +100,7 @@ test('toXdotool keysyms', () => {
 });
 
 test('toMacKeyCodes: kVK codes and CGEventFlags', () => {
-  assert.deepEqual(keys.toMacKeyCodes(['meta', 'c']), { keyCode: 0x08, keyCodes: [0x08], flags: 0x100000, modifierKeyCodes: [0x37] });
+  assert.deepEqual(keys.toMacKeyCodes(['meta', 'c']), { keyCode: 0x08, keyCodes: [0x08], chars: ['c'], flags: 0x100000, modifierKeyCodes: [0x37] });
   const r = keys.toMacKeyCodes(['ctrl', 'alt', 'shift', 'meta', 'a']);
   assert.equal(r.flags, 0x40000 | 0x80000 | 0x20000 | 0x100000);
   assert.deepEqual(r.modifierKeyCodes, [0x3b, 0x3a, 0x38, 0x37]);
@@ -112,10 +112,52 @@ test('toMacKeyCodes: kVK codes and CGEventFlags', () => {
   assert.equal(q.flags, 0x20000);
   assert.deepEqual(q.modifierKeyCodes, [0x38]);
   // Modifier-only combo.
-  assert.deepEqual(keys.toMacKeyCodes(['meta']), { keyCode: 0x37, keyCodes: [0x37], flags: 0x100000, modifierKeyCodes: [] });
+  assert.deepEqual(keys.toMacKeyCodes(['meta']), { keyCode: 0x37, keyCodes: [0x37], chars: [null], flags: 0x100000, modifierKeyCodes: [] });
   assert.throws(() => keys.toMacKeyCodes(['printscreen']), (e) => e.code === 'UNSUPPORTED' && /cmd\+shift\+3/.test(e.hint));
   assert.throws(() => keys.toMacKeyCodes(['f21']), (e) => e.code === 'UNSUPPORTED');
   assert.equal(keys.toMacKeyCodes('primary+s').flags, 0x100000);
+});
+
+test('toMacKeyCodes: layout-dependent keys carry the character to resolve against the current layout', () => {
+  // kVK_ANSI_* codes are US-QWERTY positions: on AZERTY kVK_ANSI_A is the "q" key, so cmd+a must be
+  // resolved by character, never sent as a raw position.
+  assert.deepEqual(keys.toMacKeyCodes(['meta', 'a']).chars, ['a']);
+  assert.deepEqual(keys.toMacKeyCodes(['meta', 'z']).chars, ['z']);
+  assert.deepEqual(keys.toMacKeyCodes(['meta', ',']).chars, [',']);
+  assert.deepEqual(keys.toMacKeyCodes(['meta', '1']).chars, ['1']);
+  // Shifted punctuation resolves the unshifted character and keeps Shift in the flags.
+  const q = keys.toMacKeyCodes(['meta', '?']);
+  assert.deepEqual([q.chars, q.keyCodes, q.flags], [['/'], [0x2c], 0x100000 | 0x20000]);
+  // Position-independent keys keep their fixed codes.
+  for (const k of ['enter', 'tab', 'space', 'escape', 'backspace', 'delete', 'left', 'up', 'home', 'pageup', 'f5']) {
+    assert.deepEqual(keys.toMacKeyCodes([k]).chars, [null], k);
+  }
+  // chars is aligned with keyCodes.
+  const multi = keys.toMacKeyCodes(['meta', 'k', 'enter', 'v']);
+  assert.deepEqual(multi.keyCodes, [0x28, 0x24, 0x09]);
+  assert.deepEqual(multi.chars, ['k', null, 'v']);
+  for (const k of keys.KEY_NAMES) {
+    let r;
+    try {
+      r = keys.toMacKeyCodes([k]);
+    } catch (e) {
+      assert.equal(e.code, 'UNSUPPORTED', k);
+      continue;
+    }
+    assert.equal(r.chars.length, r.keyCodes.length, k);
+  }
+});
+
+test('toMacKeyCodes: volume keys are refused with an osascript hint (macOS ignores them as key events)', () => {
+  for (const k of ['volumeup', 'volumedown', 'volumemute']) {
+    assert.throws(() => keys.toMacKeyCodes([k]), (e) => e.code === 'UNSUPPORTED' && /osascript -e 'set volume/.test(e.hint), k);
+  }
+  assert.throws(() => keys.toMacKeyCodes(['volumeup']), (e) => /\+ 10/.test(e.hint));
+  assert.throws(() => keys.toMacKeyCodes(['volumedown']), (e) => /- 10/.test(e.hint));
+  assert.throws(() => keys.toMacKeyCodes(['volumemute']), (e) => /output muted/.test(e.hint));
+  // Other backends still send them.
+  assert.equal(keys.toXdotool(['volumeup']), 'XF86AudioRaiseVolume');
+  assert.deepEqual(keys.toWindowsVk(['volumeup']), [0xaf]);
 });
 
 test('toWindowsVk: VK codes, modifiers first', () => {

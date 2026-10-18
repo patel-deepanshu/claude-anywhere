@@ -84,7 +84,10 @@ function run(cmd, args = [], opts = {}) {
   });
 }
 
-const whichCache = new Map();
+const whichCache = new Map(); // name -> { found, at }
+// A miss is re-checked after this long, so a tool installed while the daemon runs (xdotool,
+// gcloud, ...) is found without a restart. Hits are kept.
+const WHICH_MISS_TTL_MS = 10000;
 
 /**
  * Find an executable on PATH (honours PATHEXT on Windows).
@@ -93,7 +96,8 @@ const whichCache = new Map();
  */
 function which(name) {
   if (!name) return null;
-  if (whichCache.has(name)) return whichCache.get(name);
+  const cached = whichCache.get(name);
+  if (cached && (cached.found || Date.now() - cached.at < WHICH_MISS_TTL_MS)) return cached.found;
   let found = null;
   const isWin = process.platform === 'win32';
   const exts = isWin ? (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';').filter(Boolean) : [''];
@@ -120,7 +124,7 @@ function which(name) {
       }
     }
   }
-  whichCache.set(name, found);
+  whichCache.set(name, { found, at: Date.now() });
   return found;
 }
 

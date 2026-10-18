@@ -21,6 +21,7 @@ const { truncate } = require('../shared/util');
 const BUSY_STATUSES = new Set(['starting', 'thinking', 'acting', 'waiting_approval', 'waiting_answer', 'stopping']);
 const LOUD_STATUSES = new Set(['starting', 'stopping', 'error', 'offline']);
 const DOUBLE_CTRL_C_MS = 2000;
+const PIPED_CONNECT_WAIT_MS = 10000;
 const MAX_RECORD_MS = 120000;
 const MIN_AUDIO_BYTES = 44 + 3200; // 0.1 s of 16 kHz mono 16-bit
 const SNAPSHOT_HISTORY = 40;
@@ -202,6 +203,7 @@ function renderResult(data, t = PLAIN_THEME) {
   const turns = Number(d.numTurns) || 0;
   if (turns > 0) parts.push(`${turns} turn${turns === 1 ? '' : 's'}`);
   const meta = parts.length ? c.dim(` ${s.dot} ${parts.join(` ${s.dot} `)}`) : '';
+  if (d.interrupted) return `${c.yellow('Stopped')}${meta}`;
   if (d.isError) {
     const why = d.text ? `: ${firstLine(d.text, 300)}` : '';
     return `${c.red(`${s.fail} Failed${why}`)}${meta}`;
@@ -552,6 +554,7 @@ class Tui {
     this.lastLineKey = null;
     this.promptVisible = false;
     this.attachNext = false;
+    this.attachDefault = false; // config.context.attachScreenshotByDefault, from the snapshot
     this.recording = null;
     this.inFlight = 0;
     this.everConnected = false;
@@ -563,6 +566,12 @@ class Tui {
     this.sub = null;
     this._done = null;
     this._sigint = null;
+    // Piped (non-TTY) input is handled one line at a time, once connected, so
+    // `printf '/status\n/quit\n' | anywhere tui` prints the status before quitting.
+    this.inputChain = Promise.resolve();
+    this._connected = new Promise((resolve) => {
+      this._markConnected = resolve;
+    });
   }
 
   /** Start reading input and events; resolves when the user quits. */
@@ -738,6 +747,7 @@ class Tui {
         break;
       case 'config':
         this.state.config = data;
+        this._seedAttach(data);
         break;
       case 'error':
         this.line(c.red(`${s.fail} ${data.message || 'error'}`));
@@ -769,8 +779,12 @@ class Tui {
     this.state.statusDetail = snap.statusDetail || '';
     if (snap.project) this.state.project = snap.project;
     if (snap.session) this.state.session = snap.session;
-    if (snap.config) this.state.config = snap.config;
+    if (snap.config) {
+      this.state.config = snap.config;
+      this._seedAttach(snap.config);
+    }
     if (first) this.line(renderHeader(snap, this.theme));
+    if (first) this._markConnected();
 
     const msgs = Array.isArray(snap.messages) ? snap.messages.filter((m) => m && m.id) : [];
     const unseen = msgs.filter((m) => !this.seen.has(m.id));
@@ -1035,11 +1049,32 @@ class Tui {
       }
     }
     if (this.closed) return;
-    if (this.recording) {
-      this._stopRecording().catch((err) => this.line(this.theme.c.red(`Recording failed: ${err.message}`)));
+    if (this.isTTY) {
+      this._handleLine(line);
       return;
     }
-    this.handleInput(line).catch((err) => this.line(this.theme.c.red(`${this.theme.s.fail} ${err.message}`)));
+    this.inputChain = this.inputChain
+      .then(() => this._waitConnected())
+      .then(() => (this.closed ? null : this._handleLine(line)))
+      .catch(() => {});
+  }
+
+  _handleLine(line) {
+    if (this.recording) {
+      return this._stopRecording().catch((err) => this.line(this.theme.c.red(`Recording failed: ${err.message}`)));
+    }
+    return this.handleInput(line).catch((err) => this.line(this.theme.c.red(`${this.theme.s.fail} ${err.message}`)));
+  }
+
+  /** Resolves once the first snapshot arrived (or after a while, so input is never stuck). */
+  _waitConnected() {
+    if (this.everConnected) return Promise.resolve();
+    let timer;
+    const late = new Promise((resolve) => {
+      timer = setTimeout(resolve, PIPED_CONNECT_WAIT_MS);
+      if (timer.unref) timer.unref();
+    });
+    return Promise.race([this._connected, late]).then(() => clearTimeout(timer));
   }
 
   /** Handle one line of user input (exposed for tests). */
@@ -1063,12 +1098,23 @@ class Tui {
     await this._sendCommand(text, 'text', { echoed: this.isTTY });
   }
 
+  /**
+   * Follow config.context.attachScreenshotByDefault, unless /screen already changed the next
+   * message's choice.
+   * @param {object} cfg public config
+   */
+  _seedAttach(cfg) {
+    const def = Boolean(cfg && cfg.context && cfg.context.attachScreenshotByDefault);
+    if (this.attachNext === this.attachDefault) this.attachNext = def;
+    this.attachDefault = def;
+  }
+
   async _sendCommand(text, source, { echoed = false } = {}) {
     const { c, s } = this.theme;
     if (echoed) this.localEcho.push({ text, at: Date.now() });
-    const body = { text, source };
-    if (this.attachNext) body.attachScreenshot = true;
-    this.attachNext = false;
+    // Always explicit, so the daemon's default cannot differ from what [+screen] showed.
+    const body = { text, source, attachScreenshot: Boolean(this.attachNext) };
+    this.attachNext = this.attachDefault;
     this.inFlight += 1;
     try {
       await this.client.request('POST', '/api/command', body);
@@ -1203,6 +1249,16 @@ class Tui {
   }
 
   _onInputClosed() {
+    if (this.closed) return;
+    if (!this.isTTY) {
+      // Let the lines read before EOF finish first.
+      this.inputChain = this.inputChain.then(() => this._afterInputClosed());
+      return;
+    }
+    this._afterInputClosed();
+  }
+
+  _afterInputClosed() {
     if (this.closed) return;
     // Piped input ended: wait for the work it started, then leave.
     if (!this.isTTY && (this.inFlight > 0 || BUSY_STATUSES.has(this.state.status))) {

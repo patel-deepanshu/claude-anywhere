@@ -24,6 +24,10 @@ import { WavRecorder } from './wav-recorder.js';
 const FALLBACK_ERRORS = new Set(['network', 'not-allowed', 'service-not-allowed', 'audio-capture', 'language-not-supported']);
 const ARM_MS = 8000;
 const SPEECH_MAX = 600;
+// After Claude stops talking, how long recognition results may still hold its words.
+const ECHO_TAIL_MS = 700;
+// Whisper's usual output for silence; dropped when the recorder heard no speech.
+const SILENCE_HALLUCINATIONS = new Set(['thank you', 'thanks', 'thanks for watching', 'thank you for watching', 'you', 'bye', 'bye bye']);
 
 export const VOICE_HELP =
   'To use voice, open this dialog in Chrome, Edge or Safari (built-in speech recognition), or enable server ' +
@@ -139,30 +143,52 @@ function levenshtein(a, b) {
   return prev[b.length];
 }
 
+// Close mishearings of a wake word, accepted wherever that word is expected.
 const WORD_ALIASES = {
-  claude: ['cloud', 'clod', 'claud', 'clawed', 'clawd', 'klaud', 'klaus', 'claws', 'clause', 'clode', 'clyde', 'glad', 'claudes', "claude's"],
-  hey: ['hi', 'hay', 'hei', 'he', 'a', 'hej', 'heh', 'okay', 'ok', 'hello'],
+  claude: ['claud', 'clawed', 'clawd', 'klaud', 'clode', 'claudes', "claude's"],
+  hey: ['hi', 'hay', 'hei', 'hej', 'heh', 'hello'],
 };
+// Everyday words a recognizer also hears for a wake word. They count only inside the whole
+// phrase, after the words before them matched ("hey cloud"), never on their own: Claude's own
+// answers ("Cloud Run is deployed", "Glad that worked") must not wake it.
+const LOOSE_ALIASES = {
+  claude: ['cloud', 'clod', 'klaus', 'claws', 'clause', 'clyde', 'glad'],
+};
+// One of these may come before the wake phrase ("okay, hey claude", "so claude…").
+const LEAD_FILLERS = new Set(['ok', 'okay', 'so', 'um', 'uh', 'umm', 'uhm', 'er', 'erm', 'oh', 'well', 'and', 'yo', 'alright', 'hey', 'hi', 'hello']);
 
-function wordMatches(heard, want) {
+/**
+ * @param {string} heard normalized word
+ * @param {string} want normalized wake word
+ * @param {'exact'|'near'|'close'|'loose'} mode exact spelling; or within one edit; or also
+ *   close aliases and edits; or also loose aliases
+ */
+function wordMatches(heard, want, mode = 'close') {
   const h = heard.replace(/'/g, '');
   const w = want.replace(/'/g, '');
   if (h === w) return true;
-  const aliases = WORD_ALIASES[w];
-  if (aliases && aliases.some((a) => a.replace(/'/g, '') === h)) return true;
+  if (mode === 'exact') return false;
+  const listed = (list) => Boolean(list) && list.some((a) => a.replace(/'/g, '') === h);
+  if (listed(LOOSE_ALIASES[w])) return mode === 'loose';
+  if (mode === 'near') return w.length >= 4 && levenshtein(h, w) <= 1;
+  if (listed(WORD_ALIASES[w])) return true;
   if (w.length >= 7) return levenshtein(h, w) <= 2;
   if (w.length >= 4) return levenshtein(h, w) <= 1;
   return false;
 }
 
 /**
- * Find the wake word in an utterance (tolerant of common mishearings such as
- * "hey cloud"). Returns the text spoken after it.
+ * Find the wake word at the start of an utterance (tolerant of common
+ * mishearings such as "hey cloud"). Returns the text spoken after it.
+ * The phrase must open the utterance (after at most one filler such as
+ * "okay"); later on, only the exact multi-word phrase counts. With `strict`
+ * (used while Claude is speaking), only the exact phrase at the start counts.
  * @param {string} text
  * @param {string} wakeWord
+ * @param {{strict?:boolean}} [opts]
  * @returns {{matched:boolean, rest:string}}
  */
-export function matchWakeWord(text, wakeWord) {
+export function matchWakeWord(text, wakeWord, { strict = false } = {}) {
   const want = normalizeSpeech(wakeWord).split(' ').filter(Boolean);
   const src = String(text || '');
   if (!want.length) return { matched: true, rest: src.trim() };
@@ -171,20 +197,27 @@ export function matchWakeWord(text, wakeWord) {
   let m;
   while ((m = re.exec(src))) words.push({ w: normalizeSpeech(m[0]), end: m.index + m[0].length });
   const tidy = (end) => src.slice(end).replace(/^[\s,.:;!?'"’-]+/, '').trim();
-  for (let k = 0; k + want.length <= words.length; k += 1) {
-    let ok = true;
+  const phraseAt = (k, exact) => {
+    if (k + want.length > words.length) return false;
     for (let j = 0; j < want.length; j += 1) {
-      if (!wordMatches(words[k + j].w, want[j])) {
-        ok = false;
-        break;
-      }
+      if (!wordMatches(words[k + j].w, want[j], exact ? 'exact' : j > 0 ? 'loose' : 'close')) return false;
     }
-    if (ok) return { matched: true, rest: tidy(words[k + want.length - 1].end) };
+    return true;
+  };
+  const found = (k, n) => ({ matched: true, rest: tidy(words[k + n - 1].end) });
+  const starts = [0];
+  if (words.length > 1 && LEAD_FILLERS.has(words[0].w)) starts.push(1);
+  for (const k of starts) if (phraseAt(k, strict)) return found(k, want.length);
+  if (strict) return { matched: false, rest: '' };
+  // Further in, only the exact phrase counts ("so I said hey claude, open mail").
+  if (want.length > 1) {
+    for (let k = 1; k + want.length <= words.length; k += 1) if (phraseAt(k, true)) return found(k, want.length);
   }
-  // Recognizers often drop a short greeting ("hey"): accept the last wake
-  // word on its own when it opens the utterance.
-  if (want.length > 1 && words.length && want[want.length - 1].length >= 4 && wordMatches(words[0].w, want[want.length - 1])) {
-    return { matched: true, rest: tidy(words[0].end) };
+  // Recognizers often drop a short greeting ("hey"): accept the last wake word on its own,
+  // spelled (nearly) right, when it opens the utterance.
+  const last = want[want.length - 1];
+  if (want.length > 1 && last.length >= 4) {
+    for (const k of starts) if (k < words.length && wordMatches(words[k].w, last, 'near')) return found(k, 1);
   }
   return { matched: false, rest: '' };
 }
@@ -192,9 +225,18 @@ export function matchWakeWord(text, wakeWord) {
 const ORDINALS = { first: 1, one: 1, second: 2, two: 2, third: 3, three: 3, fourth: 4, four: 4, fifth: 5, five: 5, sixth: 6, six: 6, seventh: 7, seven: 7, eighth: 8, eight: 8, ninth: 9, nine: 9, tenth: 10, ten: 10, last: -1 };
 
 const STOP_RE = /^(?:please )?(?:stop|cancel|halt|abort|enough|never ?mind|stop it|stop that|cancel that|stop stop|stop now|stop please|cancel it)(?: please)?$/;
-const ALWAYS_RE = /^(?:always|always allow|allow always|yes always|always yes|always allow (?:it|this|that)|allow (?:it|this|that) always)\b/;
-const ALLOW_RE = /^(?:yes|yeah|yep|yup|ya|yes please|allow|approve|approved|ok|okay|go ahead|go for it|do it|sure|confirm|confirmed|proceed|continue|allow once|allow it|sounds good|affirmative)\b/;
+// Approvals: "no…" anywhere at the start denies (the safe direction, and the rest becomes the
+// reason). Allowing takes a whole utterance that is nothing but a yes ("yeah, go ahead") or an
+// "always"; anything hedged ("okay wait…", "yes, but…", "always ask me first") is left for the
+// card. The alternatives below are unambiguous word sequences, so matching stays linear.
+const ALWAYS_RE = /^(?:(?:yes|yeah|ok|okay) )?(?:always|always allow|allow always|always yes|always allow (?:it|this|that)|allow (?:it|this|that) always|(?:always )?allow (?:it |this |that )?for (?:this|the) session)(?: (?:please|thanks|thank you))?$/;
+const AFFIRM = 'yes|yeah|yep|yup|ya|allow|approve|approved|ok|okay|go ahead|go for it|go on|do it|sure|sure thing|confirm|confirmed|proceed|continue|allow once|sounds good|affirmative';
+const ALLOW_FILLER = 'please|it|this|that|thanks|thank you|and|then|now|claude';
+const ALLOW_RE = new RegExp(`^(?:please )?(?:${AFFIRM})(?: (?:${AFFIRM}|${ALLOW_FILLER}))*$`);
 const DENY_RE = /^(?:no|nope|nah|deny|denied|don't|do not|reject|decline|refuse|negative|cancel)\b/;
+const APPROVAL_HEDGE_RE = /\b(?:no|not|nope|nah|don't|dont|never|deny|denied|reject|refuse|cancel|stop|wait|hold|hang|but|ask|asking|what|why|how|which|instead|before|unless|except|first|later|maybe)\b/;
+// Words around a spoken option that mean it is not simply being chosen ("not sure", "no, not staging").
+const ANSWER_HEDGE_RE = /\b(?:no|not|don't|dont|never|neither|nor|or|but|instead|unless|except|what|why|which|how|who|where|when|maybe|perhaps|unsure|wait|mean)\b/;
 
 /**
  * Interpret a spoken utterance given what the dialog is waiting for.
@@ -209,8 +251,7 @@ export function parseVoiceIntent(text, ctx = {}) {
   if (!t) return { kind: 'command', text: '' };
   if (STOP_RE.test(t)) return { kind: 'stop' };
   if (ctx.approval) {
-    if (ALWAYS_RE.test(t)) return { kind: 'approve', decision: 'allow_session' };
-    const deny = DENY_RE.exec(t);
+    const deny = /^no (?:problem|worries)\b/.test(t) ? null : DENY_RE.exec(t);
     if (deny) {
       const lead = deny[0]
         .split(' ')
@@ -219,7 +260,10 @@ export function parseVoiceIntent(text, ctx = {}) {
       const rest = raw.replace(new RegExp(`^[\\s"'“]*${lead}[\\s,.:;!-]*`, 'iu'), '').trim();
       return { kind: 'approve', decision: 'deny', ...(rest && rest !== raw ? { message: rest } : {}) };
     }
-    if (ALLOW_RE.test(t)) return { kind: 'approve', decision: 'allow' };
+    if (t.length <= 80 && !APPROVAL_HEDGE_RE.test(t)) {
+      if (ALWAYS_RE.test(t)) return { kind: 'approve', decision: 'allow_session' };
+      if (ALLOW_RE.test(t)) return { kind: 'approve', decision: 'allow' };
+    }
     return { kind: 'unmatched_approval', text: raw };
   }
   if (ctx.question) {
@@ -233,11 +277,23 @@ export function parseVoiceIntent(text, ctx = {}) {
         if (n === -1) n = options.length;
         if (n >= 1 && n <= options.length) return { kind: 'answer', text: options[n - 1] };
       }
-      const partial = options.filter((o) => {
-        const no = normalizeSpeech(o);
-        return no && (t.includes(no) || (no.includes(t) && t.length >= 3));
-      });
-      if (partial.length === 1) return { kind: 'answer', text: partial[0] };
+      // Whole words only ("yesterday" is not "yes"); exactly one option named ("yes no" is
+      // neither); and nothing around it that hedges or negates it ("not sure", "no, not that one").
+      const padded = ` ${t} `;
+      const norm = options.map((o) => ({ o, no: normalizeSpeech(o) })).filter((x) => x.no);
+      let named = norm.filter((x) => padded.includes(` ${x.no} `));
+      named = named.filter((x) => !named.some((y) => y !== x && y.no !== x.no && ` ${y.no} `.includes(` ${x.no} `)));
+      if (named.length === 1) {
+        const { o, no } = named[0];
+        const around = padded.replace(` ${no} `, ' ').trim();
+        // A short option ("Yes", "Staging") counts only when it is most of what was said.
+        const short = no.split(' ').length <= 2;
+        if (!ANSWER_HEDGE_RE.test(around) && (!short || (around ? around.split(' ').length : 0) <= 2)) return { kind: 'answer', text: o };
+      } else if (!named.length && t.split(' ').length >= 2 && !ANSWER_HEDGE_RE.test(t)) {
+        // A few words from inside one longer option ("new project").
+        const inside = norm.filter((x) => x.no !== t && ` ${x.no} `.includes(padded));
+        if (inside.length === 1) return { kind: 'answer', text: inside[0].o };
+      }
     }
     return { kind: 'answer', text: raw };
   }
@@ -282,10 +338,11 @@ function sttErrorMessage(code, lang) {
  *   onState?: (state:{phase:string, mode:string|null, provider:string|null, speaking:boolean}) => void,
  *   onError?: (message:string, opts?:{level?:string, code?:string}) => void,
  *   onLevel?: (level:number) => void,              0..1 microphone level (server recording)
- *   getServerVoice?: () => {serverStt?:boolean, sttProvider?:string, serverTts?:boolean, ttsProvider?:string}
+ *   getServerVoice?: () => {serverStt?:boolean, sttProvider?:string, sttHint?:string, serverTts?:boolean, ttsProvider?:string},
+ *   Recorder?: typeof WavRecorder                  server-transcription recorder (tests pass a fake)
  * }} opts
  */
-export function createVoice({ getConfig, api, onInterim, onFinal, onState, onError, onLevel, getServerVoice } = {}) {
+export function createVoice({ getConfig, api, onInterim, onFinal, onState, onError, onLevel, getServerVoice, Recorder = WavRecorder } = {}) {
   const g = globalThis;
   const SR = g.SpeechRecognition || g.webkitSpeechRecognition || null;
   const synth = g.speechSynthesis || null;
@@ -297,6 +354,9 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
   let browserFailed = false;
   let speakingBrowser = false;
   let serverSpeakUntil = 0;
+  let serverPending = 0; // speakGen of the POST /api/tts still waiting for the daemon to finish
+  let speakTimer = 0; // re-emits state when the server speech estimate runs out
+  let lastSpeechEnd = 0;
   let speakGen = 0;
   let lastStopPost = 0;
   const liveUtterances = new Set();
@@ -328,7 +388,22 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
   };
 
   function isSpeaking() {
-    return speakingBrowser || Boolean(synth && synth.speaking) || Date.now() < serverSpeakUntil;
+    return speakingBrowser || Boolean(synth && synth.speaking) || (serverPending !== 0 && serverPending === speakGen) || Date.now() < serverSpeakUntil;
+  }
+
+  /**
+   * True while Claude is speaking and for a moment after: speech synthesis and the daemon's
+   * TTS bypass the browser's echo cancellation, so the microphone hears Claude's own words.
+   */
+  function echoLikely() {
+    return isSpeaking() || Date.now() < Math.max(lastSpeechEnd, serverSpeakUntil) + ECHO_TAIL_MS;
+  }
+
+  /** The user spoke over Claude on purpose: stop speaking, and trust what follows. */
+  function bargeIn() {
+    if (isSpeaking()) cancelSpeech();
+    lastSpeechEnd = 0;
+    serverSpeakUntil = 0;
   }
 
   function emitState() {
@@ -349,7 +424,7 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
   function sttProvider() {
     const v = voiceCfg();
     const mode = v.stt || 'auto';
-    const canRecord = WavRecorder.isSupported();
+    const canRecord = Recorder.isSupported();
     if (mode === 'off') return 'off';
     if (mode === 'server') return canRecord ? 'server' : 'none';
     if (mode === 'browser') return SR ? 'browser' : 'none';
@@ -357,7 +432,10 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
     if (browserFailed && srv.serverStt && canRecord) return 'server';
     if (isElectron && canRecord && (srv.serverStt || !SR)) return 'server';
     if (SR && !browserFailed) return 'browser';
-    if (canRecord) return 'server';
+    // The daemon reports serverStt:false both before it has checked (no hint yet) and once it
+    // knows there is no provider (with a hint saying what to set up). Only the second rules it out.
+    const noServerStt = srv.serverStt === false && Boolean(srv.sttHint);
+    if (canRecord && !noServerStt) return 'server';
     return SR ? 'browser' : 'none';
   }
 
@@ -390,22 +468,30 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
     const t = String(text || '').trim();
     if (!t) return;
     const ww = wakeWord();
+    // While Claude talks (and just after), the microphone hears Claude: without a wake word only
+    // "stop" gets through, and with one only the exact phrase at the start.
+    const echo = echoLikely();
     if (!ww) {
-      if (isSpeaking()) cancelSpeech();
+      if (echo && !STOP_RE.test(normalizeSpeech(t))) return;
+      bargeIn();
       deliver(t, s);
       return;
     }
-    if (Date.now() < armedUntil) {
+    if (!echo && Date.now() < armedUntil) {
       armedUntil = 0;
       const again = matchWakeWord(t, ww);
       deliver(again.matched && again.rest ? again.rest : t, s);
       setPhase(session === s ? 'wake' : phase);
       return;
     }
-    const m = matchWakeWord(t, ww);
+    const m = matchWakeWord(t, ww, { strict: echo });
     if (!m.matched) return;
-    if (isSpeaking()) cancelSpeech();
+    bargeIn();
     if (m.rest) {
+      if (armedUntil) {
+        armedUntil = 0;
+        if (session === s) setPhase('wake');
+      }
       deliver(m.rest, s);
       return;
     }
@@ -422,13 +508,14 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
 
   function handsFreeInterim(text) {
     const ww = wakeWord();
-    if (!ww || Date.now() < armedUntil) {
+    const echo = echoLikely();
+    if (!ww || (!echo && Date.now() < armedUntil)) {
       cb(onInterim, text);
       return;
     }
-    const m = matchWakeWord(text, ww);
+    const m = matchWakeWord(text, ww, { strict: echo });
     if (m.matched) {
-      if (isSpeaking()) cancelSpeech();
+      bargeIn();
       cb(onInterim, m.rest);
     }
   }
@@ -452,6 +539,8 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
       quickEnds: 0,
       startedAt: 0,
       rec: null,
+      ended: false, // s.rec has ended (a restart may be pending)
+      restartTimer: 0,
     };
     session = s;
 
@@ -462,6 +551,7 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
       rec.continuous = mode === 'handsfree';
       rec.maxAlternatives = 1;
       s.rec = rec;
+      s.ended = false;
       s.startedAt = Date.now();
       rec.onstart = () => {
         if (session !== s) return;
@@ -494,13 +584,14 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
       };
       rec.onend = () => {
         if (session !== s) return;
+        s.ended = true;
         const err = s.error;
         s.error = null;
         if (err) {
           const lang = rec.lang;
           const srv = serverVoice();
           const autoMode = (voiceCfg().stt || 'auto') === 'auto';
-          if (FALLBACK_ERRORS.has(err) && autoMode && srv.serverStt && WavRecorder.isSupported() && !s.cancelled) {
+          if (FALLBACK_ERRORS.has(err) && autoMode && srv.serverStt && Recorder.isSupported() && !s.cancelled) {
             browserFailed = true;
             session = null;
             const name = srv.sttProvider ? ` (${srv.sttProvider})` : '';
@@ -521,7 +612,10 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
             fail('Speech recognition keeps stopping right after it starts. Check the microphone, or switch Speech input to "Server transcription" in Settings.', 'restart-loop');
             return;
           }
-          setTimeout(() => {
+          // stop() and cancel() clear this timer: a recognizer that already ended never fires
+          // onend again, so they finish the session themselves.
+          s.restartTimer = setTimeout(() => {
+            s.restartTimer = 0;
             if (session !== s || s.stopping || s.cancelled) return;
             try {
               spawn();
@@ -566,7 +660,7 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
     session = s;
     setPhase('starting');
     const record = async () => {
-      const rec = new WavRecorder({
+      const rec = new Recorder({
         onLevel: (l) => cb(onLevel, l),
         vad: {
           silenceMs: mode === 'ptt' ? Infinity : 1200,
@@ -619,10 +713,13 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
       }
     };
     if (s.cancelled) return;
-    if (!heard || blob.size <= 44 + 3200) {
+    // A quiet or distant microphone may never trip the VAD: when the user ended a push-to-talk or
+    // click recording themselves, send anything of 300 ms or more and let the server decide.
+    const userEnded = s.mode !== 'handsfree' && s.stopping;
+    if (blob.size <= 44 + 3200 || (!heard && !(userEnded && blob.size >= 44 + 9600))) {
       if (s.mode !== 'handsfree' && session === s) {
         finish(s);
-        if (!s.stopping) fail("I didn't catch that. Try again a little closer to the microphone.", 'no-speech', 'info');
+        fail("I didn't catch that. Try again a little closer to the microphone.", 'no-speech', 'info');
         return;
       }
       again();
@@ -637,15 +734,29 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
         timeoutMs: 120000,
       });
       text = (res && typeof res.text === 'string' ? res.text : '').trim();
+      s.failures = 0;
     } catch (err) {
       s.transcribing = false;
-      if (session === s) finish(s);
       const hint = err.hint ? ` ${err.hint}` : '';
       const help = err.status === 503 || err.status === 501 ? ` ${VOICE_HELP}` : '';
-      fail(`${err.message || 'Transcription failed.'}${hint}${help}`, 'server-stt');
+      const message = `${err.message || 'Transcription failed.'}${hint}${help}`;
+      // Hands-free keeps listening through a dropped connection, rate limit or provider hiccup
+      // (backing off), and stops only when transcription isn't set up or keeps failing.
+      const transient = err.status === 0 || err.status === 408 || err.status === 429 || (err.status >= 500 && err.status !== 501 && err.status !== 503);
+      if (s.mode === 'handsfree' && session === s && !s.stopping && !s.cancelled && transient && (s.failures || 0) < 5) {
+        s.failures = (s.failures || 0) + 1;
+        const delay = Math.min(8000, 1000 * 2 ** (s.failures - 1));
+        fail(`${message} Listening again in ${Math.round(delay / 1000)} s.`, 'server-stt', 'warning');
+        setPhase('starting');
+        setTimeout(again, delay);
+        return;
+      }
+      if (session === s) finish(s);
+      fail(message, 'server-stt');
       return;
     }
     if (s.cancelled) return;
+    if (!heard && SILENCE_HALLUCINATIONS.has(normalizeSpeech(text))) text = '';
     if (s.mode === 'handsfree') {
       handsFreeUtterance(text, s);
       again();
@@ -686,6 +797,16 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
     s.stopping = true;
     s.held = false;
     if (s.provider === 'browser') {
+      if (s.ended || s.restartTimer) {
+        // Released between a recognizer ending and its restart: stop() on an ended recognizer
+        // does nothing, so end the session here with what was heard.
+        clearTimeout(s.restartTimer);
+        s.restartTimer = 0;
+        const text = s.finals;
+        finish(s);
+        if (s.mode !== 'handsfree' && text.trim()) deliver(text, s);
+        return;
+      }
       try {
         s.rec.stop();
       } catch {
@@ -710,6 +831,8 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
     s.held = false;
     session = null;
     if (s.provider === 'browser') {
+      clearTimeout(s.restartTimer);
+      s.restartTimer = 0;
       try {
         s.rec.abort();
       } catch {
@@ -791,6 +914,7 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
         liveUtterances.delete(u);
         if (last && gen === speakGen) {
           speakingBrowser = false;
+          lastSpeechEnd = Date.now();
           emitState();
         }
       };
@@ -819,15 +943,31 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
   async function speakServer(text, gen, vc) {
     if (gen !== speakGen) return;
     const rate = Math.max(0.5, Math.min(2, Number((vc || voiceCfg()).ttsRate) || 1));
-    serverSpeakUntil = Date.now() + Math.min(120000, ((text.length / 14) * 1000) / rate + 2000);
+    const est = ((text.length / 14) * 1000) / rate + 2000;
+    serverSpeakUntil = Date.now() + Math.min(120000, est);
     emitState();
-    setTimeout(emitState, serverSpeakUntil - Date.now() + 50);
+    clearTimeout(speakTimer);
+    speakTimer = setTimeout(emitState, serverSpeakUntil - Date.now() + 50);
+    // The daemon answers once it has finished speaking: until then Claude counts as speaking
+    // even past the estimate (slow engines, low rates), so Esc and barge-in still stop it.
+    serverPending = gen;
     try {
-      await api('POST', '/api/tts', { text }, { timeoutMs: 30000 });
+      await api('POST', '/api/tts', { text }, { timeoutMs: Math.min(310000, Math.max(30000, est * 1.5 + 15000)) });
+      if (gen === speakGen) serverSpeakUntil = Date.now();
     } catch (err) {
+      if (gen !== speakGen) return; // stopped or replaced meanwhile
+      // Our own timeout says nothing about the daemon (it caps speech itself): no error.
+      if (err && (err.timeout || err.name === 'AbortError')) return;
+      if (Date.now() < serverSpeakUntil) lastSpeechEnd = Date.now();
       serverSpeakUntil = 0;
-      emitState();
       if (err && err.status !== 400) fail(`Could not speak the answer: ${err.message}${err.hint ? ` ${err.hint}` : ''}`, 'tts', 'warning');
+    } finally {
+      if (serverPending === gen) serverPending = 0;
+      if (gen === speakGen) {
+        clearTimeout(speakTimer);
+        speakTimer = 0;
+      }
+      emitState();
     }
   }
 
@@ -861,6 +1001,7 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
   }
 
   function stopBrowserSpeech() {
+    if (speakingBrowser || (synth && synth.speaking)) lastSpeechEnd = Date.now();
     if (synth) {
       try {
         synth.cancel();
@@ -874,10 +1015,13 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
 
   /** Stop any speech, in the browser and on the daemon (POST /api/tts/stop). */
   function cancelSpeech() {
-    speakGen += 1;
     const wasSpeaking = isSpeaking();
+    speakGen += 1;
     stopBrowserSpeech();
+    if (wasSpeaking) lastSpeechEnd = Date.now();
     serverSpeakUntil = 0;
+    clearTimeout(speakTimer);
+    speakTimer = 0;
     const now = Date.now();
     if (now - lastStopPost > 400) {
       lastStopPost = now;
@@ -918,5 +1062,7 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
     provider,
     phase: () => phase,
     mode: () => (session ? session.mode : null),
+    /** Hands-free heard the wake word alone and takes the next utterance as the request. */
+    armed: () => Boolean(session) && Date.now() < armedUntil,
   };
 }

@@ -746,6 +746,26 @@ function splitText(text, size = TYPE_CHUNK) {
   return out;
 }
 
+/**
+ * Host warnings on a result (e.g. input that Windows' UIPI may have dropped), logged and returned as
+ * `{ warnings }` so callers can show them; undefined when there are none.
+ * @param {...object} results host results
+ * @returns {{warnings:string[]}|undefined}
+ */
+function hostWarnings(...results) {
+  const warnings = [];
+  for (const r of results) {
+    if (!r || !Array.isArray(r.warnings)) continue;
+    for (const w of r.warnings) {
+      const text = String(w == null ? '' : w).trim();
+      if (text && !warnings.includes(text)) warnings.push(text);
+    }
+  }
+  if (!warnings.length) return undefined;
+  for (const w of warnings) log.info(`host warning: ${w}`);
+  return { warnings };
+}
+
 function windowRecord(w) {
   return {
     id: String(w.hwnd),
@@ -759,7 +779,8 @@ function windowRecord(w) {
     focused: Boolean(w.focused),
     minimized: Boolean(w.minimized),
     process: w.process || '',
-    elevated: Boolean(w.elevated),
+    // null: another account's process, so the host cannot tell whether it runs elevated.
+    elevated: w.elevated === null ? null : Boolean(w.elevated),
   };
 }
 
@@ -796,7 +817,8 @@ class Win32Driver {
         notes.push(
           info.elevated
             ? 'The host runs as administrator, so it can also control elevated windows.'
-            : 'Windows (UIPI) blocks input to apps running as administrator; such actions fail with UIPI_BLOCKED unless Claude Anywhere runs elevated too.',
+            : 'Windows (UIPI) blocks input to apps running as administrator; such actions fail with UIPI_BLOCKED unless Claude Anywhere runs elevated too. ' +
+                'Input to a window of another user account (e.g. an installer started with an administrator\'s credentials) returns a warning, because Windows does not say whether it is elevated.',
         );
       }
       return { screenshot: ok, mouse: ok, keyboard: ok, windows: ok, clipboard: ok, notify: ok, speak: ok, notes };
@@ -844,17 +866,19 @@ class Win32Driver {
     await this.host.request('move', { x: toInt(x, 'x'), y: toInt(y, 'y') });
   }
 
+  // Input commands resolve to undefined, or to { warnings } when the input may not have arrived.
+
   async click(x, y, { button = 'left', clicks = 1, modifiers = [] } = {}) {
     const args = { button: checkButton(button), clicks: Math.max(1, Math.min(10, toInt(clicks, 'clicks'))), modifiers: modifierVks(modifiers) };
     if (x != null && y != null) {
       args.x = toInt(x, 'x');
       args.y = toInt(y, 'y');
     }
-    await this.host.request('click', args);
+    return hostWarnings(await this.host.request('click', args));
   }
 
   async mouseDown(button = 'left') {
-    await this.host.request('down', { button: checkButton(button) });
+    return hostWarnings(await this.host.request('down', { button: checkButton(button) }));
   }
 
   async mouseUp(button = 'left') {
@@ -862,13 +886,14 @@ class Win32Driver {
   }
 
   async drag(x1, y1, x2, y2, { button = 'left' } = {}) {
-    await this.host.request('drag', {
+    const r = await this.host.request('drag', {
       x1: toInt(x1, 'x1'),
       y1: toInt(y1, 'y1'),
       x2: toInt(x2, 'x2'),
       y2: toInt(y2, 'y2'),
       button: checkButton(button),
     });
+    return hostWarnings(r);
   }
 
   async scroll(x, y, dx, dy) {
@@ -878,20 +903,22 @@ class Win32Driver {
       args.x = toInt(x, 'x');
       args.y = toInt(y, 'y');
     }
-    await this.host.request('scroll', args);
+    return hostWarnings(await this.host.request('scroll', args));
   }
 
   async typeText(text) {
     const s = String(text == null ? '' : text);
+    const results = [];
     for (const chunk of splitText(s)) {
-      await this.host.request('type', { text: chunk }, { timeoutMs: this.host.timeoutMs + chunk.length * 5 });
+      results.push(await this.host.request('type', { text: chunk }, { timeoutMs: this.host.timeoutMs + chunk.length * 5 }));
     }
+    return hostWarnings(...results);
   }
 
   async keyCombo(keys) {
     const vks = keysLib.toWindowsVk(keys);
     if (!vks.length) throw makeError('No keys to press', 'BAD_ARGS');
-    await this.host.request('keys', { vks });
+    return hostWarnings(await this.host.request('keys', { vks }));
   }
 
   async listWindows() {

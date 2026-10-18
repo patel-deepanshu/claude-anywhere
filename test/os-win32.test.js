@@ -278,12 +278,14 @@ test('driver: windows, focus, minimize, topmost', async () => {
   const driver = await fakeDriver();
   try {
     const wins = await driver.listWindows();
-    assert.equal(wins.length, 3);
+    assert.equal(wins.length, 4);
     assert.deepEqual(Object.keys(wins[0]).slice(0, 10), ['id', 'app', 'title', 'pid', 'x', 'y', 'width', 'height', 'focused', 'minimized']);
     assert.equal(wins[0].id, '1001');
     assert.equal(wins[0].app, 'Visual Studio Code');
     assert.equal(wins[0].focused, true);
     assert.equal(wins[2].elevated, true);
+    assert.equal(wins[0].elevated, false);
+    assert.equal(wins[3].elevated, null, "another account's window: elevation unknown, not false");
     assert.deepEqual(await driver.activeWindow(), { id: '1001', app: 'Visual Studio Code', title: 'claude-anywhere - Visual Studio Code', pid: 4101 });
 
     assert.equal(await driver.focusWindow('1002'), true);
@@ -326,6 +328,46 @@ test('driver: host errors keep their code and hint', async () => {
     await assert.rejects(driver.host.request('no_such_command'), (e) => e.code === 'UNKNOWN_COMMAND');
     // The host is still usable afterwards.
     assert.deepEqual(await driver.cursorPosition(), { x: 10, y: 10 });
+  } finally {
+    await driver.close();
+  }
+});
+
+test("driver: input to another account's window returns a warning; elevated windows are UIPI_BLOCKED", async () => {
+  const driver = await fakeDriver();
+  try {
+    // The user's own unelevated windows: nothing to report.
+    assert.equal(await driver.click(5, 6), undefined);
+    assert.equal(await driver.keyCombo(['enter']), undefined);
+    assert.equal(await driver.typeText('hi'), undefined);
+
+    // An installer started with an administrator's credentials (another account): Windows does not
+    // say whether it is elevated, so the input is sent and the caller is told it may have been dropped.
+    assert.equal(await driver.focusWindow('1004'), true);
+    const results = [
+      await driver.click(35, 25),
+      await driver.mouseDown('left'),
+      await driver.scroll(35, 25, 0, 1),
+      await driver.drag(35, 25, 40, 30),
+      await driver.keyCombo(['enter']),
+      await driver.typeText('z'.repeat(2500)),
+    ];
+    await driver.mouseUp('left');
+    for (const r of results) {
+      assert.ok(r && Array.isArray(r.warnings), 'a warning is returned');
+      assert.equal(r.warnings.length, 1, 'one warning, even over several typed chunks');
+      assert.match(r.warnings[0], /Contoso Setup/);
+      assert.match(r.warnings[0], /another user account/);
+      assert.match(r.warnings[0], /UIPI/);
+    }
+    assert.equal((await requestsSeen(driver, 'type')).length, 1 + 3, 'the text was still sent');
+    // A click on the user's own window next to it carries no warning.
+    assert.equal(await driver.click(2, 2), undefined);
+
+    // A window known to run elevated is still refused outright.
+    assert.equal(await driver.focusWindow('1003'), true);
+    await assert.rejects(driver.click(10, 10), (e) => e.code === 'UIPI_BLOCKED' && /Task Manager/.test(e.message) && Boolean(e.hint));
+    await assert.rejects(driver.keyCombo(['enter']), (e) => e.code === 'UIPI_BLOCKED');
   } finally {
     await driver.close();
   }
@@ -540,4 +582,64 @@ test('pwsh: the real host answers ping, echoes unicode and survives errors', { s
   } finally {
     await driver.close();
   }
+});
+
+test("pwsh: the host warns about another account's window and refuses an elevated one", { skip: !HAS_PWSH && 'pwsh not installed' }, () => {
+  // Load the C# types and the host's helper functions straight from win32-host.ps1 (the Win32 calls
+  // themselves need Windows), then drive Confirm-InputTarget and the response plumbing.
+  const script = [
+    '$ErrorActionPreference = "Stop"',
+    '$t = $null; $e = $null',
+    '$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:HOST_PS1, [ref]$t, [ref]$e)',
+    '$assigns = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)',
+    '$native = $assigns | Where-Object { $_.Left.Extent.Text -eq "`$NativeSource" } | Select-Object -First 1',
+    'Add-Type -TypeDefinition $native.Right.Expression.Value',
+    '$warn = $assigns | Where-Object { $_.Left.Extent.Text -eq "`$script:Warnings" } | Select-Object -First 1',
+    '. ([scriptblock]::Create($warn.Extent.Text))',
+    '$script:AppCache = @{}',
+    '$want = "New-HostError", "Get-AppName", "ConvertTo-WindowRecord", "Add-HostWarning", "Add-ResultWarnings", "Confirm-InputTarget", "Get-ErrorRecordInfo", "ConvertTo-ResponseLine"',
+    'foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) { if ($want -contains $f.Name) { . ([scriptblock]::Create($f.Extent.Text)) } }',
+    '$out = [ordered]@{}',
+    'Confirm-InputTarget $null',
+    '$out.none = $script:Warnings.Count',
+    '$target = New-Object "AnywhereNative+InputTarget"',
+    '$target.Elevation = [AnywhereNative]::ELEVATION_UNKNOWN',
+    '$target.Name = "Contoso Setup (pid 4104)"',
+    'Confirm-InputTarget $target',
+    'Confirm-InputTarget $target',
+    '$r = [ordered]@{ x = 1; y = 2 }',
+    'Add-ResultWarnings $r',
+    '$out.line = ConvertTo-ResponseLine 7 $true $r',
+    '$script:Warnings.Clear()',
+    '$plain = @{ ok = $true }',
+    'Add-ResultWarnings $plain',
+    '$out.plain = ConvertTo-ResponseLine 8 $true $plain',
+    '$target.Elevation = [AnywhereNative]::ELEVATION_YES',
+    '$target.Name = "Task Manager (Taskmgr.exe)"',
+    'try { Confirm-InputTarget $target; $out.blocked = $null } catch { $out.blocked = Get-ErrorRecordInfo $_ }',
+    '$recs = New-Object System.Collections.ArrayList',
+    'foreach ($state in 0, 1, 2) { $w = New-Object "AnywhereNative+WinInfo"; $w.Title = "w"; $w.Process = "setup.exe"; $w.ExePath = ""; $w.Elevation = $state; [void]$recs.Add((ConvertTo-WindowRecord $w)) }',
+    '$out.records = $recs',
+    'ConvertTo-Json -InputObject $out -Compress -Depth 8',
+  ].join('\n');
+  const r = pwsh(['-Command', script], { env: { ...process.env, HOST_PS1: HOST_SCRIPT } });
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout.trim().split('\n').pop());
+  assert.equal(out.none, 0, 'no target, no warning');
+
+  const line = JSON.parse(out.line);
+  assert.equal(line.ok, true);
+  assert.deepEqual([line.result.x, line.result.y], [1, 2]);
+  assert.ok(Array.isArray(line.result.warnings), 'warnings serialize as an array');
+  assert.equal(line.result.warnings.length, 1, 'the same warning is reported once');
+  assert.match(line.result.warnings[0], /'Contoso Setup \(pid 4104\)' belongs to another user account/);
+  assert.match(line.result.warnings[0], /UIPI/);
+  assert.equal(JSON.parse(out.plain).result.warnings, undefined, 'no warnings field without warnings');
+
+  assert.ok(out.blocked, 'an elevated target throws');
+  assert.equal(out.blocked.code, 'UIPI_BLOCKED');
+  assert.match(out.blocked.message, /Task Manager \(Taskmgr\.exe\).*administrator/);
+  assert.ok(out.blocked.hint);
+
+  assert.deepEqual(out.records.map((w) => w.elevated), [false, true, null], 'elevation unknown is null in the window list');
 });

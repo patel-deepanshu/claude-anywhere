@@ -492,6 +492,24 @@ test('summaries are human one-liners', () => {
   assert.ok(long.length <= 'Run: '.length + 120);
 });
 
+test('SECURITY-3: open with args is classified like the command it runs', () => {
+  const bash = classify('mcp__anywhere__open', { target: 'bash', kind: 'app', args: ['-c', 'rm -rf ~'] }, LINUX);
+  assert.equal(bash.risk, 'critical');
+  assert.equal(bash.summary, "Open bash -c 'rm -rf ~'");
+  const sh = classify('mcp__anywhere__open', { target: 'sh', kind: 'app', args: ['-c', 'touch x'] }, LINUX);
+  assert.ok(['high', 'critical'].includes(sh.risk), sh.risk);
+  const ps = classify('mcp__anywhere__open', { target: 'powershell', kind: 'app', args: ['-c', 'Get-Date'] }, WIN);
+  assert.ok(['high', 'critical'].includes(ps.risk), ps.risk);
+  const cmd = classify('mcp__anywhere__open', { target: 'C:\\Windows\\System32\\cmd.exe', args: ['/c', 'dir'] }, WIN);
+  assert.ok(['high', 'critical'].includes(cmd.risk), cmd.risk);
+  const term = classify('mcp__anywhere__open', { target: 'xterm', kind: 'app', args: ['-e', 'ls'] }, LINUX);
+  assert.ok(['high', 'critical'].includes(term.risk), term.risk);
+  assert.equal(classify('mcp__anywhere__open', { target: 'xterm', kind: 'app', args: ['-fa', 'Mono'] }, LINUX).risk, 'medium');
+  assert.equal(classify('mcp__anywhere__open', { target: 'firefox', kind: 'app' }, LINUX).risk, 'medium');
+  assert.equal(classify('mcp__anywhere__open', { target: 'firefox', kind: 'app', args: ['https://example.com'] }, LINUX).risk, 'medium');
+  assert.equal(classify('mcp__anywhere__open', { target: 'code', kind: 'app', args: ['/home/u/proj'] }, LINUX).risk, 'medium');
+});
+
 test('unknown tools and bad input do not throw', () => {
   assert.equal(classify('', null, LINUX).risk, 'medium');
   assert.equal(classify('Bash', {}, LINUX).risk, 'low');
@@ -604,6 +622,12 @@ function makeBroker({ mode = 'smart', alwaysAllow = [], alwaysAsk = [], approval
   });
   return { broker, hub, audits, attention, config };
 }
+
+test('broker: approval deadline is capped below the engine MCP server timeout (CROSS-MODULE-3)', () => {
+  assert.equal(makeBroker({ approvalTimeoutSec: 999999 }).broker.timeoutSec(), 86400);
+  assert.equal(makeBroker({ approvalTimeoutSec: 1800 }).broker.timeoutSec(), 1800);
+  assert.equal(makeBroker({ approvalTimeoutSec: 0 }).broker.timeoutSec(), 600);
+});
 
 async function waitForPending(broker, n = 1) {
   for (let i = 0; i < 100; i += 1) {

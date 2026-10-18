@@ -46,9 +46,20 @@ const KEY_RETURN = 36;
 const KEY_TAB = 48;
 const MAX_NOTCHES = 200;
 const MIN_WINDOW_SIZE = 2;
+/** First Automation check: the consent prompt blocks the helper until the user answers it. */
+const AUTOMATION_TIMEOUT_MS = 120000;
+/** Later checks while an earlier prompt may still be unanswered. */
+const AUTOMATION_RECHECK_TIMEOUT_MS = 5000;
+/** After an unanswered prompt, paste without asking again for this long. */
+const AUTOMATION_PENDING_MS = 30000;
+/** Re-check a refused or unreadable Automation answer after this long. */
+const AUTOMATION_RETRY_MS = 5 * 60000;
+const INPUT_SOURCE_TTL_MS = 3000;
+/** After a window title lookup through System Events stalled, list windows without it for this long. */
+const AX_STALL_SKIP_MS = 30000;
 
 /** Helper commands that are safe to re-run if the helper dies mid-request. */
-const IDEMPOTENT = new Set(['ping', 'perms', 'displays', 'cursor', 'windows', 'active', 'clipGet']);
+const IDEMPOTENT = new Set(['ping', 'perms', 'displays', 'cursor', 'windows', 'active', 'clipGet', 'inputSource', 'automation']);
 
 const SETTINGS_URLS = Object.freeze({
   accessibility: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
@@ -90,6 +101,8 @@ const BUNDLE_APPS = {
   'co.zeit.hyper': 'Hyper',
   'org.tabby': 'Tabby',
   'com.github.Electron': 'Electron',
+  // The launcher applet `anywhere install` compiled before it started daemons through Terminal.
+  'com.apple.ScriptEditor.id.Claude-Anywhere': 'Claude Anywhere',
 };
 const TERM_PROGRAMS = {
   Apple_Terminal: 'Terminal',
@@ -349,8 +362,10 @@ function parseWindowId(id) {
  * with System Events keystroke (≤ 50 chars per step), \n and \t become Return
  * (36) and Tab (48) presses, and any run containing other characters is pasted.
  * Other control characters cannot be typed and are dropped. With pasteAll,
- * every run is pasted (keystroke follows the keyboard layout, which garbles
- * ASCII on non-Latin layouts such as Russian or Greek).
+ * every run is pasted (keystroke follows the keyboard layout and input method,
+ * which garbles ASCII on non-Latin layouts such as Russian or Greek and under
+ * input methods such as Japanese or Korean; the helper detects those and
+ * pastes such steps itself).
  * @param {string} text
  * @param {{chunk?:number, pasteAll?:boolean}} [opts]
  * @returns {Array<{kind:'keys'|'paste',text:string}|{kind:'key',keyCode:number}>}
@@ -866,8 +881,10 @@ class HelperTransport {
 class DarwinDriver {
   /**
    * @param {{transport?:object, run?:Function, which?:Function, spawn?:Function, env?:object, keys?:object,
-   *   tmpdir?:string, checkPermissions?:boolean, scrollLinesPerNotch?:number, typing?:'auto'|'paste', exists?:Function, pid?:number}} [opts]
+   *   tmpdir?:string, checkPermissions?:boolean, scrollLinesPerNotch?:number, typing?:'auto'|'paste'|'keystroke', exists?:Function,
+   *   pid?:number}} [opts]
    *   typing 'paste' (or env ANYWHERE_DARWIN_TYPING=paste) pastes all text instead of System Events keystrokes;
+   *   'keystroke' uses keystrokes even when the active input source would garble them (no input source check);
    *   env ANYWHERE_DARWIN_SKIP_PERMCHECK=1 disables the permission pre-checks.
    *   transport/run/which/spawn/env/keys/exists are injection points for tests.
    */
@@ -890,7 +907,15 @@ class DarwinDriver {
     this._checkPerms =
       opts.checkPermissions !== undefined ? Boolean(opts.checkPermissions) : this._env.ANYWHERE_DARWIN_SKIP_PERMCHECK !== '1';
     this._linesPerNotch = clampInt(opts.scrollLinesPerNotch, 1, 20, 3);
-    this._pasteAll = String(opts.typing || this._env.ANYWHERE_DARWIN_TYPING || '').toLowerCase() === 'paste';
+    const typing = String(opts.typing || this._env.ANYWHERE_DARWIN_TYPING || 'auto').toLowerCase();
+    this._typing = typing === 'paste' ? 'paste' : typing === 'keystroke' || typing === 'keys' ? 'keystroke' : 'auto';
+    /** macOS has no public API to keep another app's window on top (see setTopmost). */
+    this.supportsTopmost = false;
+    /** Automation (System Events) consent: null (not asked yet), granted, denied, pending (prompt unanswered) or unknown. */
+    this._automation = { state: null, at: 0 };
+    this._automationCheck = null;
+    this._inputSourceCache = null;
+    this._axSkipUntil = 0;
     this._permCache = null;
     this._lastFreshPermCheck = 0;
     this._displayCache = null;
@@ -980,6 +1005,127 @@ class DarwinDriver {
     throw await this._decorate(permissionError(kind));
   }
 
+  _noteAutomation(state) {
+    this._automation = { state, at: Date.now() };
+  }
+
+  /**
+   * Make sure macOS has answered the Automation (System Events) consent prompt
+   * before keystrokes depend on it. The first Apple event to System Events
+   * shows that prompt and blocks the helper until the user answers, so this
+   * asks with a harmless event and a long timeout instead of letting a typing
+   * request time out (which kills the helper and types nothing).
+   * @param {{force?:boolean, timeoutMs?:number}} [opts]
+   * @returns {Promise<'granted'|'denied'|'pending'|'unknown'>}
+   */
+  _ensureAutomation({ force = false, timeoutMs } = {}) {
+    const a = this._automation;
+    const age = Date.now() - a.at;
+    if (!force && !this._automationCheck) {
+      if (a.state === 'granted') return Promise.resolve('granted');
+      if (a.state === 'pending' && age < AUTOMATION_PENDING_MS) return Promise.resolve('pending');
+      if ((a.state === 'denied' || a.state === 'unknown') && age < AUTOMATION_RETRY_MS) return Promise.resolve(a.state);
+    }
+    if (!this._automationCheck) {
+      // While an earlier prompt may still be open, do not hold the helper for long again.
+      const wait = timeoutMs || (a.state === 'pending' ? AUTOMATION_RECHECK_TIMEOUT_MS : AUTOMATION_TIMEOUT_MS);
+      this._automationCheck = this._checkAutomation(wait).finally(() => {
+        this._automationCheck = null;
+      });
+    }
+    return this._automationCheck;
+  }
+
+  async _checkAutomation(timeoutMs) {
+    let state = 'unknown';
+    try {
+      const r = await this._call('automation', {}, { timeoutMs });
+      if (r && r.granted === true) state = 'granted';
+      else if (r && r.granted === false) state = 'denied';
+      else log.debug(`could not check the Automation permission: ${(r && r.error) || 'no answer'}`);
+    } catch (err) {
+      if (err.code === 'TIMEOUT') state = 'pending';
+      else if (err.code === 'PERMISSION' && err.permission === 'automation') state = 'denied';
+      else log.debug(`could not check the Automation permission: ${err.message}`);
+    }
+    this._noteAutomation(state);
+    return state;
+  }
+
+  /** The active input source as the helper describes it ({id, kind, ascii, safe}), or null. Cached briefly. */
+  async _inputSource() {
+    const c = this._inputSourceCache;
+    if (c && Date.now() - c.at < INPUT_SOURCE_TTL_MS) return c.value;
+    let value = null;
+    try {
+      value = await this._call('inputSource');
+    } catch (err) {
+      log.debug(`could not read the input source: ${err.message}`);
+    }
+    this._inputSourceCache = { value: value || null, at: Date.now() };
+    return this._inputSourceCache.value;
+  }
+
+  /**
+   * Why keystrokes must not be used for this typing request ('automation'), or
+   * null. Asks for Automation consent unless it is already known, but not when
+   * the input source means the helper will paste anyway: no prompt for a
+   * permission this request does not use.
+   */
+  async _keystrokeBlocker() {
+    const known = this._automation.state;
+    if (known === 'granted') return null;
+    if (this._typing !== 'keystroke' && known !== 'denied' && known !== 'pending') {
+      const src = await this._inputSource();
+      if (src && src.safe === false) return null;
+    }
+    const consent = await this._ensureAutomation();
+    return consent === 'denied' || consent === 'pending' ? 'automation' : null;
+  }
+
+  /** Automation was refused recently enough that System Events need not be tried again yet. */
+  _automationDenied() {
+    return this._automation.state === 'denied' && Date.now() - this._automation.at < AUTOMATION_RETRY_MS;
+  }
+
+  _logOnce(key, level, ...msg) {
+    if (this._warned.has(key)) return;
+    this._warned.add(key);
+    log[level](...msg);
+  }
+
+  /** Remember what window title lookups through System Events revealed about Automation consent. */
+  _noteAx(ax) {
+    if (!ax || typeof ax !== 'object') return;
+    if (ax.perm === 'automation') this._noteAutomation('denied');
+    else if (Number(ax.filled) > 0 && this._automation.state !== 'granted') this._noteAutomation('granted');
+  }
+
+  /**
+   * Run a window query, with titles from System Events unless that is known to
+   * fail or recently stalled. A title lookup can block on the Automation
+   * consent prompt until the helper is killed; the query is then repeated
+   * without it, so callers still get the window list.
+   */
+  async _windowQuery(cmd, opts, timeoutMs) {
+    const o = opts && typeof opts === 'object' ? opts : {};
+    const ax = o.axTitles !== false && !this._automationDenied() && Date.now() >= this._axSkipUntil;
+    let payload;
+    try {
+      payload = await this._call(cmd, { axTitles: ax }, timeoutMs ? { timeoutMs } : {});
+    } catch (err) {
+      if (err.code !== 'TIMEOUT' || !ax) throw err;
+      this._axSkipUntil = Date.now() + AX_STALL_SKIP_MS;
+      log.warn(
+        `reading windows ("${cmd}") timed out while reading titles through System Events (is the Automation prompt ` +
+          'waiting for an answer?); reading them without those titles for now',
+      );
+      payload = await this._call(cmd, { axTitles: false });
+    }
+    if (payload && ax) this._noteAx(payload.ax);
+    return payload;
+  }
+
   _keysModule() {
     if (this._opts.keys) return this._opts.keys;
     try {
@@ -1024,10 +1170,16 @@ class DarwinDriver {
         `macOS privacy permissions belong to ${host ? `"${host}"` : 'the app that launched Claude Code'} (the app that started this process), ` +
           'not to node or osascript; restart that app after granting them.',
       );
-      notes.push(
-        'Typing uses System Events keystrokes: macOS asks once to let that app control "System Events" (Automation). ' +
-          'If it is refused, text is pasted instead.',
-      );
+      const automation = this._automation.state;
+      if (automation === 'denied') {
+        notes.push(`Automation (System Events) is refused, so typed text is pasted instead. ${permissionHint('automation', host)}`);
+      } else {
+        notes.push(
+          'Typing uses System Events keystrokes: macOS asks once to let that app control "System Events" (Automation) and ' +
+            'typing waits for that answer. Text is pasted instead while it is refused or unanswered, and when the active input ' +
+            'source is an input method (Japanese, Chinese, Korean...) or a non-Latin layout (Russian, Greek...).',
+        );
+      }
       const shot = Boolean(this._tool('screencapture', '/usr/sbin/screencapture'));
       if (!shot) notes.push('screencapture was not found (it ships with macOS in /usr/sbin).');
       const clip = (Boolean(this._tool('pbcopy', '/usr/bin/pbcopy')) && Boolean(this._tool('pbpaste', '/usr/bin/pbpaste'))) || helperOk;
@@ -1040,8 +1192,16 @@ class DarwinDriver {
         clipboard: clip,
         notify: true,
         speak: Boolean(this._tool('say', '/usr/bin/say')),
+        topmost: false,
         notes,
-        permissions: { accessibility: ax, screenRecording: sr, hostApp: host || null, settings: { ...SETTINGS_URLS } },
+        permissions: {
+          accessibility: ax,
+          screenRecording: sr,
+          // Only what is already known: reading it could show the consent prompt.
+          automation: automation === 'granted' ? true : automation === 'denied' ? false : null,
+          hostApp: host || null,
+          settings: { ...SETTINGS_URLS },
+        },
         helper: this._transport.mode || 'serve',
       };
     } catch (err) {
@@ -1050,14 +1210,20 @@ class DarwinDriver {
   }
 
   /**
-   * Show the macOS permission prompts (Accessibility, Screen Recording) for the
-   * app that launched this process. Not part of the Driver contract; used by
-   * `anywhere doctor` / install.
-   * @returns {Promise<{accessibility:boolean|null, screenRecording:boolean|null}>}
+   * Show the macOS permission prompts (Accessibility, Screen Recording and
+   * Automation for System Events) for the app that launched this process, so
+   * they are answered up front instead of during the first action. The
+   * Automation prompt is modal: this waits up to two minutes for the answer.
+   * Not part of the Driver contract; used by `anywhere doctor` / install.
+   * @returns {Promise<{accessibility:boolean|null, screenRecording:boolean|null, automation?:boolean|null}>}
    */
-  async requestPermissions({ accessibility = true, screenRecording = true } = {}) {
-    const res = await this._call('requestPerms', { accessibility, screenRecording }, { oneShot: true });
+  async requestPermissions({ accessibility = true, screenRecording = true, automation = true } = {}) {
+    const res = (await this._call('requestPerms', { accessibility, screenRecording }, { oneShot: true })) || {};
     this._permCache = null;
+    if (automation) {
+      const state = await this._ensureAutomation({ force: true, timeoutMs: AUTOMATION_TIMEOUT_MS });
+      res.automation = state === 'granted' ? true : state === 'denied' ? false : null;
+    }
     return res;
   }
 
@@ -1229,17 +1395,52 @@ class DarwinDriver {
 
   // ----- keyboard -----
 
-  /** Type literal text (any unicode) into the focused window. */
+  /**
+   * Type literal text (any unicode) into the focused window. Keystrokes need
+   * Automation consent for System Events, which is settled first; text is
+   * pasted while consent is refused or unanswered, and the helper pastes when
+   * the active input source would garble keystrokes.
+   */
   async typeText(text) {
-    const steps = planTyping(typeof text === 'string' ? text : String(text == null ? '' : text), { pasteAll: this._pasteAll });
+    const s = typeof text === 'string' ? text : String(text == null ? '' : text);
+    let steps = planTyping(s, { pasteAll: this._typing === 'paste' });
     if (!steps.length) return;
     await this._ensurePermission('accessibility');
-    const res = await this._call('type', { steps, fallbackPaste: true }, { timeoutMs: typingTimeoutMs(steps) });
-    if (res && res.fallback === 'paste' && !this._warned.has('automation')) {
-      this._warned.add('automation');
-      log.warn(
-        'System Events refused keystrokes (Automation permission), so text was pasted instead.',
+    let reason = steps.some((st) => st.kind === 'keys') ? await this._keystrokeBlocker() : null;
+    if (reason) steps = planTyping(s, { pasteAll: true });
+    const args = { steps, fallbackPaste: true, checkInputSource: this._typing !== 'keystroke' };
+    let res;
+    try {
+      res = await this._call('type', args, { timeoutMs: typingTimeoutMs(steps) });
+    } catch (err) {
+      // While consent could not be checked, a timeout most likely means the very first keystroke is
+      // blocked on the consent prompt, before anything was typed, so the whole text can be pasted
+      // instead. Never once consent is known: the text may then be half typed.
+      if (err.code !== 'TIMEOUT' || this._automation.state !== 'unknown' || steps[0].kind !== 'keys') throw err;
+      this._noteAutomation('pending');
+      reason = 'automation';
+      steps = planTyping(s, { pasteAll: true });
+      res = await this._call('type', { ...args, steps }, { timeoutMs: typingTimeoutMs(steps) });
+    }
+    if (res && res.automationError) this._noteAutomation('denied');
+    else if (res && Number(res.keystrokes) > 0) this._noteAutomation('granted');
+    const why = (res && res.reason) || reason;
+    if (why === 'automation') {
+      const pending = this._automation.state === 'pending';
+      this._logOnce(
+        pending ? 'automation-pending' : 'automation',
+        'warn',
+        pending
+          ? 'The Automation prompt (control "System Events") has not been answered, so text was pasted instead of typed.'
+          : 'System Events refused keystrokes (Automation permission), so text was pasted instead.',
         permissionHint('automation', await this._hostAppName()),
+      );
+    } else if (why === 'input-source') {
+      const src = (res && res.inputSource) || {};
+      this._logOnce(
+        `input-source:${src.id || ''}`,
+        'info',
+        `The active input source${src.id ? ` (${src.id})` : ''} would garble System Events keystrokes, so text was pasted instead.`,
       );
     }
   }
@@ -1252,6 +1453,9 @@ class DarwinDriver {
     await this._call('key', {
       keyCode: k.keyCode,
       keyCodes,
+      // Base characters per key: the helper presses the key that types them on the active
+      // layout (Cmd+Z on AZERTY is not the US-position Z key). null = position-independent key.
+      chars: Array.isArray(k.chars) ? k.chars : [],
       flags: Number(k.flags) || 0,
       modifierKeyCodes: Array.isArray(k.modifierKeyCodes) ? k.modifierKeyCodes : [],
     });
@@ -1259,14 +1463,17 @@ class DarwinDriver {
 
   // ----- windows -----
 
-  async listWindows() {
-    const payload = await this._call('windows', { axTitles: true }, { timeoutMs: 15000 });
-    return parseWindows(payload);
+  /**
+   * @param {{axTitles?:boolean}} [opts] axTitles false skips reading blank titles (no Screen Recording)
+   *   through System Events, which can show the Automation consent prompt; use it for background polling.
+   */
+  async listWindows(opts) {
+    return parseWindows(await this._windowQuery('windows', opts, 15000));
   }
 
-  async activeWindow() {
-    const payload = await this._call('active', { axTitles: true });
-    return parseActive(payload);
+  /** @param {{axTitles?:boolean}} [opts] see listWindows */
+  async activeWindow(opts) {
+    return parseActive(await this._windowQuery('active', opts));
   }
 
   async focusWindow(id) {
@@ -1281,6 +1488,9 @@ class DarwinDriver {
     }
     if (res && res.ok) return true;
     if (!res || /not running|does not belong/.test(res.reason || '')) return false;
+    // With several instances of the app running (the dialog's own browser next to the user's),
+    // LaunchServices would activate whichever it picks, likely the wrong one.
+    if (Number(res.instances) > 1) return false;
     // Activation can be refused (cooperative activation on macOS 14+): ask LaunchServices instead.
     const target = res.bundlePath ? ['-a', res.bundlePath] : res.bundleId ? ['-b', res.bundleId] : null;
     if (!target) return false;
@@ -1311,6 +1521,25 @@ class DarwinDriver {
     if (!(await this.focusWindow(id))) return false;
     await this.keyCombo(['meta', 'm']);
     return true;
+  }
+
+  /**
+   * Close one window by pressing its accessibility close button (AXCloseButton), leaving the
+   * app and its other windows running.
+   * @param {string} id "pid:number"
+   * @returns {Promise<boolean>} whether the button was pressed
+   */
+  async closeWindow(id) {
+    const ref = parseWindowId(id);
+    if (!ref || ref.number == null) return false;
+    try {
+      const res = await this._call('close', ref);
+      return Boolean(res && res.ok);
+    } catch (err) {
+      if (err.code === 'PERMISSION' || err.code === 'UNSUPPORTED') throw err;
+      log.debug(`closing window ${id} failed: ${err.message}`);
+      return false;
+    }
   }
 
   /** macOS has no public API to pin another app's window on top. */

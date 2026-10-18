@@ -15,6 +15,11 @@ const EVENT_TYPES = [
 ];
 const BUSY = new Set(['starting', 'thinking', 'acting', 'waiting_approval', 'waiting_answer', 'stopping']);
 const MAX_ITEMS = 600;
+// Tool rows that keep their screenshot (matches the daemon's transcript policy).
+const MAX_IMAGES_IN_TRANSCRIPT = 12;
+// A card that has just taken focus ignores Enter/Esc for this long, so a key meant for
+// whatever had focus before (or a held one) can't answer it unseen.
+const CARD_ARM_MS = 600;
 const DETAIL_LIMIT = 4096;
 const IMAGE_RE = /^data:image\/(png|jpeg|gif|webp);base64,/;
 const IS_MAC = /Mac|iPhone|iPad/i.test((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent || '');
@@ -213,6 +218,7 @@ const state = {
   histIdx: -1,
   histDraft: '',
   sending: false,
+  lastSentAt: 0,
   voicePhase: 'idle',
   voiceMode: null,
   speaking: false,
@@ -228,7 +234,57 @@ const cardNodes = new Map();
 
 // ------------------------------------------------------------------ token, theme, API
 
-function initFromUrl() {
+function rememberToken(token) {
+  state.token = token;
+  try {
+    window.sessionStorage.setItem('anywhere.token', token);
+  } catch {
+    /* storage blocked: keep it in memory */
+  }
+}
+
+function storedToken() {
+  try {
+    return window.sessionStorage.getItem('anywhere.token') || '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Trade a single-use launch code (?launch=, minted by the daemon for browser command lines)
+ * for the token. No auth header: the code is the credential.
+ * @returns {Promise<string>} the token, or '' when the exchange failed
+ */
+async function exchangeLaunchCode(code) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const res = await fetch('/api/launch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+      signal: ctrl.signal,
+      cache: 'no-store',
+      credentials: 'same-origin',
+    });
+    if (!res.ok) return '';
+    const data = await res.json().catch(() => ({}));
+    return data && typeof data.token === 'string' ? data.token : '';
+  } catch {
+    return '';
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Read theme and credentials from the URL. Synchronous up to the launch-code exchange, so
+ * the theme is set before the caller's first render; the returned promise settles once
+ * state.token is final (always resolves).
+ * @returns {Promise<void>}
+ */
+async function initFromUrl() {
   let params;
   try {
     params = new URLSearchParams(window.location.search);
@@ -238,26 +294,27 @@ function initFromUrl() {
   const theme = params.get('theme');
   if (theme === 'light' || theme === 'dark') state.themeOverride = theme;
   const fromUrl = params.get('token');
-  if (fromUrl) {
-    state.token = fromUrl;
-    try {
-      window.sessionStorage.setItem('anywhere.token', fromUrl);
-    } catch {
-      /* storage blocked: keep it in memory */
-    }
+  const launch = params.get('launch');
+  if (fromUrl || launch) {
+    // Keep credentials out of the address bar (and out of history and bookmarks).
     params.delete('token');
+    params.delete('launch');
     const qs = params.toString();
     try {
       window.history.replaceState(null, '', `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`);
     } catch {
       /* file:// or sandboxed */
     }
-  } else {
-    try {
-      state.token = window.sessionStorage.getItem('anywhere.token') || '';
-    } catch {
-      state.token = '';
-    }
+  }
+  if (fromUrl) {
+    rememberToken(fromUrl);
+    return;
+  }
+  state.token = storedToken();
+  if (launch) {
+    // A failed exchange (used or expired code, e.g. on reload) keeps the stored token.
+    const token = await exchangeLaunchCode(launch);
+    if (token) rememberToken(token);
   }
 }
 
@@ -290,9 +347,11 @@ async function api(method, path, body, { timeoutMs = 30000, contentType } = {}) 
   try {
     res = await fetch(path, { method, headers, body: payload, signal: ctrl.signal, cache: 'no-store', credentials: 'same-origin' });
   } catch (err) {
-    const e = new Error(err && err.name === 'AbortError' ? 'The request timed out.' : "Can't reach Claude Anywhere. Is it still running?");
+    const timedOut = Boolean(err && err.name === 'AbortError');
+    const e = new Error(timedOut ? 'The request timed out.' : "Can't reach Claude Anywhere. Is it still running?");
     e.status = 0;
     e.network = true;
+    if (timedOut) e.timeout = true;
     throw e;
   } finally {
     clearTimeout(timer);
@@ -548,6 +607,7 @@ function applySnapshot(s) {
   state.toolIds.clear();
   for (const m of Array.isArray(s.messages) ? s.messages : []) storeItem(m);
   trimItems();
+  trimImages(false);
   state.approvals.clear();
   state.questions.clear();
   const pending = s.pending || {};
@@ -560,10 +620,13 @@ function applySnapshot(s) {
   renderMode();
   renderFooter();
   renderView();
-  renderTranscript();
+  // Snapshots also come mid-session (reconnects, settings changes): keep a reader's place.
+  const follow = following();
+  renderTranscript(follow);
   renderCards();
   renderComposerButtons();
-  scrollToBottom();
+  if (follow) scrollToBottom();
+  else el.jump.hidden = false;
   maybeStartHandsFree();
 }
 
@@ -589,6 +652,29 @@ function trimItems() {
     const n = nodes.get(id);
     if (n) n.remove();
     nodes.delete(id);
+  }
+}
+
+/**
+ * Keep screenshots only on the newest tool rows, like the daemon's transcript
+ * (each one is a large data: URL held in memory and decoded in the DOM).
+ * @param {boolean} [render] re-render the rows that lose their image
+ */
+function trimImages(render = true) {
+  let seen = 0;
+  for (let i = state.order.length - 1; i >= 0; i -= 1) {
+    const id = state.order[i];
+    const it = state.items.get(id);
+    if (!it || it.role !== 'tool' || !it.image) continue;
+    seen += 1;
+    if (seen <= MAX_IMAGES_IN_TRANSCRIPT) continue;
+    it.image = null;
+    const n = render ? nodes.get(id) : null;
+    const fresh = n ? buildItem(it) : null;
+    if (fresh) {
+      n.replaceWith(fresh);
+      nodes.set(id, fresh);
+    }
   }
 }
 
@@ -618,11 +704,19 @@ function afterChange(wasNear) {
 function watchImages(node, wasNear) {
   if (!wasNear) return;
   for (const img of node.querySelectorAll('img')) {
-    if (!img.complete) img.addEventListener('load', () => scrollToBottom(), { once: true });
+    if (!img.complete) {
+      img.addEventListener(
+        'load',
+        () => {
+          if (pinned) scrollToBottom();
+        },
+        { once: true }
+      );
+    }
   }
 }
 
-function renderTranscript() {
+function renderTranscript(follow = true) {
   nodes.clear();
   const frag = document.createDocumentFragment();
   for (const id of state.order) {
@@ -634,7 +728,7 @@ function renderTranscript() {
   el.items.replaceChildren(frag);
   renderEmpty();
   renderTyping();
-  watchImages(el.items, true);
+  watchImages(el.items, follow);
 }
 
 function upsertMessage(item) {
@@ -648,6 +742,7 @@ function upsertMessage(item) {
   else el.items.append(node);
   nodes.set(item.id, node);
   trimItems();
+  if (stored.role === 'tool' && stored.image) trimImages();
   renderEmpty();
   renderTyping();
   watchImages(node, wasNear);
@@ -909,17 +1004,56 @@ function renderTyping() {
 
 // ------------------------------------------------------------------ cards
 
+// What each card node was built from, so a snapshot only rebuilds cards that changed.
+const cardSource = new WeakMap();
+
+function cardSignature(kind, c) {
+  try {
+    return `${kind}:${JSON.stringify(c)}`;
+  } catch {
+    return `${kind}:${c.id}:${Math.random()}`;
+  }
+}
+
+/**
+ * Bring the cards in line with state.approvals/questions. Cards still pending
+ * keep their node, so a snapshot mid-session (a reconnect, a settings change)
+ * doesn't wipe a half-typed reason or answer, or move focus.
+ */
 function renderCards() {
-  for (const n of cardNodes.values()) n.remove();
-  cardNodes.clear();
   const all = [
     ...[...state.approvals.values()].map((c) => ({ kind: 'approval', c })),
     ...[...state.questions.values()].map((c) => ({ kind: 'question', c })),
   ].sort((a, b) => String(a.c.ts || '').localeCompare(String(b.c.ts || '')));
-  for (const { kind, c } of all) {
-    const n = kind === 'approval' ? buildApprovalCard(c) : buildQuestionCard(c);
+  const active = document.activeElement;
+  const hadFocus = Boolean(active && el.cards.contains(active));
+  const wanted = new Set(all.map((x) => x.c.id));
+  for (const [id, n] of cardNodes) {
+    if (wanted.has(id)) continue;
+    cardNodes.delete(id);
+    n.remove();
+  }
+  const order = all.map(({ kind, c }) => {
+    const sig = cardSignature(kind, c);
+    let n = cardNodes.get(c.id);
+    if (n && cardSource.get(n) !== sig) {
+      const fresh = kind === 'approval' ? buildApprovalCard(c) : buildQuestionCard(c);
+      n.replaceWith(fresh);
+      n = fresh;
+    } else if (!n) {
+      n = kind === 'approval' ? buildApprovalCard(c) : buildQuestionCard(c);
+    }
+    cardSource.set(n, sig);
     cardNodes.set(c.id, n);
-    el.cards.append(n);
+    return n;
+  });
+  // Moving a node drops its focus, so only touch the DOM when the order differs.
+  const current = [...el.cards.children];
+  if (order.length !== current.length || order.some((n, i) => current[i] !== n)) el.cards.append(...order);
+  if (hadFocus && document.activeElement !== active) {
+    if (active.isConnected) active.focus({ preventScroll: true });
+    else if (order.length) focusCard(order[0]);
+    else focusInput();
   }
   updateTimers();
 }
@@ -929,6 +1063,7 @@ function addApproval(card) {
   state.approvals.set(card.id, card);
   if (cardNodes.has(card.id)) return;
   const n = buildApprovalCard(card);
+  cardSource.set(n, cardSignature('approval', card));
   cardNodes.set(card.id, n);
   el.cards.append(n);
   updateTimers();
@@ -940,9 +1075,30 @@ function addQuestion(q) {
   state.questions.set(q.id, q);
   if (cardNodes.has(q.id)) return;
   const n = buildQuestionCard(q);
+  cardSource.set(n, cardSignature('question', q));
   cardNodes.set(q.id, n);
   el.cards.append(n);
   maybeFocusCard(n);
+}
+
+// card node → time before which Enter/Esc on the card itself are ignored
+const cardArmAt = new WeakMap();
+
+/**
+ * Enter/Esc on a card count only once it has had focus for CARD_ARM_MS (from a
+ * programmatic focus, a click, or the window coming back to the front), and
+ * never as key repeats.
+ * @returns {(e:KeyboardEvent) => boolean} true when the key must be ignored
+ */
+function armCard(node) {
+  node.addEventListener('focus', () => cardArmAt.set(node, Date.now() + CARD_ARM_MS));
+  return (e) => e.repeat || (e.target === node && Date.now() < (cardArmAt.get(node) || 0));
+}
+
+/** Focus a card from code (no focus event fires while the window is in the background). */
+function focusCard(node) {
+  cardArmAt.set(node, Date.now() + CARD_ARM_MS);
+  node.focus({ preventScroll: true });
 }
 
 function removeCard(id, kind) {
@@ -955,14 +1111,14 @@ function removeCard(id, kind) {
   n.remove();
   if (hadFocus) {
     const next = el.cards.querySelector('.card');
-    if (next) next.focus();
+    if (next) focusCard(next);
     else focusInput();
   }
 }
 
 function maybeFocusCard(node) {
   const a = document.activeElement;
-  if (!a || a === document.body || a === el.log) node.focus({ preventScroll: true });
+  if (!a || a === document.body || a === el.log) focusCard(node);
 }
 
 function firstApproval() {
@@ -1011,8 +1167,15 @@ function buildApprovalCard(card) {
   allow.addEventListener('click', () => decide('allow'));
   always.addEventListener('click', () => decide('allow_session'));
   deny.addEventListener('click', () => decide('deny'));
+  const ignoreKey = armCard(node);
   node.addEventListener('keydown', (e) => {
     if (e.isComposing || e.keyCode === 229) return;
+    if ((e.key === 'Escape' || e.key === 'Enter') && ignoreKey(e)) {
+      // A held key, or one pressed for whatever had focus a moment ago: not a decision.
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
@@ -1050,8 +1213,16 @@ function buildQuestionCard(q) {
     options.length ? h('div', { class: 'q-options' }, options.map((o) => h('button', { type: 'button', class: 'btn btn-sm btn-option', onclick: () => answerQuestion(q.id, String(o)) }, String(o)))) : null,
     form
   );
+  const ignoreKey = armCard(node);
   node.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !e.isComposing) {
+    if (e.isComposing || e.keyCode === 229) return;
+    if ((e.key === 'Escape' || e.key === 'Enter') && ignoreKey(e)) {
+      // A held Enter would otherwise focus the first option and then pick it.
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
       focusInput();
@@ -1630,7 +1801,7 @@ function renderComposerButtons() {
   el.input.placeholder = state.mode === 'bridge'
     ? 'Send a task to your Claude Code terminal…'
     : busy
-      ? 'Add more, or press Esc to stop…'
+      ? 'Queue a follow-up, or press Esc to stop…'
       : 'Tell Claude what to do…';
 }
 
@@ -1678,8 +1849,9 @@ async function send(textOverride, { source = 'text' } = {}) {
   if (!text && !images.length) return;
   if (!text) text = images.length === 1 ? 'Look at the attached image.' : 'Look at the attached images.';
   if (voice.isSpeaking()) voice.cancelSpeech();
-  const body = { text, source };
-  if (state.includeScreen) body.attachScreenshot = true;
+  // Always explicit: left out, the daemon falls back to attachScreenshotByDefault, which
+  // would ignore the chip being switched off.
+  const body = { text, source, attachScreenshot: Boolean(state.includeScreen) };
   if (images.length) body.images = images;
   const saved = { value: el.input.value, attachments: state.attachments };
   if (fromInput) {
@@ -1691,7 +1863,10 @@ async function send(textOverride, { source = 'text' } = {}) {
   autosize();
   pushHistory(text);
   state.sending = true;
+  state.lastSentAt = Date.now();
   renderComposerButtons();
+  // Sending is a request to see what happens next, even when scrolled up in the history.
+  scrollToBottom();
   try {
     await api('POST', '/api/command', body, { timeoutMs: 60000 });
   } catch (err) {
@@ -1710,9 +1885,16 @@ async function send(textOverride, { source = 'text' } = {}) {
   }
 }
 
-function submit() {
+/**
+ * Send what's in the composer; with nothing typed while Claude works, stop it.
+ * @param {{fromKey?:boolean}} [opts] fromKey: Enter in the composer, which only
+ *   stops Claude when nothing was sent in the last moment (a double-tapped
+ *   Enter must not cancel the command it just sent)
+ */
+function submit({ fromKey = false } = {}) {
   const empty = !el.input.value.trim() && !state.attachments.length;
   if (isBusy() && empty) {
+    if (fromKey && (state.sending || Date.now() - state.lastSentAt < 1500)) return;
     interrupt();
     return;
   }
@@ -1989,7 +2171,11 @@ function handleEscape(e) {
     closeSettings(true);
     return;
   }
-  if (voice.isActive()) {
+  // Hands-free waiting for its wake word is always "active": Esc first stops Claude's speech or
+  // work, and only then turns hands-free off. A request being captured is cancelled first.
+  const handsFreeIdle =
+    voice.mode() === 'handsfree' && !voice.armed() && voice.phase() !== 'transcribing' && !state.interim;
+  if (voice.isActive() && !handsFreeIdle) {
     e.preventDefault();
     voice.cancel();
     return;
@@ -2002,13 +2188,20 @@ function handleEscape(e) {
   if (isBusy()) {
     e.preventDefault();
     interrupt();
+    return;
+  }
+  if (voice.isActive()) {
+    e.preventDefault();
+    voice.cancel();
+    toast('Hands-free listening is off. Click the microphone to turn it back on.', 'info');
   }
 }
 
 function bindKeys() {
   document.addEventListener('keydown', (e) => {
     const key = (e.key || '').toLowerCase();
-    const mod = e.ctrlKey || e.metaKey;
+    // Cmd on macOS (Ctrl+K there is the text fields' kill-line), Ctrl elsewhere.
+    const mod = IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
     if (mod && !e.shiftKey && !e.altKey && key === 'k') {
       e.preventDefault();
       closePopover(false);
@@ -2021,7 +2214,10 @@ function bindKeys() {
       voice.toggle();
       return;
     }
-    if (mod && e.shiftKey && !e.altKey && key === 'n') {
+    // New session: Ctrl/Cmd+Alt+N everywhere. Browsers keep Ctrl/Cmd+Shift+N (a private
+    // window) in ordinary tabs, so that one only reaches app windows and Electron.
+    const altN = e.altKey && !e.shiftKey && (key === 'n' || (IS_MAC && e.code === 'KeyN')) && !(e.getModifierState && e.getModifierState('AltGraph'));
+    if (mod && (altN || (e.shiftKey && !e.altKey && key === 'n'))) {
       e.preventDefault();
       newSession();
       return;
@@ -2030,7 +2226,7 @@ function bindKeys() {
       handleEscape(e);
       return;
     }
-    if (e.code === 'Space' && !mod && !e.altKey) {
+    if (e.code === 'Space' && !e.ctrlKey && !e.metaKey && !e.altKey) {
       if (spaceHeld) {
         e.preventDefault();
         return;
@@ -2069,7 +2265,7 @@ function bindUi() {
     if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey && !e.altKey) {
       e.preventDefault();
-      submit();
+      if (!e.repeat) submit({ fromKey: true });
       return;
     }
     if (e.key === 'ArrowUp' && !e.shiftKey && !mod(e)) {
@@ -2248,6 +2444,7 @@ function bindUi() {
     })
   );
   el.composerHint.textContent = `Enter to send · Shift+Enter for a new line · ${MOD_LABEL}K to focus`;
+  el.newSession.title = `New session (${IS_MAC ? '⌥⌘N' : 'Ctrl+Alt+N'})`;
 
   setInterval(() => {
     updateTimers();
@@ -2286,7 +2483,7 @@ function grabElements() {
 
 function init() {
   grabElements();
-  initFromUrl();
+  const credentials = initFromUrl();
   applyTheme();
   const storedScreen = store.get('includeScreen', null);
   if (typeof storedScreen === 'boolean') {
@@ -2313,7 +2510,8 @@ function init() {
     }
     focusInput();
   };
-  connect();
+  // The first API call waits for a ?launch= code to be traded for the token.
+  credentials.then(() => connect());
   focusInput();
 }
 

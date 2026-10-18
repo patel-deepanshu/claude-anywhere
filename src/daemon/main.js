@@ -22,7 +22,7 @@ const state = require('../shared/state');
 const platformMod = require('../shared/platform');
 const { spawnDetached } = require('../shared/proc');
 const { uuid, randomToken, sleep, nowIso, truncate } = require('../shared/util');
-const { createLogger, audit, setAuditEnabled } = require('../shared/log');
+const { createLogger, audit, applyPrivacyConfig } = require('../shared/log');
 const { Hub } = require('./hub');
 const { QuestionBroker } = require('./questions');
 const { Bridge } = require('./bridge');
@@ -34,10 +34,15 @@ const log = createLogger('daemon');
 const ATTENTION_THROTTLE_MS = 3000;
 const SHUTDOWN_HARD_MS = 8000;
 const UI_OPEN_TIMEOUT_MS = 20000;
+const START_LOCK_WAIT_MS = 10000; // how long a second start waits for the first to come up
+const START_LOCK_STALE_MS = 30000; // a start never holds the lock this long (it is released once daemon.json is written)
+const START_LOCK_FRESH_MS = 2000; // an empty lock file this young is still being written
 const FALLBACK_DRIVER_METHODS = [
   'capabilities', 'displays', 'captureDisplay', 'cursorPosition', 'moveMouse', 'click', 'mouseDown', 'mouseUp', 'drag',
   'scroll', 'typeText', 'keyCombo', 'listWindows', 'activeWindow', 'focusWindow', 'minimizeWindow', 'setTopmost',
   'clipboardGet', 'clipboardSet', 'close',
+  // optional: UiHost closes just the dialog window with it (macOS) when the driver has it
+  'closeWindow',
 ];
 
 function packageVersion() {
@@ -129,7 +134,7 @@ class BasicPermissionBroker {
       ts: nowIso(),
       toolUseId: toolUseId || null,
     };
-    const timeoutSec = Number((this.config.permissions || {}).approvalTimeoutSec) || 600;
+    const timeoutSec = Math.min(86400, Number((this.config.permissions || {}).approvalTimeoutSec) || 600);
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.finish(id, 'deny', `No response from the user within ${timeoutSec} s`, 'timeout');
@@ -175,6 +180,10 @@ class BasicPermissionBroker {
   setMode() {
     /* the basic broker always asks */
   }
+
+  clearSessionRules() {
+    this.sessionAllow.clear();
+  }
 }
 
 function isDir(p) {
@@ -185,14 +194,134 @@ function isDir(p) {
   }
 }
 
+function alreadyRunningError(existing, detail) {
+  const where = existing ? existing.url || `port ${existing.port}` : detail;
+  const e = new Error(`Claude Anywhere is already running (pid ${existing ? existing.pid : '?'}${where ? `, ${where}` : ''})`);
+  e.code = 'ALREADY_RUNNING';
+  e.state = existing || null;
+  return e;
+}
+
+/** @returns {string} run/daemon.lock: held by a daemon from its single-instance check until daemon.json is written */
+function startLockPath() {
+  return path.join(paths.runDir(), 'daemon.lock');
+}
+
+function readStartLock(file) {
+  let st;
+  try {
+    st = fs.statSync(file);
+  } catch {
+    return null;
+  }
+  let pid = null;
+  try {
+    pid = Number(JSON.parse(fs.readFileSync(file, 'utf8')).pid) || null;
+  } catch {
+    /* empty: the holder is still writing it */
+  }
+  return { pid, ageMs: Date.now() - st.mtimeMs };
+}
+
 /**
- * Run the daemon in this process.
+ * Take the exclusive start lock, so two daemons started at the same moment (the hotkey
+ * pressed twice, two /anywhere runs) cannot both pass the single-instance check. While
+ * another live process holds it, wait for that daemon to answer and report it as running.
+ * @param {{waitMs?:number}} [opts]
+ * @returns {Promise<()=>void>} releases the lock (idempotent)
+ */
+async function acquireStartLock({ waitMs = START_LOCK_WAIT_MS } = {}) {
+  const file = startLockPath();
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    let fd = null;
+    try {
+      fd = fs.openSync(file, 'wx', 0o600);
+    } catch (err) {
+      if (err.code !== 'EEXIST') {
+        log.warn(`could not take the start lock ${file}: ${err.message}; continuing without it`);
+        return () => {};
+      }
+    }
+    if (fd !== null) {
+      try {
+        fs.writeSync(fd, JSON.stringify({ pid: process.pid, startedAt: nowIso() }));
+      } finally {
+        fs.closeSync(fd);
+      }
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        const cur = readStartLock(file);
+        if (cur && cur.pid && cur.pid !== process.pid) return;
+        try {
+          fs.unlinkSync(file);
+        } catch {
+          /* already gone */
+        }
+      };
+    }
+    const holder = readStartLock(file);
+    if (!holder) continue; // released just now
+    const stale = holder.pid ? holder.pid === process.pid || !state.isPidAlive(holder.pid) || holder.ageMs > START_LOCK_STALE_MS : holder.ageMs > START_LOCK_FRESH_MS;
+    if (stale) {
+      log.warn(`removing a stale start lock${holder.pid ? ` (pid ${holder.pid})` : ''}`);
+      try {
+        fs.unlinkSync(file);
+      } catch {
+        /* someone else removed it */
+      }
+      continue;
+    }
+    const existing = await state.findRunningDaemon({ timeoutMs: 1000 });
+    if (existing && existing.pid !== process.pid) throw alreadyRunningError(existing);
+    if (Date.now() >= deadline) throw alreadyRunningError(null, `another daemon (pid ${holder.pid || '?'}) is still starting`);
+    await sleep(100);
+  }
+}
+
+/**
+ * GET /api/health on a local port.
+ * @returns {Promise<object|null>} the health body when a Claude Anywhere daemon answers there
+ */
+async function probeDaemon(port, timeoutMs = 1500) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: ctrl.signal });
+    const body = res.ok ? await res.json() : null;
+    return body && body.app === 'claude-anywhere' ? body : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Run the daemon in this process. Unless allowMultiple is set, the single-instance check,
+ * listen and the daemon.json write happen under an exclusive start lock.
  * @param {{project?:string, mode?:'companion'|'bridge', ui?:string, open?:boolean, port?:number,
  *   handleSignals?:boolean, exitProcess?:boolean, installCrashHandlers?:boolean, allowMultiple?:boolean}} [opts]
  * @returns {Promise<{url:string, port:number, token:string, instanceId:string, hub:Hub, session:SessionManager,
  *   server:object, shutdown:(reason?:string)=>Promise<void>, done:Promise<void>}>}
  */
 async function runDaemon(opts = {}) {
+  if (opts.allowMultiple) return startDaemon(opts);
+  const release = await acquireStartLock();
+  try {
+    return await startDaemon(opts, release);
+  } finally {
+    release();
+  }
+}
+
+/**
+ * runDaemon's body (see there); calls releaseStartLock once daemon.json is written.
+ * @private
+ */
+async function startDaemon(opts = {}, releaseStartLock = () => {}) {
   const {
     project,
     mode,
@@ -205,19 +334,14 @@ async function runDaemon(opts = {}) {
     allowMultiple = false,
   } = opts;
   const config = configMod.load();
-  setAuditEnabled(!(config.privacy && config.privacy.auditLog === false));
+  applyPrivacyConfig(config);
   if (ui) config.ui.host = ui;
   const platformInfo = platformMod.info();
   const version = packageVersion();
 
   if (!allowMultiple) {
     const existing = await state.findRunningDaemon({ timeoutMs: 1500 });
-    if (existing && existing.pid !== process.pid) {
-      const e = new Error(`Claude Anywhere is already running (pid ${existing.pid}, ${existing.url || `port ${existing.port}`})`);
-      e.code = 'ALREADY_RUNNING';
-      e.state = existing;
-      throw e;
-    }
+    if (existing && existing.pid !== process.pid) throw alreadyRunningError(existing);
   }
 
   let projectDir = path.resolve(project || process.cwd());
@@ -277,8 +401,7 @@ async function runDaemon(opts = {}) {
           throw e;
         }
         const driver = await getDriver();
-        // 'memory': the daemon only takes full-display shots (deterministic size), and must not
-        // overwrite the CLI's last-shot.json geometry.
+        // 'file': share the last-shot geometry (runDir()/last-shot.json) with the CLI and MCP server, so a dialog/attach screenshot updates the coordinate mapping they use.
         return new computerMod.Computer({ driver, config: config.computer, geometryStore: 'file' });
       })();
       computerPromise.catch(() => {
@@ -309,17 +432,24 @@ async function runDaemon(opts = {}) {
       log.error('VoiceService failed to start; voice is disabled:', err);
     }
   }
+  let server = null;
   let uihost = null;
   if (uihostMod) {
     try {
-      uihost = new uihostMod.UiHost({ config, platformInfo, driver: lazyDriver });
+      uihost = new uihostMod.UiHost({
+        config,
+        platformInfo,
+        driver: lazyDriver,
+        // Browsers get a single-use launch URL, not the token URL (command lines are readable
+        // by every local user). `server` is assigned below, before any dialog opens.
+        launchUrl: (u) => (server && typeof server.launchUrl === 'function' ? server.launchUrl(u) : u),
+      });
     } catch (err) {
       log.error('UiHost failed to start; the dialog URL will be printed instead:', err);
     }
   }
   const notifyOS = commonMod ? (title, body) => commonMod.notify(title, body) : null;
 
-  let server = null;
   let lastAttention = 0;
   const onNeedAttention = (info = {}) => {
     const now = Date.now();
@@ -368,7 +498,7 @@ async function runDaemon(opts = {}) {
 
   const applyConfig = (next, prev) => {
     for (const k of Object.keys(next)) config[k] = next[k];
-    setAuditEnabled(!(config.privacy && config.privacy.auditLog === false));
+    applyPrivacyConfig(config);
     const pm = config.permissions && config.permissions.mode;
     if (prev && prev.permissions && pm !== prev.permissions.mode && typeof permissions.setMode === 'function') {
       try {
@@ -379,6 +509,14 @@ async function runDaemon(opts = {}) {
     }
     if (prev && JSON.stringify(prev.computer) !== JSON.stringify(config.computer)) computerPromise = null;
     if (session) session.applyConfig(config);
+    // The dialog's Settings (and `anywhere config set mode`) switch companion/bridge live.
+    if (session && prev && config.mode !== prev.mode && (config.mode === 'companion' || config.mode === 'bridge')) {
+      try {
+        session.setMode(config.mode);
+      } catch (err) {
+        log.warn(`mode change failed: ${err.message}`);
+      }
+    }
     if (voice) {
       try {
         if (typeof voice.updateConfig === 'function') voice.updateConfig(config);
@@ -392,7 +530,12 @@ async function runDaemon(opts = {}) {
 
   const refreshVoice = (broadcastSnapshot) => {
     if (!voice || typeof voice.capabilities !== 'function') return;
-    Promise.race([voice.capabilities(), sleep(8000).then(() => null)])
+    // An unref'd timer: a slow probe must not keep a stopped daemon's process alive.
+    const giveUp = new Promise((resolve) => {
+      const t = setTimeout(() => resolve(null), 8000);
+      if (t.unref) t.unref();
+    });
+    Promise.race([voice.capabilities(), giveUp])
       .then((caps) => {
         if (!caps || !session) return;
         const before = JSON.stringify(session.voiceInfo);
@@ -466,6 +609,13 @@ async function runDaemon(opts = {}) {
     boundPort = await server.listen(wanted);
   } catch (err) {
     if (err && (err.code === 'EADDRINUSE' || err.code === 'EACCES') && wanted !== 0) {
+      // Our own port taken by another Claude Anywhere daemon (one whose daemon.json is missing
+      // or was overwritten) means it is running: a second daemon on a random port would be an orphan.
+      const other = !allowMultiple && err.code === 'EADDRINUSE' ? await probeDaemon(wanted) : null;
+      if (other) {
+        hub.close();
+        throw alreadyRunningError({ pid: other.pid, port: wanted, url: null, instanceId: other.instanceId });
+      }
       log.warn(`port ${wanted} is unavailable (${err.code}); using a random free port`);
       boundPort = await server.listen(0);
     } else {
@@ -521,6 +671,7 @@ async function runDaemon(opts = {}) {
     }
   };
   writeState();
+  releaseStartLock(); // daemon.json now answers for this daemon
   session.on('project', writeState);
   session.on('mode', writeState);
 
@@ -528,7 +679,9 @@ async function runDaemon(opts = {}) {
   log.info(`Claude Anywhere ${version} listening on 127.0.0.1:${boundPort} (project ${projectDir}, ${daemonMode} mode)`);
 
   session.init().catch((err) => log.warn(`project info failed: ${err.message}`));
-  refreshVoice(false);
+  // Broadcast once the voice probe answers: a dialog that connected during startup would
+  // otherwise keep the placeholder voiceInfo (serverStt:false without a hint).
+  refreshVoice(true);
 
   // ---- process hooks
   if (handleSignals) {
@@ -667,6 +820,11 @@ async function startDaemonProcess({ project, mode, ui, open = true, timeoutMs = 
     const st = await state.findRunningDaemon({ timeoutMs: 1000 });
     if (st && (!child.pid || st.pid === child.pid)) return { ...st, reused: false };
     if (st && exited) return { ...st, reused: true }; // another start won the race
+    // Exit code 0 is "already running": the winner may not have written daemon.json yet.
+    if (exited && !exited.error && exited.code === 0 && !exited.signal) {
+      await sleep(150);
+      continue;
+    }
     if (exited) {
       const how = exited.error ? exited.error.message : `exit code ${exited.code}${exited.signal ? `, ${exited.signal}` : ''}`;
       throw new Error(`The Claude Anywhere daemon stopped during startup (${how}). Log (${logFile}):\n${logTail(logFile)}`);
@@ -699,4 +857,14 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runDaemon, startDaemonProcess, parseDaemonArgs, createLazyDriver, BasicPermissionBroker, optionalRequire };
+module.exports = {
+  runDaemon,
+  startDaemonProcess,
+  parseDaemonArgs,
+  createLazyDriver,
+  BasicPermissionBroker,
+  optionalRequire,
+  acquireStartLock,
+  startLockPath,
+  probeDaemon,
+};

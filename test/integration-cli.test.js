@@ -98,6 +98,10 @@ test('start → status → bridge send/listen/reply → stop with the real daemo
   const stop = await runCli(['listen', '--timeout', '5'], e);
   assert.equal(stop.code, 3);
   assert.equal(stop.stdout.trim(), 'STOP');
+  // DAEMON-PROTOCOL-9: a reply after the switch to companion mode (HTTP 409) ends the loop too.
+  const late = await runCli(['reply', '--final', '--no-speak', 'Done.'], e);
+  assert.equal(late.code, 3, late.stderr);
+  assert.match(late.stdout, /^STOP \(bridge mode is off/);
 
   const halt = await runCli(['stop', '--json'], e);
   assert.equal(halt.code, 0, halt.stderr);
@@ -105,6 +109,25 @@ test('start → status → bridge send/listen/reply → stop with the real daemo
   assert.ok(!fs.existsSync(path.join(home, 'daemon.json')));
   const after = await runCli(['status'], e);
   assert.equal(after.code, 4);
+});
+
+test('config set mode switches the running daemon; start-up settings say restart', { skip: haveDaemon ? false : 'daemon modules are not present yet', timeout: 90000 }, async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-int-'));
+  const e = env(home);
+  t.after(async () => {
+    await runCli(['stop'], e).catch(() => {});
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+  const start = await runCli(['start', '--no-open', '--port', '0', '--mode', 'bridge', '--project', ROOT, '--json'], e);
+  assert.equal(start.code, 0, `${start.stdout}\n${start.stderr}`);
+  const set = await runCli(['config', 'set', 'mode', 'companion'], e);
+  assert.equal(set.code, 0, set.stderr);
+  assert.match(set.stdout, /applied to the running dialog/);
+  const st = JSON.parse((await runCli(['status', '--json'], e)).stdout);
+  assert.equal(st.state.mode, 'companion');
+  const port = await runCli(['config', 'set', 'port', '0'], e);
+  assert.equal(port.code, 0, port.stderr);
+  assert.match(port.stdout, /restart to apply/);
 });
 
 test('start reports a clear error with the log tail when the daemon cannot start', { skip: haveDaemon ? false : 'daemon modules are not present yet', timeout: 60000 }, async (t) => {

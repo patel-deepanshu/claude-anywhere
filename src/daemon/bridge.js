@@ -19,16 +19,20 @@ const { createLogger } = require('../shared/log');
 const log = createLogger('bridge');
 
 const LISTEN_GRACE_MS = 20000;
+// A terminal that took a command and has not sent its final reply is working on it (a long
+// deploy polls nothing for minutes): it counts as connected this long after its last sign of life.
+const BUSY_GRACE_MS = 30 * 60 * 1000;
 const MAX_QUEUE = 100;
 
 class Bridge extends EventEmitter {
   /**
-   * @param {{hub?:{broadcast:Function}, listenGraceMs?:number}} [opts]
+   * @param {{hub?:{broadcast:Function}, listenGraceMs?:number, busyGraceMs?:number}} [opts]
    */
-  constructor({ hub, listenGraceMs = LISTEN_GRACE_MS } = {}) {
+  constructor({ hub, listenGraceMs = LISTEN_GRACE_MS, busyGraceMs = BUSY_GRACE_MS } = {}) {
     super();
     this.hub = hub || null;
     this.listenGraceMs = listenGraceMs;
+    this.busyGraceMs = busyGraceMs;
     /** @type {object[]} */
     this.queue = [];
     /** @type {Set<{resolve:Function, timer:NodeJS.Timeout, cleanup:Function}>} */
@@ -40,11 +44,26 @@ class Bridge extends EventEmitter {
     this.lastListening = false;
   }
 
-  /** True while a listen poll is active or one happened in the last 20 s. */
+  /**
+   * True while a listen poll is active, one happened in the last 20 s, or the terminal is
+   * working on a command it took (until its final reply, up to 30 min without a sign of life).
+   */
   get listening() {
     if (this.stopped) return false;
     if (this.waiters.size > 0) return true;
-    return this.lastPollAt > 0 && Date.now() - this.lastPollAt < this.listenGraceMs;
+    return this.lastPollAt > 0 && Date.now() - this.lastPollAt < this.graceMs();
+  }
+
+  /** @private */
+  graceMs() {
+    return this.current ? Math.max(this.busyGraceMs, this.listenGraceMs) : this.listenGraceMs;
+  }
+
+  /** The terminal showed a sign of life (a tool call, notification or question) while working. */
+  touch() {
+    if (this.stopped) return;
+    this.lastPollAt = Date.now();
+    this.updateListening();
   }
 
   /** @returns {number} queued commands */
@@ -69,7 +88,7 @@ class Bridge extends EventEmitter {
     clearTimeout(this.graceTimer);
     this.graceTimer = null;
     if (now && this.waiters.size === 0 && this.lastPollAt) {
-      const remaining = this.listenGraceMs - (Date.now() - this.lastPollAt);
+      const remaining = this.graceMs() - (Date.now() - this.lastPollAt);
       this.graceTimer = setTimeout(() => this.updateListening(), Math.max(10, remaining + 5));
       if (this.graceTimer.unref) this.graceTimer.unref();
     }
@@ -117,6 +136,7 @@ class Bridge extends EventEmitter {
     log.info(`re-queueing bridge command ${cmd.id}: the listener disconnected before receiving it`);
     this.emit('requeued', cmd);
     this.enqueue(cmd, { front: true });
+    this.updateListening();
   }
 
   /**
@@ -217,4 +237,4 @@ class Bridge extends EventEmitter {
   }
 }
 
-module.exports = { Bridge, LISTEN_GRACE_MS };
+module.exports = { Bridge, LISTEN_GRACE_MS, BUSY_GRACE_MS };

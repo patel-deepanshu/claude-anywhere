@@ -42,7 +42,15 @@ test('SKILL.md frontmatter has the required fields', () => {
   assert.match(fields.description, /Use when the user runs \/anywhere/);
   assert.ok(fields.description.length <= 1024, 'description fits the skill limit');
   assert.equal(fields['argument-hint'], '[here | stop | status | doctor | setup | <task to run>]');
-  assert.equal(fields['allowed-tools'], 'Bash(node *)');
+  // Only the skill's own launcher is pre-approved (not any `node …` command), plus read-only screen tools.
+  const allowed = fields['allowed-tools'].split(/,\s*/);
+  assert.equal(allowed[0], 'Bash(node "${CLAUDE_SKILL_DIR}/run.js"*)');
+  assert.ok(!allowed.includes('Bash(node *)'));
+  for (const server of ['mcp__anywhere__', 'mcp__plugin_anywhere_anywhere__']) {
+    for (const tool of ['screenshot', 'list_windows', 'cursor_position', 'screen_info', 'get_desktop_context']) assert.ok(allowed.includes(server + tool), server + tool);
+    for (const tool of ['click', 'type_text', 'key', 'clipboard_get', 'open']) assert.ok(!allowed.includes(server + tool), `${server}${tool} is not pre-approved`);
+  }
+  assert.equal(allowed.length, 11);
   assert.equal(fields['disable-model-invocation'], 'true');
 });
 

@@ -439,6 +439,56 @@ function makeJxa(opts = {}) {
     }
   }
   if (opts.cgBounds) $.CGDisplayBounds = (id) => opts.cgBounds[id];
+  if (opts.layout) {
+    // Keyboard layout: the character each key code types without modifiers.
+    $.NSEvent = {
+      eventWithCGEvent: (e) => {
+        log.push(['layoutChar', e.code]);
+        return { isNil: () => false, charactersIgnoringModifiers: wrap(opts.layout[e.code] || '') };
+      },
+    };
+  }
+  $.NSRunningApplication.runningApplicationsWithBundleIdentifier = (id) => {
+    log.push(['instances', $u(id)]);
+    return { isNil: () => false, count: (opts.instances && opts.instances[$u(id)]) || 1 };
+  };
+  if (opts.tis) {
+    // Text Input Sources: the current source's properties, keyed by the kTIS* literal values.
+    $.TISCopyCurrentKeyboardInputSource = () => ({ __tis: opts.tis, isNil: () => false });
+    $.TISGetInputSourceProperty = (src, key) => {
+      const k = $u(key);
+      log.push(['tis', k]);
+      const props = {
+        TISPropertyInputSourceID: src.__tis.id,
+        TISPropertyInputSourceType: src.__tis.type,
+        TISPropertyInputSourceIsASCIICapable: src.__tis.ascii,
+      };
+      return props[k] === undefined ? null : wrap(props[k]);
+    };
+    if (opts.tisConstants) {
+      $.kTISPropertyInputSourceID = wrap('TISPropertyInputSourceID');
+      $.kTISPropertyInputSourceType = wrap('TISPropertyInputSourceType');
+      $.kTISPropertyInputSourceIsASCIICapable = wrap('TISPropertyInputSourceIsASCIICapable');
+    }
+  }
+  if (opts.hitoolbox) {
+    $.NSUserDefaults = {
+      alloc: {
+        initWithSuiteName: (name) => {
+          log.push(['defaults', name]);
+          const prefs = opts.hitoolbox;
+          return {
+            isNil: () => false,
+            get synchronize() {
+              return true;
+            },
+            stringForKey: (k) => (prefs[k] == null ? null : wrap(prefs[k])),
+            arrayForKey: (k) => (prefs[k] == null ? null : { __deep: prefs[k], isNil: () => false }),
+          };
+        },
+      },
+    };
+  }
   if (opts.noScroll) delete $.CGEventCreateScrollWheelEvent2;
   else $.CGEventCreateScrollWheelEvent2 = (src, units, count, w1, w2, w3) => ({ kind: 'scroll', units, count, w1, w2, w3, flags: 0, fields: {} });
 
@@ -452,6 +502,10 @@ function makeJxa(opts = {}) {
   function axWindow(pid, w) {
     const attr = (name) => ({
       get value() {
+        if (name === 'AXCloseButton') {
+          return () =>
+            w.noCloseButton ? null : { actions: { byName: (n) => ({ perform: () => log.push(['perform', pid, w.name, `AXCloseButton.${n}`]) }) } };
+        }
         return () => Boolean(w[name]);
       },
       set value(v) {
@@ -495,7 +549,14 @@ function makeJxa(opts = {}) {
       if (opts.keystrokeError) throw opts.keystrokeError;
       log.push(['keystroke', t]);
     },
-    processes: { whose: (q) => [processFor(q.unixId)] },
+    processes: {
+      whose: (q) => [processFor(q.unixId)],
+      get length() {
+        if (opts.automationError) throw opts.automationError;
+        log.push(['countProcesses']);
+        return 7;
+      },
+    },
   };
   const Application = (name) => {
     log.push(['Application', name]);
@@ -629,7 +690,7 @@ test('helper: type uses keystroke for ASCII, key codes for Return/Tab, and paste
     steps: [{ kind: 'keys', text: 'echo hi' }, { kind: 'key', keyCode: 36 }, { kind: 'paste', text: 'héllo ☕' }],
     fallbackPaste: true,
   });
-  assert.deepEqual(r.result, { steps: 3, pasted: 1, fallback: null, automationError: null });
+  assert.deepEqual(r.result, { steps: 3, pasted: 1, keystrokes: 1, fallback: null, reason: null, automationError: null, inputSource: null });
   assert.deepEqual(j.log.filter((l) => l[0] === 'keystroke'), [['keystroke', 'echo hi']]);
   assert.deepEqual(keysOnly(j.posted), [
     [36, true, 0],
@@ -661,6 +722,7 @@ test('helper: keystroke refused by Automation falls back to paste', () => {
   const r = j.call('type', { steps: [{ kind: 'keys', text: 'abc' }, { kind: 'keys', text: 'def' }], fallbackPaste: true });
   assert.equal(r.ok, true);
   assert.equal(r.result.fallback, 'paste');
+  assert.equal(r.result.reason, 'automation');
   assert.equal(r.result.pasted, 2);
   assert.deepEqual(j.pb.writes, ['abc', 'def']);
   assert.equal(j.pb.text, null, 'an empty clipboard is left empty');
@@ -782,6 +844,75 @@ test('helper: minimize sets AXMinimized on the matching window', () => {
   assert.equal(j.call('minimize', { pid: 501, number: 55 }).result.ok, false);
 });
 
+test('helper: close presses the matching window\'s close button (MACOS-4)', () => {
+  const j = makeJxa({ windowList: CG_WINDOWS, axWindows: { 777: [{ name: 'GCP – Chrome', x: 10, y: 10, w: 800, h: 600 }] } });
+  assert.deepEqual(j.call('close', { pid: 777, number: 55 }).result, { ok: true });
+  assert.ok(j.log.some((l) => l[0] === 'perform' && l[2] === 'GCP – Chrome' && l[3] === 'AXCloseButton.AXPress'));
+  assert.equal(j.call('close', { pid: 777, number: 4040 }).result.ok, false);
+  assert.equal(j.call('close', { pid: 501, number: 55 }).result.ok, false);
+  const none = makeJxa({ windowList: CG_WINDOWS, axWindows: { 777: [{ name: 'GCP – Chrome', x: 10, y: 10, w: 800, h: 600, noCloseButton: true }] } });
+  const r = none.call('close', { pid: 777, number: 55 }).result;
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /no close button/);
+});
+
+test('helper: focus reports how many instances of the app run (MACOS-7)', () => {
+  const j = makeJxa({ windowList: CG_WINDOWS, fronts: { ...FRONTS }, front: FRONTS[501], activationWorks: false, axWindows: { 777: [] }, instances: { 'com.google.Chrome': 2 } });
+  const r = j.call('focus', { pid: 777, number: 55 }).result;
+  assert.equal(r.ok, false);
+  assert.equal(r.instances, 2);
+  const one = makeJxa({ windowList: CG_WINDOWS, fronts: { ...FRONTS }, front: FRONTS[501], axWindows: { 777: [] } });
+  assert.equal(one.call('focus', { pid: 777, number: 55 }).result.instances, 1);
+});
+
+// US ANSI positions (subset) and two layouts that move letters around.
+const US_LAYOUT_CHARS = {
+  0x00: 'a', 0x01: 's', 0x02: 'd', 0x03: 'f', 0x04: 'h', 0x05: 'g', 0x06: 'z', 0x07: 'x', 0x08: 'c', 0x09: 'v', 0x0b: 'b', 0x0c: 'q',
+  0x0d: 'w', 0x0e: 'e', 0x0f: 'r', 0x10: 'y', 0x11: 't', 0x12: '1', 0x13: '2', 0x1f: 'o', 0x20: 'u', 0x22: 'i', 0x23: 'p', 0x25: 'l',
+  0x26: 'j', 0x28: 'k', 0x2b: ',', 0x2c: '/', 0x2d: 'n', 0x2e: 'm', 0x2f: '.', 0x53: '1', 0x41: '.',
+};
+const AZERTY_CHARS = { ...US_LAYOUT_CHARS, 0x0c: 'a', 0x00: 'q', 0x0d: 'z', 0x06: 'w', 0x2e: ',', 0x29: 'm', 0x2b: ';', 0x12: '&', 0x13: 'é' };
+const DVORAK_CHARS = { ...US_LAYOUT_CHARS, 0x09: 'k', 0x2f: 'v', 0x28: 't', 0x11: 'y', 0x10: 'f', 0x03: 'u' };
+
+test('helper: key presses the key that types the character on the active layout (AZERTY)', () => {
+  let j = makeJxa({ layout: AZERTY_CHARS });
+  j.call('key', { keyCode: 0x00, keyCodes: [0x00], chars: ['a'], flags: 0x100000, modifierKeyCodes: [0x37] });
+  assert.deepEqual(keysOnly(j.posted), [[0x37, true, 0x100000], [0x0c, true, 0x100000], [0x0c, false, 0x100000], [0x37, false, 0]]);
+  // A key that types its own character keeps its code without building the whole map.
+  j = makeJxa({ layout: AZERTY_CHARS });
+  j.call('key', { keyCode: 0x11, keyCodes: [0x11], chars: ['t'], flags: 0x100000, modifierKeyCodes: [0x37] });
+  assert.equal(keysOnly(j.posted)[1][0], 0x11);
+  assert.equal(j.log.filter((l) => l[0] === 'layoutChar').length, 1);
+  // Position-independent keys (null) and characters the layout lacks keep the US position.
+  j = makeJxa({ layout: AZERTY_CHARS });
+  j.call('key', { keyCode: 0x24, keyCodes: [0x24], chars: [null], flags: 0, modifierKeyCodes: [] });
+  assert.equal(j.log.filter((l) => l[0] === 'layoutChar').length, 0);
+  assert.equal(keysOnly(j.posted)[0][0], 0x24);
+  // '1' is shifted on AZERTY: the keypad 1 (0x53) must not stand in for it.
+  j = makeJxa({ layout: AZERTY_CHARS });
+  j.call('key', { keyCode: 0x12, keyCodes: [0x12], chars: ['1'], flags: 0x100000, modifierKeyCodes: [0x37] });
+  assert.equal(keysOnly(j.posted)[1][0], 0x12);
+  // US layout: unchanged.
+  j = makeJxa({ layout: US_LAYOUT_CHARS });
+  j.call('key', { keyCode: 0x00, keyCodes: [0x00], chars: ['a'], flags: 0x100000, modifierKeyCodes: [0x37] });
+  assert.equal(keysOnly(j.posted)[1][0], 0x00);
+  // Without NSEvent (or chars) the codes are used as sent.
+  j = makeJxa();
+  j.call('key', { keyCode: 0x00, keyCodes: [0x00], chars: ['a'], flags: 0x100000, modifierKeyCodes: [0x37] });
+  assert.equal(keysOnly(j.posted)[1][0], 0x00);
+});
+
+test('helper: paste presses Cmd+V by layout, not position (Dvorak)', () => {
+  const j = makeJxa({ layout: DVORAK_CHARS });
+  const r = j.call('type', { steps: [{ kind: 'paste', text: 'héllo' }, { kind: 'paste', text: 'wörld' }], checkInputSource: false });
+  assert.equal(r.ok, true);
+  const downs = keysOnly(j.posted).filter(([, down, flags]) => down && flags & 0x100000 && true);
+  const vs = downs.filter(([code]) => code !== 0x37);
+  assert.deepEqual(vs.map(([code]) => code), [0x2f, 0x2f], 'the Dvorak V key, not the US-position V (which types K)');
+  assert.equal(j.log.filter((l) => l[0] === 'layoutChar' && l[1] === 0x09).length, 2, 'one quick check plus one map build');
+  assert.equal(j.log.filter((l) => l[0] === 'layoutChar' && l[1] === 0x00).length, 1, 'the layout map is built once per request');
+});
+
 test('helper: perms, ping, clipboard and errors', () => {
   assert.deepEqual(
     pick(makeJxa({ perms: { accessibility: false, screenRecording: true } }).call('perms', {}).result, ['accessibility', 'screenRecording']),
@@ -819,6 +950,127 @@ test('helper: classifyError maps Apple event errors', () => {
   assert.equal(c("Can't get window 1.", -1728).code, 'NOT_FOUND');
   assert.equal(c('boom').code, 'HELPER_ERROR');
   assert.equal(c('x', -25211).perm, 'accessibility');
+});
+
+// ----- MACOS-3: keystrokes go through the active input source
+
+const HIRAGANA = { id: 'com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese', type: 'TISTypeKeyboardInputMode', ascii: false };
+const US_LAYOUT = { id: 'com.apple.keylayout.US', type: 'TISTypeKeyboardLayout', ascii: true };
+const RUSSIAN = { id: 'com.apple.keylayout.Russian', type: 'TISTypeKeyboardLayout', ascii: false };
+
+test('helper: describeInputSource marks input methods and non-Latin layouts unsafe for keystrokes', () => {
+  const { ctx } = makeJxa();
+  const d = (raw) => plain(ctx.describeInputSource(raw));
+  assert.deepEqual(d({ ...US_LAYOUT, source: 'tis' }), { id: US_LAYOUT.id, kind: 'layout', ascii: true, safe: true, source: 'tis' });
+  assert.equal(d(HIRAGANA).safe, false);
+  assert.equal(d(HIRAGANA).kind, 'inputMethod');
+  // Even an ASCII-capable input mode (Japanese "Romaji" alphanumerics) goes through the input method.
+  assert.equal(d({ id: 'com.apple.inputmethod.Japanese.Roman', type: 'TISTypeKeyboardInputMode', ascii: true }).safe, false);
+  assert.equal(d({ id: 'com.apple.inputmethod.Korean.2SetKorean', type: 'TISTypeKeyboardInputMethodModeEnabled' }).safe, false);
+  assert.deepEqual(pick(d(RUSSIAN), ['kind', 'ascii', 'safe']), { kind: 'layout', ascii: false, safe: false });
+  // Without TIS (preferences only): known non-Latin layouts and any input method are unsafe; the rest is unknown.
+  assert.equal(d({ id: 'com.apple.keylayout.Greek', source: 'defaults' }).safe, false);
+  assert.equal(d({ id: 'com.apple.keylayout.Serbian', source: 'defaults' }).safe, false);
+  assert.equal(d({ id: 'com.apple.keylayout.Serbian-Latin', source: 'defaults' }).safe, null);
+  assert.equal(d({ id: 'com.apple.keylayout.ABC', source: 'defaults' }).safe, null);
+  assert.equal(d({ id: 'com.google.inputmethod.Japanese.base' }).safe, false);
+  assert.equal(d({ id: 'whatever', inputMethod: true }).safe, false);
+  assert.deepEqual(pick(d({}), ['kind', 'safe']), { kind: 'unknown', safe: null });
+});
+
+test('helper: type pastes keystroke steps when an input method is active', () => {
+  const j = makeJxa({ tis: HIRAGANA, clipboard: 'old' });
+  const r = j.call('type', {
+    steps: [{ kind: 'keys', text: 'git ' }, { kind: 'keys', text: 'status' }, { kind: 'key', keyCode: 36 }, { kind: 'keys', text: 'ls' }],
+    fallbackPaste: true,
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.result.fallback, 'paste');
+  assert.equal(r.result.reason, 'input-source');
+  assert.equal(r.result.keystrokes, 0);
+  assert.equal(r.result.steps, 4);
+  assert.deepEqual(pick(r.result.inputSource, ['id', 'kind', 'safe', 'source']), { id: HIRAGANA.id, kind: 'inputMethod', safe: false, source: 'tis' });
+  assert.deepEqual(j.log.filter((l) => l[0] === 'keystroke' || l[0] === 'Application'), [], 'System Events is never used');
+  // Adjacent runs are pasted as one; Return stays a key press between the pastes.
+  assert.deepEqual(j.pb.writes, ['git status', 'ls', 'restore:old']);
+  assert.deepEqual(keysOnly(j.posted).filter((k) => k[0] === 36), [[36, true, 0], [36, false, 0]]);
+  // A non-Latin layout is pasted too.
+  const ru = makeJxa({ tis: RUSSIAN, tisConstants: true });
+  assert.equal(ru.call('type', { steps: [{ kind: 'keys', text: 'echo' }] }).result.reason, 'input-source');
+  assert.ok(ru.log.some((l) => l[0] === 'tis' && l[1] === 'TISPropertyInputSourceIsASCIICapable'));
+});
+
+test('helper: type keeps keystrokes on an ASCII layout, or when the check is turned off', () => {
+  const j = makeJxa({ tis: US_LAYOUT });
+  const r = j.call('type', { steps: [{ kind: 'keys', text: 'echo hi' }] });
+  assert.deepEqual(pick(r.result, ['keystrokes', 'fallback', 'reason']), { keystrokes: 1, fallback: null, reason: null });
+  assert.equal(r.result.inputSource.safe, true);
+  assert.deepEqual(j.log.filter((l) => l[0] === 'keystroke'), [['keystroke', 'echo hi']]);
+  const forced = makeJxa({ tis: HIRAGANA });
+  const r2 = forced.call('type', { steps: [{ kind: 'keys', text: 'abc' }], checkInputSource: false });
+  assert.deepEqual(pick(r2.result, ['keystrokes', 'reason', 'inputSource']), { keystrokes: 1, reason: null, inputSource: null });
+  // Paste-only plans never look at the input source.
+  const pasteOnly = makeJxa({ tis: HIRAGANA });
+  pasteOnly.call('type', { steps: [{ kind: 'paste', text: 'ü' }] });
+  assert.equal(pasteOnly.log.filter((l) => l[0] === 'tis').length, 0);
+});
+
+test('helper: without TIS the input source comes from the HIToolbox preferences', () => {
+  const japanese = makeJxa({
+    hitoolbox: {
+      AppleCurrentKeyboardLayoutInputSourceID: 'com.apple.keylayout.ABC',
+      AppleSelectedInputSources: [
+        { InputSourceKind: 'Keyboard Layout', 'KeyboardLayout ID': 252, 'KeyboardLayout Name': 'ABC' },
+        { InputSourceKind: 'Non Keyboard Input Method', 'Bundle ID': 'com.apple.PressAndHold' },
+        { InputSourceKind: 'Input Mode', 'Bundle ID': 'com.apple.inputmethod.Kotoeri.RomajiTyping', 'Input Mode': 'com.apple.inputmethod.Japanese' },
+      ],
+    },
+  });
+  const src = japanese.call('inputSource', {}).result;
+  assert.deepEqual(src, { id: 'com.apple.inputmethod.Japanese', kind: 'inputMethod', ascii: null, safe: false, source: 'defaults' });
+  assert.deepEqual(japanese.imports.slice(-1), ['Carbon'], 'Carbon is imported lazily for TIS');
+  japanese.call('inputSource', {});
+  assert.equal(japanese.imports.filter((n) => n === 'Carbon').length, 1, 'and only once');
+  assert.ok(japanese.log.some((l) => l[0] === 'defaults' && l[1] === 'com.apple.HIToolbox'));
+  const greek = makeJxa({ hitoolbox: { AppleCurrentKeyboardLayoutInputSourceID: 'com.apple.keylayout.Greek', AppleSelectedInputSources: [] } });
+  assert.equal(greek.call('type', { steps: [{ kind: 'keys', text: 'ls' }] }).result.reason, 'input-source');
+  const abc = makeJxa({ hitoolbox: { AppleCurrentKeyboardLayoutInputSourceID: 'com.apple.keylayout.ABC' } });
+  assert.equal(abc.call('inputSource', {}).result.safe, null);
+  assert.equal(abc.call('type', { steps: [{ kind: 'keys', text: 'ls' }] }).result.keystrokes, 1, 'unknown keeps keystrokes');
+  // Nothing readable at all: null, and typing behaves as before.
+  assert.equal(makeJxa().call('inputSource', {}).result, null);
+});
+
+test('helper: pastePlan merges adjacent text and keeps key presses', () => {
+  const { ctx } = makeJxa();
+  assert.deepEqual(
+    plain(
+      ctx.pastePlan([
+        { kind: 'keys', text: 'a' },
+        { kind: 'paste', text: 'é' },
+        { kind: 'keys', text: '' },
+        { kind: 'key', keyCode: 48 },
+        { kind: 'keys', text: 'b' },
+        { kind: 'keys', text: 'c' },
+      ]),
+    ),
+    [{ kind: 'paste', text: 'aé' }, { kind: 'key', keyCode: 48 }, { kind: 'paste', text: 'bc' }],
+  );
+});
+
+// ----- MACOS-6: Automation consent for System Events
+
+test('helper: automation sends a harmless Apple event and reports consent', () => {
+  const ok = makeJxa();
+  assert.deepEqual(ok.call('automation', {}).result, { granted: true, processes: 7 });
+  assert.ok(ok.log.some((l) => l[0] === 'Application' && l[1] === 'System Events'));
+  const refused = makeJxa({ automationError: Object.assign(new Error('Not authorized to send Apple events to System Events.'), { errorNumber: -1743 }) });
+  assert.deepEqual(pick(refused.call('automation', {}).result, ['granted', 'errorNumber']), { granted: false, errorNumber: -1743 });
+  const broken = makeJxa({ automationError: Object.assign(new Error('System Events got an error: Connection is invalid.'), { errorNumber: -609 }) });
+  const r = broken.call('automation', {});
+  assert.equal(r.ok, true);
+  assert.equal(r.result.granted, null);
+  assert.match(r.result.error, /Connection is invalid/);
 });
 
 test('helper: serve mode reads chunked JSON lines and answers in order', () => {
@@ -870,6 +1122,8 @@ function fakeTransport(handlers = {}) {
       if (typeof h === 'function') return h(args, opts);
       if (h !== undefined) return h;
       if (cmd === 'perms') return { accessibility: true, screenRecording: true };
+      if (cmd === 'automation') return { granted: true, processes: 7 };
+      if (cmd === 'inputSource') return { id: 'com.apple.keylayout.US', kind: 'layout', ascii: true, safe: true, source: 'tis' };
       return { ok: true };
     },
     async restart() {
@@ -904,6 +1158,8 @@ function fakeRun(handler) {
   return fn;
 }
 
+const BOOKKEEPING = new Set(['perms', 'automation', 'inputSource']);
+
 function mkDriver({ handlers, run, opts } = {}) {
   const t = fakeTransport(handlers);
   const r = run || fakeRun();
@@ -916,7 +1172,8 @@ function mkDriver({ handlers, run, opts } = {}) {
     pid: 4321,
     ...opts,
   });
-  const actions = () => t.calls.filter((c) => c.cmd !== 'perms');
+  // Permission, consent and input source queries are bookkeeping; tests that care look at t.calls.
+  const actions = () => t.calls.filter((c) => !BOOKKEEPING.has(c.cmd));
   return { d, t, run: r, actions };
 }
 
@@ -981,10 +1238,11 @@ test('driver: typeText sends a typing plan; keyCombo uses toMacKeyCodes', async 
   assert.deepEqual(calls[0].args, {
     steps: [{ kind: 'keys', text: 'ls -la' }, { kind: 'key', keyCode: 36 }, { kind: 'paste', text: 'naïve' }],
     fallbackPaste: true,
+    checkInputSource: true,
   });
   assert.ok(calls[0].opts.timeoutMs >= 10000);
   assert.deepEqual(FAKE_KEYS.last, ['meta', 'shift', 't']);
-  assert.deepEqual(calls[1], { cmd: 'key', args: { keyCode: 0x11, keyCodes: [0x11], flags: 0x120000, modifierKeyCodes: [0x38, 0x37] }, opts: {} });
+  assert.deepEqual(calls[1], { cmd: 'key', args: { keyCode: 0x11, keyCodes: [0x11], chars: [], flags: 0x120000, modifierKeyCodes: [0x38, 0x37] }, opts: {} });
 
   const pasting = mkDriver({ opts: { env: { ANYWHERE_DARWIN_TYPING: 'paste' } } });
   await pasting.d.typeText('hello');
@@ -997,9 +1255,9 @@ test('driver: keyCombo with the real keys.js table', { skip: realKeys ? false : 
   await d.keyCombo(['enter']);
   await d.keyCombo('cmd+space');
   assert.deepEqual(actions().map((c) => c.args), [
-    { keyCode: 0x11, keyCodes: [0x11], flags: 0x120000, modifierKeyCodes: [0x38, 0x37] },
-    { keyCode: 0x24, keyCodes: [0x24], flags: 0, modifierKeyCodes: [] },
-    { keyCode: 0x31, keyCodes: [0x31], flags: 0x100000, modifierKeyCodes: [0x37] },
+    { keyCode: 0x11, keyCodes: [0x11], chars: ['t'], flags: 0x120000, modifierKeyCodes: [0x38, 0x37] },
+    { keyCode: 0x24, keyCodes: [0x24], chars: [null], flags: 0, modifierKeyCodes: [] },
+    { keyCode: 0x31, keyCodes: [0x31], chars: [null], flags: 0x100000, modifierKeyCodes: [0x37] },
   ]);
   await assert.rejects(d.keyCombo(['printscreen']), { code: 'UNSUPPORTED' });
 });
@@ -1061,6 +1319,25 @@ test('driver: focusWindow falls back to `open -a` when activation is refused', a
   const gone = mkDriver({ handlers: { focus: { ok: false, reason: 'process 9 is not running' } } });
   assert.equal(await gone.d.focusWindow('9:1'), false);
   assert.equal(gone.run.calls.filter((c) => c.cmd === 'open').length, 0);
+});
+
+test('driver: closeWindow presses the close button through the helper (MACOS-4)', async () => {
+  const { d, actions } = mkDriver({ handlers: { close: { ok: true } } });
+  assert.equal(await d.closeWindow('777:55'), true);
+  assert.equal(await d.closeWindow('777'), false, 'an app id names no window');
+  assert.deepEqual(actions().map((c) => [c.cmd, c.args]), [['close', { pid: 777, number: 55 }]]);
+  const refused = mkDriver({ handlers: { close: { ok: false, reason: 'the window has no close button' } } });
+  assert.equal(await refused.d.closeWindow('777:55'), false);
+});
+
+test('driver: focusWindow skips the LaunchServices fallback when several instances run (MACOS-7)', async () => {
+  const run = fakeRun();
+  const { d } = mkDriver({
+    run,
+    handlers: { focus: { ok: false, bundlePath: '/Applications/Google Chrome.app', bundleId: 'com.google.Chrome', instances: 2 } },
+  });
+  assert.equal(await d.focusWindow('777:55'), false);
+  assert.equal(run.calls.filter((c) => c.cmd === 'open').length, 0, 'open -a could activate the user\'s browser instead');
 });
 
 test('driver: minimizeWindow falls back to focus + cmd+M', async () => {
@@ -1272,6 +1549,248 @@ test('driver: close stops the transport and forgets held buttons', async () => {
   assert.equal(t.closed, true);
   await d.moveMouse(1, 1);
   assert.deepEqual(actions().pop().args, { x: 1, y: 1 });
+});
+
+// ----- MACOS-6 / MACOS-3: Automation consent and input sources in the driver
+
+const timeoutError = (cmd) => Object.assign(new Error(`the macOS helper timed out running "${cmd}"`), { code: 'TIMEOUT' });
+
+test('driver: the first keystrokes wait for the Automation answer with a long timeout, once', async () => {
+  const { d, t } = mkDriver();
+  await d.typeText('echo hi');
+  await d.typeText('ls');
+  const cmds = t.calls.map((c) => c.cmd);
+  assert.deepEqual(cmds, ['perms', 'inputSource', 'automation', 'type', 'type']);
+  const auto = t.calls.find((c) => c.cmd === 'automation');
+  assert.equal(auto.opts.timeoutMs, 120000, 'room to answer the consent prompt');
+  assert.deepEqual(t.calls[3].args.steps, [{ kind: 'keys', text: 'echo hi' }]);
+  assert.equal(t.calls[3].opts.timeoutMs < 120000, true, 'the typing request itself keeps a normal timeout');
+  // Paste-only text needs no consent at all.
+  const pasteOnly = mkDriver();
+  await pasteOnly.d.typeText('naïve ☕');
+  assert.equal(pasteOnly.t.calls.filter((c) => c.cmd === 'automation' || c.cmd === 'inputSource').length, 0);
+  const forced = mkDriver({ opts: { typing: 'paste' } });
+  await forced.d.typeText('hello');
+  assert.equal(forced.t.calls.filter((c) => c.cmd === 'automation').length, 0);
+});
+
+test('driver: refused Automation pastes the text and is not asked again soon', async () => {
+  const { d, t, actions } = mkDriver({ handlers: { automation: { granted: false, error: 'Not authorized', errorNumber: -1743 } } });
+  await d.typeText('git status\n');
+  await d.typeText('ls');
+  assert.deepEqual(actions().map((c) => c.args.steps), [
+    [{ kind: 'paste', text: 'git status' }, { kind: 'key', keyCode: 36 }],
+    [{ kind: 'paste', text: 'ls' }],
+  ]);
+  assert.equal(t.calls.filter((c) => c.cmd === 'automation').length, 1);
+  const caps = await d.capabilities();
+  assert.equal(caps.permissions.automation, false);
+  assert.ok(caps.notes.some((n) => n.includes('Privacy_Automation')));
+  // A rejected Apple event reported as a PERMISSION error counts as refused too.
+  const thrown = mkDriver({
+    handlers: {
+      automation: () => {
+        throw Object.assign(new Error('automation: Not authorized'), { code: 'PERMISSION', permission: 'automation' });
+      },
+    },
+  });
+  await thrown.d.typeText('x');
+  assert.deepEqual(thrown.actions()[0].args.steps, [{ kind: 'paste', text: 'x' }]);
+});
+
+test('driver: an unanswered consent prompt pastes instead of killing the typing request', async () => {
+  let automationCalls = 0;
+  const { d, t, actions } = mkDriver({
+    handlers: {
+      automation: () => {
+        automationCalls++;
+        if (automationCalls === 1) throw timeoutError('automation');
+        return { granted: true };
+      },
+    },
+  });
+  await d.typeText('ls -la');
+  assert.deepEqual(actions()[0].args.steps, [{ kind: 'paste', text: 'ls -la' }]);
+  await d.typeText('pwd');
+  assert.equal(automationCalls, 1, 'no new wait while the prompt is probably still open');
+  assert.deepEqual(actions()[1].args.steps, [{ kind: 'paste', text: 'pwd' }]);
+  // Later, a short re-check: the user answered in the meantime.
+  d._automation.at -= 31000;
+  d._inputSourceCache = null;
+  await d.typeText('cd');
+  const checks = t.calls.filter((c) => c.cmd === 'automation');
+  assert.equal(checks.length, 2);
+  assert.equal(checks[1].opts.timeoutMs, 5000);
+  assert.deepEqual(actions()[2].args.steps, [{ kind: 'keys', text: 'cd' }]);
+});
+
+test('driver: a typing timeout while consent is unknown is retried as a paste', async () => {
+  let typeCalls = 0;
+  const { d, actions } = mkDriver({
+    handlers: {
+      automation: { granted: null, error: 'Connection is invalid.' },
+      type: (args) => {
+        typeCalls++;
+        if (typeCalls === 1) throw timeoutError('type');
+        return { steps: args.steps.length, pasted: 1, keystrokes: 0, fallback: null, reason: null };
+      },
+    },
+  });
+  await d.typeText('echo hi');
+  assert.deepEqual(actions().map((c) => c.args.steps), [[{ kind: 'keys', text: 'echo hi' }], [{ kind: 'paste', text: 'echo hi' }]]);
+  assert.equal(d._automation.state, 'pending');
+  // Once consent is known, a timeout may mean half-typed text: it is reported, not retried.
+  const granted = mkDriver({
+    handlers: {
+      type: () => {
+        throw timeoutError('type');
+      },
+    },
+  });
+  await assert.rejects(granted.d.typeText('echo hi'), { code: 'TIMEOUT' });
+  assert.equal(granted.actions().length, 1);
+  // A plan that starts with a key press already ran it: not retried either.
+  const keyFirst = mkDriver({
+    handlers: {
+      automation: { granted: null },
+      type: () => {
+        throw timeoutError('type');
+      },
+    },
+  });
+  await assert.rejects(keyFirst.d.typeText('\nls'), { code: 'TIMEOUT' });
+  assert.equal(keyFirst.actions().length, 1);
+});
+
+test('driver: no consent prompt when the input source means the helper pastes anyway', async () => {
+  const { d, t, actions } = mkDriver({
+    handlers: {
+      inputSource: { id: 'com.apple.inputmethod.Korean.2SetKorean', kind: 'inputMethod', ascii: false, safe: false, source: 'tis' },
+      type: (args) => ({ steps: args.steps.length, pasted: 1, keystrokes: 0, fallback: 'paste', reason: 'input-source', inputSource: { id: 'com.apple.inputmethod.Korean.2SetKorean' } }),
+    },
+  });
+  await d.typeText('git status');
+  assert.equal(t.calls.filter((c) => c.cmd === 'automation').length, 0);
+  // The helper re-checks the input source right before typing and decides.
+  assert.deepEqual(actions()[0].args, { steps: [{ kind: 'keys', text: 'git status' }], fallbackPaste: true, checkInputSource: true });
+  assert.equal(d._automation.state, null, 'consent is still unknown');
+  // typing 'keystroke' skips the input source check entirely.
+  const keys = mkDriver({ opts: { typing: 'keystroke' } });
+  await keys.d.typeText('abc');
+  assert.equal(keys.t.calls.filter((c) => c.cmd === 'inputSource').length, 0);
+  assert.equal(keys.actions()[0].args.checkInputSource, false);
+});
+
+test('driver: typing results teach the driver about consent', async () => {
+  const { d, t } = mkDriver({
+    handlers: {
+      automation: { granted: null },
+      type: { steps: 1, pasted: 0, keystrokes: 1, fallback: null, reason: null, automationError: null },
+    },
+  });
+  await d.typeText('a');
+  assert.equal(d._automation.state, 'granted');
+  await d.typeText('b');
+  assert.equal(t.calls.filter((c) => c.cmd === 'automation').length, 1);
+  const refused = mkDriver({
+    handlers: {
+      automation: { granted: null },
+      type: { steps: 1, pasted: 1, keystrokes: 0, fallback: 'paste', reason: 'automation', automationError: 'Not authorized' },
+    },
+  });
+  await refused.d.typeText('a');
+  assert.equal(refused.d._automation.state, 'denied');
+  assert.equal((await refused.d.capabilities()).permissions.automation, false);
+});
+
+test('driver: requestPermissions asks for Automation up front with a long timeout', async () => {
+  const { d, t } = mkDriver({ handlers: { requestPerms: { accessibility: true, screenRecording: false } } });
+  assert.deepEqual(await d.requestPermissions(), { accessibility: true, screenRecording: false, automation: true });
+  const req = t.calls.find((c) => c.cmd === 'requestPerms');
+  assert.equal(req.opts.oneShot, true);
+  assert.equal(t.calls.find((c) => c.cmd === 'automation').opts.timeoutMs, 120000);
+  // Asked again even when the answer is cached, so a later grant or revoke is seen.
+  await d.requestPermissions();
+  assert.equal(t.calls.filter((c) => c.cmd === 'automation').length, 2);
+  await d.typeText('x');
+  assert.equal(t.calls.filter((c) => c.cmd === 'automation').length, 2, 'typing reuses the answer');
+  const pending = mkDriver({
+    handlers: {
+      requestPerms: { accessibility: true, screenRecording: true },
+      automation: () => {
+        throw timeoutError('automation');
+      },
+    },
+  });
+  assert.equal((await pending.d.requestPermissions()).automation, null);
+  const skip = mkDriver({ handlers: { requestPerms: { accessibility: true, screenRecording: true } } });
+  assert.deepEqual(await skip.d.requestPermissions({ automation: false }), { accessibility: true, screenRecording: true });
+  assert.equal(skip.t.calls.filter((c) => c.cmd === 'automation').length, 0);
+});
+
+test('driver: capabilities never asks for consent and says always-on-top is unsupported', async () => {
+  const { d, t } = mkDriver();
+  const caps = await d.capabilities();
+  assert.equal(caps.topmost, false);
+  assert.equal(d.supportsTopmost, false);
+  assert.equal(caps.permissions.automation, null);
+  assert.equal(t.calls.filter((c) => c.cmd === 'automation').length, 0);
+  await d.typeText('x');
+  assert.equal((await d.capabilities()).permissions.automation, true);
+});
+
+test('driver: window queries can skip System Events titles and survive a stalled title lookup', async () => {
+  let windowsCalls = 0;
+  const payload = { frontPid: 501, windows: [{ number: 41, pid: 501, owner: 'Code', title: '', layer: 0, alpha: 1, x: 0, y: 25, width: 1440, height: 875 }] };
+  const { d, t } = mkDriver({
+    handlers: {
+      windows: (args) => {
+        windowsCalls++;
+        if (args.axTitles) throw timeoutError('windows');
+        return payload;
+      },
+    },
+  });
+  await d.listWindows({ axTitles: false });
+  assert.deepEqual(t.calls.map((c) => [c.cmd, c.args.axTitles]), [['windows', false]]);
+  // A title lookup blocked (e.g. on the consent prompt): the list still comes back, without those titles.
+  const wins = await d.listWindows();
+  assert.deepEqual(wins.map((w) => w.id), ['501:41']);
+  assert.deepEqual(t.calls.slice(1).map((c) => [c.cmd, c.args.axTitles]), [['windows', true], ['windows', false]]);
+  // ...and the next queries do not stall again right away.
+  await d.listWindows();
+  await d.activeWindow();
+  assert.deepEqual(t.calls.slice(3).map((c) => [c.cmd, c.args.axTitles]), [['windows', false], ['active', false]]);
+  assert.equal(windowsCalls, 4);
+  // Other errors are not swallowed.
+  const broken = mkDriver({
+    handlers: {
+      windows: () => {
+        throw Object.assign(new Error('boom'), { code: 'HELPER_ERROR' });
+      },
+    },
+  });
+  await assert.rejects(broken.d.listWindows(), { code: 'HELPER_ERROR' });
+});
+
+test('driver: refused Automation turns off System Events titles; successful titles confirm consent', async () => {
+  const { d, t } = mkDriver({
+    handlers: { windows: { frontPid: 1, windows: [], ax: { filled: 0, error: 'Not authorized', perm: 'automation' } } },
+  });
+  await d.listWindows();
+  assert.equal(d._automation.state, 'denied');
+  await d.listWindows();
+  await d.activeWindow();
+  assert.deepEqual(t.calls.map((c) => c.args.axTitles), [true, false, false]);
+  // Tried again later, in case it was granted in System Settings meanwhile.
+  d._automation.at -= 5 * 60000 + 1;
+  await d.listWindows();
+  assert.equal(t.calls[t.calls.length - 1].args.axTitles, true);
+  const ok = mkDriver({ handlers: { active: { pid: 1, app: 'X', window: { number: 2, title: 'T' }, ax: { filled: 1 } } } });
+  await ok.d.activeWindow();
+  assert.equal(ok.d._automation.state, 'granted');
+  await ok.d.typeText('x');
+  assert.equal(ok.t.calls.filter((c) => c.cmd === 'automation').length, 0, 'no separate consent check needed');
 });
 
 // ===========================================================================

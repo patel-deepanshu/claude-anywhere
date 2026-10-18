@@ -70,6 +70,7 @@ test('result, notify, system, user and assistant lines', () => {
   assert.equal(T.renderResult({ costUsd: 0.2, totalCostUsd: 0.2, numTurns: 1 }, plain), '✓ Done · $0.2000 · 1 turn');
   assert.equal(T.renderResult({}, plain), '✓ Done');
   assert.equal(T.renderResult({ isError: true, text: 'Budget exceeded\nmore', durationMs: 900 }, plain), '✗ Failed: Budget exceeded · 900 ms');
+  assert.equal(T.renderResult({ isError: true, interrupted: true, durationMs: 900 }, plain), 'Stopped · 900 ms');
   assert.equal(T.renderNotify({ text: 'Deployed!', level: 'success' }, plain), '• Deployed!');
   assert.equal(T.renderSystem({ text: 'MCP missing', level: 'warning' }, plain), '⚠ MCP missing');
   assert.equal(T.renderSystem({ text: 'oops', level: 'error' }, plain), '✗ oops');
@@ -384,6 +385,22 @@ test('TUI: approvals and questions are answered from the prompt', async () => {
   assert.ok(!/approval answered: allow\)/.test(t), 'no duplicate note for our own answer');
 });
 
+test('TUI: the screenshot marker follows attachScreenshotByDefault and resets after each send (CROSS-MODULE-2)', async () => {
+  const { client, input, cap, done } = await startTui({ responses: {} });
+  client.emit('snapshot', { ...SNAPSHOT, config: { ...SNAPSHOT.config, context: { attachScreenshotByDefault: true } } });
+  for (const line of ['first', '/screen', 'second', 'third']) {
+    input.write(`${line}\n`);
+    await tick(5);
+  }
+  input.write('/quit\n');
+  await done;
+  assert.deepEqual(
+    client.calls.filter((c) => c.path === '/api/command').map((c) => [c.body.text, c.body.attachScreenshot]),
+    [['first', true], ['second', false], ['third', true]],
+  );
+  assert.match(cap.text, /The next message will not include a screenshot\./);
+});
+
 test('TUI: commands, slash commands and the screenshot toggle', async () => {
   const responses = {
     'POST /api/mode': { ok: true, mode: 'bridge' },
@@ -401,10 +418,11 @@ test('TUI: commands, slash commands and the screenshot toggle', async () => {
   input.write('/quit\n');
   await done;
   const byPath = (p) => client.calls.filter((c) => c.path === p);
+  // CROSS-MODULE-2: always an explicit boolean, so the daemon's default cannot override [+screen].
   assert.deepEqual(byPath('/api/command').map((c) => c.body), [
-    { text: 'deploy this repo to Cloud Run', source: 'text' },
+    { text: 'deploy this repo to Cloud Run', source: 'text', attachScreenshot: false },
     { text: 'what is on screen?', source: 'text', attachScreenshot: true },
-    { text: '/compact please', source: 'text' },
+    { text: '/compact please', source: 'text', attachScreenshot: false },
   ]);
   assert.deepEqual(byPath('/api/mode').map((c) => c.body), [{ mode: 'bridge' }]);
   assert.deepEqual(byPath('/api/project').map((c) => c.body.dir), [
@@ -462,6 +480,18 @@ test('TUI: piped input waits for the result before exiting', async () => {
   client.emit('result', { costUsd: 0.02, numTurns: 1 });
   await done;
   assert.match(cap.text, /✓ Done/);
+});
+
+test('TUI: piped lines run in order after connecting (/status before /quit)', async () => {
+  const responses = { 'GET /api/state': { ...SNAPSHOT, status: 'idle' } };
+  const { client, input, cap, done } = await startTui({ responses });
+  input.end('/status\n/quit\n');
+  await tick(20);
+  assert.equal(client.calls.length, 0, 'nothing runs before the first snapshot');
+  client.emit('snapshot', SNAPSHOT);
+  await done;
+  assert.deepEqual(client.calls.map((c) => c.path), ['/api/state']);
+  assert.match(cap.text, /Claude Anywhere v0\.1\.0[\s\S]*Status: +idle/);
 });
 
 test('TUI: Ctrl+C interrupts when busy and a second Ctrl+C within 2 s quits', async () => {
@@ -522,7 +552,7 @@ test('TUI: /voice records, transcribes and sends the text as a voice command', a
   assert.equal(stt.contentType, 'audio/wav');
   assert.equal(stt.binary.readUInt32LE(40), 16000, 'WAV header repaired before upload');
   const cmd = client.calls.find((c) => c.path === '/api/command');
-  assert.deepEqual(cmd.body, { text: 'deploy to cloud run', source: 'voice' });
+  assert.deepEqual(cmd.body, { text: 'deploy to cloud run', source: 'voice', attachScreenshot: false });
   assert.match(cap.text, /You \(voice\): deploy to cloud run/);
   assert.deepEqual(fs.readdirSync(tmp), [], 'temporary audio removed');
   fs.rmSync(tmp, { recursive: true, force: true });

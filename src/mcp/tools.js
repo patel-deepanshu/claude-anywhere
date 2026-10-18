@@ -23,6 +23,11 @@ const NOTIFY_TIMEOUT_MS = 5000;
 const PROGRESS_INTERVAL_MS = 15000;
 const MAX_WAIT_SEC = 30;
 const DEFAULT_ASK_TIMEOUT_SEC = 900;
+// The daemon's PermissionBroker owns the approval deadline (approvalTimeoutSec, read
+// live from config) and answers "deny" when it passes; Claude Code's cancellation
+// reaches us through extra.signal. This HTTP limit is only a backstop for a daemon
+// that never answers, so it must outlast any deadline the user can set.
+const PERMISSION_HTTP_TIMEOUT_MS = 24 * 3600 * 1000;
 const CLIPBOARD_MAX_CHARS = 50000;
 const MAX_LISTED_WINDOWS = 100;
 const NO_DIALOG_MESSAGE = 'The Anywhere dialog is not running; ask the user in your normal reply instead.';
@@ -161,7 +166,10 @@ function matchWindows(windows, { id, title, app } = {}) {
 
 function windowLine(w) {
   const geo = [w.width, w.height].every(Number.isFinite) ? ` · ${w.width}x${w.height} at (${w.x}, ${w.y})` : '';
-  const flags = `${w.focused ? ' [focused]' : ''}${w.minimized ? ' [minimized]' : ''}`;
+  // Windows: elevated true = runs as admin, null = another account's process (unknown); input
+  // to either may be dropped by UIPI unless Claude Code itself runs elevated.
+  const elevated = w.elevated === true ? ' [admin]' : w.elevated === null ? ' [other account; may be admin]' : '';
+  const flags = `${w.focused ? ' [focused]' : ''}${w.minimized ? ' [minimized]' : ''}${elevated}`;
   return `- id ${w.id}: ${windowLabel(w)}${geo}${w.pid ? ` · pid ${w.pid}` : ''}${flags}`;
 }
 
@@ -322,10 +330,14 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
           throw err;
         }
         const isError = Boolean(out.isError);
+        // Input the OS may have dropped silently (Windows UIPI: another account's window).
+        const warnings = Array.isArray(out.warnings) ? out.warnings.filter((w) => typeof w === 'string' && w) : [];
+        const text = warnings.length ? `${out.text}\n\nWarning: ${warnings.join('\nWarning: ')}` : out.text;
         const activity = { tool: name, summary: out.summary || summarize(args), ok: !isError };
         if (isError) activity.error = oneLine(out.text, 300);
+        if (warnings.length) activity.warning = oneLine(warnings.join(' '), 300);
         postActivity(activity);
-        return isError ? fail(out.text) : ok(out.text);
+        return isError ? fail(text) : ok(text);
       },
     };
   }
@@ -334,11 +346,6 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
     if (!driver || typeof driver.activeWindow !== 'function') return null;
     return withTimeout(driver.activeWindow(), 1500, null);
   }
-
-  const approvalTimeoutMs = (() => {
-    const sec = Number(config && config.permissions && config.permissions.approvalTimeoutSec);
-    return Number.isFinite(sec) && sec > 0 ? (sec + 60) * 1000 : 24 * 3600 * 1000;
-  })();
 
   const tools = [];
 
@@ -432,6 +439,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
         return {
           text: `${verb} ${button} at (${num(x)}, ${num(y)}) on display ${display}${mods}. Take a screenshot to verify.`,
           summary: `${verb} ${button} at (${num(x)}, ${num(y)})${mods}`,
+          warnings: r && r.warnings,
         };
       },
     })
@@ -486,6 +494,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
         return {
           text: `Dragged with the ${button} button from (${num(from.x)}, ${num(from.y)}) to (${num(to.x)}, ${num(to.y)}) on display ${display}. Take a screenshot to verify.`,
           summary: `Dragged from (${num(from.x)}, ${num(from.y)}) to (${num(to.x)}, ${num(to.y)})`,
+          warnings: r && r.warnings,
         };
       },
     })
@@ -521,6 +530,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
         return {
           text: `Scrolled ${a.direction} ${n} notch${n === 1 ? '' : 'es'}${at} on display ${display}. Take a screenshot to see the new content.`,
           summary: `Scrolled ${a.direction} ${n}${at}`,
+          warnings: r && r.warnings,
         };
       },
     })
@@ -554,6 +564,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
         return {
           text: `Typed ${chars} character${chars === 1 ? '' : 's'}${how} into the focused window. Take a screenshot to verify.`,
           summary: `Typed ${chars} chars: "${oneLine(a.text, 60)}"`,
+          warnings: r && r.warnings,
         };
       },
     })
@@ -587,6 +598,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
         return {
           text: `Pressed ${shown}${n > 1 ? ` ${n} times` : ''}. Take a screenshot to verify.`,
           summary: `Pressed ${shown}${n > 1 ? ` x${n}` : ''}`,
+          warnings: r && r.warnings,
         };
       },
     })
@@ -933,7 +945,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
         try {
           const body = { tool_name: toolName, input };
           if (args.tool_use_id) body.tool_use_id = String(args.tool_use_id);
-          const res = await daemonRequest(c, 'POST', '/api/mcp/permission', body, { timeoutMs: approvalTimeoutMs, signal: extra.signal });
+          const res = await daemonRequest(c, 'POST', '/api/mcp/permission', body, { timeoutMs: PERMISSION_HTTP_TIMEOUT_MS, signal: extra.signal });
           if (res && res.behavior === 'allow') {
             const updated = res.updatedInput && typeof res.updatedInput === 'object' && !Array.isArray(res.updatedInput) ? res.updatedInput : input;
             decision = { behavior: 'allow', updatedInput: updated };

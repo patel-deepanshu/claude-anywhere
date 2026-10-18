@@ -26,6 +26,39 @@ function Install-ClaudeAnywhere {
 
   function Write-Step([string]$Message) { Write-Host "==> $Message" -ForegroundColor Cyan }
 
+  # The user Path with $Dir appended, or $null when it is already there. @() keeps a one-entry
+  # Path an array (a lone string would be concatenated with $Dir and no ';').
+  function Get-PathWithEntry {
+    param([AllowNull()][AllowEmptyString()][string]$Current, [string]$Dir)
+    $parts = @()
+    if ($Current) { $parts = @($Current.Split(';') | Where-Object { $_ }) }
+    $want = $Dir.TrimEnd('\')
+    foreach ($p in $parts) {
+      if ($p.TrimEnd('\') -ieq $want -or [Environment]::ExpandEnvironmentVariables($p).TrimEnd('\') -ieq $want) { return $null }
+    }
+    return ((@($parts) + $Dir) -join ';')
+  }
+
+  # Append $Dir to HKCU\Environment\Path without expanding it: entries such as %JAVA_HOME%\bin
+  # stay live (REG_EXPAND_SZ). Returns $true when the Path changed.
+  function Add-UserPathEntry {
+    param([string]$Dir)
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+    try {
+      $raw = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+      $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+      if ($key.GetValueNames() -contains 'Path') { $kind = $key.GetValueKind('Path') }
+      $new = Get-PathWithEntry -Current $raw -Dir $Dir
+      if ($null -eq $new) { return $false }
+      if ($kind -ne [Microsoft.Win32.RegistryValueKind]::String -or $new.Contains('%')) { $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString }
+      $key.SetValue('Path', $new, $kind)
+    }
+    finally { $key.Close() }
+    # SetEnvironmentVariable broadcasts WM_SETTINGCHANGE, so Explorer and new terminals see the change.
+    try { [Environment]::SetEnvironmentVariable('CLAUDE_ANYWHERE_PATH_REFRESH', $null, 'User') } catch { }
+    return $true
+  }
+
   # Node.js 18.17+
   $node = Get-Command node -ErrorAction SilentlyContinue
   if (-not $node) {
@@ -83,14 +116,13 @@ function Install-ClaudeAnywhere {
 
   if ($env:ANYWHERE_NO_PATH -ne '1') {
     $binDir = Join-Path $appDir 'bin'
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $parts = @()
-    if ($userPath) { $parts = $userPath.Split(';') | Where-Object { $_ } }
-    if (-not ($parts | Where-Object { $_.TrimEnd('\') -ieq $binDir.TrimEnd('\') })) {
-      [Environment]::SetEnvironmentVariable('Path', (($parts + $binDir) -join ';'), 'User')
-      Write-Host "Added $binDir to your user PATH (open a new terminal to use 'anywhere')."
+    try {
+      if (Add-UserPathEntry -Dir $binDir) { Write-Host "Added $binDir to your user PATH (open a new terminal to use 'anywhere')." }
     }
-    if (-not (($env:Path -split ';') | Where-Object { $_.TrimEnd('\') -ieq $binDir.TrimEnd('\') })) { $env:Path = "$env:Path;$binDir" }
+    catch {
+      Write-Host "Could not add $binDir to your user PATH ($($_.Exception.Message)). Add it in Settings > System > About > Advanced system settings > Environment Variables." -ForegroundColor Yellow
+    }
+    if (-not (@($env:Path -split ';') | Where-Object { $_.TrimEnd('\') -ieq $binDir.TrimEnd('\') })) { $env:Path = "$env:Path;$binDir" }
   }
 
   Write-Host ''

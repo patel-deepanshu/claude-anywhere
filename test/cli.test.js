@@ -180,6 +180,7 @@ test('coerceForKey types values by the defaults and validates enums', () => {
   assert.deepEqual(cli.coerceForKey('engine.extraArgs', '["--verbose"]'), ['--verbose']);
   assert.deepEqual(cli.coerceForKey('permissions.alwaysAllow', 'Bash(git *),Read'), ['Bash(git *)', 'Read']);
   assert.equal(cli.coerceForKey('permissions.mode', 'auto'), 'auto');
+  assert.equal(cli.coerceForKey('permissions.mode', 'autopilot'), 'auto', 'the dialog calls it Autopilot');
   assert.throws(() => cli.coerceForKey('permissions.mode', 'yolo'), /must be one of/);
   assert.throws(() => cli.coerceForKey('voice.ttsRate', 'fast'), /must be a number/);
   assert.throws(() => cli.coerceForKey('ui.alwaysOnTop', 'maybe'), /true or false/);

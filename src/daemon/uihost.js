@@ -14,6 +14,11 @@
  * Only processes we started are ever killed: the Electron child, and app-mode browser
  * processes whose command line carries our dedicated --user-data-dir. The user's own
  * browser is never touched.
+ *
+ * The dialog URL carries the daemon's access token, and process command lines are readable by
+ * every local user (ps, /proc/<pid>/cmdline). Electron therefore gets the URL through its
+ * environment (ANYWHERE_UI_URL), and browsers get a single-use launch URL from the `launchUrl`
+ * option when the daemon provides one.
  */
 
 const fs = require('fs');
@@ -39,21 +44,38 @@ const MIN_HEIGHT = 400;
 const EARLY_EXIT_MS = 3000;
 const TOPMOST_WAIT_MS = 6000;
 const BROWSER_WAIT_MS = 1500;
+const PID_WAIT_MS = 3000;
 const DRIVER_TIMEOUT_MS = 5000;
+// Background window searches: on macOS, skip reading blank titles through System Events, which
+// can raise the Automation consent prompt and hold the helper queue. Other drivers ignore it.
+const BACKGROUND_LIST = Object.freeze({ axTitles: false });
+const SCALE_CACHE_MS = 60000;
+const HANDLER_CACHE_MS = 5 * 60000;
+/** Environment variable that carries the dialog URL to src/electron/main.js (never argv). */
+const ELECTRON_URL_ENV = 'ANYWHERE_UI_URL';
 const UI_LOG_MAX_BYTES = 2 * 1024 * 1024;
 const WSL_POWERSHELL = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe';
 const WSL_SYSTEM32 = '/mnt/c/Windows/System32';
 const WSL_PROFILE_KEY = 'wsl:%LOCALAPPDATA%\\claude-anywhere\\ui-profile';
 const WSL_PROFILE_EXPR = "(Join-Path $env:LOCALAPPDATA 'claude-anywhere\\ui-profile')";
 
+// [name, app bundle name, CFBundleIdentifier]
 const MAC_BROWSERS = [
-  ['Google Chrome', 'Google Chrome'],
-  ['Google Chrome Canary', 'Google Chrome Canary'],
-  ['Microsoft Edge', 'Microsoft Edge'],
-  ['Brave', 'Brave Browser'],
-  ['Chromium', 'Chromium'],
-  ['Vivaldi', 'Vivaldi'],
+  ['Google Chrome', 'Google Chrome', 'com.google.Chrome'],
+  ['Google Chrome Canary', 'Google Chrome Canary', 'com.google.Chrome.canary'],
+  ['Microsoft Edge', 'Microsoft Edge', 'com.microsoft.edgemac'],
+  ['Brave', 'Brave Browser', 'com.brave.Browser'],
+  ['Chromium', 'Chromium', 'org.chromium.Chromium'],
+  ['Vivaldi', 'Vivaldi', 'com.vivaldi.Vivaldi'],
 ];
+
+/** JXA that prints the bundle id of the app LaunchServices opens https links with. */
+const MAC_DEFAULT_BROWSER_JXA = [
+  "ObjC.import('AppKit');",
+  "var u = $.NSWorkspace.sharedWorkspace.URLForApplicationToOpenURL($.NSURL.URLWithString('https://example.com/'));",
+  'var b = (u && !u.isNil()) ? $.NSBundle.bundleWithURL(u) : null;',
+  "(b && !b.isNil()) ? ObjC.unwrap(b.bundleIdentifier) : '';",
+].join('\n');
 
 const WIN_BROWSERS = [
   ['Google Chrome', 'Google\\Chrome\\Application\\chrome.exe'],
@@ -168,17 +190,17 @@ function chromiumArgs({ url, profileDir, width, height, x, y, noSandbox = false 
 }
 
 /**
- * Arguments for `electron <args>`.
- * @param {{mainPath?:string,url:string,ui?:object,noSandbox?:boolean}} o
+ * Arguments for `electron <args>`. The dialog URL is not among them: it carries the access
+ * token, so it travels in the ANYWHERE_UI_URL environment variable (see electronEnv).
+ * @param {{mainPath?:string,ui?:object,noSandbox?:boolean}} o
  * @returns {string[]}
  */
-function electronArgs({ mainPath = ELECTRON_MAIN, url, ui = {}, noSandbox = false }) {
+function electronArgs({ mainPath = ELECTRON_MAIN, ui = {}, noSandbox = false }) {
   const args = [];
   // Chromium refuses to start as root without this switch; it must precede the app path.
   if (noSandbox) args.push('--no-sandbox');
   args.push(
     mainPath,
-    '--url', url,
     '--always-on-top', String(ui.alwaysOnTop !== false),
     '--hotkey', String(ui.hotkey || ''),
     '--hide-from-screenshots', String(ui.hideFromScreenshots !== false),
@@ -187,6 +209,20 @@ function electronArgs({ mainPath = ELECTRON_MAIN, url, ui = {}, noSandbox = fals
     '--position', String(ui.position || 'right')
   );
   return args;
+}
+
+/**
+ * Environment for the Electron child: the dialog URL in ANYWHERE_UI_URL (a process environment
+ * is readable only by its owner, unlike its command line), without ELECTRON_RUN_AS_NODE.
+ * @param {object} env the daemon environment
+ * @param {string} url the dialog URL (with ?token=)
+ * @returns {object}
+ */
+function electronEnv(env, url) {
+  const out = { ...env, [ELECTRON_URL_ENV]: url };
+  // Inherited from VS Code extension hosts and similar; it would make Electron run as plain Node.
+  delete out.ELECTRON_RUN_AS_NODE;
+  return out;
 }
 
 /** Arguments that run `script` with -EncodedCommand (UTF-16LE base64), immune to quoting. */
@@ -254,7 +290,9 @@ try {
     if ($a -notmatch '[\\s"]') { return $a }
     return '"' + ($a -replace '(\\\\*)"', '$1$1\\"' -replace '(\\\\+)$', '$1$1') + '"'
   }
-  $list = @('--app=' + $url, '--user-data-dir=' + $profileDir, ${switches.map((s) => `'${s}'`).join(', ')})
+  # Each concatenation is parenthesized: PowerShell's comma binds tighter than '+', so
+  # @('--app=' + $url, ...) would fold every switch into one argument.
+  $list = @(('--app=' + $url), ('--user-data-dir=' + $profileDir), ${switches.map((s) => `'${s}'`).join(', ')})
   $line = ($list | ForEach-Object { Format-WinArg $_ }) -join ' '
   $p = Start-Process -FilePath $exe -ArgumentList $line -PassThru
   [Console]::Out.WriteLine('ANYWHERE_PID ' + $p.Id + ' ' + $exe)
@@ -346,7 +384,7 @@ function snapNameOf(p, { realpath = defaultRealpath, readHead = defaultReadHead 
  * @param {(p:string)=>string} [o.readHead]
  * @param {string} [o.homedir]
  * @param {string} o.profileDir the default dedicated profile directory
- * @returns {Array<{name:string,cmd:string,prefixArgs:string[],kind:'path'|'mac-app'|'snap'|'flatpak',profileDir:string,bundle?:string}>}
+ * @returns {Array<{name:string,cmd:string,prefixArgs:string[],kind:'path'|'mac-app'|'snap'|'flatpak',profileDir:string,bundle?:string,bundleId?:string}>}
  */
 function findChromiumCandidates({
   platformInfo,
@@ -382,11 +420,11 @@ function findChromiumCandidates({
 
   if (plat === 'darwin') {
     const bases = ['/Applications', path.posix.join(homedir, 'Applications')];
-    for (const [name, app] of MAC_BROWSERS) {
+    for (const [name, app, bundleId] of MAC_BROWSERS) {
       for (const base of bases) {
         const bundle = path.posix.join(base, `${app}.app`);
         const exe = path.posix.join(bundle, 'Contents', 'MacOS', app);
-        if (exists(exe)) add({ name, cmd: exe, prefixArgs: [], kind: 'mac-app', bundle });
+        if (exists(exe)) add({ name, cmd: exe, prefixArgs: [], kind: 'mac-app', bundle, bundleId });
       }
     }
     return out;
@@ -437,6 +475,21 @@ function findChromiumCandidates({
     }
   }
   return out;
+}
+
+/**
+ * macOS: move the browsers LaunchServices opens links with to the end. The dialog's browser
+ * runs as a regular app instance with its own profile, so while the user's copy of that browser
+ * is closed, links clicked elsewhere would open in the dialog's empty profile (and close with it).
+ * Candidates without a known bundle id (ANYWHERE_BROWSER, CHROME_PATH) keep their place.
+ * @param {Array<{bundleId?:string}>} candidates
+ * @param {string|null} defaultBundleId
+ */
+function preferNonDefaultBrowser(candidates, defaultBundleId) {
+  const def = String(defaultBundleId || '').trim().toLowerCase();
+  if (!def) return candidates.slice();
+  const isDefault = (c) => Boolean(c.bundleId) && c.bundleId.toLowerCase() === def;
+  return [...candidates.filter((c) => !isDefault(c)), ...candidates.filter(isDefault)];
 }
 
 /** Escape a URL for `cmd.exe /c start "" <url>`. */
@@ -498,8 +551,10 @@ function browserOpenCommands({ platformInfo, url, which = proc.which, exists = f
 
 /**
  * Locate the Electron binary: env ANYWHERE_ELECTRON, the `electron` npm package next to this
- * package or under <stateDir>/electron, then `electron` on PATH.
- * @returns {{path:string, source:'env'|'module'|'path'}|null}
+ * package or under <stateDir>/electron, then `electron` on PATH. On Windows a global npm
+ * install puts an electron.cmd shim on PATH whose cmd.exe and `node cli.js` would keep a console
+ * window open beside the dialog, so the real electron.exe of that global package is used instead.
+ * @returns {{path:string, source:'env'|'module'|'global-module'|'path'}|null}
  */
 function resolveElectron({
   env = process.env,
@@ -509,6 +564,7 @@ function resolveElectron({
   loadModule = (p) => require(p),
   packageRoot = paths.PACKAGE_ROOT,
   stateDir = () => paths.stateDir(),
+  platform = process.platform,
 } = {}) {
   const fromEnv = env.ANYWHERE_ELECTRON;
   if (fromEnv) {
@@ -531,14 +587,25 @@ function resolveElectron({
     log.debug(`electron npm package not usable: ${err.message}`);
   }
   const onPath = which('electron');
-  if (onPath) return { path: onPath, source: 'path' };
-  return null;
+  if (!onPath) return null;
+  if (platform === 'win32' && /\.(cmd|bat)$/i.test(onPath)) {
+    try {
+      // %APPDATA%\npm\electron.cmd -> %APPDATA%\npm\node_modules\electron
+      const modPath = resolveModule('electron', { paths: [path.win32.join(path.win32.dirname(onPath), 'node_modules')] });
+      const bin = loadModule(modPath);
+      if (typeof bin === 'string' && bin && exists(bin)) return { path: bin, source: 'global-module' };
+    } catch (err) {
+      log.debug(`the global electron package behind ${onPath} is not usable: ${err.message}`);
+    }
+  }
+  return { path: onPath, source: 'path' };
 }
 
 /**
  * Pick our dialog window from a driver window list: windows owned by our processes, then
- * exact, prefix and substring title matches for "Claude Anywhere".
- * @param {Array<{id:any,title?:string,pid?:number,minimized?:boolean}>} windows
+ * exact, prefix and substring title matches for "Claude Anywhere". A blank title on a window of
+ * ours still counts (macOS hides window titles without Screen Recording permission).
+ * @param {Array<{id:any,title?:string,pid?:number,minimized?:boolean,layer?:number}>} windows
  * @param {{pids?:number[]}} [opts]
  */
 function pickWindow(windows, { pids = [] } = {}) {
@@ -553,6 +620,7 @@ function pickWindow(windows, { pids = [] } = {}) {
     if (pidMatch && t.includes(WINDOW_TITLE)) rank = 0;
     else if (t === WINDOW_TITLE) rank = 1;
     else if (pidMatch && t.trim()) rank = 2;
+    else if (pidMatch && (w.layer == null || Number(w.layer) === 0)) rank = 2.5;
     else if (t.startsWith(WINDOW_TITLE)) rank = 3;
     else if (t.includes(WINDOW_TITLE)) rank = 4;
     else continue;
@@ -563,6 +631,51 @@ function pickWindow(windows, { pids = [] } = {}) {
     }
   }
   return best;
+}
+
+/**
+ * Sort the windows of the dialog's browser instance into dialog windows and others (macOS, where
+ * that instance can also receive the user's links). Titles are blank without Screen Recording
+ * permission, so blank windows only count as the dialog when the instance has one window.
+ * @param {Array<{id:any,title?:string,pid?:number,layer?:number}>} windows
+ * @param {number[]} pids the instance's processes
+ * @returns {{dialog:object[], others:object[], unknown:object[], onlyDialog:boolean}}
+ */
+function classifyInstanceWindows(windows, pids) {
+  const pidSet = new Set((pids || []).filter((p) => Number(p) > 0).map(Number));
+  const dialog = [];
+  const others = [];
+  const unknown = [];
+  for (const w of Array.isArray(windows) ? windows : []) {
+    if (!w || w.id == null || !w.pid || !pidSet.has(Number(w.pid))) continue;
+    if (w.layer != null && Number(w.layer) !== 0) continue;
+    const t = String(w.title || '').trim();
+    if (!t) unknown.push(w);
+    else if (t.includes(WINDOW_TITLE)) dialog.push(w);
+    else others.push(w);
+  }
+  const onlyDialog = others.length === 0 && (unknown.length === 0 || dialog.length + unknown.length <= 1);
+  return { dialog, others, unknown, onlyDialog };
+}
+
+/**
+ * Chromium's device scale factor on an X11 session, which it applies to --window-position and
+ * --window-size (DIPs) while the X11 driver reports physical pixels. GDK_SCALE first, then
+ * Xft.dpi / 96 from `xrdb -query`, then GNOME's scaling-factor; null when nothing says.
+ * @param {{env?:object, xrdb?:string|null, gsettings?:string|null}} o raw command outputs
+ * @returns {number|null}
+ */
+function x11ScaleFrom({ env = {}, xrdb = null, gsettings = null } = {}) {
+  const clean = (n) => (Number.isFinite(n) && n > 0 && n <= 8 ? Math.round(n * 100) / 100 : null);
+  const gdk = clean(Number(String(env.GDK_SCALE || '').trim()));
+  if (gdk) return gdk;
+  const m = /^Xft\.dpi:\s*([\d.]+)\s*$/m.exec(String(xrdb || ''));
+  const dpi = m ? clean(Number(m[1]) / 96) : null;
+  if (dpi) return dpi;
+  const g = /(\d+(?:\.\d+)?)\s*$/.exec(String(gsettings || '').trim());
+  // 0 means "automatic" (GNOME picks by monitor DPI), which says nothing here.
+  const gs = g ? clean(Number(g[1])) : null;
+  return gs || null;
 }
 
 /**
@@ -645,9 +758,14 @@ class UiHost {
    * @param {object} opts
    * @param {object} opts.config full config (reads `config.ui` on every call)
    * @param {object} [opts.platformInfo] platform.info()
-   * @param {object} [opts.driver] OS driver (displays, listWindows, focusWindow, setTopmost)
+   * @param {object} [opts.driver] OS driver (displays, listWindows, focusWindow, setTopmost, closeWindow)
+   * @param {(url:string)=>string|Promise<string>} [opts.launchUrl] turns the dialog URL (with
+   *   ?token=) into one that is safe on a child-process command line, such as a URL with a
+   *   single-use launch code that the page exchanges for the token. Every browser launch asks
+   *   for a fresh one. Without it browsers get the token URL itself.
    * Test seams: which, exists, spawn, run, env, getuid, kill, homedir, realpath, readHead,
-   * resolveModule, loadModule, profileDir, stateDir, logFile, earlyExitMs, topmostWaitMs, browserWaitMs.
+   * resolveModule, loadModule, profileDir, stateDir, logFile, earlyExitMs, topmostWaitMs,
+   * browserWaitMs, pidWaitMs.
    */
   constructor({ config, platformInfo, driver, ...deps } = {}) {
     this.config = config || {};
@@ -671,6 +789,8 @@ class UiHost {
     this.earlyExitMs = deps.earlyExitMs != null ? deps.earlyExitMs : EARLY_EXIT_MS;
     this.topmostWaitMs = deps.topmostWaitMs != null ? deps.topmostWaitMs : TOPMOST_WAIT_MS;
     this.browserWaitMs = deps.browserWaitMs != null ? deps.browserWaitMs : BROWSER_WAIT_MS;
+    this.pidWaitMs = deps.pidWaitMs != null ? deps.pidWaitMs : PID_WAIT_MS;
+    this._launchUrlFn = typeof deps.launchUrl === 'function' ? deps.launchUrl : null;
 
     this._host = null;
     this._external = false; // a window exists that we did not spawn directly (hand-off, `open -n`, WSL, browser tab)
@@ -678,7 +798,11 @@ class UiHost {
     this._owned = []; // [{child, host, group}]
     this._appProfiles = new Set(); // profile dirs (or WSL_PROFILE_KEY) our app windows were started with
     this._wslPid = null;
+    this._profilePids = new Set(); // macOS: the dialog browser started through `open -n` (not our child)
     this._topmost = null;
+    this._x11ScaleCache = null;
+    this._macHandlerCache = null;
+    this._electronTipShown = false;
     this._chain = Promise.resolve();
   }
 
@@ -721,7 +845,29 @@ class UiHost {
   _ownedPids() {
     const pids = this._ownedLive().map((o) => o.child.pid);
     if (this._wslPid) pids.push(this._wslPid);
+    for (const pid of this._profilePids) {
+      if (this._alive(pid)) pids.push(pid);
+      else this._profilePids.delete(pid);
+    }
     return pids.filter(Boolean);
+  }
+
+  /**
+   * The URL to put on a browser's command line. Command lines are readable by every local user,
+   * so the token URL is swapped for a single-use launch URL when the daemon provides one.
+   * @param {string} url the dialog URL (with ?token=)
+   * @returns {Promise<string>}
+   */
+  async _argvUrl(url) {
+    if (!this._launchUrlFn) return url;
+    try {
+      const out = await this._launchUrlFn(url);
+      if (typeof out === 'string' && out) return out;
+      log.warn('no launch URL was minted; the browser command line carries the access token');
+    } catch (err) {
+      log.warn(`could not mint a launch URL (${err.message}); the browser command line carries the access token`);
+    }
+    return url;
   }
 
   _own(child, host, group) {
@@ -803,13 +949,48 @@ class UiHost {
       }
     }
     const pi = this.platformInfo;
+    let useDpiScale = pi.platform === 'win32' || Boolean(pi.isWSL);
+    if (pi.platform === 'linux' && !pi.isWSL && this._isX11() && Array.isArray(displays) && displays.length) {
+      // The X11 driver reports physical pixels; Chromium reads the bounds as DIPs.
+      const scale = await this._x11Scale();
+      if (scale && scale !== 1) {
+        displays = displays.map((d) => (d && typeof d === 'object' ? { ...d, dpiScale: scale } : d));
+        useDpiScale = true;
+      }
+    }
     return computeBounds({
       displays,
       width: ui.width,
       height: ui.height,
       position: ui.position,
-      useDpiScale: pi.platform === 'win32' || Boolean(pi.isWSL),
+      useDpiScale,
     });
+  }
+
+  _isX11() {
+    return Boolean(this.env.DISPLAY) && !this.env.WAYLAND_DISPLAY;
+  }
+
+  /** Chromium's device scale factor on this X11 session (cached for a minute), or null. */
+  async _x11Scale() {
+    const now = Date.now();
+    if (this._x11ScaleCache && now - this._x11ScaleCache.at < SCALE_CACHE_MS) return this._x11ScaleCache.value;
+    const probe = async (cmd, args) => {
+      const exe = this._which(cmd);
+      if (!exe) return null;
+      try {
+        const r = await this._run(exe, args, { timeoutMs: 2000 });
+        return !r.error && r.code === 0 ? String(r.stdout || '') : null;
+      } catch {
+        return null;
+      }
+    };
+    let value = x11ScaleFrom({ env: this.env });
+    if (!value) value = x11ScaleFrom({ xrdb: await probe('xrdb', ['-query']) });
+    if (!value) value = x11ScaleFrom({ gsettings: await probe('gsettings', ['get', 'org.gnome.desktop.interface', 'scaling-factor']) });
+    if (value && value !== 1) log.debug(`X11 scale factor ${value}: app window bounds are converted to DIPs`);
+    this._x11ScaleCache = { at: now, value };
+    return value;
   }
 
   // ----- hosts
@@ -823,18 +1004,20 @@ class UiHost {
       env: this.env,
       exists: this._exists,
       which: this._which,
+      platform: pi.platform,
       ...(this._resolveModule ? { resolveModule: this._resolveModule } : {}),
       ...(this._loadModule ? { loadModule: this._loadModule } : {}),
       stateDir: this._stateDir,
     });
     if (!found) return { ok: false, reason: 'Electron is not installed (optional: anywhere install --electron)' };
-    const args = electronArgs({ url, ui: this._ui(), noSandbox: this._noSandbox() });
-    const env = { ...this.env };
-    // Inherited from VS Code extension hosts and similar; it would make Electron run as plain Node.
-    delete env.ELECTRON_RUN_AS_NODE;
+    const args = electronArgs({ ui: this._ui(), noSandbox: this._noSandbox() });
+    // The URL (with the token) goes through the environment, never the command line.
+    const env = electronEnv(this.env, url);
     const isShim = pi.platform === 'win32' && /\.(cmd|bat)$/i.test(found.path);
+    // Last resort for a bare electron.cmd: without windowsHide its cmd.exe (and `node cli.js`)
+    // would keep a console window open beside the dialog.
     const r = isShim
-      ? await this._launch(proc.quoteWinArg(found.path), args.map(proc.quoteWinArg), { shell: true, env })
+      ? await this._launch(proc.quoteWinArg(found.path), args.map(proc.quoteWinArg), { shell: true, env, windowsHide: true })
       : await this._launch(found.path, args, { env });
     if (!r.ok) return { ok: false, reason: `Electron ${r.reason}` };
     if (r.child) this._own(r.child, 'electron', false);
@@ -873,7 +1056,7 @@ class UiHost {
       };
     }
     const preferredExe = await this._wslPreferredExe();
-    const script = buildWslLaunchScript({ url, ...bounds, preferredExe });
+    const script = buildWslLaunchScript({ url: await this._argvUrl(url), ...bounds, preferredExe });
     const r = await this._run(ps, psArgs(script), { timeoutMs: 15000, cwd: this._exists('/mnt/c') ? '/mnt/c' : undefined });
     const out = String(r.stdout || '');
     const m = /ANYWHERE_PID (\d+) ([^\r\n]+)/.exec(out);
@@ -912,7 +1095,7 @@ class UiHost {
     } catch (err) {
       return { ok: false, reason: `cannot create the browser profile directory: ${err.message}` };
     }
-    const candidates = findChromiumCandidates({
+    let candidates = findChromiumCandidates({
       platformInfo: pi,
       env: this.env,
       which: this._which,
@@ -922,6 +1105,9 @@ class UiHost {
       homedir: this._homedir,
       profileDir: defaultProfile,
     });
+    if (pi.platform === 'darwin' && candidates.length > 1) {
+      candidates = preferNonDefaultBrowser(candidates, await this._macDefaultBrowserId());
+    }
     if (!candidates.length) reasons.push(noBrowserHint(pi));
     const noSandbox = this._noSandbox();
     const posix = pi.platform !== 'win32';
@@ -934,9 +1120,11 @@ class UiHost {
           continue;
         }
       }
-      const args = chromiumArgs({ url, profileDir: c.profileDir, ...bounds, noSandbox: noSandbox && c.kind !== 'flatpak' });
+      // A fresh single-use launch URL per attempt: a failed attempt may have used its code.
+      const args = chromiumArgs({ url: await this._argvUrl(url), profileDir: c.profileDir, ...bounds, noSandbox: noSandbox && c.kind !== 'flatpak' });
       let r;
-      if (c.kind === 'mac-app' && this._which('open')) {
+      const viaOpen = c.kind === 'mac-app' && Boolean(this._which('open'));
+      if (viaOpen) {
         // Launching through LaunchServices makes the browser its own "responsible process", so the
         // microphone prompt names the browser instead of the terminal that started the daemon.
         r = await this._launch(this._which('open'), ['-n', '-a', c.bundle, '--args', ...args], { detached: true });
@@ -947,6 +1135,13 @@ class UiHost {
       if (r.ok) {
         if (r.child) this._own(r.child, 'app', posix);
         this._appProfiles.add(c.profileDir);
+        if (viaOpen) {
+          await this._collectProfilePids(c.profileDir);
+          if (!this._electronTipShown) {
+            this._electronTipShown = true;
+            log.info(`the dialog runs in ${c.name} with its own profile; for a dedicated window that never shares the browser's link handling, run: anywhere install --electron`);
+          }
+        }
         this._scheduleTopmost();
         return { ok: true, detail: `${c.name} app window`, handedOff: r.handedOff };
       }
@@ -955,17 +1150,63 @@ class UiHost {
     return { ok: false, reason: reasons.join('; ') || noBrowserHint(pi) };
   }
 
+  /**
+   * macOS: `open -n` exits at once, so the dialog's browser is not our child. Find its processes
+   * by their --user-data-dir, so its window can be matched by pid (window titles are blank
+   * without Screen Recording permission) and `show` focuses it instead of opening another one.
+   */
+  async _collectProfilePids(profileDir) {
+    const deadline = Date.now() + this.pidWaitMs;
+    for (;;) {
+      let r;
+      try {
+        r = await this._run('ps', ['-A', '-ww', '-o', 'pid=,args='], { timeoutMs: 3000 });
+      } catch (err) {
+        r = { error: err };
+      }
+      if (!r || r.error || r.code !== 0) return;
+      const pids = findProfilePids(r.stdout, [profileDir], [process.pid]);
+      if (pids.length) {
+        for (const pid of pids) this._profilePids.add(pid);
+        return;
+      }
+      if (Date.now() >= deadline) return;
+      await sleep(250);
+    }
+  }
+
+  /** macOS: the bundle id of the default https handler (cached for a few minutes), or null. */
+  async _macDefaultBrowserId() {
+    const now = Date.now();
+    if (this._macHandlerCache && now - this._macHandlerCache.at < HANDLER_CACHE_MS) return this._macHandlerCache.value;
+    let value = null;
+    try {
+      const r = await this._run(this._which('osascript') || '/usr/bin/osascript', ['-l', 'JavaScript', '-e', MAC_DEFAULT_BROWSER_JXA], { timeoutMs: 5000 });
+      const id = String((r && r.stdout) || '').trim();
+      if (r && !r.error && r.code === 0 && /^[\w.-]+$/.test(id)) value = id;
+    } catch (err) {
+      log.debug(`cannot read the default browser: ${err.message}`);
+    }
+    this._macHandlerCache = { at: now, value };
+    return value;
+  }
+
   async _tryBrowser(url) {
     const pi = this.platformInfo;
     if (pi.platform === 'linux' && !pi.isWSL && !this._linuxDisplay()) {
       return { ok: false, reason: 'no graphical display (DISPLAY/WAYLAND_DISPLAY is not set)' };
     }
-    const cmds = browserOpenCommands({ platformInfo: pi, url, which: this._which, exists: this._exists, env: this.env });
+    const listFor = (u) => browserOpenCommands({ platformInfo: pi, url: u, which: this._which, exists: this._exists, env: this.env });
+    const cmds = listFor(url);
     if (!cmds.length) {
       return { ok: false, reason: pi.platform === 'linux' ? 'no URL opener found (install xdg-utils: sudo apt install xdg-utils)' : 'no URL opener found' };
     }
     const reasons = [];
-    for (const c of cmds) {
+    for (let i = 0; i < cmds.length; i += 1) {
+      // The browser's command line gets a single-use launch URL, fresh for every attempt.
+      const argvUrl = await this._argvUrl(url);
+      const c = argvUrl === url ? cmds[i] : listFor(argvUrl)[i];
+      if (!c) continue;
       const r = await this._launch(c.cmd, c.args, {
         detached: pi.platform !== 'win32',
         cwd: c.cwd,
@@ -993,18 +1234,29 @@ class UiHost {
     this._topmost = null;
   }
 
+  /**
+   * Whether the driver can pin windows on top. macOS cannot (DarwinDriver.setTopmost always
+   * returns false); the daemon hands UiHost a lazy driver that cannot report supportsTopmost
+   * synchronously, so the platform is checked too.
+   */
+  _topmostSupported() {
+    const d = this.driver;
+    if (!d || typeof d.setTopmost !== 'function' || d.supportsTopmost === false) return false;
+    return !(this.platformInfo && this.platformInfo.platform === 'darwin');
+  }
+
   _scheduleTopmost() {
     this._cancelTopmost();
     const ui = this._ui();
     const d = this.driver;
-    if (!ui.alwaysOnTop || !d || typeof d.listWindows !== 'function' || typeof d.setTopmost !== 'function') return null;
+    if (!ui.alwaysOnTop || !d || typeof d.listWindows !== 'function' || !this._topmostSupported()) return null;
     const token = { cancelled: false, promise: null };
     this._topmost = token;
     token.promise = (async () => {
       const deadline = Date.now() + this.topmostWaitMs;
       while (!token.cancelled && Date.now() < deadline) {
         try {
-          const wins = await withTimeout(d.listWindows(), 3000, 'listing windows');
+          const wins = await withTimeout(d.listWindows(BACKGROUND_LIST), 3000, 'listing windows');
           const w = pickWindow(wins, { pids: this._ownedPids() });
           if (w) {
             const ok = await withTimeout(d.setTopmost(w.id, true), 3000, 'setTopmost').catch(() => false);
@@ -1028,7 +1280,7 @@ class UiHost {
     const d = this.driver;
     if (!d || typeof d.listWindows !== 'function') return null;
     try {
-      const wins = await withTimeout(d.listWindows(), DRIVER_TIMEOUT_MS, 'listing windows');
+      const wins = await withTimeout(d.listWindows(BACKGROUND_LIST), DRIVER_TIMEOUT_MS, 'listing windows');
       return pickWindow(wins, { pids: this._ownedPids() });
     } catch (err) {
       log.debug(`cannot list windows: ${err.message}`);
@@ -1109,7 +1361,7 @@ class UiHost {
       const target = url || this._url;
       const win = await this._findWindow();
       if (win && (await this._focus(win.id))) {
-        if (this._host === 'app' && this._ui().alwaysOnTop && this.driver && typeof this.driver.setTopmost === 'function') {
+        if (this._host === 'app' && this._ui().alwaysOnTop && this._topmostSupported()) {
           Promise.resolve()
             .then(() => this.driver.setTopmost(win.id, true))
             .catch(() => {});
@@ -1141,12 +1393,22 @@ class UiHost {
   close() {
     return this._serialize(async () => {
       this._cancelTopmost();
-      const tasks = this._ownedLive().map((o) => this._killChild(o));
-      if (this._appProfiles.size) tasks.push(this._killProfileProcesses());
+      let keepApp = false;
+      if (this.platformInfo.platform === 'darwin' && this._appProfiles.size) {
+        keepApp = await this._macAppInstanceInUse().catch((err) => {
+          log.debug(`cannot check the dialog browser's windows: ${err.message}`);
+          return false;
+        });
+      }
+      const tasks = this._ownedLive()
+        .filter((o) => !(keepApp && o.host === 'app'))
+        .map((o) => this._killChild(o));
+      if (this._appProfiles.size && !keepApp) tasks.push(this._killProfileProcesses());
       const results = await Promise.allSettled(tasks);
       for (const r of results) if (r.status === 'rejected') log.debug(`close: ${r.reason && r.reason.message}`);
       this._owned = [];
       this._appProfiles.clear();
+      this._profilePids.clear();
       this._wslPid = null;
       this._host = null;
       this._external = false;
@@ -1159,6 +1421,47 @@ class UiHost {
     if (host === 'none') return { host, open: false };
     const ownedAlive = this._ownedLive().some((o) => o.host === host);
     return { host, open: ownedAlive || this._external };
+  }
+
+  /**
+   * macOS: the dialog's browser instance is a regular LaunchServices app, so links opened while
+   * the user's own copy of that browser is closed land in it, as normal windows. Before stopping
+   * it, make sure it holds nothing but the dialog. If it holds more, close only the dialog window
+   * (when the driver can) and leave the instance running.
+   * @returns {Promise<boolean>} true when the instance must be left running
+   */
+  async _macAppInstanceInUse() {
+    const d = this.driver;
+    if (!d || typeof d.listWindows !== 'function') return false;
+    const pids = new Set(this._profilePids);
+    for (const o of this._ownedLive()) if (o.host === 'app' && o.child.pid) pids.add(o.child.pid);
+    const r = await this._run('ps', ['-A', '-ww', '-o', 'pid=,args='], { timeoutMs: 5000 });
+    if (r && !r.error && r.code === 0) {
+      for (const pid of findProfilePids(r.stdout, [...this._appProfiles], [process.pid])) pids.add(pid);
+    }
+    if (!pids.size) return false;
+    let wins;
+    try {
+      wins = await withTimeout(d.listWindows(BACKGROUND_LIST), DRIVER_TIMEOUT_MS, 'listing windows');
+    } catch (err) {
+      log.debug(`cannot list windows; stopping the dialog browser: ${err.message}`);
+      return false;
+    }
+    const v = classifyInstanceWindows(wins, [...pids]);
+    if (v.onlyDialog) return false;
+    let closed = 0;
+    if (typeof d.closeWindow === 'function') {
+      for (const w of v.dialog) {
+        const ok = await withTimeout(d.closeWindow(w.id), DRIVER_TIMEOUT_MS, 'closing the dialog window').catch(() => false);
+        if (ok) closed += 1;
+      }
+    }
+    const otherCount = v.others.length + (v.dialog.length ? v.unknown.length : Math.max(0, v.unknown.length - 1));
+    log.info(
+      `the dialog's browser also holds ${otherCount} other window(s); leaving it running` +
+        (closed ? ' and closing only the dialog window' : ' (close the "Claude Anywhere" window yourself)')
+    );
+    return true;
   }
 
   _signal(rec, sig) {
@@ -1273,6 +1576,11 @@ module.exports = {
   browserOpenCommands,
   resolveElectron,
   pickWindow,
+  classifyInstanceWindows,
+  x11ScaleFrom,
+  preferNonDefaultBrowser,
+  electronEnv,
+  ELECTRON_URL_ENV,
   findProfilePids,
   waitForExit,
   cmdEscape,

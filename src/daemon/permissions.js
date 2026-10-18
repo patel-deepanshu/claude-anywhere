@@ -28,6 +28,9 @@ const RANK = { low: 0, medium: 1, high: 2, critical: 3 };
 const MODES = ['ask', 'smart', 'auto'];
 const MODE_MAX = { ask: 'low', smart: 'medium', auto: 'high' };
 const DEFAULT_TIMEOUT_SEC = 600;
+// The engine's MCP config gives the anywhere server a timeout of 86400 s + 60 s, so the
+// broker's deadline must stay below it (the dialog's Settings input has the same max).
+const MAX_TIMEOUT_SEC = 86400;
 const MAX_DEPTH = 4;
 
 const SHELL_TOOLS = { Bash: 'bash', PowerShell: 'powershell' };
@@ -636,7 +639,6 @@ const WRAPPERS = {
   chronic: (a) => skipOpts(a, 1),
   unbuffer: (a) => skipOpts(a, 1),
   caffeinate: (a) => skipOpts(a, 1, new Set(['-t', '-w'])),
-  watch: (a) => skipOpts(a, 1, new Set(['-n', '--interval'])),
   'xvfb-run': (a) => skipOpts(a, 1, new Set(['-n', '-s', '-f', '-e', '-p', '--server-args', '--server-num'])),
   npx: (a) => skipOpts(a, 1, new Set(['-p', '--package'])),
   pnpx: (a) => skipOpts(a, 1, new Set(['-p', '--package'])),
@@ -1547,7 +1549,7 @@ const SQL_CLIENTS = new Set([
 const SQL_DANGER =
   /\b(drop\s+(table|database|schema|index|view|user|role|collection)|truncate\s+(table\s+)?\w|delete\s+from|alter\s+table\s+\S+\s+drop)\b|\bdropDatabase\s*\(|\.drop\s*\(|\bdeleteMany\s*\(|\bflushall\b|\bflushdb\b/i;
 const EXEC_EXT =
-  /\.(exe|bat|cmd|com|ps1|psm1|vbs|vbe|js|jse|wsf|wsh|msi|msix|appx|scr|cpl|jar|sh|bash|zsh|command|app|pkg|dmg|deb|rpm|run|appimage|lnk|reg|hta|py|rb|pl)$/i;
+  /\.(exe|bat|cmd|com|ps1|psm1|vbs|vbe|js|jse|wsf|wsh|msi|msix|appx|scr|cpl|jar|sh|bash|zsh|command|app|pkg|dmg|deb|rpm|run|appimage|lnk|reg|hta|py|rb|pl|desktop|terminal|workflow|scpt|applescript|url|webloc|inetloc|fileloc|pif|msc|library-ms|settingcontent-ms|appref-ms|application|xll|search-ms|searchconnector-ms)$/i;
 const DEPLOY_WORD = /(^|[-_:./])(deploy|deployment|release|publish|destroy|teardown|undeploy|nuke|rollout|ship|prod|production)([-_:.]|$)/i;
 const FORCE_FLAG = /^(--force|-f|--yes|-y|--auto-approve|-auto-approve|--quiet|-q|--confirm|--no-confirm|--non-interactive|-Force)$/;
 const DELETE_WORD = /^(delete|destroy|remove|rm|purge|drop|terminate|uninstall|wipe|nuke|deploy)$/i;
@@ -2022,55 +2024,109 @@ function classifyAws(args, words) {
   return V('high', `Changes AWS resources (${label})`);
 }
 
-function classifyGit(args) {
+// "Read-only" git subcommands. (difftool is deliberately NOT here: it runs an external command.)
+const GIT_READ_ONLY_SUBS = new Set([
+  'status',
+  'log',
+  'diff',
+  'show',
+  'blame',
+  'shortlog',
+  'ls-files',
+  'ls-tree',
+  'ls-remote',
+  'cat-file',
+  'rev-parse',
+  'describe',
+  'grep',
+  'whatchanged',
+  'count-objects',
+  'merge-base',
+  'name-rev',
+  'rev-list',
+  'show-ref',
+  'for-each-ref',
+  'check-ignore',
+  'check-attr',
+  'cherry',
+  'var',
+  'help',
+  'version',
+  '--version',
+  'show-branch',
+  'range-diff',
+  'annotate',
+  'fsck',
+  'verify-commit',
+  'verify-tag',
+  'archive',
+]);
+
+/** Options that make an otherwise read-only git subcommand run a command or write recovered objects. */
+function gitExecOptionVerdict(sub, rest) {
+  const has = (...names) => rest.some((a) => names.includes(a));
+  const hasPrefix = (...prefixes) => rest.some((a) => prefixes.some((p) => a.startsWith(p)));
+  // The ext:: transport runs an arbitrary program (e.g. `git ls-remote ext::sh -c …`).
+  if (rest.some((a) => /(^|[/@])ext::/.test(a))) return V('high', 'Uses the git ext:: transport, which runs a command');
+  if (sub === 'grep' && (has('-O', '--open-files-in-pager') || hasPrefix('-O', '--open-files-in-pager=')))
+    return V('high', 'Opens matches in a pager/command (git grep -O)');
+  if (sub === 'ls-remote' && (has('--upload-pack', '-u', '--receive-pack') || hasPrefix('--upload-pack=', '--receive-pack=')))
+    return V('high', 'Runs a remote helper command (git ls-remote)');
+  if (sub === 'archive' && (has('--exec', '--remote') || hasPrefix('--exec=', '--remote=')))
+    return V('high', 'Runs a remote command (git archive)');
+  if (sub === 'fsck' && has('--lost-found')) return V('high', 'Writes recovered objects to disk (git fsck --lost-found)');
+  return null;
+}
+
+function classifyGit(args, ctx) {
   let i = 0;
+  let override = null;
+  const flagOverride = () => {
+    override = maxVerdict(override, V('high', 'Overrides git configuration (can run commands)'));
+  };
   while (i < args.length && args[i].startsWith('-')) {
-    i += ['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env'].includes(args[i]) ? 2 : 1;
+    const a = args[i];
+    if (a === '-C') {
+      i += 2;
+      continue;
+    }
+    if (a === '-c' || a === '--config-env') {
+      flagOverride();
+      i += 2;
+      continue;
+    }
+    if (a === '--git-dir' || a === '--work-tree' || a === '--namespace') {
+      flagOverride();
+      i += 2;
+      continue;
+    }
+    if (/^-c./.test(a) || /^--config-env=/.test(a) || /^--(git-dir|work-tree|namespace|exec-path)(=|$)/.test(a)) {
+      flagOverride();
+      i += 1;
+      continue;
+    }
+    i += 1;
   }
   const sub = (args[i] || '').toLowerCase();
   const rest = args.slice(i + 1);
   const shortHas = (ch) => rest.some((a) => /^-[a-zA-Z]+$/.test(a) && a.includes(ch));
-  if (!sub) return V('low', 'Shows git help');
-  if (
-    [
-      'status',
-      'log',
-      'diff',
-      'show',
-      'blame',
-      'shortlog',
-      'ls-files',
-      'ls-tree',
-      'ls-remote',
-      'cat-file',
-      'rev-parse',
-      'describe',
-      'grep',
-      'whatchanged',
-      'count-objects',
-      'merge-base',
-      'name-rev',
-      'rev-list',
-      'show-ref',
-      'for-each-ref',
-      'check-ignore',
-      'check-attr',
-      'cherry',
-      'var',
-      'help',
-      'version',
-      '--version',
-      'show-branch',
-      'range-diff',
-      'annotate',
-      'difftool',
-      'fsck',
-      'verify-commit',
-      'verify-tag',
-      'archive',
-    ].includes(sub)
-  ) {
-    return V('low', 'Read-only git command');
+  // Fold the global-option override into every verdict.
+  const done = (v) => maxVerdict(override, v);
+  if (!sub) return done(V('low', 'Shows git help'));
+  if (GIT_READ_ONLY_SUBS.has(sub)) {
+    let v = V('low', 'Read-only git command');
+    v = maxVerdict(v, gitExecOptionVerdict(sub, rest));
+    const outPath = sub === 'archive' ? flagValue(rest, '-o', '--output') : flagValue(rest, '--output');
+    if (outPath) {
+      v = maxVerdict(v, V('medium', 'Writes git output to a file'));
+      v = maxVerdict(v, targetVerdict(outPath, ctx));
+    }
+    return done(v);
+  }
+  if (sub === 'difftool') {
+    if (rest.some((a) => /^(--extcmd|--tool|-x|-t)$/.test(a) || /^(--extcmd|--tool)=/.test(a) || /^-[xt]./.test(a)))
+      return done(V('high', 'Runs an external command (git difftool --extcmd/--tool)'));
+    return done(V('medium', 'Runs git difftool'));
   }
   if (sub === 'push') {
     if (
@@ -2081,23 +2137,23 @@ function classifyGit(args) {
       ) ||
       rest.some((a) => /^\+/.test(a) || /^:[^/]/.test(a))
     ) {
-      return V('high', 'Force-pushes or deletes remote git history/branches');
+      return done(V('high', 'Force-pushes or deletes remote git history/branches'));
     }
-    return V('medium', 'Pushes commits to the remote');
+    return done(V('medium', 'Pushes commits to the remote'));
   }
-  if (sub === 'reset' && rest.includes('--hard')) return V('high', 'Discards uncommitted changes (git reset --hard)');
-  if (sub === 'clean' && (rest.includes('--force') || shortHas('f'))) return V('high', 'Deletes untracked files (git clean -f)');
+  if (sub === 'reset' && rest.includes('--hard')) return done(V('high', 'Discards uncommitted changes (git reset --hard)'));
+  if (sub === 'clean' && (rest.includes('--force') || shortHas('f'))) return done(V('high', 'Deletes untracked files (git clean -f)'));
   if (sub === 'branch') {
     if (rest.includes('-D') || (rest.includes('--delete') && (rest.includes('--force') || rest.includes('-f'))) || shortHas('D')) {
-      return V('high', 'Force-deletes a git branch');
+      return done(V('high', 'Force-deletes a git branch'));
     }
     if (
       rest.some((a) => /^(-d|--delete|-m|-M|--move|-c|-C|--copy|-u|--set-upstream-to.*|--unset-upstream|--edit-description)$/.test(a)) ||
       leadingWords(rest).length
     ) {
-      return V('medium', 'Changes git branches');
+      return done(V('medium', 'Changes git branches'));
     }
-    return V('low', 'Lists git branches');
+    return done(V('low', 'Lists git branches'));
   }
   if (
     sub === 'checkout' &&
@@ -2106,38 +2162,39 @@ function classifyGit(args) {
       (rest.includes('--') && rest[rest.length - 1] === '.') ||
       (rest.length === 1 && rest[0] === '.'))
   ) {
-    return V('high', 'Discards local changes (git checkout)');
+    return done(V('high', 'Discards local changes (git checkout)'));
   }
-  if (sub === 'restore' && !rest.includes('--staged') && rest.includes('.')) return V('high', 'Discards local changes (git restore .)');
-  if (sub === 'stash' && ['drop', 'clear'].includes(rest[0])) return V('high', 'Deletes stashed changes');
-  if (sub === 'stash' && ['list', 'show'].includes(rest[0])) return V('low', 'Reads git stashes');
+  if (sub === 'restore' && !rest.includes('--staged') && rest.includes('.'))
+    return done(V('high', 'Discards local changes (git restore .)'));
+  if (sub === 'stash' && ['drop', 'clear'].includes(rest[0])) return done(V('high', 'Deletes stashed changes'));
+  if (sub === 'stash' && ['list', 'show'].includes(rest[0])) return done(V('low', 'Reads git stashes'));
   if (sub === 'reflog')
-    return ['expire', 'delete'].includes(rest[0]) ? V('high', 'Deletes git reflog entries') : V('low', 'Reads the git reflog');
-  if (['filter-branch', 'filter-repo'].includes(sub)) return V('high', 'Rewrites git history');
-  if (sub === 'update-ref' && rest.includes('-d')) return V('high', 'Deletes a git ref');
-  if (sub === 'gc' && rest.some((a) => a.startsWith('--prune'))) return V('high', 'Permanently prunes git objects');
+    return done(['expire', 'delete'].includes(rest[0]) ? V('high', 'Deletes git reflog entries') : V('low', 'Reads the git reflog'));
+  if (['filter-branch', 'filter-repo'].includes(sub)) return done(V('high', 'Rewrites git history'));
+  if (sub === 'update-ref' && rest.includes('-d')) return done(V('high', 'Deletes a git ref'));
+  if (sub === 'gc' && rest.some((a) => a.startsWith('--prune'))) return done(V('high', 'Permanently prunes git objects'));
   if (sub === 'config') {
     if (
       rest.some((a) => /^(--get|--get-all|--get-regexp|--list|-l|get|list|--show-origin|--show-scope)$/.test(a)) &&
       !rest.some((a) => /^(--unset|--add|--replace-all|set|unset)$/.test(a))
     ) {
-      return V('low', 'Reads git config');
+      return done(V('low', 'Reads git config'));
     }
-    if (rest.includes('--global') || rest.includes('--system')) return V('high', 'Changes global git configuration');
-    return V('medium', 'Changes repository git config');
+    if (rest.includes('--global') || rest.includes('--system')) return done(V('high', 'Changes global git configuration'));
+    return done(V('medium', 'Changes repository git config'));
   }
   if (sub === 'remote') {
-    if (!rest.length || ['-v', '--verbose', 'show', 'get-url'].includes(rest[0])) return V('low', 'Lists git remotes');
-    return V('medium', 'Changes git remotes');
+    if (!rest.length || ['-v', '--verbose', 'show', 'get-url'].includes(rest[0])) return done(V('low', 'Lists git remotes'));
+    return done(V('medium', 'Changes git remotes'));
   }
   if (sub === 'tag') {
-    if (rest.includes('-d') || rest.includes('--delete')) return V('medium', 'Deletes a local git tag');
-    if (!leadingWords(rest).length || rest.includes('-l') || rest.includes('--list')) return V('low', 'Lists git tags');
-    return V('medium', 'Creates a git tag');
+    if (rest.includes('-d') || rest.includes('--delete')) return done(V('medium', 'Deletes a local git tag'));
+    if (!leadingWords(rest).length || rest.includes('-l') || rest.includes('--list')) return done(V('low', 'Lists git tags'));
+    return done(V('medium', 'Creates a git tag'));
   }
-  if (sub === 'worktree' && rest[0] === 'list') return V('low', 'Lists git worktrees');
-  if (sub === 'submodule' && (!rest.length || rest[0] === 'status')) return V('low', 'Reads git submodules');
-  return V('medium', `Runs git ${sub}`);
+  if (sub === 'worktree' && rest[0] === 'list') return done(V('low', 'Lists git worktrees'));
+  if (sub === 'submodule' && (!rest.length || rest[0] === 'status')) return done(V('low', 'Reads git submodules'));
+  return done(V('medium', `Runs git ${sub}`));
 }
 
 function classifyGh(args) {
@@ -2492,6 +2549,47 @@ function psNamed(named, ...names) {
 const PS_RECURSE = /^-r(e(c(u(r(se?)?)?)?)?)?(:\$?true)?$/i;
 
 /**
+ * The trailing command of a wrapper: skip leading options (value-taking ones
+ * consume the next token), honour a `--` separator, then skip `skipPos` leading
+ * positionals (e.g. a lock file or chroot NEWROOT) before the command.
+ */
+function wrapTrailing(args, valueFlags = new Set(), skipPos = 0) {
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i];
+    if (a === '--') {
+      i += 1;
+      break;
+    }
+    if (a.startsWith('-') && a !== '-') {
+      i += valueFlags.has(a) ? 2 : 1;
+      continue;
+    }
+    break;
+  }
+  i += skipPos;
+  return args.slice(i);
+}
+
+/** Non-flag positional arguments, skipping the values of the given value-taking flags. */
+function positionals(args, valueFlags = new Set()) {
+  const out = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i];
+    if (a === '--') {
+      out.push(...args.slice(i + 1).filter((x) => x !== ''));
+      break;
+    }
+    if (a.startsWith('-') && a !== '-') {
+      if (valueFlags.has(a)) i += 1;
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
+/**
  * Paths a command writes to or deletes, as raw strings.
  */
 function writeTargets(p, args, tk) {
@@ -2563,6 +2661,47 @@ function writeTargets(p, args, tk) {
     case 'ssh-keygen': {
       const f = flagValue(args, '-f');
       if (f && !args.some((a) => /^-[lyFBH]$/.test(a))) out.push(f);
+      break;
+    }
+    case 'uniq': {
+      // uniq [OPTION] [INPUT [OUTPUT]] — the 2nd positional is an output file.
+      const pos = positionals(args, new Set(['-f', '--skip-fields', '-s', '--skip-chars', '-w', '--check-chars']));
+      if (pos.length >= 2) out.push(pos[1]);
+      break;
+    }
+    case 'xxd': {
+      // xxd [options] [infile [outfile]] — the 2nd positional is an output file (with or without -r).
+      const pos = positionals(args, new Set(['-c', '-cols', '-g', '-groupsize', '-l', '-len', '-o', '-s', '-seek']));
+      if (pos.length >= 2) out.push(pos[1]);
+      break;
+    }
+    case 'tree': {
+      const o = flagValue(args, '-o');
+      if (o) out.push(o);
+      break;
+    }
+    case 'base64':
+    case 'sort':
+    case 'shuf':
+    case 'iconv':
+    case 'strace':
+    case 'ltrace': {
+      const o = flagValue(args, '-o', '--output');
+      if (o) out.push(o);
+      break;
+    }
+    case 'split': {
+      // split [OPTION] [FILE [PREFIX]] — files are written as PREFIXaa, PREFIXab, …
+      const pfx = positionals(
+        args,
+        new Set(['-a', '--suffix-length', '-b', '--bytes', '-C', '--line-bytes', '-l', '--lines', '-n', '--number', '--additional-suffix']),
+      );
+      if (pfx.length >= 2) out.push(pfx[1]);
+      break;
+    }
+    case 'csplit': {
+      const o = flagValue(args, '-f', '--prefix');
+      if (o) out.push(o);
       break;
     }
     case 'remove-item':
@@ -2663,9 +2802,22 @@ function classifyArgv(u, tk, ctx, raw) {
     : /^(chmod|chown|chgrp|set-acl)$/.test(prog)
       ? 'Changes permissions of'
       : 'Writes to';
-  const targetProg = prog.startsWith('cmd-') ? prog.slice(4) : psProg;
-  for (const target of writeTargets(targetProg, args, tk)) {
+  // prog is already PowerShell-aliased when the shell is PowerShell; using psProg here would
+  // wrongly alias bash programs too (e.g. `sort` → `sort-object`), hiding their output files.
+  const targetProg = prog.startsWith('cmd-') ? prog.slice(4) : prog;
+  const writes = writeTargets(targetProg, args, tk);
+  for (const target of writes) {
     v = maxVerdict(v, targetVerdict(target, ctx, verb));
+  }
+  // A "read-only" utility that writes to a real output file is not read-only. targetVerdict returns
+  // null for project/temp paths, so bump low to medium here or it would auto-run in ask mode.
+  // (Null-device redirects like `ls 2>/dev/null` do not count.)
+  if (
+    RANK[v.risk] < RANK.medium &&
+    (READ_ONLY_PROGS.has(prog) || READ_ONLY_PROGS.has(psProg)) &&
+    writes.some((t) => !NULL_DEVICE_RE.test(str(t).replace(/^@/, '')))
+  ) {
+    v = maxVerdict(v, V('medium', 'Writes to a file'));
   }
   // self-escalation through an interpreter or editor
   if (
@@ -2675,7 +2827,7 @@ function classifyArgv(u, tk, ctx, raw) {
     (INTERPRETERS.test(prog) ||
       SHELLS.test(prog) ||
       PS_HOSTS.test(prog) ||
-      /^(sed|awk|gawk|ed|ex|vi|vim|nvim|nano|emacs|sponge|xargs|cp|mv|ln|install|tee|truncate|rm|set-content|add-content|out-file|copy-item|move-item|remove-item|new-item)$/.test(
+      /^(sed|awk|gawk|ed|ex|vi|vim|nvim|nano|emacs|sponge|xargs|cp|mv|ln|install|tee|truncate|rm|uniq|xxd|tree|base64|sort|shuf|iconv|set-content|add-content|out-file|copy-item|move-item|remove-item|new-item)$/.test(
         prog,
       ))
   ) {
@@ -2882,6 +3034,102 @@ const PS_SYSTEM_CMDLETS = new Set([
   'invoke-wmimethod',
   'invoke-cimmethod',
 ]);
+
+/**
+ * Collect sed script text from -e/--expression values, or the first non-flag
+ * argument when neither -e nor -f is given.
+ */
+function sedScripts(args) {
+  const scripts = [];
+  let hasFile = false;
+  let sawScriptFlag = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i];
+    if (a === '-e' || a === '--expression') {
+      if (args[i + 1] != null) scripts.push(args[i + 1]);
+      sawScriptFlag = true;
+      i += 1;
+      continue;
+    }
+    if (a.startsWith('--expression=')) {
+      scripts.push(a.slice('--expression='.length));
+      sawScriptFlag = true;
+      continue;
+    }
+    if (a.startsWith('-e') && a.length > 2 && !a.startsWith('--')) {
+      scripts.push(a.slice(2));
+      sawScriptFlag = true;
+      continue;
+    }
+    if (a === '-f' || a === '--file') {
+      hasFile = true;
+      sawScriptFlag = true;
+      i += 1;
+      continue;
+    }
+    if (a.startsWith('--file=') || (a.startsWith('-f') && a.length > 2 && !a.startsWith('--'))) {
+      hasFile = true;
+      sawScriptFlag = true;
+      continue;
+    }
+  }
+  if (!sawScriptFlag) {
+    const first = args.find((a) => !a.startsWith('-'));
+    if (first != null) scripts.push(first);
+  }
+  return { scripts, hasFile };
+}
+
+// The sed `e` command / `s///e` flag run a shell; `w`/`W` write a file.
+const SED_EXEC_CMD = /(^|;|\n|\})\s*\d*\s*e(\s|$)/;
+const SED_EXEC_SFLAG = /s[^\w\s].*[^\\]e[a-z]*\s*($|;)/;
+
+function sedExecCommand(script) {
+  const m = /(?:^|;|\n|\})\s*\d*\s*e\s+([^\n;]+)/.exec(script);
+  return m ? m[1].trim() : null;
+}
+
+function sedWriteTarget(script) {
+  // `w file` / `W file` command (optionally address-prefixed), or the `w file` flag on s///.
+  const flag = /s([^\w\s])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[a-z0-9]*w\s+([^\n;]+)/.exec(script);
+  if (flag) return flag[2].trim();
+  const cmd = /(?:^|;|\n|\})\s*(?:\d+|\$)?(?:,\s*(?:\d+|\$))?\s*[wW]\s+([^\n;]+)/.exec(script);
+  return cmd ? cmd[1].trim() : null;
+}
+
+/**
+ * sed is read-only text processing UNLESS: it edits in place (-i), runs a shell
+ * (the `e` command or `s///e` flag), writes files (`w`/`W`), or runs an unknown
+ * script from a file. GNU --sandbox disables e/w/r.
+ */
+function classifySed(args, ctx) {
+  const sandbox = args.includes('--sandbox');
+  const inPlace = args.some((a) => /^(-i|--in-place)/.test(a) || (/^-[a-hj-zA-Z]*i/.test(a) && !a.startsWith('--')));
+  let v = inPlace ? V('medium', 'Edits files in place (sed -i)') : V('low', 'Read-only text processing (sed)');
+  if (sandbox) return v;
+  const { scripts, hasFile } = sedScripts(args);
+  for (const s of scripts) {
+    if (SED_EXEC_CMD.test(s) || SED_EXEC_SFLAG.test(s)) {
+      v = maxVerdict(v, V('high', 'Runs a shell command (sed e command)'));
+      const cmd = sedExecCommand(s);
+      if (cmd) {
+        try {
+          v = maxVerdict(v, recurse(cmd, 'bash', ctx));
+        } catch {
+          /* the text after `e` may not parse as a command */
+        }
+      }
+      continue;
+    }
+    const wt = sedWriteTarget(s);
+    if (wt != null) {
+      v = maxVerdict(v, V('medium', 'Writes a file (sed w command)'));
+      v = maxVerdict(v, targetVerdict(wt, ctx));
+    }
+  }
+  if (hasFile) v = maxVerdict(v, V('medium', 'Runs a sed script from a file'));
+  return v;
+}
 
 /** Program-specific verdict (before sudo / target / network bumps). */
 function baseVerdict(prog, args, u, tk, ctx, raw) {
@@ -3092,6 +3340,145 @@ function baseVerdict(prog, args, u, tk, ctx, raw) {
     const rest = args.slice(i);
     if (!rest.length) return V('low', 'xargs echo');
     return recurseArgv(rest, ctx);
+  }
+
+  // ---- command wrappers that run another command (by their payload, not a fixed risk)
+  if (prog === 'watch') {
+    // watch runs its arguments through `sh -c`.
+    let i = 0;
+    while (i < args.length && args[i].startsWith('-')) i += args[i] === '-n' || args[i] === '--interval' ? 2 : 1;
+    const rest = args.slice(i);
+    if (!rest.length) return V('medium', 'Runs watch');
+    return maxVerdict(V('medium', 'Repeatedly runs a command (watch)'), recurse(rest.join(' '), 'bash', ctx));
+  }
+  if (prog === 'script') {
+    // script [options] [file]; the recorded command is the -c/--command value (also in combined flags like -qec).
+    let cmd = flagValue(args, '-c', '--command');
+    if (cmd == null) {
+      const idx = args.findIndex((a) => !a.startsWith('--') && /^-[a-z]*c$/i.test(a));
+      if (idx !== -1 && args[idx + 1] != null) cmd = args[idx + 1];
+    }
+    const base = V('medium', 'Records a terminal session (script)');
+    return cmd != null ? maxVerdict(base, recurse(cmd, 'bash', ctx)) : base;
+  }
+  if (prog === 'flock') {
+    const cmd = flagValue(args, '-c', '--command');
+    if (cmd != null) return maxVerdict(V('medium', 'Runs a command under a lock (flock)'), recurse(cmd, 'bash', ctx));
+    // flock [options] LOCKFILE COMMAND [args]
+    const rest = wrapTrailing(args, new Set(['-w', '--timeout', '-E', '--conflict-exit-code']), 1);
+    if (!rest.length) return V('low', 'Takes a file lock (flock)');
+    return maxVerdict(V('medium', 'Runs a command under a lock (flock)'), recurseArgv(rest, ctx));
+  }
+  if (prog === 'strace' || prog === 'ltrace') {
+    // [options] COMMAND [args]; the trace file (-o) is handled by writeTargets.
+    const rest = wrapTrailing(
+      args,
+      new Set(['-o', '--output', '-e', '-p', '--attach', '-s', '-u', '--user', '-E', '-a', '-O', '-S', '-P', '-I', '-b', '-D', '-x']),
+    );
+    if (!rest.length) return V('medium', `Traces a process (${prog})`);
+    return maxVerdict(V('medium', `Traces a command (${prog})`), recurseArgv(rest, ctx));
+  }
+  if (prog === 'ssh-agent') {
+    const rest = wrapTrailing(args, new Set(['-t', '-a', '-O', '-P']));
+    if (!rest.length) return V('medium', 'Starts the SSH agent');
+    return maxVerdict(V('medium', 'Runs a command under ssh-agent'), recurseArgv(rest, ctx));
+  }
+  if (prog === 'setsid' || prog === 'firejail' || prog === 'unshare' || prog === 'dbus-run-session' || prog === 'eatmydata') {
+    const rest = wrapTrailing(args, new Set(['--config-file', '--dbus-daemon', '--profile', '--private', '--netns']));
+    if (!rest.length) return V('medium', `Runs ${prog}`);
+    return maxVerdict(V('medium', `Runs a command (${prog})`), recurseArgv(rest, ctx));
+  }
+  if (prog === 'systemd-run') {
+    const rest = wrapTrailing(
+      args,
+      new Set([
+        '--unit',
+        '-u',
+        '-p',
+        '--property',
+        '--on-active',
+        '--on-boot',
+        '--on-calendar',
+        '--on-startup',
+        '--on-unit-active',
+        '--on-unit-inactive',
+        '--timer-property',
+        '--description',
+        '--slice',
+        '--uid',
+        '--gid',
+        '--setenv',
+        '-E',
+        '--working-directory',
+      ]),
+    );
+    if (!rest.length) return V('high', 'Runs systemd-run');
+    return maxVerdict(V('high', 'Runs a command as a transient systemd unit (systemd-run)'), recurseArgv(rest, ctx));
+  }
+  if (prog === 'chroot') {
+    // chroot [options] NEWROOT [COMMAND [args]]
+    const rest = wrapTrailing(args, new Set(['--userspec', '--groups']), 1);
+    if (!rest.length) return V('high', 'Runs a shell in a chroot');
+    return maxVerdict(V('high', 'Runs a command in a chroot'), recurseArgv(rest, ctx));
+  }
+  if (prog === 'sg' || prog === 'newgrp') {
+    const cmd = flagValue(args, '-c');
+    if (cmd != null) return maxVerdict(V('high', `Runs a command as another group (${prog})`), recurse(cmd, 'bash', ctx));
+    const rest = wrapTrailing(args, new Set(['-c']), 1);
+    if (!rest.length) return V('high', `Switches group (${prog})`);
+    return maxVerdict(V('high', `Runs a command as another group (${prog})`), recurseArgv(rest, ctx));
+  }
+  if (prog === 'runuser') {
+    const cmd = flagValue(args, '-c', '--command');
+    if (cmd != null) return maxVerdict(V('high', 'Runs a command as another user (runuser)'), recurse(cmd, 'bash', ctx));
+    let i = 0;
+    const VAL = new Set(['-u', '--user', '-g', '--group', '-G', '--supp-group', '-s', '--shell', '--session-command']);
+    while (i < args.length && args[i].startsWith('-') && args[i] !== '--') i += VAL.has(args[i]) ? 2 : 1;
+    if (args[i] === '--') i += 1;
+    else if (args[i] != null && !hasFlag(args, '-u', '--user')) i += 1; // positional USER
+    const rest = args.slice(i);
+    if (!rest.length) return V('high', 'Switches to another user (runuser)');
+    return maxVerdict(V('high', 'Runs a command as another user (runuser)'), recurseArgv(rest, ctx));
+  }
+  if (['xterm', 'urxvt', 'rxvt', 'konsole', 'alacritty', 'kitty', 'xfce4-terminal', 'lxterminal', 'st', 'foot'].includes(prog)) {
+    const ei = args.findIndex((a) => a === '-e' || a === '--command' || a === '--');
+    if (ei !== -1 && args[ei + 1] != null) {
+      return maxVerdict(V('medium', `Opens a terminal running a command (${prog})`), recurseArgv(args.slice(ei + 1), ctx));
+    }
+    return V('medium', `Opens a terminal (${prog})`);
+  }
+  if (['gnome-terminal', 'tilix', 'terminator', 'kgx'].includes(prog)) {
+    const dd = args.indexOf('--');
+    if (dd !== -1 && args[dd + 1] != null)
+      return maxVerdict(V('medium', `Opens a terminal running a command (${prog})`), recurseArgv(args.slice(dd + 1), ctx));
+    const e = flagValue(args, '-e', '--command');
+    if (e != null) return maxVerdict(V('medium', `Opens a terminal running a command (${prog})`), recurse(e, 'bash', ctx));
+    return V('medium', `Opens a terminal (${prog})`);
+  }
+  if (['vim', 'nvim', 'vi', 'ex', 'view', 'rvim', 'gvim'].includes(prog)) {
+    const cmds = [];
+    for (let i = 0; i < args.length; i += 1) {
+      const a = args[i];
+      if (a === '-c' || a === '--cmd') {
+        if (args[i + 1] != null) cmds.push(args[i + 1]);
+        i += 1;
+      } else if (a.startsWith('+') && a.length > 1) cmds.push(a.slice(1));
+    }
+    let v = V('medium', `Edits files (${prog})`);
+    for (const cstr of cmds) {
+      if (/^\s*:?\s*!/.test(cstr) || /:\s*!/.test(cstr) || /\b[rw]\s*!/.test(cstr)) {
+        v = maxVerdict(v, V('high', `Runs a shell command from ${prog}`));
+        const sh = cstr.slice(cstr.indexOf('!') + 1).trim();
+        if (sh) {
+          try {
+            v = maxVerdict(v, recurse(sh, 'bash', ctx));
+          } catch {
+            /* the ex command may not be a shell command */
+          }
+        }
+      }
+    }
+    return v;
   }
   if (prog === 'find') {
     let v = V('low', 'Searches for files');
@@ -3599,7 +3986,7 @@ function baseVerdict(prog, args, u, tk, ctx, raw) {
   if (SYS_PKG.has(prog)) return classifySysPkg(prog, args);
 
   // ---- version control, cloud, containers, databases
-  if (prog === 'git') return classifyGit(args);
+  if (prog === 'git') return classifyGit(args, ctx);
   if (prog === 'gh') return classifyGh(args);
   if (['docker', 'podman', 'nerdctl', 'docker-compose'].includes(prog)) {
     return classifyDocker(prog === 'docker-compose' ? 'docker' : prog, prog === 'docker-compose' ? ['compose', ...args] : args);
@@ -3622,10 +4009,7 @@ function baseVerdict(prog, args, u, tk, ctx, raw) {
   }
 
   // ---- files and editors
-  if (prog === 'sed')
-    return args.some((a) => /^(-i|--in-place)/.test(a) || /^-[a-hj-zA-Z]*i/.test(a))
-      ? V('medium', 'Edits files in place (sed -i)')
-      : V('low', 'Read-only text processing (sed)');
+  if (prog === 'sed') return classifySed(args, ctx);
   if (prog === 'perl' && args.some((a) => /^-[a-zA-Z]*i/.test(a))) return V('medium', 'Edits files in place (perl -i)');
   if (
     prog === 'open' ||
@@ -3903,6 +4287,53 @@ function pt(x, y) {
   return x == null || y == null ? '' : `(${Math.round(Number(x))}, ${Math.round(Number(y))})`;
 }
 
+// Typed/pasted text that changes Claude Code or Claude Anywhere settings (self-escalation).
+const SELF_ESCALATION_TYPED =
+  /\b(claude-)?anywhere\s+config\b|\bclaude\s+config\b|permissions\.mode|defaultMode|bypassPermissions|dangerously-skip-permissions/i;
+
+/**
+ * type_text and clipboard_set can drive a terminal: a trailing newline runs the
+ * line, and a paste is the same. So the text gets the same scrutiny as Bash, and
+ * self-escalation payloads are critical. Returns a verdict to maxVerdict with the
+ * base (never lowers it), or null when the text is empty.
+ */
+function typedTextVerdict(text, ctx) {
+  const t = str(text);
+  if (!t.trim()) return null;
+  if (selfEscalationText(t) || SELF_ESCALATION_TYPED.test(t))
+    return V('critical', 'Types a command that changes Claude Code/Anywhere settings (self-escalation)');
+  try {
+    return recurse(t.replace(/\r?\n$/, ''), ctx.platform === 'win32' ? 'powershell' : 'bash', ctx);
+  } catch {
+    // prose does not always parse as a command; fall back to the medium base.
+    return null;
+  }
+}
+
+const OPEN_RUNNERS = /^(cmd|osascript|wscript|cscript|mshta)$/i;
+const OPEN_TERMINALS =
+  /^(xterm|uxterm|urxvt|rxvt|konsole|alacritty|kitty|xfce4-terminal|lxterminal|st|foot|footclient|gnome-terminal|mate-terminal|qterminal|tilix|terminator|kgx|ptyxis|wezterm|ghostty|hyper|terminology|x-terminal-emulator|wt|windowsterminal|windows terminal|conhost|terminal|iterm|iterm2)$/i;
+// Terminal hosts whose positional arguments are already a command line.
+const OPEN_TERMINAL_CMDLINE = /^(wt|windowsterminal|windows terminal|conhost)$/i;
+
+/** Verdict for open {target, args}: the target run with those arguments, like a command. */
+function openArgsVerdict(t, args, ctx) {
+  const base = progName(t).replace(/\.app$/i, '');
+  let v = null;
+  try {
+    v = recurseArgv([t, ...args], { ...ctx, depth: ctx.depth || 0, shell: ctx.platform === 'win32' ? 'powershell' : 'bash' });
+  } catch {
+    v = null;
+  }
+  if (SHELLS.test(base) || INTERPRETERS.test(base) || PS_HOSTS.test(base) || OPEN_RUNNERS.test(base)) {
+    v = maxVerdict(v, V('high', 'Launches an interpreter or shell with arguments'));
+  } else if (OPEN_TERMINALS.test(base)) {
+    const runs = OPEN_TERMINAL_CMDLINE.test(base) || args.some((a) => a === '-e' || a === '--' || a === '-x' || a === '--command' || /^--command=/.test(a));
+    if (runs) v = maxVerdict(v, V('high', `Opens a terminal running a command (${base})`));
+  }
+  return v;
+}
+
 function anywhereToolVerdict(tool, input, ctx) {
   if (tool === 'key') {
     const keys = normalizeKeyCombo(input.combo, ctx.platform);
@@ -3912,13 +4343,13 @@ function anywhereToolVerdict(tool, input, ctx) {
   }
   if (tool === 'type_text') {
     const why = secretLike(input.text);
-    if (why) return V('high', `Types text that ${why}`);
-    return V('medium', 'Types text into the focused window');
+    let v = why ? V('high', `Types text that ${why}`) : V('medium', 'Types text into the focused window');
+    return maxVerdict(v, typedTextVerdict(input.text, ctx));
   }
   if (tool === 'clipboard_set') {
     const why = secretLike(input.text);
-    if (why) return V('high', `Puts text on the clipboard that ${why}`);
-    return V('medium', 'Changes the clipboard');
+    let v = why ? V('high', `Puts text on the clipboard that ${why}`) : V('medium', 'Changes the clipboard');
+    return maxVerdict(v, typedTextVerdict(input.text, ctx));
   }
   if (tool === 'open') {
     const t = str(input.target).trim();
@@ -3928,9 +4359,14 @@ function anywhereToolVerdict(tool, input, ctx) {
       if (scheme === 'about') return V('medium', 'Opens a browser page');
       return V('high', `Opens a ${scheme}: link, which can launch other programs`);
     }
-    if (EXEC_EXT.test(t.replace(/[\\/]+$/, ''))) return V('high', 'Opens an executable, script or installer');
-    if (input.kind === 'app' || (!/[\\/.]/.test(t) && t)) return V('medium', 'Opens an app');
-    return V('medium', 'Opens a file or folder');
+    let v;
+    if (EXEC_EXT.test(t.replace(/[\\/]+$/, ''))) v = V('high', 'Opens an executable, script or installer');
+    else if (input.kind === 'app' || (!/[\\/.]/.test(t) && t)) v = V('medium', 'Opens an app');
+    else v = V('medium', 'Opens a file or folder');
+    // Arguments make `open` a way to run commands: {target:'bash', args:['-c', ...]}.
+    const args = Array.isArray(input.args) ? input.args.map(String) : [];
+    if (args.length && t) v = maxVerdict(v, openArgsVerdict(t, args, ctx));
+    return v;
   }
   if (ANYWHERE_LOW.has(tool)) return V('low', 'Reads the screen or talks to the user');
   if (ANYWHERE_MEDIUM.has(tool)) return V('medium', 'Controls the mouse, keyboard or windows');
@@ -3968,8 +4404,11 @@ function anywhereSummary(tool, input) {
     }
     case 'focus_window':
       return `Focus ${truncate(str(i.title || i.app || i.id || 'a window'), 60)}`;
-    case 'open':
-      return `Open ${truncate(str(i.target), 100)}`;
+    case 'open': {
+      // Show the arguments too: they decide what an app such as a shell actually runs.
+      const args = Array.isArray(i.args) ? i.args.map((a) => (/^[\w@%+=:,./-]+$/.test(String(a)) ? String(a) : `'${String(a)}'`)) : [];
+      return `Open ${truncate(oneLine([str(i.target), ...args].join(' ')), 140)}`;
+    }
     case 'clipboard_set': {
       const text = str(i.text);
       return secretLike(text)
@@ -4425,7 +4864,7 @@ class PermissionBroker extends EventEmitter {
   /** @private */
   timeoutSec() {
     const n = Number(this.perms().approvalTimeoutSec);
-    return Number.isFinite(n) && n > 0 ? n : DEFAULT_TIMEOUT_SEC;
+    return Number.isFinite(n) && n > 0 ? Math.min(n, MAX_TIMEOUT_SEC) : DEFAULT_TIMEOUT_SEC;
   }
 
   /**

@@ -2,7 +2,7 @@
 name: anywhere
 description: Open Claude Anywhere: a floating, voice-enabled command dialog that lets Claude Code see and operate the whole desktop (screen, mouse, keyboard, apps, browser, terminal) to carry out tasks like "deploy this repo to GCP". Use when the user runs /anywhere or asks to open, stop or check the Anywhere dialog, or to control their computer by voice.
 argument-hint: "[here | stop | status | doctor | setup | <task to run>]"
-allowed-tools: Bash(node *)
+allowed-tools: Bash(node "${CLAUDE_SKILL_DIR}/run.js"*), mcp__anywhere__screenshot, mcp__anywhere__list_windows, mcp__anywhere__cursor_position, mcp__anywhere__screen_info, mcp__anywhere__get_desktop_context, mcp__plugin_anywhere_anywhere__screenshot, mcp__plugin_anywhere_anywhere__list_windows, mcp__plugin_anywhere_anywhere__cursor_position, mcp__plugin_anywhere_anywhere__screen_info, mcp__plugin_anywhere_anywhere__get_desktop_context
 disable-model-invocation: true
 ---
 
@@ -77,7 +77,8 @@ If it fails, show the error lines and the fix it suggests, then offer `/anywhere
    - Progress for milestones (one short line):
      `node "${CLAUDE_SKILL_DIR}/run.js" reply 'Enabling the Cloud Run API…'`
    - Decisions and missing details: ask in the dialog (Bash `timeout` 600000); it prints the answer,
-     or `TIMEOUT`:
+     `TIMEOUT`, or `No answer (…)` (exit 1) when the user cancelled the question or pressed Stop; then
+     send a final reply and stop instead of going ahead:
      `node "${CLAUDE_SKILL_DIR}/run.js" ask 'Deploy to project shop-prod in us-central1?' --options 'Yes,No' --timeout 540`
    - Finish every command, also failed ones, with a final reply of 1–3 plain sentences that read
      well aloud (no markdown or tables; include the key result such as a URL):
@@ -158,8 +159,9 @@ Claude Anywhere (for example `run.js install --hotkey`, `run.js install --electr
   reopen that app after granting. `doctor` prints the exact panes.
 - **Linux**: X11 needs `xdotool wmctrl xclip imagemagick` (Debian/Ubuntu:
   `sudo apt install xdotool wmctrl xclip imagemagick x11-xserver-utils`). Wayland needs `ydotool`
-  (with `ydotoold` running), `grim` or `gnome-screenshot`, and `wl-clipboard`. Without a display
-  (SSH), use the terminal dialog: `run.js tui`.
+  >= 1.0 with `ydotoold` running (Debian 12 and Ubuntu up to 24.04 ship 0.1.8, which is not
+  supported; build 1.x from github.com/ReimuNotMoe/ydotool), plus `grim` or `gnome-screenshot` and
+  `wl-clipboard`. Without a display (SSH), use the terminal dialog: `run.js tui`.
 - **Windows / WSL**: works with built-in PowerShell; elevated (admin) windows can only be controlled
   when Claude Code itself runs elevated.
 - **No window appeared**: `run.js show`, or open the URL from `run.js url` in a browser.

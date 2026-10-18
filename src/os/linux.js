@@ -8,7 +8,7 @@
  * xwd+convert, gnome-screenshot).
  *
  * Wayland (best effort): grim / gnome-screenshot / spectacle for pixels,
- * swaymsg / hyprctl / ydotool / wtype for input, swaymsg / hyprctl for windows,
+ * swaymsg / hyprctl / ydotool (>= 1.0) / wtype for input, swaymsg / hyprctl for windows,
  * wl-clipboard (or XWayland xclip) for the clipboard.
  *
  * Every external call is bounded by a timeout; missing tools raise
@@ -34,6 +34,8 @@ const DRAG_STEP_MS = 15;
 const DISPLAY_CACHE_MS = 2000;
 const CAPTURE_TIMEOUT_MS = 10000;
 const MAX_NOTCHES = 200;
+/** How often a missing tool is looked up again (proc.which caches misses for the life of the process). */
+const WHICH_MISS_TTL_MS = 10000;
 
 // ---------------------------------------------------------------------------
 // Package hints
@@ -407,6 +409,29 @@ function parseXwininfoRoot(text) {
   return finalizeDisplays([{ id: 'screen', x: 0, y: 0, width: +w[1], height: +h[1], primary: true }]);
 }
 
+/**
+ * Parse `xwininfo -root -tree` into a Map of normalized window id → absolute geometry. Each window line
+ * ends in "WxH+relX+relY  +absX+absY" (offsets may be negative: "+-100+-100").
+ * @param {string} text
+ * @returns {Map<string,{x:number,y:number,width:number,height:number}>}
+ */
+function parseXwininfoTree(text) {
+  const out = new Map();
+  const re = /^\s*(0x[0-9a-f]+)\s.*\s(\d+)x(\d+)\+-?\d+\+-?\d+\s+\+(-?\d+)\+(-?\d+)\s*$/i;
+  for (const line of String(text || '').split('\n')) {
+    const m = re.exec(line.replace(/\r$/, ''));
+    if (!m) continue;
+    let id;
+    try {
+      id = normalizeX11Id(m[1]);
+    } catch {
+      continue;
+    }
+    out.set(id, { x: +m[4], y: +m[5], width: +m[2], height: +m[3] });
+  }
+  return out;
+}
+
 /** Parse `xdpyinfo` ("dimensions:    1920x1080 pixels"). */
 function parseXdpyinfo(text) {
   const m = /dimensions:\s+(\d+)x(\d+)\s+pixels/.exec(String(text || ''));
@@ -761,6 +786,26 @@ function walkSwayTree(tree) {
   return wins;
 }
 
+/**
+ * Parse `xprop -root _NET_CLIENT_LIST_STACKING`
+ * ("_NET_CLIENT_LIST_STACKING(WINDOW): window id # 0x1a00003, 0x1c00007"), bottom to top.
+ * @returns {string[]} normalized ids, bottom first
+ */
+function parseClientListStacking(text) {
+  const m = /#\s*(.*)$/m.exec(String(text || ''));
+  if (!m) return [];
+  const out = [];
+  for (const tok of m[1].split(/[\s,]+/)) {
+    if (!/^0x[0-9a-f]+$/i.test(tok)) continue;
+    try {
+      out.push(normalizeX11Id(tok));
+    } catch {
+      /* 0x0 or out of range */
+    }
+  }
+  return out;
+}
+
 /** Parse `hyprctl clients -j` (+ optional active window address). */
 function parseHyprClients(json, activeAddress) {
   let arr;
@@ -787,6 +832,8 @@ function parseHyprClients(json, activeAddress) {
         height: size[1] || 0,
         focused: activeAddress ? c.address === activeAddress : c.focusHistoryID === 0,
         minimized: Boolean(c.hidden) || wsName.startsWith('special'),
+        // Focus history (0 = most recently focused) is Hyprland's closest thing to a z-order.
+        ...(Number.isInteger(c.focusHistoryID) && c.focusHistoryID >= 0 ? { stackIndex: c.focusHistoryID } : {}),
       };
     });
 }
@@ -1151,6 +1198,7 @@ class LinuxDriverBase {
     this._pm = undefined;
     this._displayCache = null;
     this._captureTool = null;
+    this._whichRetryAt = 0;
   }
 
   _env(extra) {
@@ -1158,8 +1206,25 @@ class LinuxDriverBase {
     return extra ? { ...base, ...extra } : base;
   }
 
+  /** The environment with a UTF-8 locale forced in, or undefined when the current locale is already UTF-8. */
+  _utf8Env() {
+    const loc = utf8LocaleOverride(this._env());
+    return loc ? this._env(loc) : undefined;
+  }
+
   _has(name) {
-    return Boolean(this._whichImpl(name));
+    if (this._whichImpl(name)) return true;
+    // proc.which remembers misses forever. Look again now and then, so a tool the user installs after
+    // reading an "is not installed" hint is found without restarting the daemon.
+    if (this._whichImpl === proc.which && typeof proc.clearWhichCache === 'function') {
+      const now = Date.now();
+      if (now - this._whichRetryAt >= WHICH_MISS_TTL_MS) {
+        this._whichRetryAt = now;
+        proc.clearWhichCache();
+        return Boolean(this._whichImpl(name));
+      }
+    }
+    return false;
   }
 
   _run(cmd, args, opts = {}) {
@@ -1510,16 +1575,20 @@ class X11Driver extends LinuxDriverBase {
     if (text == null || text === '') return;
     this._requireXdotool();
     const s = String(text).replace(/\r\n?/g, '\n');
+    // xdotool decodes the text with the locale's charset: in a C/POSIX locale it stops at the first
+    // non-ASCII character ("Invalid multi-byte sequence") after typing what came before it.
+    const env = this._utf8Env();
     for (const chunk of chunkText(s, TYPE_CHUNK)) {
       await this._xdo(['type', '--clearmodifiers', '--delay', '8', '--', chunk], {
         timeoutMs: 10000 + chunk.length * 60,
+        env,
       });
     }
   }
 
   async keyCombo(keys) {
     const combo = xdotoolCombo(keys);
-    const r = await this._xdo(['key', '--clearmodifiers', combo], { timeoutMs: 5000 });
+    const r = await this._xdo(['key', '--clearmodifiers', combo], { timeoutMs: 5000, env: this._utf8Env() });
     // xdotool exits 0 even when it skipped an unknown keysym.
     if (/No such key name/i.test(String(r.stderr))) {
       const err = new Error(`Unknown key in "${combo}": ${firstLine(r.stderr)}`);
@@ -1608,13 +1677,30 @@ class X11Driver extends LinuxDriverBase {
     this._requireDisplay();
     let wins = null;
     if (this._has('wmctrl')) {
-      const loc = utf8LocaleOverride(this._env());
-      const r = await this._run('wmctrl', ['-lpGx'], { timeoutMs: 5000, env: loc ? this._env(loc) : undefined });
+      const r = await this._run('wmctrl', ['-lpGx'], { timeoutMs: 5000, env: this._utf8Env() });
       if (ok(r)) wins = parseWmctrl(r.stdout, { hostnames: this._opts.hostnames });
       else log.debug('wmctrl -lpGx failed:', firstLine(r.stderr));
     }
     if (!wins && this._has('xdotool')) wins = await this._listWindowsXdotool();
     if (!wins) throw unsupportedError('Cannot list windows: install wmctrl (or xdotool)', this._hint(['wmctrl', 'xdotool']));
+
+    // wmctrl -G (and older xdotool getwindowgeometry) add the client's offset inside its frame to the
+    // client's origin, so x/y land one title bar too low. xwininfo reports the true absolute origin.
+    if (this._has('xwininfo') && wins.length) {
+      const r = await this._run('xwininfo', ['-root', '-tree'], { timeoutMs: 3000, env: this._env({ LC_ALL: 'C' }) });
+      const abs = ok(r) ? parseXwininfoTree(r.stdout) : null;
+      if (abs) {
+        for (const w of wins) {
+          const a = abs.get(w.id);
+          if (a) {
+            w.x = a.x;
+            w.y = a.y;
+          }
+        }
+      } else {
+        log.debug('xwininfo -root -tree failed:', firstLine(r.stderr));
+      }
+    }
 
     const activeId = await this._activeWindowId().catch(() => null);
     if (this._has('xprop') && wins.length) {
@@ -1625,6 +1711,15 @@ class X11Driver extends LinuxDriverBase {
         const types = (p && p._NET_WM_WINDOW_TYPE && p._NET_WM_WINDOW_TYPE.values) || [];
         return !types.some((t) => /_NET_WM_WINDOW_TYPE_(DOCK|DESKTOP)$/.test(t));
       });
+    }
+    // Stacking order (EWMH lists it bottom to top): stackIndex 0 = topmost.
+    if (this._has('xprop') && wins.length) {
+      const r = await this._run('xprop', ['-root', '_NET_CLIENT_LIST_STACKING'], { timeoutMs: 2000, env: this._env({ LC_ALL: 'C' }) });
+      const ids = ok(r) ? parseClientListStacking(r.stdout) : [];
+      if (ids.length) {
+        const pos = new Map(ids.map((id, idx) => [id, ids.length - 1 - idx]));
+        for (const w of wins) if (pos.has(w.id)) w.stackIndex = pos.get(w.id);
+      }
     }
     return wins.map((w) => ({
       id: w.id,
@@ -1637,6 +1732,7 @@ class X11Driver extends LinuxDriverBase {
       height: w.height,
       focused: w.id === activeId,
       minimized: Boolean(w.minimized),
+      ...(Number.isInteger(w.stackIndex) ? { stackIndex: w.stackIndex } : {}),
     }));
   }
 
@@ -1800,6 +1896,9 @@ class X11Driver extends LinuxDriverBase {
       notes.push('xrandr not found: multiple monitors are reported as one screen.');
     }
     if (!this._has('xprop')) notes.push('xprop not found: minimized state and panel filtering are unavailable.');
+    if (!this._has('xwininfo') && (this._has('wmctrl') || xdotool)) {
+      notes.push(`xwininfo not found: listed window positions may be off by the title-bar height (${this._hint(['xwininfo'])}).`);
+    }
     const notify = this._has('notify-send');
     if (!notify) missing.push('notify-send');
     const speak = this._speakAvailable();
@@ -1830,22 +1929,57 @@ class X11Driver extends LinuxDriverBase {
  * @returns {'sway'|'hyprland'|'gnome'|'kde'|'wlroots'|'unknown'}
  */
 function detectCompositor(env) {
+  // Sockets and variables the compositors export to their clients beat desktop names.
   if (env.SWAYSOCK) return 'sway';
   if (env.HYPRLAND_INSTANCE_SIGNATURE) return 'hyprland';
-  const desk = [env.XDG_CURRENT_DESKTOP, env.XDG_SESSION_DESKTOP, env.DESKTOP_SESSION].filter(Boolean).join(':').toLowerCase();
-  if (desk.includes('sway')) return 'sway';
-  if (desk.includes('hyprland')) return 'hyprland';
-  if (/gnome|unity|ubuntu|pop|budgie/.test(desk)) return 'gnome';
-  if (/kde|plasma/.test(desk)) return 'kde';
-  if (/wlroots|river|wayfire|labwc|niri|cosmic|hikari|dwl|qtile/.test(desk)) return 'wlroots';
+  if (env.LABWC_PID || env.WAYFIRE_SOCKET || env.NIRI_SOCKET) return 'wlroots';
+  // Whole ':'-separated tokens ("ubuntu:GNOME", "Budgie:GNOME"), never substrings ("Lubuntu" is not Ubuntu).
+  const tokens = [env.XDG_CURRENT_DESKTOP, env.XDG_SESSION_DESKTOP, env.DESKTOP_SESSION]
+    .filter(Boolean)
+    .join(':')
+    .toLowerCase()
+    .split(':')
+    .map((t) => t.trim().split('/').pop())
+    .filter(Boolean);
+  const any = (re) => tokens.some((t) => re.test(t));
+  if (any(/^sway$/)) return 'sway';
+  if (any(/^hyprland$/)) return 'hyprland';
+  // wlroots-family first: Budgie's Wayland session (10.10+) runs on labwc but still says "Budgie:GNOME".
+  if (any(/^(wlroots|labwc|wayfire|river|niri|hikari|dwl|qtile|cosmic|budgie(-desktop)?)$/)) return 'wlroots';
+  if (any(/^(gnome(-.+)?|unity|ubuntu(-wayland|-xorg)?|pop)$/)) return 'gnome';
+  if (any(/^(kde|plasma(-?wayland|-?x11)?)$/)) return 'kde';
   return 'unknown';
 }
 
 const SWAY_BUTTONS = { 1: 'button1', 2: 'button2', 3: 'button3', 8: 'button8', 9: 'button9' };
 const YDO_BUTTONS = { 1: 0, 3: 1, 2: 2, 8: 3, 9: 4 };
 const YDOTOOLD_HINT =
-  'ydotool needs its daemon: run `sudo systemctl enable --now ydotool` (or `sudo ydotoold &`), make /dev/uinput ' +
-  'accessible to your user, and set YDOTOOL_SOCKET if the socket is not in the default place.';
+  'ydotool needs its daemon ydotoold running with write access to /dev/uinput: enable the user service ' +
+  '(`systemctl --user enable --now ydotool`, after giving your user access to /dev/uinput), or run ' +
+  '`sudo ydotoold --socket-path=/tmp/.ydotool_socket --socket-own=$(id -u):$(id -g) &`. The socket is looked ' +
+  'for at $YDOTOOL_SOCKET, $XDG_RUNTIME_DIR/.ydotool_socket and /tmp/.ydotool_socket.';
+const YDOTOOL_LEGACY_MESSAGE =
+  'ydotool 0.1.x (the version Debian 12 and Ubuntu up to 24.04 package) is too old: ydotool >= 1.0 with ydotoold is required';
+const YDOTOOL_LEGACY_HINT =
+  'Remove the distro package and build ydotool >= 1.0 from github.com/ReimuNotMoe/ydotool (then start ydotoold), ' +
+  'or choose "Ubuntu on Xorg"/"GNOME on Xorg" at login.';
+/** How long a "legacy" or unrecognised ydotool probe result is trusted before ydotool is probed again. */
+const YDOTOOL_PROBE_TTL_MS = 30000;
+
+/**
+ * Tell ydotool generations apart from `ydotool help` (stdout + stderr; no daemon needed by either).
+ * 1.x lists its `debug` and `bakers` commands (and names YDOTOOL_SOCKET since 1.0.4); 0.1.x lists
+ * `recorder`. 0.1.x also has no mouse down/up or wheel, and exits 0 even when it rejects its arguments, so
+ * it cannot be driven safely.
+ * @param {string} text
+ * @returns {'1'|'0.1'|null} null when the output is not recognised
+ */
+function parseYdotoolHelp(text) {
+  const s = String(text || '');
+  if (/^\s*(bakers|debug)\s*$/m.test(s) || /YDOTOOL_SOCKET/.test(s)) return '1';
+  if (/^\s*recorder\s*$/m.test(s)) return '0.1';
+  return null;
+}
 
 /** ydotool click code for a button and phase (0xC0 = down+up, 0x40 = down, 0x80 = up). */
 function ydotoolButtonCode(button, phase = 'click') {
@@ -1865,6 +1999,7 @@ class WaylandDriver extends LinuxDriverBase {
     this._wtypeBroken = false;
     this._warnedXwayland = false;
     this._x11 = null;
+    this._ydoGen = null;
   }
 
   /** XWayland helper for fallbacks (only when DISPLAY is set). */
@@ -1874,7 +2009,11 @@ class WaylandDriver extends LinuxDriverBase {
     return this._x11;
   }
 
-  _ydotoolSocket() {
+  /**
+   * Find the ydotoold socket: the first candidate this user can write to, else the first one that exists.
+   * @returns {{path:string, writable:boolean}|null}
+   */
+  _ydotoolSocketInfo() {
     const env = this._env();
     const uid = typeof process.getuid === 'function' ? process.getuid() : null;
     const candidates = [
@@ -1883,22 +2022,72 @@ class WaylandDriver extends LinuxDriverBase {
       uid != null && `/run/user/${uid}/.ydotool_socket`,
       '/tmp/.ydotool_socket',
     ].filter(Boolean);
-    return candidates.find((p) => {
+    let existing = null;
+    for (const p of candidates) {
       try {
-        return fs.existsSync(p);
+        if (!fs.existsSync(p)) continue;
       } catch {
-        return false;
+        continue;
       }
-    }) || null;
+      try {
+        fs.accessSync(p, fs.constants.W_OK);
+        return { path: p, writable: true };
+      } catch {
+        if (!existing) existing = { path: p, writable: false };
+      }
+    }
+    return existing;
+  }
+
+  /** Path of a ydotoold socket this user can connect to, or null. */
+  _ydotoolSocket() {
+    const s = this._ydotoolSocketInfo();
+    return s && s.writable ? s.path : null;
+  }
+
+  /** `ydotool` install hint; apt systems are told that their packaged version is too old. */
+  _ydotoolInstallHint(tools = ['ydotool']) {
+    const hint = this._hint(tools);
+    if (this._packageManager() !== 'apt') return hint;
+    return `${hint} (needs ydotool >= 1.0: Debian 12 and Ubuntu up to 24.04 package 0.1.8, so build it from github.com/ReimuNotMoe/ydotool there)`;
+  }
+
+  /**
+   * Installed ydotool generation ('1' or '0.1'), probed once with `ydotool help`. A legacy or unrecognised
+   * answer is probed again after a while, so upgrading ydotool needs no daemon restart.
+   */
+  async _ydotoolGen() {
+    const c = this._ydoGen;
+    if (c && (c.final || Date.now() - c.at < YDOTOOL_PROBE_TTL_MS)) return c.gen;
+    const r = await this._run('ydotool', ['help'], { timeoutMs: 3000 });
+    const parsed = parseYdotoolHelp(`${typeof r.stdout === 'string' ? r.stdout : ''}\n${r.stderr || ''}`);
+    // Unrecognised output keeps the 1.x syntax (the only one this driver speaks).
+    this._ydoGen = { gen: parsed || '1', final: parsed === '1', at: Date.now() };
+    return this._ydoGen.gen;
+  }
+
+  /** Throw UNSUPPORTED unless ydotool >= 1.0 is installed. */
+  async _requireYdotool() {
+    if (!this._has('ydotool')) {
+      throw unsupportedError('ydotool is not installed (needed for mouse input on Wayland)', `${this._ydotoolInstallHint()}. ${YDOTOOLD_HINT}`);
+    }
+    if ((await this._ydotoolGen()) === '0.1') throw unsupportedError(YDOTOOL_LEGACY_MESSAGE, YDOTOOL_LEGACY_HINT);
   }
 
   async _ydotool(args, opts = {}) {
-    if (!this._has('ydotool')) throw unsupportedError('ydotool is not installed (needed for mouse input on Wayland)', `${this._hint(['ydotool'])}. ${YDOTOOLD_HINT}`);
-    const r = await this._run('ydotool', args, { timeoutMs: 5000, ...opts });
+    await this._requireYdotool();
+    // ydotool 1.x only looks at $YDOTOOL_SOCKET, else $XDG_RUNTIME_DIR/.ydotool_socket, else /tmp: hand it
+    // the socket that was actually found (e.g. /tmp/.ydotool_socket while XDG_RUNTIME_DIR is set).
+    const sock = this._ydotoolSocket();
+    const env = opts.env || (sock ? this._env({ YDOTOOL_SOCKET: sock }) : this._env());
+    const r = await this._run('ydotool', args, { timeoutMs: 5000, ...opts, env });
     if (!ok(r)) {
-      const msg = `${r.stderr || ''}`;
+      // ydotool 1.x prints its connection errors on stdout.
+      const msg = `${r.stderr || ''}\n${typeof r.stdout === 'string' ? r.stdout : ''}`.trim();
       if (/socket|ydotoold|connect|uinput|permission/i.test(msg)) {
-        throw unsupportedError(`ydotool cannot reach ydotoold: ${firstLine(msg)}`, YDOTOOLD_HINT);
+        const info = sock ? null : this._ydotoolSocketInfo();
+        const why = info ? `ydotoold socket ${info.path} is not writable by this user` : firstLine(msg);
+        throw unsupportedError(`ydotool cannot reach ydotoold: ${why}`, YDOTOOLD_HINT);
       }
       throw commandError('ydotool', args, r, YDOTOOLD_HINT);
     }
@@ -2238,8 +2427,10 @@ class WaylandDriver extends LinuxDriverBase {
       if (!chunks.length) return;
     }
     if (!this._has('ydotool')) {
-      throw unsupportedError('No Wayland keyboard tool found', `${this._hint(['wtype', 'ydotool'])}. ${YDOTOOLD_HINT}`);
+      throw unsupportedError('No Wayland keyboard tool found', `${this._ydotoolInstallHint(['wtype', 'ydotool'])}. ${YDOTOOLD_HINT}`);
     }
+    // Before the clipboard is touched for a paste.
+    await this._requireYdotool();
     // Continue with whatever wtype did not type.
     const rest = chunks.join('');
     if (/[^\x00-\x7f]/.test(rest)) {
@@ -2267,7 +2458,7 @@ class WaylandDriver extends LinuxDriverBase {
     if (!norm.length) throw new Error('Empty key combo');
     if (this._canWtype() && (await this._wtype(wtypeKeyArgs(norm), 5000))) return;
     if (!this._has('ydotool')) {
-      throw unsupportedError('No Wayland keyboard tool found', `${this._hint(['wtype', 'ydotool'])}. ${YDOTOOLD_HINT}`);
+      throw unsupportedError('No Wayland keyboard tool found', `${this._ydotoolInstallHint(['wtype', 'ydotool'])}. ${YDOTOOLD_HINT}`);
     }
     await this._ydotool(ydotoolKeyArgs(norm));
   }
@@ -2425,9 +2616,21 @@ class WaylandDriver extends LinuxDriverBase {
       missing.push(this.compositor === 'gnome' ? 'gnome-screenshot' : this.compositor === 'kde' ? 'spectacle' : 'grim');
     }
     const ydotool = this._has('ydotool');
-    const ydotoolReady = ydotool && Boolean(this._ydotoolSocket());
-    if (!ydotool) missing.push('ydotool');
-    else if (!ydotoolReady) notes.push(`ydotoold socket not found. ${YDOTOOLD_HINT}`);
+    const legacy = ydotool && (await this._ydotoolGen()) === '0.1';
+    const sock = ydotool && !legacy ? this._ydotoolSocketInfo() : null;
+    const ydotoolReady = Boolean(sock && sock.writable);
+    if (!ydotool) {
+      missing.push('ydotool');
+      if (this._packageManager() === 'apt') {
+        notes.push('ydotool >= 1.0 is required: Debian 12 and Ubuntu up to 24.04 package 0.1.8, so build it from github.com/ReimuNotMoe/ydotool.');
+      }
+    } else if (legacy) {
+      notes.push(`${YDOTOOL_LEGACY_MESSAGE}. ${YDOTOOL_LEGACY_HINT}`);
+    } else if (!sock) {
+      notes.push(`ydotoold socket not found. ${YDOTOOLD_HINT}`);
+    } else if (!sock.writable) {
+      notes.push(`ydotoold socket ${sock.path} is not writable by this user. ${YDOTOOLD_HINT}`);
+    }
     const mouse = this._swayOk() || ydotoolReady;
     if (ydotoolReady && !this._swayOk() && !this._hyprOk()) {
       notes.push('ydotool moves the pointer relatively; use a flat pointer-acceleration profile for accurate clicks.');
@@ -2481,6 +2684,7 @@ module.exports = {
   parseXrandr,
   parseDisplayGeometry,
   parseXwininfoRoot,
+  parseXwininfoTree,
   parseXdpyinfo,
   parseMouseLocation,
   parseWmctrl,
@@ -2493,6 +2697,7 @@ module.exports = {
   parseWlrRandrJson,
   walkSwayTree,
   parseHyprClients,
+  parseClientListStacking,
   normalizeX11Id,
   prettifyApp,
   classFromWmctrl,
@@ -2505,6 +2710,7 @@ module.exports = {
   x11Button,
   ydotoolKeyArgs,
   ydotoolButtonCode,
+  parseYdotoolHelp,
   wtypeKeyArgs,
   wtypeTextArgs,
   buildClickArgs,

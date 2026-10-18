@@ -3,6 +3,7 @@
 # Protocol: one request per line on stdin  {"id":1,"cmd":"click","args":{...}}
 #           one response per line on stdout {"id":1,"ok":true,"result":{...}}
 #                                       or {"id":1,"ok":false,"error":{"message":"...","code":"...","hint":"..."}}
+#           a successful result may carry "warnings": ["..."] (e.g. input that Windows may have dropped).
 # The host exits when stdin closes. Runs on Windows PowerShell 5.1 and PowerShell 7+.
 # Keep this file pure ASCII: Windows PowerShell 5.1 reads BOM-less scripts in the ANSI code page.
 #
@@ -130,7 +131,14 @@ public static class AnywhereNative
         public int Height;
         public bool Minimized;
         public bool Focused;
-        public bool Elevated;
+        public int Elevation;   // ELEVATION_NO, ELEVATION_YES or ELEVATION_UNKNOWN
+    }
+
+    /// A window whose input Windows' UIPI may drop (see CheckTarget).
+    public class InputTarget
+    {
+        public int Elevation;   // ELEVATION_YES, or ELEVATION_UNKNOWN for a process this host may not inspect
+        public string Name;
     }
 
     public class MonitorInfo
@@ -235,6 +243,10 @@ public static class AnywhereNative
     const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
     const uint TOKEN_QUERY = 0x0008;
     const int TOKEN_ELEVATION_CLASS = 20;
+    const int ERROR_ACCESS_DENIED = 5;
+    public const int ELEVATION_NO = 0;
+    public const int ELEVATION_YES = 1;
+    public const int ELEVATION_UNKNOWN = 2;
     const byte VK_MENU = 0x12;
     const byte VK_UNASSIGNED = 0xE8;
     const ushort VK_RETURN = 0x0D;
@@ -244,7 +256,7 @@ public static class AnywhereNative
 
     static readonly int InputSize = Marshal.SizeOf(typeof(INPUT));
     static readonly Dictionary<uint, string> PathCache = new Dictionary<uint, string>();
-    static readonly Dictionary<uint, bool> ElevationCache = new Dictionary<uint, bool>();
+    static readonly Dictionary<uint, int> ElevationCache = new Dictionary<uint, int>();
     static readonly Dictionary<int, bool> ExtendedVk = BuildExtended();
 
     static Dictionary<int, bool> BuildExtended()
@@ -606,38 +618,47 @@ public static class AnywhereNative
         return path;
     }
 
-    public static bool IsElevatedPid(uint pid)
+    /// ELEVATION_YES or ELEVATION_NO when the process token can be read. ELEVATION_UNKNOWN when Windows
+    /// denies access to the process or its token: typically a process of another account (an installer
+    /// started with an administrator's credentials at the UAC prompt, or "Run as different user"), which
+    /// may or may not be elevated. Only definite answers are cached.
+    public static int ElevationState(uint pid)
     {
-        if (pid == 0) return false;
-        bool cached;
+        if (pid == 0) return ELEVATION_NO;
+        int cached;
         if (ElevationCache.TryGetValue(pid, out cached)) return cached;
-        bool elevated = false;
+        int state = -1;
+        bool denied = false;
         IntPtr hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-        if (hp != IntPtr.Zero)
+        if (hp == IntPtr.Zero) denied = Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED;
+        else
         {
             try
             {
                 IntPtr token;
-                if (OpenProcessToken(hp, TOKEN_QUERY, out token))
+                if (!OpenProcessToken(hp, TOKEN_QUERY, out token)) denied = Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED;
+                else
                 {
                     try
                     {
                         int value, returned;
-                        if (GetTokenInformation(token, TOKEN_ELEVATION_CLASS, out value, 4, out returned)) elevated = value != 0;
+                        if (GetTokenInformation(token, TOKEN_ELEVATION_CLASS, out value, 4, out returned)) state = value != 0 ? ELEVATION_YES : ELEVATION_NO;
+                        else denied = Marshal.GetLastWin32Error() == ERROR_ACCESS_DENIED;
                     }
                     finally { CloseHandle(token); }
                 }
             }
             finally { CloseHandle(hp); }
         }
+        if (state < 0) return denied ? ELEVATION_UNKNOWN : ELEVATION_NO;
         if (ElevationCache.Count > 2048) ElevationCache.Clear();
-        ElevationCache[pid] = elevated;
-        return elevated;
+        ElevationCache[pid] = state;
+        return state;
     }
 
     public static bool HostElevated()
     {
-        try { return IsElevatedPid(GetCurrentProcessId()); } catch (Exception) { return false; }
+        try { return ElevationState(GetCurrentProcessId()) == ELEVATION_YES; } catch (Exception) { return false; }
     }
 
     // UWP apps live in an ApplicationFrameHost frame; the real app owns a CoreWindow child.
@@ -691,7 +712,7 @@ public static class AnywhereNative
         w.Process = w.ExePath.Length > 0 ? Path.GetFileName(w.ExePath) : "";
         w.Minimized = IsIconic(h);
         w.Focused = h == fg;
-        w.Elevated = IsElevatedPid(pid);
+        w.Elevation = ElevationState(pid);
         RECT r = new RECT();
         bool haveRect = false;
         if (w.Minimized)
@@ -810,9 +831,11 @@ public static class AnywhereNative
         return SetWindowPos(h, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
-    /// Non-null when Windows' UIPI would silently drop injected input: the target window (under the
-    /// point, or the foreground window) belongs to an elevated process and this host is not elevated.
-    public static string BlockedTarget(int x, int y, bool foreground, bool hostElevated)
+    /// Non-null when Windows' UIPI may silently drop injected input (SendInput still reports success):
+    /// this host is not elevated and the target window (under the point, or the foreground window)
+    /// belongs to an elevated process (ELEVATION_YES) or to a process it may not inspect, typically
+    /// another account's (ELEVATION_UNKNOWN). Such a process may run unelevated and accept the input.
+    public static InputTarget CheckTarget(int x, int y, bool foreground, bool hostElevated)
     {
         if (hostElevated) return null;
         IntPtr h;
@@ -829,11 +852,16 @@ public static class AnywhereNative
         if (root != IntPtr.Zero) h = root;
         uint pid;
         GetWindowThreadProcessId(h, out pid);
-        if (pid == 0 || !IsElevatedPid(pid)) return null;
+        if (pid == 0) return null;
+        int state = ElevationState(pid);
+        if (state == ELEVATION_NO) return null;
         string exe = ProcessPath(pid);
         string name = exe.Length > 0 ? Path.GetFileName(exe) : ("pid " + pid);
         string title = WindowTitle(h);
-        return title.Length > 0 ? (title + " (" + name + ")") : name;
+        InputTarget t = new InputTarget();
+        t.Elevation = state;
+        t.Name = title.Length > 0 ? (title + " (" + name + ")") : name;
+        return t;
     }
 
     // ---------------------------------------------------------------- monitors
@@ -1000,6 +1028,9 @@ function Get-AppName([string]$Path, [string]$Fallback) {
 function ConvertTo-WindowRecord($W) {
   $proc = [string]$W.Process
   $fallback = if ($proc) { [System.IO.Path]::GetFileNameWithoutExtension($proc) } else { '' }
+  # null: the process belongs to another account and Windows does not say whether it is elevated.
+  $elevated = $null
+  if ([int]$W.Elevation -ne 2) { $elevated = [bool]([int]$W.Elevation -eq 1) }
   return [ordered]@{
     hwnd = [string]$W.Hwnd
     app = [string](Get-AppName ([string]$W.ExePath) $fallback)
@@ -1012,16 +1043,38 @@ function ConvertTo-WindowRecord($W) {
     height = [int]$W.Height
     focused = [bool]$W.Focused
     minimized = [bool]$W.Minimized
-    elevated = [bool]$W.Elevated
+    elevated = $elevated
     className = [string]$W.ClassName
   }
 }
 
-function Assert-InputAllowed([bool]$Foreground, [int]$X, [int]$Y) {
-  $blocked = [AnywhereNative]::BlockedTarget($X, $Y, $Foreground, $script:HostElevated)
-  if ($blocked) {
-    throw (New-HostError ("Windows blocks input to '" + $blocked + "' because it runs as administrator and Claude Anywhere does not.") 'UIPI_BLOCKED' 'Interact with that window yourself, or restart your terminal and Claude Code with "Run as administrator" if you want Claude to control elevated apps.')
+# Warnings for the current request; the main loop clears them and adds them to the result.
+$script:Warnings = New-Object 'System.Collections.Generic.List[string]'
+
+function Add-HostWarning([string]$Text) {
+  if ($Text -and -not $script:Warnings.Contains($Text)) { [void]$script:Warnings.Add($Text) }
+}
+
+function Add-ResultWarnings($Result) {
+  if ($script:Warnings.Count -gt 0 -and $Result -is [System.Collections.IDictionary]) {
+    $Result['warnings'] = $script:Warnings.ToArray()
   }
+}
+
+# $Target is an [AnywhereNative+InputTarget] (or $null): Elevation 1 = elevated, 2 = unknown.
+function Confirm-InputTarget($Target) {
+  if ($null -eq $Target) { return }
+  if ([int]$Target.Elevation -eq 1) {
+    throw (New-HostError ("Windows blocks input to '" + $Target.Name + "' because it runs as administrator and Claude Anywhere does not.") 'UIPI_BLOCKED' 'Interact with that window yourself, or restart your terminal and Claude Code with "Run as administrator" if you want Claude to control elevated apps.')
+  }
+  # Another account's process (UAC prompt answered with an administrator's credentials, or "Run as
+  # different user"): it may be unelevated and accept input, so warn instead of refusing.
+  Add-HostWarning ("'" + $Target.Name + "' belongs to another user account, so Claude Anywhere cannot tell whether it runs as administrator. " +
+    'If nothing happened, it probably does and Windows (UIPI) silently dropped the input: ask the user to do this step in that window themselves.')
+}
+
+function Assert-InputAllowed([bool]$Foreground, [int]$X, [int]$Y) {
+  Confirm-InputTarget ([AnywhereNative]::CheckTarget($X, $Y, $Foreground, $script:HostElevated))
 }
 
 # ---------------------------------------------------------------- notifications (background runspace)
@@ -1371,11 +1424,13 @@ while ($true) {
   if ($line.Trim().Length -eq 0) { continue }
   $id = $null
   $response = $null
+  $script:Warnings.Clear()
   try {
     if ($script:NotifyJobs.Count -gt 0) { Clear-NotifyJobs $false }
     $req = ConvertFrom-Json -InputObject $line
     $id = $req.id
     $result = Invoke-HostCommand ([string]$req.cmd) $req.args
+    Add-ResultWarnings $result
     $response = ConvertTo-ResponseLine $id $true $result
   } catch {
     try {

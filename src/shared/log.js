@@ -23,15 +23,20 @@ const SECRET_PATTERNS = [
   [/\b(password|passwd|pwd|secret|token|api[_-]?key)(\s*[:=]\s*)("[^"]*"|'[^']*'|\S+)/gi, '$1$2***'],
 ];
 
-/** Mask likely secrets in strings (deep for objects/arrays). */
-function redact(value) {
+/**
+ * Deep copy for logging: elides binary/image payloads and, when `secrets` is
+ * true, masks likely secrets in strings. Fields that are Claude Anywhere's own
+ * credentials (token, apiKey, ...) are always masked.
+ */
+function scrub(value, secrets) {
   if (value == null) return value;
   if (typeof value === 'string') {
+    if (!secrets) return value;
     let s = value;
     for (const [re, rep] of SECRET_PATTERNS) s = s.replace(re, rep);
     return s;
   }
-  if (Array.isArray(value)) return value.map(redact);
+  if (Array.isArray(value)) return value.map((v) => scrub(v, secrets));
   if (Buffer.isBuffer(value)) return `[${value.length} bytes]`;
   if (typeof value === 'object') {
     const out = {};
@@ -41,12 +46,23 @@ function redact(value) {
       } else if ((k === 'image' || k === 'data' || k === 'dataUrl') && typeof v === 'string' && v.length > 256) {
         out[k] = `[${v.length} chars]`;
       } else {
-        out[k] = redact(v);
+        out[k] = scrub(v, secrets);
       }
     }
     return out;
   }
   return value;
+}
+
+/** Mask likely secrets in strings (deep for objects/arrays). Always masks, whatever the log setting. */
+function redact(value) {
+  return scrub(value, true);
+}
+
+// privacy.redactSecretsInLogs: masks secrets in daemon/MCP log lines and the audit trail.
+let redactLogs = true;
+function setRedactLogs(on) {
+  redactLogs = Boolean(on);
 }
 
 let fileStream = null;
@@ -65,10 +81,10 @@ function sink() {
 }
 
 function fmt(arg) {
-  if (arg instanceof Error) return arg.stack || arg.message;
-  if (typeof arg === 'string') return arg;
+  if (arg instanceof Error) return scrub(String(arg.stack || arg.message), redactLogs);
+  if (typeof arg === 'string') return scrub(arg, redactLogs);
   try {
-    return JSON.stringify(redact(arg));
+    return JSON.stringify(scrub(arg, redactLogs));
   } catch {
     return String(arg);
   }
@@ -98,15 +114,22 @@ function setAuditEnabled(on) {
   auditEnabled = Boolean(on);
 }
 
+/** Apply config.privacy to this process; only an explicit `false` turns a setting off. */
+function applyPrivacyConfig(config) {
+  const privacy = (config && config.privacy) || {};
+  setAuditEnabled(privacy.auditLog !== false);
+  setRedactLogs(privacy.redactSecretsInLogs !== false);
+}
+
 /** Append one event to today's audit log (JSONL). Never throws. */
 function audit(event) {
   if (!auditEnabled) return;
   try {
-    const line = JSON.stringify({ ts: new Date().toISOString(), ...redact(event) });
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...scrub(event, redactLogs) });
     fs.appendFileSync(auditLogPath(), `${line}\n`, { mode: 0o600 });
   } catch {
     /* ignore */
   }
 }
 
-module.exports = { createLogger, audit, redact, setAuditEnabled };
+module.exports = { createLogger, audit, redact, setAuditEnabled, setRedactLogs, applyPrivacyConfig };

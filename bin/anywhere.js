@@ -654,7 +654,10 @@ async function call(client, method, urlPath, body, opts) {
     }
     if (err && err.status) {
       const hint = err.data && err.data.hint;
-      throw new CliError(`Claude Anywhere: ${err.message} (HTTP ${err.status})`, EXIT.ERROR, hint);
+      const e = new CliError(`Claude Anywhere: ${err.message} (HTTP ${err.status})`, EXIT.ERROR, hint);
+      e.status = err.status;
+      e.serverMessage = err.message;
+      throw e;
     }
     throw err;
   }
@@ -737,12 +740,20 @@ async function callLong(client, method, urlPath, body, timeoutMs) {
   return call(proxy, method, urlPath, body, { timeoutMs });
 }
 
-/** Guard for CLI input actions: honours the dialog's pause (Stop button) when a daemon runs. */
-function makeGuard() {
+/** getDaemon(), looked up at most once (null when it fails). */
+function daemonOnce() {
   let pending = null;
-  return async () => {
+  return () => {
     if (!pending) pending = getDaemon().catch(() => null);
-    const d = await pending;
+    return pending;
+  };
+}
+
+/** Guard for CLI input actions: honours the dialog's pause (Stop button) when a daemon runs. */
+function makeGuard(lookup) {
+  const find = lookup || daemonOnce();
+  return async () => {
+    const d = await find();
     if (!d) return { allowed: true };
     try {
       const r = await d.client.request('GET', '/api/mcp/guard', undefined, { timeoutMs: 300 });
@@ -763,6 +774,55 @@ async function waitForDialogHost(logFile, offset, timeoutMs) {
     await sleep(250);
   }
   return null;
+}
+
+/**
+ * PATH for a daemon this CLI starts. OS launchers (the WSL hotkey's `wsl.exe -e`, the macOS applet,
+ * .desktop entries) run without the login shell's PATH, so the daemon would miss an nvm/npm-installed
+ * claude and `#!/usr/bin/env node` shims would fail. Puts node's own directory first when it is
+ * missing (nvm, fnm and volta keep global npm binaries next to node), then appends the PATH recorded
+ * by `anywhere install` and the usual per-user and Homebrew directories that exist.
+ * @param {string} current
+ * @param {{nodeDir?:string, recorded?:string, home?:string, platform?:string, isDir?:(p:string)=>boolean}} [opts]
+ * @returns {string}
+ */
+function daemonPath(current, opts = {}) {
+  const platform = opts.platform || process.platform;
+  if (platform === 'win32') return current;
+  const P = path.posix;
+  const dirOk = opts.isDir || isDir;
+  const norm = (p) => p.replace(/\/+$/, '') || '/';
+  const parts = String(current || '').split(':').filter(Boolean);
+  const out = parts.length ? parts : ['/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+  const have = new Set(out.map(norm));
+  if (opts.nodeDir && P.isAbsolute(opts.nodeDir) && !have.has(norm(opts.nodeDir))) {
+    out.unshift(opts.nodeDir);
+    have.add(norm(opts.nodeDir));
+  }
+  const home = opts.home || os.homedir();
+  const extra = String(opts.recorded || '')
+    .split(':')
+    .concat([P.join(home, '.local', 'bin')])
+    .concat(platform === 'darwin' ? ['/opt/homebrew/bin', '/usr/local/bin'] : []);
+  for (const dir of extra) {
+    if (!dir || !P.isAbsolute(dir) || have.has(norm(dir)) || !dirOk(dir)) continue;
+    out.push(dir);
+    have.add(norm(dir));
+  }
+  return out.join(':');
+}
+
+/** Environment for a daemon spawned by this CLI. */
+function daemonEnv(base) {
+  const env = Object.assign({}, base || process.env, { ANYWHERE_LOG_FILE: '1' });
+  delete env.ANYWHERE_DAEMON_URL;
+  delete env.ANYWHERE_TOKEN;
+  delete env.ANYWHERE_ROLE;
+  if (process.platform !== 'win32') {
+    const install = readInstallInfo();
+    env.PATH = daemonPath(env.PATH, { nodeDir: path.dirname(process.execPath), recorded: install && typeof install.envPath === 'string' ? install.envPath : '' });
+  }
+  return env;
 }
 
 /**
@@ -820,10 +880,7 @@ async function ensureDaemon(opts) {
   if (opts.ui) args.push('--ui', opts.ui);
   if (!open) args.push('--no-open');
   if (opts.port != null) args.push('--port', String(opts.port));
-  const env = Object.assign({}, process.env, { ANYWHERE_LOG_FILE: '1' });
-  delete env.ANYWHERE_DAEMON_URL;
-  delete env.ANYWHERE_TOKEN;
-  delete env.ANYWHERE_ROLE;
+  const env = daemonEnv(process.env);
   const { spawnDetached } = shared('proc');
   let child;
   try {
@@ -863,11 +920,16 @@ async function ensureDaemon(opts) {
     if (exited) {
       const again = await stateMod.findRunningDaemon({ timeoutMs: 1500 });
       if (again) return { state: again, reused: true, host: null, notes, pid: again.pid };
-      const how = exited.error ? exited.error.message : `the daemon exited with code ${exited.code}${exited.signal ? ` (${exited.signal})` : ''}`;
-      throw failure(how);
+      // Exit code 0 is ALREADY_RUNNING: another daemon won the start lock and is still coming
+      // up, so keep waiting for it until the deadline instead of failing now.
+      if (!(exited.code === 0 && !exited.error && !exited.signal)) {
+        const how = exited.error ? exited.error.message : `the daemon exited with code ${exited.code}${exited.signal ? ` (${exited.signal})` : ''}`;
+        throw failure(how);
+      }
     }
     await sleep(200);
   }
+  if (exited && exited.code === 0) throw failure(`another daemon was starting but did not answer within ${Math.round(timeoutMs / 1000)} s`);
   throw failure(`no answer within ${Math.round(timeoutMs / 1000)} s`);
 }
 
@@ -1120,10 +1182,41 @@ async function cmdStatus(p) {
   return EXIT.OK;
 }
 
+/**
+ * macOS launcher applet with no daemon running: start it from Terminal instead of inside the
+ * applet. A daemon spawned by the applet belongs to the applet for macOS privacy (Accessibility and
+ * Screen Recording granted to Terminal would not apply) and gets the bare `do shell script` PATH.
+ * @returns {Promise<{opened:boolean, file:string, error?:string}>}
+ */
+async function startViaTerminal(project) {
+  const dir = shared('paths').stateDir();
+  const file = path.join(dir, 'start-anywhere.command');
+  const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    file,
+    `#!/bin/sh\n# Written by the Claude Anywhere launcher: starts the dialog from Terminal.\nexec ${q(process.execPath)} ${q(BIN_PATH)} start --project ${q(project)}\n`,
+    { mode: 0o700 }
+  );
+  fs.chmodSync(file, 0o700);
+  const { run } = shared('proc');
+  const r = await run('open', ['-a', 'Terminal', file], { timeoutMs: 15000 });
+  if (!r.error && r.code === 0) return { opened: true, file };
+  await run('osascript', ['-e', 'display notification "Type /anywhere in Claude Code to start it." with title "Claude Anywhere is not running"'], { timeoutMs: 10000 });
+  return { opened: false, file, error: String(r.stderr || (r.error && r.error.message) || `exit ${r.code}`).trim().split(/\r?\n/)[0] };
+}
+
 async function cmdShow(p) {
   const d = await getDaemon();
   if (!d) {
     const project = p.flags.project ? resolveProject(p.flags.project) : lastProject();
+    if (p.flags.launcher && process.platform === 'darwin') {
+      const r = await startViaTerminal(project);
+      if (p.flags.json) printJson(Object.assign({ ok: r.opened, running: false }, r));
+      else if (r.opened) writeOut('Claude Anywhere was not running; opened Terminal to start it.');
+      else writeOut(`Claude Anywhere is not running, and Terminal could not be opened (${r.error}). Type /anywhere in Claude Code, or run: anywhere start`);
+      return r.opened ? EXIT.OK : EXIT.NOT_RUNNING;
+    }
     const config = shared('config').load();
     const res = await ensureDaemon({ project, open: true });
     if (p.flags.json) printJson(startJson(res, config));
@@ -1206,7 +1299,9 @@ async function cmdSend(p, opts) {
     d = await requireDaemon();
   }
   const body = { text, source: f.source || (opts && opts.source) || 'cli' };
-  if (f.screenshot) body.attachScreenshot = true;
+  // --screenshot / --no-screenshot override context.attachScreenshotByDefault; neither = the default.
+  if (f.screenshot === true) body.attachScreenshot = true;
+  else if (f.screenshot === false) body.attachScreenshot = false;
   if (images.length) body.images = images;
   const commandId = { value: null };
   let waiting = null;
@@ -1228,8 +1323,9 @@ async function cmdSend(p, opts) {
   const res = await waiting;
   if (f.json) printJson(Object.assign({ ok: !res.timeout, id: r.id }, res));
   else if (res.timeout) writeOut('TIMEOUT');
-  else writeOut(res.text || '(no text in the result)');
+  else writeOut(res.text || (res.result && res.result.interrupted ? 'Stopped.' : '(no text in the result)'));
   if (res.timeout) return EXIT.TIMEOUT;
+  if (res.result && res.result.interrupted) return EXIT.INTERRUPTED;
   return res.result && res.result.isError ? EXIT.ERROR : EXIT.OK;
 }
 
@@ -1286,7 +1382,17 @@ async function cmdReply(p) {
   const text = await gatherText(p);
   if (!text.trim()) throw usageError('Nothing to reply. Usage: anywhere reply [--final] "text"', 'reply');
   const d = await requireDaemon();
-  await call(d.client, 'POST', '/api/bridge/reply', { text, final: Boolean(f.final), speak: f.speak !== false }, { timeoutMs: 15000 });
+  try {
+    await call(d.client, 'POST', '/api/bridge/reply', { text, final: Boolean(f.final), speak: f.speak !== false }, { timeoutMs: 15000 });
+  } catch (err) {
+    // 409: the dialog switched to companion mode, so the /anywhere here loop must end.
+    if (err && err.status === 409) {
+      if (f.json) printJson({ ok: false, stop: true, error: err.serverMessage || err.message });
+      else writeOut('STOP (bridge mode is off: the dialog switched to companion mode, so this reply was not shown)');
+      return EXIT.STOP;
+    }
+    throw err;
+  }
   if (f.json) printJson({ ok: true, final: Boolean(f.final) });
   else if (f.final) writeOut(`${color.green(sym().ok)} Final reply shown in the dialog. Run "listen" again for the next command.`);
   else writeOut(`${color.green(sym().ok)} Progress shown in the dialog.`);
@@ -1444,7 +1550,8 @@ async function openComputer() {
   const computerMod = requirePkg('src/os/computer.js', 'Desktop control');
   const driver = await osIndex.getDriver();
   const config = shared('config').load();
-  const computer = new computerMod.Computer({ driver, config: config.computer, geometryStore: 'file', guard: makeGuard() });
+  const daemon = daemonOnce();
+  const computer = new computerMod.Computer({ driver, config: config.computer, geometryStore: 'file', guard: makeGuard(daemon) });
   const close = async () => {
     try {
       if (typeof osIndex.resetDriver === 'function') await withTimeout(osIndex.resetDriver(), 5000, 'closing the driver');
@@ -1453,7 +1560,31 @@ async function openComputer() {
       /* ignore */
     }
   };
-  return { driver, computer, config, close };
+  // `activity` is what runComputerOp is doing, reported to the dialog afterwards (like the MCP tools).
+  return { driver, computer, config, close, daemon, activity: null };
+}
+
+function brief(text, max) {
+  const s = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+/**
+ * Show a finished `computer` action in the dialog (tool row, "Claude's view"), as the MCP tools do,
+ * so bridge-mode screen work through the CLI is visible. Best effort: never changes output or exit code.
+ */
+async function reportComputerActivity(env, err) {
+  const a = env && env.activity;
+  if (!a || (err && (err.usage || err.code === 'PAUSED'))) return;
+  try {
+    const d = await withTimeout(env.daemon(), 1500, 'finding the daemon');
+    if (!d) return;
+    const body = Object.assign({}, a, { ok: !err });
+    if (err) body.error = brief((err && err.message) || err, 300);
+    await d.client.request('POST', '/api/mcp/activity', body, { timeoutMs: 1000 });
+  } catch (_) {
+    /* the dialog is optional here */
+  }
 }
 
 async function runComputerOp(op, p, env) {
@@ -1468,6 +1599,7 @@ async function runComputerOp(op, p, env) {
   switch (op) {
     case 'screenshot': {
       const region = f.region ? parseRegion(f.region) : undefined;
+      env.activity = { tool: 'screenshot', summary: 'Screenshot' };
       const shot = await computer.screenshot({
         display: display == null ? 0 : display,
         region,
@@ -1479,6 +1611,15 @@ async function runComputerOp(op, p, env) {
       fs.mkdirSync(path.dirname(out), { recursive: true });
       fs.writeFileSync(out, shot.png);
       if (!f.out) pruneScreenshots(runDir, 30);
+      env.activity = {
+        tool: 'screenshot',
+        summary: shot.region
+          ? `Zoomed screenshot of display ${shot.display} (${shot.region.width}x${shot.region.height} at ${shot.region.x},${shot.region.y})`
+          : `Screenshot of display ${shot.display} (${shot.width}x${shot.height})`,
+        image: Buffer.from(shot.png).toString('base64'),
+        width: shot.width,
+        height: shot.height,
+      };
       const res = { path: out, width: shot.width, height: shot.height, display: shot.display, displays: shot.displays, scale: shot.scale, cursor: shot.cursor };
       if (shot.region) res.region = shot.region;
       return res;
@@ -1493,15 +1634,19 @@ async function runComputerOp(op, p, env) {
         opts.x = c[0];
         opts.y = c[1];
       }
+      const verb = opts.clicks === 2 ? 'Double-click' : opts.clicks === 3 ? 'Triple-click' : 'Click';
+      env.activity = { tool: 'click', summary: `${verb} ${opts.button} ${opts.x != null ? `at (${Math.round(opts.x)}, ${Math.round(opts.y)})` : 'at the mouse position'}` };
       return computer.click(opts);
     }
     case 'move': {
       const c = xy(0, 'X', 'Y');
+      env.activity = { tool: 'mouse_move', summary: `Move mouse to (${Math.round(c[0])}, ${Math.round(c[1])})` };
       return computer.moveMouse({ x: c[0], y: c[1], display });
     }
     case 'drag': {
       const a = xy(0, 'X1', 'Y1');
       const b = xy(2, 'X2', 'Y2');
+      env.activity = { tool: 'drag', summary: `Drag from (${Math.round(a[0])}, ${Math.round(a[1])}) to (${Math.round(b[0])}, ${Math.round(b[1])})` };
       return computer.drag({ fromX: a[0], fromY: a[1], toX: b[0], toY: b[1], button: f.button ? String(f.button).toLowerCase() : 'left', display });
     }
     case 'scroll': {
@@ -1512,17 +1657,20 @@ async function runComputerOp(op, p, env) {
         opts.x = toNum(f.at[0], '--at X');
         opts.y = toNum(f.at[1], '--at Y');
       }
+      env.activity = { tool: 'scroll', summary: `Scroll ${dir} ${opts.amount}${opts.x != null ? ` at (${Math.round(opts.x)}, ${Math.round(opts.y)})` : ''}` };
       return computer.scroll(opts);
     }
     case 'type': {
       const sub = { _: args, rest: p.rest, flags: f };
       const text = await gatherText(sub);
       if (!text) throw usageError('computer type needs the text to type (quote it), or --stdin', 'computer');
+      env.activity = { tool: 'type_text', summary: `Type ${Array.from(text).length} chars: "${brief(text, 60)}"` };
       return computer.typeText({ text, method: f.method ? String(f.method).toLowerCase() : 'auto' });
     }
     case 'key': {
       if (!args.length) throw usageError('computer key needs a key or combo, e.g. enter, ctrl+s, primary+shift+p', 'computer');
       const repeat = f.repeat != null ? toInt(f.repeat, '--repeat', 1, 100) : 1;
+      env.activity = { tool: 'key', summary: `Press ${args.join(', ')}${repeat > 1 ? ` x${repeat}` : ''}` };
       const results = [];
       for (const combo of args) results.push(await computer.key({ combo, repeat }));
       return results.length === 1 ? results[0] : { ok: true, action: 'keys', presses: results };
@@ -1540,6 +1688,7 @@ async function runComputerOp(op, p, env) {
       const q = { id: f.id, app: f.app, title: f.title };
       if (args.length && q.id == null && q.title == null && q.app == null) q.title = args.join(' ');
       if (q.id == null && !q.title && !q.app) throw usageError('computer focus needs a window: QUERY (title or app), --id, --app or --title', 'computer');
+      env.activity = { tool: 'focus_window', summary: `Focus window ${q.id != null ? `id ${q.id}` : [q.app && `app "${q.app}"`, q.title && `title "${q.title}"`].filter(Boolean).join(' ')}` };
       const wins = (await driver.listWindows()) || [];
       const matches = tools && typeof tools.matchWindows === 'function' ? tools.matchWindows(wins, q) : matchWindowsLocal(wins, q, desktop);
       if (!matches.length) {
@@ -1552,7 +1701,7 @@ async function runComputerOp(op, p, env) {
         err.data = { candidates: matches.map((w) => ({ id: w.id, app: w.app, title: w.title })) };
         throw err;
       }
-      const g = await makeGuard()();
+      const g = await makeGuard(env.daemon)();
       if (g && g.allowed === false) {
         const err = new CliError(`Paused by the user${g.reason ? `: ${g.reason}` : ''}.`);
         err.code = 'PAUSED';
@@ -1564,6 +1713,7 @@ async function runComputerOp(op, p, env) {
     case 'open': {
       const target = args.join(' ');
       if (!target) throw usageError('computer open needs a URL, file path or app name', 'computer');
+      env.activity = { tool: 'open', summary: `Open ${brief(target, 100)}` };
       const common = requirePkg('src/os/common.js', 'Desktop control');
       const kind = f.kind ? String(f.kind).toLowerCase() : 'auto';
       return common.openTarget(target, { kind, args: p.rest || [], cwd: process.cwd() });
@@ -1573,6 +1723,7 @@ async function runComputerOp(op, p, env) {
       if (sub === 'get') return { text: await driver.clipboardGet() };
       if (sub === 'set') {
         const text = await gatherText({ _: args.slice(1), rest: p.rest, flags: f });
+        env.activity = { tool: 'clipboard_set', summary: `Copy ${Array.from(text).length} chars to the clipboard` };
         await driver.clipboardSet(text);
         return { ok: true, chars: Array.from(text).length };
       }
@@ -1606,6 +1757,7 @@ async function cmdComputer(p) {
     const res = await runComputerOp(op, p, env);
     if (op === 'context' && res && typeof res.text === 'string') writeOut(res.text);
     else printJson(res === undefined ? { ok: true } : res);
+    await reportComputerActivity(env, res && res.ok === false ? new Error(res.error || 'failed') : null);
     return EXIT.OK;
   } catch (err) {
     if (err && err.usage) throw err;
@@ -1614,6 +1766,7 @@ async function cmdComputer(p) {
     if (err && err.hint) outErr.hint = err.hint;
     if (err && err.data) Object.assign(outErr, err.data);
     printJson(outErr);
+    await reportComputerActivity(env, err);
     return EXIT.ERROR;
   } finally {
     if (env) await env.close();
@@ -1686,6 +1839,21 @@ function findPluginInstall(claudeHomeDir) {
   };
   walk(root, 0);
   return found[0] || null;
+}
+
+/**
+ * Absolute paths in `claude mcp get anywhere` output ("Command: …", "Args: …/server.js") that are gone.
+ * @param {string} out
+ * @returns {string[]}
+ */
+function staleMcpPaths(out) {
+  const text = String(out || '');
+  const gone = [];
+  const command = ((text.match(/^\s*Command:\s*(.+)$/im) || [])[1] || '').trim();
+  const args = ((text.match(/^\s*Args:\s*(.+)$/im) || [])[1] || '').trim();
+  if (command && path.isAbsolute(command) && !fs.existsSync(command)) gone.push(command);
+  if (args && path.isAbsolute(args) && /server\.js$/i.test(args) && !fs.existsSync(args)) gone.push(args);
+  return gone;
 }
 
 function portFree(port) {
@@ -1822,18 +1990,38 @@ async function runDoctor() {
   );
 
   if (pinfo.platform === 'darwin') {
-    await check('permissions', 'macOS permissions', false, () => {
+    await check('permissions', 'macOS permissions', false, async () => {
       const perms = caps && caps.permissions;
       if (!perms) return { status: 'warn', detail: 'could not read Accessibility / Screen Recording state' };
       const host = perms.hostApp || 'your terminal app';
       const urls = perms.settings || {};
+      const word = (v) => (v === true ? 'granted' : v === false ? 'not granted' : 'unknown');
+      const notes = [];
+      if (perms.automation !== undefined) notes.push(`Automation (System Events, for typing): ${word(perms.automation)}`);
+      // Permissions belong to the app that started a process: a daemon started by the launcher
+      // applet, a hotkey or another terminal can differ from this one.
+      const running = await daemonPermissions();
+      if (running && running.permissions) {
+        const dp = running.permissions;
+        const dHost = dp.hostApp || 'the app that started it';
+        notes.push(`The running daemon (started by ${dHost}): Accessibility ${word(dp.accessibility)} ${sym().dot} Screen Recording ${word(dp.screenRecording)}${dp.automation !== undefined ? ` ${sym().dot} Automation ${word(dp.automation)}` : ''}`);
+      }
       const missing = [];
       if (perms.accessibility === false) missing.push('Accessibility');
       if (perms.screenRecording === false) missing.push('Screen Recording');
-      if (!missing.length) return { detail: `Accessibility ${perms.accessibility === true ? 'granted' : 'unknown'} ${sym().dot} Screen Recording ${perms.screenRecording === true ? 'granted' : 'unknown'} (for ${host})` };
+      const daemonMissing = running && running.permissions ? ['accessibility', 'screenRecording'].filter((k) => running.permissions[k] === false) : [];
+      if (!missing.length) {
+        const r = { detail: `Accessibility ${word(perms.accessibility)} ${sym().dot} Screen Recording ${word(perms.screenRecording)} (for ${host})`, notes };
+        if (daemonMissing.length) {
+          r.status = 'warn';
+          r.fix = `The running daemon lacks ${daemonMissing.map((k) => (k === 'accessibility' ? 'Accessibility' : 'Screen Recording')).join(' and ')}: grant it to "${(running.permissions.hostApp) || 'the app that started it'}", or restart it from here: anywhere restart`;
+        }
+        return r;
+      }
       return {
         status: 'fail',
         detail: `${missing.join(' and ')} not granted to ${host}`,
+        notes,
         fix: `System Settings → Privacy & Security → ${missing.join(' / ')} → enable "${host}", then quit and reopen it. Open the panes: ${missing
           .map((m) => `open "${m === 'Accessibility' ? urls.accessibility || 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility' : urls.screenRecording || 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'}"`)
           .join(' ; ')}`,
@@ -1871,7 +2059,14 @@ async function runDoctor() {
     ].join(` ${s.dot} `);
     if (electron || chromeLike.length) {
       const r = { detail };
-      if (!electron) r.notes = ['Optional: "anywhere install --electron" adds an always-on-top window with a global hotkey that hides itself from screenshots.'];
+      if (!electron && pinfo.platform === 'darwin' && config.ui.host !== 'browser' && config.ui.host !== 'none') {
+        // On macOS the app window is a second instance of the user's browser app (same Dock
+        // icon and bundle id), so links and focus can end up in the wrong instance.
+        r.status = 'warn';
+        r.fix = 'anywhere install --electron   (gives the dialog its own app, so it stays out of your browser\'s windows and link handling)';
+      } else if (!electron) {
+        r.notes = ['Optional: "anywhere install --electron" adds an always-on-top window with a global hotkey that hides itself from screenshots.'];
+      }
       return r;
     }
     if (opener) return { status: 'warn', detail, fix: 'Install Google Chrome, Microsoft Edge, Brave or Chromium for a compact app window, or run: anywhere install --electron' };
@@ -1954,7 +2149,16 @@ async function runDoctor() {
         const out = String(r.stdout || '');
         const scope = (out.match(/Scope:\s*([^\n]+)/i) || [])[1];
         const status = (out.match(/Status:\s*([^\n]+)/i) || [])[1];
-        return { detail: `"anywhere" registered${scope ? ` ${sym().dot} ${scope.trim()}` : ''}${status ? ` ${sym().dot} ${status.trim()}` : ''}` };
+        const detail = `"anywhere" registered${scope ? ` ${sym().dot} ${scope.trim()}` : ''}${status ? ` ${sym().dot} ${status.trim()}` : ''}`;
+        const gone = staleMcpPaths(out);
+        if (gone.length) {
+          return {
+            status: 'warn',
+            detail: `${detail} ${sym().dot} ${gone.join(' and ')} no longer exist${gone.length === 1 ? 's' : ''} (moved, or removed by an upgrade such as "brew upgrade node")`,
+            fix: 'Register it again: anywhere install',
+          };
+        }
+        return { detail };
       }
       if (plugin) return { detail: 'provided by the anywhere plugin (mcp__plugin_anywhere_anywhere__*)' };
       if (r.timedOut) return { status: 'warn', detail: '"claude mcp get anywhere" timed out', fix: 'Retry, or register it: anywhere install' };
@@ -1966,6 +2170,21 @@ async function runDoctor() {
     },
     12000
   );
+
+  await check('claudeperms', 'Claude Code allow rules', false, () => {
+    const home = paths.claudeHome();
+    const project = process.cwd();
+    const files = [path.join(home, 'settings.json'), path.join(project, '.claude', 'settings.json'), path.join(project, '.claude', 'settings.local.json')];
+    const broad = broadAllowRules(files);
+    const notes = ['The dialog\'s engine runs with --permission-mode default, so permissions.defaultMode does not bypass its approvals.'];
+    if (!broad.length) return { detail: 'no broad allow rules', notes };
+    return {
+      status: 'warn',
+      detail: broad.map((b) => `${b.rule} (${b.file})`).join(', '),
+      notes: ['Allow rules apply before the dialog\'s approval broker, so these commands and tools run without asking.'].concat(notes),
+      fix: 'Narrow them in those settings files, e.g. "Bash(npm test:*)" instead of "Bash".',
+    };
+  });
 
   await check('config', 'Config', false, () => {
     const file = paths.configPath();
@@ -1997,6 +2216,49 @@ async function runDoctor() {
   }
   const ok = !checks.some((c) => c.critical && c.status === 'fail');
   return { ok, version: packageVersion(), platform: pinfo, checks };
+}
+
+function tildify(file) {
+  const home = os.homedir();
+  return home && (file === home || file.startsWith(home + path.sep)) ? `~${file.slice(home.length)}` : file;
+}
+
+const BROAD_ALLOW_RE = /^(Bash|Bash\(\s*\*?\s*\)|Bash\(\s*\*\s*:\s*\*\s*\)|PowerShell|PowerShell\(\s*\*?\s*\)|Write|Write\(\s*\*{0,2}\s*\)|Edit|Edit\(\s*\*{0,2}\s*\)|MultiEdit|NotebookEdit|mcp__anywhere(__\*)?|mcp__plugin_anywhere_anywhere(__\*)?|mcp__\*|\*)$/;
+
+/**
+ * permissions.allow entries in Claude Code settings files that allow whole tools (Bash,
+ * Write, Edit, every anywhere tool...).
+ * @param {string[]} files
+ * @returns {Array<{rule:string, file:string}>}
+ */
+function broadAllowRules(files) {
+  const out = [];
+  for (const file of files) {
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (_) {
+      continue;
+    }
+    const allow = parsed && parsed.permissions && Array.isArray(parsed.permissions.allow) ? parsed.permissions.allow : [];
+    for (const rule of allow) {
+      if (typeof rule === 'string' && BROAD_ALLOW_RE.test(rule.trim())) out.push({ rule: rule.trim(), file: tildify(file) });
+    }
+  }
+  return out;
+}
+
+/** The running daemon's OS permission state (GET /api/permissions), or null. */
+async function daemonPermissions() {
+  try {
+    const st = await shared('state').findRunningDaemon();
+    if (!st) return null;
+    const { DaemonClient } = shared('client');
+    const client = new DaemonClient({ baseUrl: `http://127.0.0.1:${st.port}`, token: st.token });
+    return await client.request('GET', '/api/permissions', undefined, { timeoutMs: 8000 });
+  } catch (_) {
+    return null;
+  }
 }
 
 function renderDoctor(report) {
@@ -2038,16 +2300,59 @@ async function cmdInstall(p) {
   const f = p.flags;
   const installer = requirePkg('scripts/install.js', 'The installer');
   const quiet = Boolean(f.quiet || f.json);
+  const hotkeyKey = f['hotkey-key'] != null ? String(f['hotkey-key']) : undefined;
+  if (hotkeyKey !== undefined) {
+    try {
+      installer.parseHotkeyCombo(hotkeyKey);
+    } catch (err) {
+      throw usageError(err.message, 'install');
+    }
+  }
   const res = await installer.install({
     electron: Boolean(f.electron),
     mcp: f.mcp !== false,
-    hotkey: Boolean(f.hotkey),
+    hotkey: Boolean(f.hotkey || hotkeyKey),
+    hotkeyKey,
     skillDir: f['skill-dir'] ? path.resolve(expandHome(f['skill-dir'])) : undefined,
     quiet,
     print: quiet ? () => {} : (line) => writeOut(line),
   });
+  if (process.platform === 'darwin' && !quiet && f.permissions !== false && process.stdin.isTTY && process.stdout.isTTY && !(res && res.ok === false)) {
+    await askMacPermissions();
+  }
   if (f.json) printJson(res);
   return res && res.ok === false ? EXIT.ERROR : EXIT.OK;
+}
+
+/**
+ * Show the macOS permission prompts (Accessibility, Screen Recording, Automation for System
+ * Events) for the app running this terminal, so they are answered now instead of during the
+ * first action. The Automation prompt is modal; this waits up to about two minutes.
+ */
+async function askMacPermissions() {
+  const osIndex = optionalPkg('src/os/index.js');
+  if (!osIndex) return;
+  writeOut('Asking macOS for Accessibility, Screen Recording and Automation (System Events) access for this app…');
+  try {
+    const driver = await withTimeout(osIndex.getDriver(), 15000, 'loading the desktop driver');
+    if (typeof driver.requestPermissions !== 'function') return;
+    const r = (await withTimeout(driver.requestPermissions(), 130000, 'the macOS permission prompts')) || {};
+    const word = (v) => (v === true ? 'granted' : v === false ? 'not granted' : 'not answered');
+    writeOut(`  Accessibility ${word(r.accessibility)} ${sym().dot} Screen Recording ${word(r.screenRecording)} ${sym().dot} Automation ${word(r.automation)}`);
+    if (r.accessibility === false || r.screenRecording === false) {
+      writeOut('  Grant them in System Settings → Privacy & Security, then quit and reopen this app. "anywhere doctor" shows the exact panes.');
+    }
+  } catch (err) {
+    writeOut(`  Could not ask for permissions (${err.message}). Run "anywhere doctor" later.`);
+  } finally {
+    if (typeof osIndex.resetDriver === 'function') {
+      try {
+        await withTimeout(osIndex.resetDriver(), 5000, 'closing the driver');
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
 }
 
 async function cmdUninstall(p) {
@@ -2078,6 +2383,8 @@ const CONFIG_ENUMS = {
   'engine.effort': ['', 'low', 'medium', 'high', 'xhigh', 'max'],
 };
 const SECRET_PATHS = ['voice.sttApiKey'];
+// Read only when the daemon starts or launches the dialog window: saving them changes nothing now.
+const STARTUP_ONLY = ['port', 'ui', 'ui.host', 'ui.width', 'ui.height', 'ui.position', 'ui.hotkey', 'ui.hideFromScreenshots', 'ui.openOnStart'];
 
 function configKeys(obj, prefix) {
   const out = [];
@@ -2123,6 +2430,8 @@ function coerceForKey(key, raw) {
   } else {
     value = configMod.coerce(raw);
   }
+  // The dialog labels "auto" as Autopilot; accept that name too.
+  if (key === 'permissions.mode' && typeof value === 'string' && value.trim().toLowerCase() === 'autopilot') value = 'auto';
   const allowed = CONFIG_ENUMS[key];
   if (allowed && allowed.indexOf(value) < 0) throw usageError(`"${key}" must be one of ${allowed.filter(Boolean).join(', ')} (got "${raw}")`, 'config');
   if (key === 'port' && (!Number.isInteger(value) || value < 0 || value > 65535)) throw usageError('"port" must be 0..65535', 'config');
@@ -2182,7 +2491,9 @@ async function cmdConfig(p) {
     if (d) {
       try {
         await d.client.request('POST', '/api/config', partial, { timeoutMs: 5000 });
-        live = true;
+        // The saved mode is only the start-up default; switch the running dialog too.
+        if (key === 'mode') await d.client.request('POST', '/api/mode', { mode: value }, { timeoutMs: 15000 });
+        live = STARTUP_ONLY.indexOf(key) < 0;
       } catch (_) {
         live = false;
       }
@@ -2295,15 +2606,25 @@ const COMMANDS = {
     spec: spec({ string: ['project', 'mode', 'ui', 'timeout', 'port'], boolean: ['open', 'foreground'], alias: { p: 'project' } }),
   },
   status: { run: cmdStatus, group: 'Dialog', summary: 'Show whether the dialog runs, and what it is doing', usage: 'anywhere status [--json]', spec: spec() },
-  show: { run: cmdShow, group: 'Dialog', summary: 'Bring the dialog to the front (starts it if needed)', usage: 'anywhere show [--project DIR]', spec: spec({ string: ['project'] }) },
+  show: {
+    run: cmdShow,
+    group: 'Dialog',
+    summary: 'Bring the dialog to the front (starts it if needed)',
+    usage: 'anywhere show [--project DIR]',
+    details: ['--launcher (used by the macOS "Claude Anywhere" app) starts a stopped dialog from Terminal, so it keeps the permissions granted to Terminal.'],
+    spec: spec({ string: ['project'], boolean: ['launcher'] }),
+  },
   url: { run: cmdUrl, group: 'Dialog', summary: 'Print the dialog URL (with its access token)', usage: 'anywhere url [--json]', spec: spec() },
   tui: { run: cmdTui, group: 'Dialog', summary: 'Terminal version of the dialog (SSH, headless)', usage: 'anywhere tui [--project DIR]', spec: spec({ string: ['project', 'mode'] }) },
   send: {
     run: cmdSend,
     group: 'Talk to Claude',
     summary: 'Send a task to the dialog (starts it if needed)',
-    usage: 'anywhere send <text…> [--screenshot] [--image FILE]… [--wait [--timeout SEC]] [--stdin] [--no-start]',
-    details: ['--screenshot attaches the current screen; --wait prints the final answer (companion mode).', 'Text that starts with "-" goes after "--": anywhere send -- "-v flag fails"'],
+    usage: 'anywhere send <text…> [--screenshot | --no-screenshot] [--image FILE]… [--wait [--timeout SEC]] [--stdin] [--no-start]',
+    details: [
+      '--screenshot attaches the current screen and --no-screenshot never does (default: context.attachScreenshotByDefault); --wait prints the final answer (companion mode).',
+      'Text that starts with "-" goes after "--": anywhere send -- "-v flag fails"',
+    ],
     spec: spec({ string: ['timeout', 'source', 'project'], boolean: ['screenshot', 'wait', 'stdin', 'start', 'open'], multi: ['image'] }),
   },
   interrupt: { run: cmdInterrupt, group: 'Talk to Claude', summary: 'Stop the task Claude is working on', usage: 'anywhere interrupt', spec: spec() },
@@ -2338,6 +2659,7 @@ const COMMANDS = {
     group: 'Bridge mode',
     summary: 'Show progress or the final answer in the dialog',
     usage: 'anywhere reply <text…> [--final] [--no-speak] [--stdin]',
+    details: ['Prints STOP and exits 3 when the dialog has left bridge mode (the /anywhere here loop should end).'],
     spec: spec({ boolean: ['final', 'speak', 'stdin'] }),
   },
   computer: {
@@ -2366,9 +2688,14 @@ const COMMANDS = {
     run: cmdInstall,
     group: 'Setup',
     summary: 'Install the /anywhere skill, MCP tools and optional extras',
-    usage: 'anywhere install [--electron] [--no-mcp] [--hotkey] [--skill-dir DIR] [--quiet] [--json]',
-    details: ['--electron downloads Electron (~100 MB) for an always-on-top window with a global hotkey.', '--hotkey adds an OS shortcut (Ctrl+Alt+A) that shows the dialog.'],
-    spec: spec({ string: ['skill-dir'], boolean: ['electron', 'mcp', 'hotkey', 'quiet'] }),
+    usage: 'anywhere install [--electron] [--no-mcp] [--hotkey [--hotkey-key COMBO]] [--skill-dir DIR] [--no-permissions] [--quiet] [--json]',
+    details: [
+      '--electron downloads Electron (~100 MB) for an always-on-top window with a global hotkey.',
+      '--hotkey adds an OS shortcut that shows the dialog: Ctrl+Alt+F12 on Windows and WSL, Ctrl+Alt+A on GNOME; macOS gets an app to bind in Shortcuts.',
+      '--hotkey-key picks another shortcut (two of Ctrl, Alt, Shift plus A-Z, 0-9 or F1-F24), e.g. --hotkey-key Ctrl+Shift+F9.',
+      'On macOS, an interactive install shows the Accessibility, Screen Recording and Automation prompts up front; --no-permissions skips them.',
+    ],
+    spec: spec({ string: ['skill-dir', 'hotkey-key'], boolean: ['electron', 'mcp', 'hotkey', 'quiet', 'permissions'] }),
   },
   uninstall: { run: cmdUninstall, group: 'Setup', summary: 'Remove the skill, MCP registration and shortcuts', usage: 'anywhere uninstall [--purge] [--json]', details: ['--purge also deletes ~/.claude-anywhere (settings, logs, Electron).'], spec: spec({ boolean: ['purge', 'quiet'] }) },
   config: {
@@ -2574,5 +2901,9 @@ module.exports = {
   renderDoctor,
   ensureDaemon,
   stopDaemon,
+  daemonPath,
+  staleMcpPaths,
+  broadAllowRules,
+  STARTUP_ONLY,
   main,
 };
