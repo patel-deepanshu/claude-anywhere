@@ -221,14 +221,14 @@ async function waitFor(fn, ms = 1500) {
 
 test('interactive sessions do not see the permission_prompt plumbing tool', () => {
   const tools = createTools({ computer: fakeComputer(), getClient: async () => null, config: {}, role: 'interactive' });
-  assert.equal(tools.length, 18);
+  assert.deepEqual(tools.slice(0, 18).map((t) => t.name), TOOL_NAMES.filter((n) => n !== 'permission_prompt'));
   assert.ok(!tools.some((t) => t.name === 'permission_prompt'));
 });
 
 test('createTools returns the 19 contract tools with schemas and annotations', () => {
   const tools = createTools({ computer: fakeComputer(), getClient: async () => null, config: {}, role: 'engine' });
-  assert.equal(tools.length, 19);
-  assert.deepEqual(tools.map((t) => t.name), TOOL_NAMES);
+  // The 19 contract tools come first; feature modules (tools-*.js) may append more.
+  assert.deepEqual(tools.slice(0, 19).map((t) => t.name), TOOL_NAMES);
   for (const t of tools) {
     assert.equal(typeof t.handler, 'function', t.name);
     assert.ok(t.description.length > 60, `${t.name} description`);

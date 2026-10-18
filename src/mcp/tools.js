@@ -975,7 +975,28 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
 
   // permission_prompt is plumbing for the daemon's engine (--permission-prompt-tool).
   // Interactive sessions have Claude Code's own prompts, so keep it away from the model there.
+  // Feature modules (src/mcp/tools-*.js) contribute their own tools: each exports
+  // createTools(ctx) -> [{name, description, inputSchema, annotations, handler}].
+  const ext = { computer, getClient, config, role, progressIntervalMs, deps, getComputer, getDriver, client, checkGuard, postActivity, keepAlive, ok, fail, daemonRequest, objectSchema, annotations };
+  for (const name of TOOL_MODULES) {
+    const mod = loadOptional(`./${name}`);
+    if (mod && typeof mod.createTools === 'function') tools.push(...mod.createTools(ext));
+  }
+
   return role === 'engine' ? tools : tools.filter((t) => t.name !== 'permission_prompt');
+}
+
+/** Optional feature modules that add tools (missing ones are skipped). */
+const TOOL_MODULES = ['tools-browser', 'tools-jira', 'tools-project', 'tools-calls'];
+
+/** require() a sibling module that may not exist; other load errors still throw. */
+function loadOptional(rel) {
+  try {
+    return require(rel);
+  } catch (err) {
+    if (err && err.code === 'MODULE_NOT_FOUND' && String(err.message).includes(rel.replace(/^\.\//, ''))) return null;
+    throw err;
+  }
 }
 
 /** Names of all tools in contract order. */
@@ -988,6 +1009,7 @@ const TOOL_NAMES = [
 module.exports = {
   createTools,
   TOOL_NAMES,
+  TOOL_MODULES,
   // helpers exported for tests
   daemonRequest,
   matchWindows,

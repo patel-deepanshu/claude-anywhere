@@ -3363,6 +3363,19 @@ const COMMANDS = {
   help: { run: null, group: 'Setup', summary: 'Show help for a command', usage: 'anywhere help [command]', spec: spec() },
 };
 
+// Feature command modules (src/cli/<name>.js) export commands(helpers) -> { name: {run, group, summary, usage, spec} }.
+for (const name of ['voice', 'jira', 'calls']) {
+  let mod = null;
+  try {
+    mod = require(path.join(__dirname, '..', 'src', 'cli', `${name}.js`));
+  } catch (err) {
+    if (!(err && err.code === 'MODULE_NOT_FOUND' && String(err.message).includes(`${name}.js`))) throw err;
+  }
+  if (mod && typeof mod.commands === 'function') {
+    Object.assign(COMMANDS, mod.commands({ spec, shared, call, requireDaemon, ensureDaemon, writeOut, writeErr, printJson, sym, color, EXIT }));
+  }
+}
+
 const ALIASES = { open: 'show', ui: 'show', cancel: 'interrupt', log: 'logs', '-v': 'version', '--version': 'version', '-V': 'version' };
 
 function helpText() {
