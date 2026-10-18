@@ -446,10 +446,12 @@ const appJs = fs.readFileSync(path.join(UI, 'app.js'), 'utf8');
 
 test('page: title, module script and no inline script or handlers', () => {
   assert.match(html, /<title>Claude Anywhere<\/title>/);
+  // app.js, then the feature-3 loader (calls-ui.js: the calls panel and the voice enrollment view).
   const scripts = html.match(/<script\b[^>]*>/g) || [];
-  assert.equal(scripts.length, 1);
-  assert.match(scripts[0], /type="module"/);
+  assert.equal(scripts.length, 2);
+  for (const s of scripts) assert.match(s, /type="module"/);
   assert.match(scripts[0], /src="app\.js"/);
+  assert.match(scripts[1], /src="calls-ui\.js"/);
   assert.ok(!/<script\b[^>]*>[^<\s]/.test(html), 'inline script body');
   assert.ok(!/\son[a-z]+\s*=/i.test(html), 'inline event handler');
   assert.ok(!/javascript:/i.test(html));

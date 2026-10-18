@@ -98,11 +98,18 @@ class DaemonClient {
    * @param {string} method
    * @param {string} path
    * @param {object} [body]
-   * @param {{timeoutMs?:number, signal?:AbortSignal}} [opts]
+   * @param {{timeoutMs?:number, signal?:AbortSignal, headers?:object}} [opts] headers: extra request headers
+   *   (e.g. X-Anywhere-Role: call); Authorization and Content-Type cannot be replaced
    */
-  async request(method, path, body, { timeoutMs = 30000, signal } = {}) {
+  async request(method, path, body, { timeoutMs = 30000, signal, headers } = {}) {
     const payload = body !== undefined ? Buffer.from(JSON.stringify(body)) : null;
-    const extra = payload ? { 'Content-Type': 'application/json' } : {};
+    const extra = {};
+    if (headers && typeof headers === 'object') {
+      for (const [k, v] of Object.entries(headers)) {
+        if (typeof v === 'string' && !/^(authorization|content-type|content-length|host)$/i.test(k)) extra[k] = v;
+      }
+    }
+    if (payload) extra['Content-Type'] = 'application/json';
     const { status, text } = await this.send(method, path, payload, extra, { timeoutMs, signal });
     let data;
     try {

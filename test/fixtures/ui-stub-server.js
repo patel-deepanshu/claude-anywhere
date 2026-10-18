@@ -17,6 +17,7 @@
  * event, which helps when poking at the UI by hand.
  *
  * Voice and Jira: the snapshot says the daemon announces (voice.announcer);
+ * GET /api/calls/status and GET /api/clone/status answer as an idle daemon (feature 3's panel and enrollment view).
  * GET /api/voice/status lists a Piper catalog; POST /api/voice/install streams
  * SSE voice_install progress and then reports Piper installed; POST
  * /api/voice/test and POST /api/debug/announce {kind, text, audio, chime}
@@ -856,6 +857,37 @@ async function createStubServer(opts = {}) {
         deployment: /\.atlassian\.net$/.test(new URL(baseUrl).hostname) ? 'Cloud' : 'Server',
       };
     },
+    // Feature 3 (calls-ui.js loads the calls panel and the voice enrollment view): the daemon's idle answers.
+    'GET /api/calls/status': () => ({
+      state: 'disarmed',
+      armed: false,
+      until: null,
+      untilLocal: null,
+      apps: ['zoho-cliq', 'google-meet', 'teams', 'slack', 'zoom'],
+      instructions: false,
+      cloned: null,
+      voice: null,
+      quietHours: { enabled: true, start: '22:00', end: '08:00' },
+      inQuietHours: false,
+      audio: null,
+      current: null,
+      recent: [],
+      notesDir: '',
+      detector: null,
+      arming: false,
+      clone: { exists: false, ok: false },
+    }),
+    'GET /api/clone/status': () => ({
+      enabled: false,
+      engine: 'pocket',
+      profile: { exists: false, ok: false, reason: null, engine: null, createdAt: null, ownerName: null, referenceSeconds: null, testSimilarity: null, testLabel: null },
+      session: null,
+      openSeq: 0,
+      openAck: 0,
+      openAgeMs: null,
+      installing: null,
+      lastInstall: null,
+    }),
     'POST /api/debug/announce': ({ body }) => announce(body),
     'POST /api/mode': ({ body }) => {
       if (!['companion', 'bridge'].includes(body.mode)) throw fail(400, 'mode must be companion or bridge');

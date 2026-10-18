@@ -884,11 +884,14 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     shuttingDown = (async () => {
       log.info(`shutting down (${reason})`);
       audit({ type: 'daemon_stop', reason, instanceId });
+      // A call in progress gets up to 15 s more to write its notes (CallManager.shutdown); the
+      // process 'exit' hook of routes-calls restores the microphone even when this timer fires.
+      const callActive = Boolean(server && server.deps.calls && server.deps.calls.call);
       const hard = setTimeout(() => {
         log.warn('shutdown is taking too long; exiting now');
         state.clearDaemonState(instanceId);
         if (exitProcess) process.exit(0);
-      }, SHUTDOWN_HARD_MS);
+      }, SHUTDOWN_HARD_MS + (callActive ? 16000 : 0));
       if (hard.unref) hard.unref();
       const step = async (what, fn) => {
         try {
@@ -901,6 +904,10 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
       await step('cancel approvals', () => permissions.cancelAll('Claude Anywhere is shutting down'));
       await step('cancel questions', () => questions.cancelAll('Claude Anywhere is shutting down'));
       await step('close bridge', () => bridge.close());
+      // Calls first: a call in progress gets up to 15 s to write its notes, then the user's microphone
+      // and the audio routing are restored and the voice sidecar stops (CALLS-DESIGN §13.3).
+      if (server && server.deps.calls) await step('stop calls', () => server.deps.calls.shutdown());
+      if (server && server.deps.clone) await step('stop voice sidecar', () => server.deps.clone.shutdown());
       if (session) await step('stop session', () => session.shutdown());
       if (uihost) await step('close dialog', () => uihost.close());
       if (announcer) await step('stop announcer', () => announcer.stop());
@@ -943,6 +950,10 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
   // refresh (snapshot broadcast) after a voice is installed, chosen or removed.
   server.deps.announcer = announcer;
   server.deps.refreshVoice = () => refreshVoice(true);
+  // Feature 3 (docs/CALLS-DESIGN.md §13.3): routes-calls answers calls with the daemon's own Computer
+  // (one geometry cache, one guard) and needs the platform for audio routing and notes.
+  server.deps.getComputer = getComputer;
+  server.deps.platformInfo = platformInfo;
   const wanted = Number.isInteger(port) ? port : Number.isInteger(config.port) ? config.port : 47120;
   let boundPort;
   try {

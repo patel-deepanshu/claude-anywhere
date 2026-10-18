@@ -75,15 +75,22 @@ src/mcp/tools-{browser,jira,project}.js   feature tools: read_browser_tab · jir
 src/daemon/{main,server,hub,session,engine-cli,permissions,questions,bridge,prompt,voice,uihost}.js
 src/daemon/{piper,announcer,chime,routes-voice}.js   free neural voice (Piper), spoken announcements, chimes, voice routes
 src/daemon/routes-{jira,project}.js  GET /api/jira/status, POST /api/jira/test · POST /api/mcp/switch-project
+src/daemon/routes-{clone,calls}.js  /api/clone/* (voice enrollment) · /api/calls/* (AI-answered calls), §13
+src/voice/clone/                    cloned voice: Python sidecar (sidecar.py, audio_io.py, requirements.txt) and
+                                    {models,installer,client,quality,consent,script,profile,index}.js
+src/calls/                          {signatures,notifications,screen-diff,vision,detector,answer,audio-bridge,
+                                    policy,greeting,prompt,session,manager,notes,cliq}.js
 src/integrations/jira.js            Jira Cloud / Server REST client (zero dependencies)
-src/cli/{voice,jira}.js             anywhere voice … · anywhere jira …
+src/cli/{voice,jira,clone,calls}.js anywhere voice … · anywhere jira … · anywhere clone-voice … · anywhere calls …
 src/ui/{index.html,app.css,app.js,voice.js,wav-recorder.js,markdown.js}
+src/ui/{calls-ui,calls-panel,clone,calls-audio-test}.js, calls.css, clone.html, calls-audio-test.html
+skills/clone-voice/{SKILL.md,run.js}  /anywhere:clone-voice (plugin)
 src/electron/{main,preload}.js
 src/tui/tui.js
 scripts/{install.js,install.sh,install.ps1}
 scripts/{check-syntax,test}.js          npm run lint / npm test
 test/*.test.js, test/fixtures/fake-claude.js
-docs/{PLAN,ARCHITECTURE,VOICE,JIRA,PLATFORMS,SECURITY}.md
+docs/{PLAN,ARCHITECTURE,VOICE,JIRA,PLATFORMS,SECURITY,CALLS,CALLS-DESIGN}.md
 package.json, README.md, .github/workflows/ci.yml
 ```
 
@@ -92,10 +99,11 @@ any other load error still throws):
 - `src/mcp/tools.js` loads `src/mcp/tools-{browser,jira,project,calls}.js`; each exports
   `createTools(ext) -> tool[]` with `ext = {computer, getClient, config, role, progressIntervalMs, deps, getComputer,
   getDriver, client, checkGuard, postActivity, keepAlive, ok, fail, daemonRequest, objectSchema, annotations}`.
-- `src/daemon/server.js` loads `src/daemon/routes-{voice,jira,project,calls}.js`; each exports `register(add, server)`.
+- `src/daemon/server.js` loads `src/daemon/routes-{voice,jira,project,clone,calls}.js`; each exports `register(add, server)`.
+  A route may set `rawLimit` (bytes) to lower the 25 MB raw upload limit.
   Handlers are bound to the DaemonServer and get `({req, res, url, body, raw})` like the built-in ones; paths match
   exactly (ids go in the query string).
-- `bin/anywhere.js` loads `src/cli/{voice,jira,calls}.js`; each exports `commands(helpers) -> {name: {run, group,
+- `bin/anywhere.js` loads `src/cli/{voice,jira,clone,calls}.js`; each exports `commands(helpers) -> {name: {run, group,
   summary, usage, spec, details?}}` with `helpers = {spec, shared, call, requireDaemon, ensureDaemon, writeOut,
   writeErr, printJson, sym, color, EXIT}`.
 
@@ -991,7 +999,11 @@ other process with the token URL: `show` posts `/api/show`, so the daemon's UiHo
   and `mcp__plugin_anywhere_anywhere__` (Claude Code 2.1.302 expands `${CLAUDE_SKILL_DIR}` in allowed-tools),
   `disable-model-invocation: true`.
 - `SKILL.md` handles `$ARGUMENTS`: empty → start the companion; `here`/`bridge` → bridge loop; `stop`; `status`;
-  `doctor`/`setup`; anything else → start, then send it as a command.
+  `doctor`/`setup`; `clone-voice …` → `run.js clone-voice …`; "answer my calls…" → `run.js calls on --instructions
+  "<their words>"` (exit 0 armed, 5 not allowed, 2 nobody clicked, 1 cannot arm), "stop answering calls" →
+  `run.js calls off`; anything else → start, then send it as a command.
+- `skills/clone-voice/` is the plugin's `/anywhere:clone-voice` (it runs `run.js clone-voice $ARGUMENTS`): its `run.js` spawns `../anywhere/run.js` with
+  the same arguments and forwards the exit code.
 - Install paths: (1) plugin: `/plugin marketplace add patel-deepanshu/claude-anywhere` then
   `/plugin install anywhere@anywhere-marketplace` (skill is `/anywhere:anywhere`, and bare `/anywhere` when unambiguous);
   (2) personal skill: `node bin/anywhere.js install` copies `skills/anywhere/` to `~/.claude/skills/anywhere/`
@@ -1011,3 +1023,51 @@ The voice, Jira and ticket features are tested without network or audio: local f
 Piper release, Hugging Face and Jira, fake `piper`/player binaries for the real ones, the mock driver and
 `test/fixtures/fake-ps-host.js` for browser tabs, and `test/fixtures/ui-stub-server.js` (voice status, install,
 `/api/tts/audio`, `announce` and Jira routes) for the dialog in headless Chromium.
+Feature 3 runs the real `sidecar.py` in fake mode (`ANYWHERE_CLONE_FAKE=1`, no numpy or models; skipped without a
+Python), a fake sidecar and call engine (`test/fixtures/fake-call-claude.js`) with a real DaemonServer and MCP
+server, captured `dbus-monitor` / `pactl` / UIA fixtures, and a fake Jira server.
+
+## 13. Calls and the cloned voice (feature 3)
+
+User guide: [CALLS.md](CALLS.md). Build contract, measurements and the as-built differences:
+[CALLS-DESIGN.md](CALLS-DESIGN.md) (§16).
+
+```
+anywhere daemon
+ ├─ routes-clone.js ─► CloneService (src/voice/clone/index.js), one per daemon (server.deps.clone)
+ │    ├─ CloneInstaller: private venv <state>/voice/clone-venv + sherpa-onnx models (sha256-pinned GitHub assets)
+ │    └─ SidecarClient ─stdio JSON lines─► python -I -u sidecar.py --state <state> --models <dir>
+ │         TTS (Pocket | ZipVoice), STT (Moonshine…), Silero VAD, speaker embeddings,
+ │         audio_io.py plug-in: playback/capture backends, tts.say, barge-in, default-input switch
+ ├─ routes-calls.js ─► CallManager (src/calls/manager.js), created on first use (server.deps.calls)
+ │    ├─ CallDetector: window titles · notifications (busctl/dbus-monitor, Windows UIA toasts) · screen diffs · vision
+ │    ├─ answer.js: shortcut, learned point or vision click, all gated in code and verified
+ │    ├─ AudioBridge: pactl / VB-CABLE + IPolicyConfig / BlackHole + ScreenCaptureKit; crash-safe restore
+ │    ├─ CallSession: greeting first (disclosure in code) → caller ASR → call engine → clause TTS
+ │    │    call engine = claude -p --model haiku --tools "" --strict-mcp-config + MCP server (ANYWHERE_ROLE=call)
+ │    │    ─► POST /api/calls/tool ─► CallPolicy (allowlist, caller binding, budgets, server-built JQL)
+ │    └─ wrap-up: Cliq message (cliq.js, window or API), notes (notes.js) on the Desktop, announcement
+ └─ PermissionBroker.requestCritical(): the click-only card that arms calls
+```
+
+- **Arming** is memory-only, expires, and needs a click on a critical card raised by `POST /api/calls/arm`
+  through `PermissionBroker.requestCritical()`; `CallManager` accepts only `via: 'click'`. `classify()` marks
+  `calls_arm` and `anywhere calls on` critical with `ownCard`, so the tool call reaches that card without a
+  second one (§13.4 of the design). `calls_disarm` / `anywhere calls off` never ask.
+- **Roles.** The MCP server in role `call` (`ANYWHERE_ROLE=call`, `ANYWHERE_CALL_ID`) lists only
+  `CALL_TOOL_NAMES` from `src/mcp/tools-calls.js`; the other roles get `calls_status`, `calls_arm`, `calls_disarm`,
+  `clone_voice_status` and `clone_voice_open`. Call tools post to `/api/calls/tool` with `X-Anywhere-Role: call`
+  (`DaemonClient.request(..., {headers})`).
+- **Voice profile**: `<state>/voice/clone/profiles/default/` (0700/0600). The sidecar's `tts.setVoice` takes
+  only that folder and checks the manifest's consent and the reference's sha256; no operation clones a free audio
+  path.
+- **Daemon lifecycle**: `main.js` sets `server.deps.getComputer` / `platformInfo`; on shutdown it stops the calls
+  (notes of a running call get up to 15 s), then the voice sidecar, then the session. routes-calls restores an
+  audio routing left by a crash at start and on process exit.
+- **Dialog**: `index.html` loads `calls-ui.js` after `app.js`, which re-dispatches every SSE event as window
+  `anywhere:event` {type, data} and exposes `window.anywhereApi(method, path, body, opts)`. `calls-ui.js` mounts the
+  calls pill and panel (`calls-panel.js`) and the enrollment overlay (`clone.js`; `/clone.html` runs it standalone).
+  SSE: `clone_install`, `clone_session`, `calls`, `call_transcript`, `call_action`, `call_notes`.
+- **Doctor**: `src/cli/calls.js` `doctorChecks()` (also appended to `anywhere doctor`, where its failures are
+  warnings): arming safeguards, voice runtime, cloned voice and speed (bench.json), audio routing
+  (`audio-bridge.doctorChecks`), detection, Claude, Jira, Cliq, notes.

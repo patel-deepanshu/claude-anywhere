@@ -310,8 +310,10 @@ numpy>=1.24,<3
 sounddevice==0.5.6 ; sys_platform == "win32" or sys_platform == "darwin"
 soundcard==0.4.6 ; sys_platform == "win32" or sys_platform == "linux"
 pyobjc-framework-ScreenCaptureKit==12.2.2 ; sys_platform == "darwin"
-pyobjc-framework-CoreAudio==12.2.2 ; sys_platform == "darwin"
+pyobjc-framework-CoreMedia==12.2.2 ; sys_platform == "darwin"
 ```
+(Phase 3: the default-input switch on macOS uses CoreAudio through `ctypes`, so `pyobjc-framework-CoreAudio`
+was dropped; CoreMedia is pinned because the ScreenCaptureKit callback reads CMSampleBuffers.)
 
 macOS / Linux:
 ```bash
@@ -365,9 +367,10 @@ runtime does not need (`test_wavs/`, fp32 duplicates).
 
 ### 3.4 Sidecar API (`src/voice/clone/sidecar.py`, protocol v1)
 
-Run: `<venv python> -I -X utf8 <pkg>/src/voice/clone/sidecar.py --state <state> --models <dir>`, with
-env `PYTHONNOUSERSITE=1`, `PYTHONUNBUFFERED=1`, `OMP_NUM_THREADS=<threads>`. Because of `-I`, the
-script adds its own directory to `sys.path` explicitly for `audio_io.py`.
+Run: `<venv python> -I -u -X utf8 <pkg>/src/voice/clone/sidecar.py --state <state> --models <dir> [--fake]`,
+with env `PYTHONNOUSERSITE=1`, `OMP_NUM_THREADS=<threads>`. Under `-I` the environment variable
+`PYTHONUNBUFFERED` is ignored, so the client passes `-u`. The sidecar loads `audio_io.py` by file path
+(no bytecode is written).
 
 - **Transport**: stdin and stdout, UTF-8 JSON, one object per line, ≤ 1 MB per line. Audio is
   **never inline**: only file paths (`<state>/run/voice-tmp/…`), which Node creates and cleans up.
@@ -382,16 +385,16 @@ script adds its own directory to `sys.path` explicitly for `audio_io.py`.
 | op | params | result / events |
 |---|---|---|
 | `hello` | — | `{protocol, python, sherpa, platform, providers:['cpu',…]}` |
-| `models.check` | `{assets:[{id, dir, files:[…]}]}` | `{missing:[…]}` |
+| `models.check` | `{assets:[{id, dir, files:[…]}]}` | `{missing:[{id, file}], complete}` (no `ok` field: `ok` is the protocol's success flag) |
 | `tts.load` | `{engine:'pocket'\|'zipvoice', dir, vocoder?, threads, provider, steps}` | `{loadMs, sampleRate}` |
 | `tts.setVoice` | `{profileDir}`: must sit under `<state>/voice/clone/profiles/`, with consent verified and the sha256 matching | `{seconds, engine}`; `PROFILE_INVALID` otherwise. **There is no op that takes a free audio path for cloning.** |
 | `tts.synthesize` | `{text, out, steps?, speed?}` | events `tts.chunk {id, index, samples}`; result `{out, audioMs, firstChunkMs, totalMs, sampleRate}` |
 | `tts.say` | `{text, utteranceId}` (live mode: synthesize clause by clause → playback sink) | events `playback.start/end {utteranceId, interrupted, playedChars}` |
 | `tts.stop` | — | stops playback within 100 ms and clears the queue |
 | `asr.load` | `{model:'moonshine'\|'whisper'\|'parakeet', dir, threads}` | `{loadMs}` |
-| `asr.transcribe` | `{wav}` | `{text, ms}` |
+| `asr.transcribe` | `{wav}` | `{text, ms, seconds}`; the non-speech ends of a clip are trimmed first (Moonshine returns nothing after ~0.8 s of room tone); audio over 28 s is split (VAD when loaded) |
 | `spk.load` / `spk.consistency` | `{model}` / `{wavs:[…], probe?}` | `{centroid:'<file>', scores:[…], probe?}` |
-| `enroll.build` | `{sessionDir, takes:[{wav, text, snr}], profileDir, consentWav, manifest}` | `{referenceSeconds, refText, sha256}` (writes reference.wav/.txt; Node writes the manifest) |
+| `enroll.build` | `{sessionDir, takes:[{wav, text, snr}], profileDir, consentWav?}` | `{referenceSeconds, refText, sha256, used, sampleRate, files}` (writes reference.wav/.txt and consent.wav, never manifest.json). CloneService builds the reference in Node (`quality.buildReference`) and does not call it. |
 | `audio.devices` | — | `{inputs, outputs, loopbacks}`, each `{name, id, backend, virtual:bool}` |
 | `audio.start` | `{capture:{backend:'pulse'\|'wasapi-loopback'\|'sck'\|'device', device, app?}, playback:{backend:'pulse'\|'device', device}, vad:{threshold:0.5, minSilenceMs:600, minSpeechMs:250}, bargeIn:{minSpeechMs:400}, halfDuplex:bool}` | events `vad.start {t}`, `vad.end {t, ms}`, `asr.final {text, t0, t1, ms}`, `level {rms}`, `barge_in {t}`, `audio.error {message, code}` |
 | `audio.stop` | — | — |
@@ -399,12 +402,15 @@ script adds its own directory to `sys.path` explicitly for `audio_io.py`.
 | `bench` | `{engine, threads:[1,2,4], steps:[2,3,5]}` | `{runs:[{engine, threads, steps, rtf, firstChunkMs}]}` |
 | `shutdown` | — | exits 0 |
 
+Also implemented (phase 1): `warmup {text?}` → `{ms, firstChunkMs}`, `vad.load`, `vad.segments {wav}`,
+`spk.similarity {wav, centroid}` and `cancel {target}`.
+
 Error codes: `MODEL_MISSING`, `PROFILE_INVALID`, `DEVICE_NOT_FOUND`, `AUDIO_BACKEND`, `BAD_REQUEST`,
-`INTERNAL`.
+`INTERNAL`, `RUNTIME_MISSING`, `CANCELLED`, `SHUTDOWN`.
 
 Fake mode for tests: `ANYWHERE_CLONE_FAKE=1` imports neither numpy nor sherpa. TTS writes a
 deterministic tone WAV whose duration is proportional to the text, ASR returns the text from
-`<wav>.txt`, and embeddings are derived from a hash of the file name. Node tests can then run the
+`<wav>.txt`, and embeddings are derived from the speaker key (`<wav>.spk`, else the take's folder name). Node tests can then run the
 real `sidecar.py` with any `python3`, and are skipped when there is no Python.
 
 `src/voice/clone/client.js` (Node):
@@ -462,7 +468,7 @@ Cliq in its own window ("Install Cliq as an app" or "Open in new window").
 
 | OS | Mechanism | Status |
 |---|---|---|
-| Linux | `dbus-monitor --session "type='method_call',interface='org.freedesktop.Notifications',member='Notify'"` (unprivileged monitor) and parse `app_name`, `summary`, `body` | **verified**: `notify-send` and a Chromium web `Notification` gave `{app_name:"Chromium", summary:"Ankit Sharma", body:"localhost:8765\n\nIncoming audio call", actions:[default, Activate, settings, Settings]}`. Chromium puts the **origin** first in the body (e.g. `cliq.zoho.com`), so match the app by origin. |
+| Linux | `busctl --user --json=short monitor org.freedesktop.Notifications` (JSON-escaped strings), falling back to `dbus-monitor --session "type='method_call',interface='org.freedesktop.Notifications',member='Notify'"`; parse `app_name`, `summary`, `body`. (`gdbus monitor` shows only signals, never the Notify method call, so it is not used.) | **verified**: `notify-send` and a Chromium web `Notification` gave `{app_name:"Chromium", summary:"Ankit Sharma", body:"localhost:8765\n\nIncoming audio call", actions:[default, Activate, settings, Settings]}`. Chromium puts the **origin** first in the body (e.g. `cliq.zoho.com`), so match the app by origin. |
 | Windows | Chromium browsers and Electron apps show native toasts. The persistent PS host polls UI Automation every 1 s: top-level `Windows.UI.Core.CoreWindow` elements owned by `ShellExperienceHost.exe` (the toast host); read the `Name` of every descendant. Match by class and process, not by the localized "New notification" title. | design; verify in phase 3. `UserNotificationListener` is not used because it needs a packaged app. |
 | macOS | Not used. Forum reports say Sequoia's SwiftUI notifications no longer expose banner text to AppleScript/AX ("Invalid index"). Rely on A, C and vision. | documented limitation |
 
@@ -1212,6 +1218,72 @@ Models came from the GitHub release URLs in §3.3; the large downloads were dele
 - Vision: headless Chromium screenshots of synthetic ring pages (cropped to 1366×768), sent as an image content block.
 - Linux routing: PulseAudio 16.1 unpacked from the Ubuntu debs (not installed system-wide), run privately (`pulseaudio -n -F min.pa`), Chromium with `PULSE_SERVER`, `--use-fake-ui-for-media-stream`, a page that records `getUserMedia` and plays an `<audio>` element; `dbus-daemon --session` + `dbus-monitor` + a jeepney fake notification server.
 - Wheel sizes: `uv pip compile --python-platform {x86_64-unknown-linux-gnu, x86_64-pc-windows-msvc, aarch64-apple-darwin}`, then PyPI JSON file sizes.
+
+---
+
+## 16. Phase 3: integration notes (as built)
+
+Where the build differs from the sections above, the build wins; this list records the differences.
+
+**Ownership and files.** The `/api/clone/*` routes are in `src/daemon/routes-clone.js` (one `CloneService`
+per daemon, from `getCloneService(server)`), and `anywhere clone-voice …` is `src/cli/clone.js`;
+`src/cli/calls.js` holds `anywhere calls …`. The tests are `test/clone-{client,sidecar,installer,quality,consent,enroll}.test.js`
+and `test/calls-{detect,answer,audio,policy,session,notes,cliq,cli,integration}.test.js`;
+`calls-detect` covers signatures, notifications, the detector and vision, and `calls-session` covers the
+routes and the MCP tool sets.
+
+**Arming (§1.3 d, §13.4).** `classify()` gives `mcp__anywhere__calls_arm`, Bash `anywhere calls on` /
+`run.js calls on` and a direct `POST /api/calls/arm` risk `critical` ("Answer phone calls for you with your
+voice"), with no session rule. The arm route raises its own click-only critical card through
+`PermissionBroker.requestCritical()` in every permission mode, so the tool call and a plain `calls on`
+command are marked `ownCard` and go on to that card instead of showing a second one first (a command that
+does anything else as well keeps its own card). `CallManager` accepts only `via: 'click'`; the terminal
+dialog can deny the card but not allow it. `anywhere clone-voice delete` and `POST /api/clone/delete` are
+`high`, `clone-voice install` is `medium`.
+
+**Call engine isolation (§7.2, §13.5).** In the `call` role the MCP server lists only `CALL_TOOL_NAMES` and
+gives short call-only instructions; the engine keeps `--tools ""`, `--strict-mcp-config`, the call
+`--allowedTools` and the always-deny `call_permission`.
+
+**Daemon.** `main.js` sets `server.deps.getComputer` and `server.deps.platformInfo`; shutdown stops the calls
+(up to 15 s for the current call's notes, then the microphone and the virtual devices are restored), then
+the voice sidecar, then the session; the hard shutdown timer grows by 16 s while a call is active.
+`server.js` honours a route's `rawLimit` (5 MB for enrollment takes) and validates the new enums
+(`voice.clone.engine|provider`, `calls.ownerPronoun`, `calls.stt.model`, `calls.audio.mode`, `calls.cliq.mode|dc`).
+`GET /api/calls/status` adds the resolved notes folder and `clone:{exists, ok}`;
+`POST /api/calls/audio-test/start {open:true}` also opens the page.
+
+**Dialog.** `index.html` loads `calls-ui.js` after `app.js`; `app.js` re-dispatches every SSE event as window
+`anywhere:event` {type, data}, exposes `window.anywhereApi`, and Settings › Voice has *Clone my voice* and
+*Answering calls…*.
+
+**Detection (§4.1B).** Linux prefers `busctl --user --json=short monitor`, falling back to `dbus-monitor`.
+When the detector replaces a ring with a stronger signal (`ring_ended` reason `replaced`), the manager waits
+again with the new candidate instead of dropping the call.
+
+**Arming requests** that name only apps calls cannot answer are refused before any card (`UNSUPPORTED_APP`),
+instead of falling back to every app. `anywhere calls learn` sends its steps ("Seen the ringing call… now you
+may answer it") to the dialog as notifications, because the CLI waits on the request.
+
+**Calls that were not answered** (quiet hours, an app not chosen, the owner active, a failed answer) add a
+line to `<notes>/Missed calls.md`. `calls.answerOnlyWhenIdleSec` reads the idle time with `ioreg`
+(macOS), `xprintidle` (Linux X11, when installed) or `GetLastInputInfo` (Windows/WSL); when it cannot be
+read, the call is not answered.
+
+**After-call messages.** A Cliq message whose outcome is unknown (an API timeout, or Enter pressed but not
+seen on screen) is reported as "maybe sent" and becomes a *check whether … got it* follow-up, never a
+second send.
+
+**Runtime measurements added in phase 1.** Pocket at 4 threads: RTF 0.97. On very short sentences ("Okay.")
+Pocket sometimes generated 14 s of audio in 17–33 s; the sidecar caps each sentence at
+`max_frames = 12.5 × (1.5 s + 0.09 s × characters)` with one retry, after which "Okay." takes 0.3–0.4 s.
+The first `warmup` after load took 1.5 s and the second 0.55 s. With Piper-read takes the 14 lines gave
+42.2 s of voiced speech, 48.8 s with the consent take, which counts toward the 45 s minimum.
+
+**Still to verify on real machines** (no device here): Windows IPolicyConfig default switching, the
+`soundcard` WASAPI loopback with numpy 2 and the UIA toast host on Windows 11; macOS ScreenCaptureKit
+audio through PyObjC, the CoreAudio default-input switch and the TCC prompts; a PipeWire (`pipewire-pulse`)
+rerun of the Linux routing; a real Zoho Cliq call with `anywhere calls learn`; the Cliq API scope.
 
 ---
 

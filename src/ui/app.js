@@ -13,6 +13,8 @@ const EVENT_TYPES = [
   'snapshot', 'status', 'message', 'delta', 'tool_update', 'approval_request', 'approval_resolved', 'question',
   'question_resolved', 'notify', 'result', 'screenshot', 'project', 'session', 'config', 'mode', 'bridge', 'show',
   'announce', 'voice_install',
+  // Feature 3 (calls-ui.js, clone.js, calls-panel.js): re-dispatched as window 'anywhere:event'.
+  'calls', 'call_transcript', 'call_action', 'call_notes', 'clone_install', 'clone_session',
 ];
 // Settings never sent back empty: the daemon keeps a saved secret unless a new one is typed.
 const SECRET_FIELDS = new Set(['voice.sttApiKey', 'jira.apiToken']);
@@ -640,6 +642,12 @@ function dispatch(type, raw) {
     } catch {
       return;
     }
+  }
+  // Feature modules (calls-ui.js: the calls panel and the voice enrollment) listen on the window.
+  try {
+    window.dispatchEvent(new CustomEvent('anywhere:event', { detail: { type, data: data || {} } }));
+  } catch (err) {
+    console.error(`Failed to re-dispatch "${type}"`, err);
   }
   const fn = handlers[type];
   if (!fn) return;
@@ -3381,6 +3389,23 @@ function bindUi() {
   el.piperVoice.addEventListener('change', renderPiper);
   el.piperInstall.addEventListener('click', installNaturalVoice);
   el.voiceTest.addEventListener('click', testVoice);
+  // Feature 3: the enrollment view and the calls panel live in calls-ui.js (loaded next to this module).
+  if (el.cloneOpen) {
+    el.cloneOpen.addEventListener('click', () => {
+      closeSettings(false);
+      window.dispatchEvent(new CustomEvent('anywhere:clone-open'));
+    });
+  }
+  if (el.callsOpen) {
+    el.callsOpen.addEventListener('click', () => {
+      if (!window.anywhereCalls || typeof window.anywhereCalls.open !== 'function') {
+        toast('The calls panel is still loading. Try again in a moment.', 'warning');
+        return;
+      }
+      closeSettings(false);
+      window.anywhereCalls.open();
+    });
+  }
   el.jiraTest.addEventListener('click', testJira);
   el.jiraUrl.addEventListener('change', () => {
     try {
@@ -3573,7 +3598,7 @@ function grabElements() {
     lightboxClose: 'lightbox-close',
     setTabs: 'set-tabs', ttsEngine: 'tts-engine', piperCard: 'piper-card', piperState: 'piper-state', piperVoice: 'piper-voice',
     piperProgress: 'piper-progress', piperBar: 'piper-bar', piperFill: 'piper-fill', piperProgressText: 'piper-progress-text',
-    piperInstall: 'piper-install', piperInstallLabel: 'piper-install-label', voiceTest: 'voice-test', piperHelp: 'piper-help',
+    piperInstall: 'piper-install', piperInstallLabel: 'piper-install-label', voiceTest: 'voice-test', piperHelp: 'piper-help', cloneOpen: 'clone-open', callsOpen: 'calls-open',
     jiraState: 'jira-state', jiraUrl: 'jira-url', jiraEmail: 'jira-email', jiraToken: 'jira-token', jiraTokenSet: 'jira-token-set',
     jiraTest: 'jira-test', jiraResult: 'jira-result', roots: 'roots', rootsList: 'roots-list', rootsInput: 'roots-input',
     rootsAdd: 'roots-add', rootsError: 'roots-error', rootsSuggest: 'roots-suggest', jiraTokenLink: 'jira-token-link',
@@ -3610,6 +3635,8 @@ function init() {
   renderEmpty();
   renderComposerButtons();
   autosize();
+  // The daemon API for feature modules loaded next to this one (calls-ui.js): same token, same 401 handling.
+  window.anywhereApi = (method, path, body, opts) => api(method, path, body, opts);
   window.anywhereFocusInput = () => {
     try {
       window.focus();

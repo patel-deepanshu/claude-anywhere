@@ -248,6 +248,16 @@ function isCriticalApproval(req) {
 }
 
 /**
+ * Cards that only a click in the dialog window can allow: answering calls (CALLS-DESIGN §1.3(d)). The
+ * CallManager refuses any other way of allowing them, so the terminal only offers to deny.
+ */
+function isClickOnlyApproval(req) {
+  return /(^|__)calls_arm$/.test(String((req && req.toolName) || ''));
+}
+
+const CLICK_ONLY_HINT = 'Click Allow once in the Claude Anywhere dialog window to allow this; it cannot be allowed here. n denies.';
+
+/**
  * Approval card. With `withHint` the "[y]es / [a]lways / [n]o" line is included (non-TTY;
  * in a TTY the readline prompt shows it). A critical card always says how to allow it.
  */
@@ -270,7 +280,8 @@ function renderApproval(req, t = PLAIN_THEME, { withHint = true } = {}) {
     for (const l of clip(String(summary), 600, s).split(/\r?\n/).slice(0, 8)) lines.push(`  ${l}`);
   }
   if (r.reason) lines.push(c.dim(`  Why: ${r.reason}`));
-  if (risk === 'critical') lines.push(`  ${c.yellow('Critical action: type allow (the whole word) to allow it once; y and voice are not enough. n denies.')}`);
+  if (isClickOnlyApproval(r)) lines.push(`  ${c.yellow(CLICK_ONLY_HINT)}`);
+  else if (risk === 'critical') lines.push(`  ${c.yellow('Critical action: type allow (the whole word) to allow it once; y and voice are not enough. n denies.')}`);
   else {
     // "always" adds the card's session rule: say what it covers, or that there is none (null).
     if (typeof r.sessionRule === 'string' && r.sessionRule) lines.push(c.dim(`  Always (session) allows ${r.sessionRule}`));
@@ -713,7 +724,7 @@ class Tui {
     if (this.recording) return `${c.red(s.rec)} recording${s.ellipsis} press Enter to stop `;
     const head = this.prompts[0];
     if (head && head.kind === 'approval') {
-      const hint = isCriticalApproval(head.data) ? 'critical: type allow / [n]o' : head.data && head.data.sessionRule === null ? '[y]es / [n]o' : '[y]es / [a]lways / [n]o';
+      const hint = isClickOnlyApproval(head.data) ? 'click Allow once in the dialog / [n]o' : isCriticalApproval(head.data) ? 'critical: type allow / [n]o' : head.data && head.data.sessionRule === null ? '[y]es / [n]o' : '[y]es / [a]lways / [n]o';
       return `${c.yellow(hint)} ${s.arrow} `;
     }
     if (head && head.kind === 'question') return `${c.cyan('answer')} ${s.arrow} `;
@@ -1119,7 +1130,9 @@ class Tui {
         return;
       }
       // "always" adds the card's session rule; without one it would only allow once.
-      const refused = critical
+      const refused = isClickOnlyApproval(head.data) && ans.decision !== 'deny'
+        ? CLICK_ONLY_HINT
+        : critical
         ? criticalRefusal(ans, text, via)
         : ans.decision === 'allow_session' && head.data && head.data.sessionRule === null
           ? 'This action always asks: no session rule covers it. Answer y to allow it once, or n to deny.'
@@ -1686,6 +1699,7 @@ module.exports = {
   renderHelp,
   parseApprovalAnswer,
   criticalRefusal,
+  isClickOnlyApproval,
   parseQuestionAnswer,
   parseSlash,
   pickRecorder,

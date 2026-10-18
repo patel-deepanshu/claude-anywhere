@@ -3912,6 +3912,7 @@ function classifyArgv(u, tk, ctx, raw) {
   const extra = { stdinExecutor: false, downloader: DOWNLOADERS.has(prog), cwd: undefined };
   if (v && v.stdinExecutor) extra.stdinExecutor = true;
   if (v && v.cwd !== undefined) extra.cwd = v.cwd;
+  const ownCard = Boolean(v && v.ownCard);
   v = V(v.risk, v.reason);
   // .NET and COM calls hide behind expressions and cmdlets that look harmless (CLASSIFIER-R3-08/09).
   if (ctx.shell === 'powershell') v = maxVerdict(v, psExpressionVerdict(raw, tk, ctx));
@@ -3976,6 +3977,12 @@ function classifyArgv(u, tk, ctx, raw) {
         if (cred) v = maxVerdict(v, V('high', `May send ${cred.what} over the network`));
       }
     }
+  }
+  // The daemon's own feature routes, called directly (CALLS-DESIGN §13.4): deleting the voice is high, and
+  // arming calls is critical (the route still raises its own click-only card).
+  if (NETWORK_PROGS.has(prog) || NETWORK_PROGS.has(psProg)) {
+    if (args.some((a) => /\/api\/calls\/arm\b/i.test(a))) v = maxVerdict(v, V('critical', CALLS_ARM_REASON));
+    else if (args.some((a) => /\/api\/clone\/delete\b/i.test(a))) v = maxVerdict(v, V('high', 'Deletes your cloned voice'));
   }
   // Reading credential stores is not harmless, whatever program prints them (CLASSIFIER-R3-04),
   // and neither is a credential file fed on stdin (CLASSIFIER-R3-02).
@@ -4055,6 +4062,8 @@ function classifyArgv(u, tk, ctx, raw) {
       v = V('high', `Forced ${psVerb} without confirmation (${prog})`);
     }
   }
+  // `anywhere calls on` keeps its own-card mark only while nothing else (sudo, a redirect) raised the verdict.
+  if (ownCard && v.risk === 'critical' && v.reason === CALLS_ARM_REASON) extra.ownCard = true;
   return { ...v, ...extra };
 }
 
@@ -4525,6 +4534,8 @@ function baseVerdict(prog, args, u, tk, ctx, raw) {
     if (w[0] === 'config' && ['set', 'reset', 'unset'].includes(w[1]))
       return V('critical', 'Changes Claude Anywhere settings (self-escalation)');
     if (['install', 'uninstall'].includes(w[0])) return V('high', `Runs anywhere ${w[0]}`);
+    const callsCli = anywhereCallsCliVerdict(w);
+    if (callsCli) return callsCli;
     if (w[0] === 'computer') {
       const op = w[1] || '';
       if (op === 'type') return anywhereToolVerdict('type_text', { text: w.slice(2).join(' ') }, ctx);
@@ -5502,6 +5513,7 @@ function classifyShellCommand(command, shell, ctx) {
         (Boolean(u.sudo) && u.argv.length === 0),
       downloader: Boolean(r.downloader),
       decoder: isDecoder(progName(u.argv[0] || ''), u.argv.slice(1)),
+      ownCard: Boolean(r.ownCard),
       part,
       u,
     });
@@ -5655,10 +5667,13 @@ function classifyShellCommand(command, shell, ctx) {
   if (!best) return { risk: 'low', reason: 'Empty command', parts: [] };
   let reason = best.reason;
   if (results.length > 1 && best.risk !== 'low') reason = `${reason} — in: ${truncate(oneLine(best.command), 80)}`;
+  // `anywhere calls on` asks on its own click-only card; only when nothing else in the command needs one.
+  const ownCard = best.ownCard && best.risk === 'critical' && results.every((r) => r.ownCard || r.risk === 'low');
   return {
     risk: best.risk,
     reason,
     parts: results.map((r) => ({ command: r.command, normalized: r.normalized, risk: r.risk, reason: r.reason })),
+    ...(ownCard ? { ownCard: true } : {}),
   };
 }
 
@@ -5931,9 +5946,51 @@ function anywhereToolVerdict(tool, input, ctx) {
   }
   const ticket = ticketToolVerdict(tool, input, ctx);
   if (ticket) return ticket;
+  const calls = callsToolVerdict(tool);
+  if (calls) return calls;
   if (ANYWHERE_LOW.has(tool)) return V('low', 'Reads the screen or talks to the user');
   if (ANYWHERE_MEDIUM.has(tool)) return V('medium', 'Controls the mouse, keyboard or windows');
   return V('medium', `Runs ${tool}`);
+}
+
+// Feature 3 (docs/CALLS-DESIGN.md §1.3(d), §13.4). Arming calls is CRITICAL and click-only, and the
+// card that asks is raised by POST /api/calls/arm itself (CallManager, through requestCritical) in every
+// permission mode. The tool call that leads to it is therefore marked ownCard: decide() lets it reach that
+// card instead of showing a second critical card first (the user would have to click twice).
+const CALLS_ARM_REASON = 'Answer phone calls for you with your voice';
+
+/** @returns {{risk:string, reason:string, ownCard?:boolean}|null} null: not a calls or clone-voice tool */
+function callsToolVerdict(tool) {
+  if (tool === 'calls_arm') return { ...V('critical', CALLS_ARM_REASON), ownCard: true, sensitive: true };
+  if (tool === 'calls_disarm') return V('low', 'Stops answering your calls');
+  if (tool === 'calls_status' || tool === 'clone_voice_status') return V('low', 'Reads the status of call answering or the voice clone');
+  if (tool === 'clone_voice_open') return V('low', 'Opens the voice enrollment in the Claude Anywhere dialog');
+  // The call engine's own tools are never run by the companion session; a stray one asks.
+  if (/^call_/.test(tool)) return V('high', 'A tool for the call assistant only');
+  return null;
+}
+
+/** `anywhere calls …` / `anywhere clone-voice …` (w: the words after the program, without flags). */
+function anywhereCallsCliVerdict(w) {
+  if (w[0] === 'calls') {
+    const sub = w[1] || 'status';
+    if (sub === 'on') return { ...V('critical', CALLS_ARM_REASON), ownCard: true };
+    if (['off', 'status', 'doctor', 'notes', 'help'].includes(sub)) return V('low', 'Claude Anywhere command');
+    if (sub === 'cliq') return V('medium', 'Sets up Zoho Cliq messages for calls');
+    if (sub === 'audio') return w[2] === 'check' ? V('low', 'Claude Anywhere command') : V('medium', 'Changes the call audio devices');
+    if (sub === 'learn') return V('medium', 'Watches the screen to learn how a call rings');
+    if (sub === 'test-audio') return V('medium', 'Runs the call audio self-test');
+    return V('medium', `Runs anywhere calls ${sub}`);
+  }
+  if (w[0] === 'clone-voice') {
+    const sub = w[1] || 'start';
+    if (sub === 'delete') return V('high', 'Deletes your cloned voice');
+    if (sub === 'install') return V('medium', 'Downloads the free voice runtime and models (about 425 MB)');
+    if (sub === 'bench') return V('medium', 'Benchmarks the voice engines (uses the CPU for a minute)');
+    if (['start', 'status', 'test', 'help'].includes(sub)) return V('low', 'Claude Anywhere command');
+    return V('medium', `Runs anywhere clone-voice ${sub}`);
+  }
+  return null;
 }
 
 // The ticket workflow's tools (tools-browser, tools-jira, tools-project). Reads are low; Jira writes
@@ -6103,6 +6160,19 @@ function anywhereSummary(tool, input, ctx) {
       return `Notify: ${truncate(oneLine(i.message), 80)}`;
     case 'ask_user':
       return `Ask: ${truncate(oneLine(i.question), 80)}`;
+    case 'calls_arm': {
+      const mins = Number(i.minutes);
+      const apps = Array.isArray(i.apps) ? i.apps.filter((a) => typeof a === 'string').slice(0, 6).join(', ') : '';
+      return `Answer your calls${Number.isFinite(mins) && mins > 0 ? ` for ${Math.round(mins)} min` : ''}${apps ? ` (${truncate(apps, 60)})` : ''}`;
+    }
+    case 'calls_disarm':
+      return 'Stop answering your calls';
+    case 'calls_status':
+      return 'Read the call-answering status';
+    case 'clone_voice_status':
+      return 'Read the voice clone status';
+    case 'clone_voice_open':
+      return 'Open the voice enrollment';
     default:
       return humanize(tool);
   }
@@ -6217,6 +6287,11 @@ function displayName(name) {
     jira_assign: 'Assign Jira issue',
     jira_comment: 'Comment on Jira issue',
     jira_find_user: 'Find Jira user',
+    calls_arm: 'Answer my calls',
+    calls_disarm: 'Stop answering calls',
+    calls_status: 'Calls status',
+    clone_voice_status: 'Voice clone status',
+    clone_voice_open: 'Clone my voice',
   };
   const m = /^mcp__(.+?)__(.+)$/.exec(n);
   if (m) {
@@ -6247,7 +6322,9 @@ function classify(toolName, input, opts = {}) {
     // A risky command's card shows all of it (a cut-off `--allow-unauthenticated` is how a
     // service goes public unnoticed, HEADLINE-SCENARIO-6), with secret-looking values masked.
     const limit = RANK[r.risk] >= RANK.high ? 300 : 120;
-    return { risk: r.risk, reason: r.reason, summary: `Run: ${truncate(redactSecrets(oneLine(command)), limit)}`, parts: r.parts };
+    const out = { risk: r.risk, reason: r.reason, summary: `Run: ${truncate(redactSecrets(oneLine(command)), limit)}`, parts: r.parts };
+    if (r.ownCard) out.ownCard = true;
+    return out;
   }
 
   if (FILE_EDIT_TOOLS.has(name)) {
@@ -6326,7 +6403,10 @@ function classify(toolName, input, opts = {}) {
     const [, server, tool] = m;
     if (server === 'anywhere' || /(^|_)anywhere$/.test(server)) {
       const v = anywhereToolVerdict(tool, inp, ctx);
-      return { risk: v.risk, reason: v.reason, summary: anywhereSummary(tool, inp, ctx) };
+      const out = { risk: v.risk, reason: v.reason, summary: anywhereSummary(tool, inp, ctx) };
+      if (v.ownCard) out.ownCard = true;
+      if (v.sensitive) out.sensitive = true;
+      return out;
     }
     if (TRACKER_SERVER_RE.test(server)) {
       const v = trackerServerVerdict(tool);
@@ -6708,6 +6788,9 @@ class PermissionBroker extends EventEmitter {
    * @returns {{allow:boolean, rule?:string, why:string}}
    */
   decide(toolName, input, cls) {
+    // Arming calls: the click-only critical card is raised by the arm route itself (CallManager), in every
+    // mode, so the tool call goes on to that card rather than a second one (CALLS-DESIGN §13.4).
+    if (cls.ownCard && cls.risk === 'critical') return { allow: true, why: 'it asks on its own click-only card' };
     if (cls.risk === 'critical') return { allow: false, why: 'critical' };
     const opts = this.ctxOpts();
     const ask = this.rulesOf('alwaysAsk').find((r) => matchRule(r, toolName, input, { ...opts, any: true }));
@@ -6783,6 +6866,25 @@ class PermissionBroker extends EventEmitter {
       return { behavior: 'allow', updatedInput: inp };
     }
     return this.prompt(toolName, inp, cls, toolUseId, d.why);
+  }
+
+  /**
+   * Raise a critical card that is not tied to an engine tool call, and wait for it. CallManager arms
+   * calls with it (CALLS-DESIGN §1.3(d)): the card has no "Always" rule, and resolve() refuses an allow
+   * by voice or key. The 'decision' event of the answer carries `via` and this toolUseId.
+   * @param {{toolName:string, input?:object, reason?:string, summary?:string, toolUseId?:string}} req
+   * @returns {Promise<{behavior:'allow', updatedInput:object}|{behavior:'deny', message:string}>}
+   */
+  requestCritical({ toolName, input, reason, summary, toolUseId } = {}) {
+    const name = str(toolName) || 'critical_action';
+    const inp = isPlainObject(input) ? input : {};
+    const cls = {
+      risk: 'critical',
+      reason: str(reason) || 'Needs your click',
+      summary: truncate(oneLine(str(summary)), 600) || displayName(name),
+      sensitive: true,
+    };
+    return this.prompt(name, inp, cls, toolUseId, 'needs a click');
   }
 
   /** @private */

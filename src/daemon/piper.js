@@ -779,6 +779,59 @@ class TtsCache {
   }
 }
 
+// ------------------------------------------------------------------ Python probe
+
+/**
+ * Find a Python interpreter with a working `venv` module, for a private venv (the user's own
+ * packages are never touched). Order: `preferred`, ANYWHERE_PYTHON, `py -3` (Windows), python3,
+ * python. Skips the macOS /usr/bin/python3 stub when the Command Line Tools are missing (it would
+ * open an install dialog) and the Windows Store alias in WindowsApps. Shared by Piper and the
+ * cloned-voice installer (src/voice/clone/installer.js).
+ * @param {{env?:object, which?:(n:string)=>string|null, runner?:Function, platform?:string,
+ *   preferred?:Array<[string, string[]]>, min?:[number, number], max?:[number, number]|null}} [opts]
+ *   min/max: the accepted version range (inclusive), default 3.9 and no maximum.
+ * @returns {Promise<{cmd:string, args:string[], version:string}|null>}
+ */
+async function findPython({ env = process.env, which = proc.which, runner = defaultRunner, platform = process.platform, preferred = [], min = [3, 9], max = null } = {}) {
+  const candidates = [];
+  const seen = new Set();
+  const add = (cmd, args = []) => {
+    const key = `${cmd}\u0000${args.join(' ')}`;
+    if (!cmd || seen.has(key)) return;
+    seen.add(key);
+    candidates.push([cmd, args]);
+  };
+  for (const [cmd, args] of preferred) add(String(cmd || '').trim(), args || []);
+  const fromEnv = String(env.ANYWHERE_PYTHON || '').trim();
+  if (fromEnv) add(fromEnv, []);
+  if (platform === 'win32') {
+    const py = which('py');
+    if (py) add(py, ['-3']);
+  }
+  for (const name of ['python3', 'python']) {
+    const p = which(name);
+    if (!p) continue;
+    // macOS: /usr/bin/python3 without the Command Line Tools opens an install dialog.
+    if (platform === 'darwin' && p === '/usr/bin/python3') {
+      const clt = await runner('/usr/bin/xcode-select', ['-p'], { timeoutMs: 5000 });
+      if (clt.code !== 0) continue;
+    }
+    // Windows: the Microsoft Store alias in WindowsApps is a stub.
+    if (platform === 'win32' && /\\WindowsApps\\/i.test(p)) continue;
+    add(p, []);
+  }
+  const cmp = (a, b) => (a[0] - b[0]) || (a[1] - b[1]);
+  for (const [cmd, pre] of candidates) {
+    const r = await runner(cmd, [...pre, '-c', 'import sys, venv; print("%d.%d" % sys.version_info[:2])'], { timeoutMs: 15000 });
+    const m = /^(\d+)\.(\d+)/.exec(String(r.stdout || '').trim());
+    if (r.error || r.code !== 0 || !m) continue;
+    const v = [Number(m[1]), Number(m[2])];
+    if (cmp(v, min) < 0 || (max && cmp(v, max) > 0)) continue;
+    return { cmd, args: pre, version: `${v[0]}.${v[1]}` };
+  }
+  return null;
+}
+
 // ------------------------------------------------------------------ Piper manager
 
 /**
@@ -1276,32 +1329,7 @@ class PiperManager {
    * @returns {Promise<{cmd:string, args:string[], version:string}|null>}
    */
   async findPython() {
-    const pi = this.platformInfo();
-    const candidates = [];
-    const fromEnv = String(this.env.ANYWHERE_PYTHON || '').trim();
-    if (fromEnv) candidates.push([fromEnv, []]);
-    if (pi.platform === 'win32') {
-      const py = this.which('py');
-      if (py) candidates.push([py, ['-3']]);
-    }
-    for (const name of ['python3', 'python']) {
-      const p = this.which(name);
-      if (!p) continue;
-      // macOS: /usr/bin/python3 without the Command Line Tools opens an install dialog.
-      if (pi.platform === 'darwin' && p === '/usr/bin/python3') {
-        const clt = await this.runner('/usr/bin/xcode-select', ['-p'], { timeoutMs: 5000 });
-        if (clt.code !== 0) continue;
-      }
-      // Windows: the Microsoft Store alias in WindowsApps is a stub.
-      if (pi.platform === 'win32' && /\\WindowsApps\\/i.test(p)) continue;
-      candidates.push([p, []]);
-    }
-    for (const [cmd, pre] of candidates) {
-      const r = await this.runner(cmd, [...pre, '-c', 'import sys, venv; print("%d.%d" % sys.version_info[:2])'], { timeoutMs: 15000 });
-      const m = /^(\d+)\.(\d+)/.exec(String(r.stdout || '').trim());
-      if (!r.error && r.code === 0 && m && (Number(m[1]) > 3 || (Number(m[1]) === 3 && Number(m[2]) >= 9))) return { cmd, args: pre, version: `${m[1]}.${m[2]}` };
-    }
-    return null;
+    return findPython({ env: this.env, which: this.which, runner: this.runner, platform: this.platformInfo().platform });
   }
 
   /**
@@ -1499,4 +1527,5 @@ module.exports = {
   downloadFile,
   checkVoiceConfig,
   defaultRunner,
+  findPython,
 };

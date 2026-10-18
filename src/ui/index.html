@@ -9,6 +9,7 @@
   <link rel="icon" type="image/svg+xml" href="icon.svg">
   <link rel="stylesheet" href="app.css">
   <script type="module" src="app.js"></script>
+  <script type="module" src="calls-ui.js"></script>
 </head>
 <body>
   <svg class="sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
@@ -275,6 +276,20 @@
               <button type="button" class="btn btn-sm" id="voice-test"><svg class="icon icon-xs" aria-hidden="true"><use href="#i-play"/></svg>Test voice</button>
             </div>
             <p class="set-help" id="piper-help"></p>
+          </section>
+
+          <section class="voice-card" id="clone-card" aria-labelledby="clone-title">
+            <div class="voice-card-head">
+              <span class="voice-card-icon" aria-hidden="true"><svg class="icon icon-sm"><use href="#i-mic"/></svg></span>
+              <span class="voice-card-text">
+                <span class="voice-card-title" id="clone-title">Your own voice</span>
+                <span class="voice-card-sub">For answering calls · recorded with your consent, stays on this computer</span>
+              </span>
+            </div>
+            <div class="set-actions">
+              <button type="button" class="btn btn-sm" id="clone-open"><svg class="icon icon-xs" aria-hidden="true"><use href="#i-mic"/></svg>Clone my voice</button>
+              <button type="button" class="btn btn-sm" id="calls-open">Answering calls…</button>
+            </div>
           </section>
 
           <div class="set-sub" id="announce-label">Announce</div>

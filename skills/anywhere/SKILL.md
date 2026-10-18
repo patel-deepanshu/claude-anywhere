@@ -152,7 +152,14 @@ OpenAI key or whisper.cpp (browser speech does not work there). It downloads abo
 the Bash tool's `timeout` set to `600000`, and report the result. Offer `run.js voice install` too when
 the Voice line says the natural voice is not installed (free and offline, about 80 MB; same timeout).
 
-## 6. Anything else: a task for the dialog
+## 6. `clone-voice …` and calls ("answer my calls…", "stop answering calls")
+
+Use the Bash `timeout` 600000 for these. Relay the output in 2–3 lines.
+- `clone-voice [start|install|status|test|bench|delete]` (empty → `start`; `delete` only when the user wrote it): `node "${CLAUDE_SKILL_DIR}/run.js" clone-voice <their words>`. For `start`: the enrollment opened in the dialog, takes about 3 minutes, the voice stays on this computer, and `/anywhere clone-voice delete` removes it.
+- Only when the user asked in their own words for their calls to be answered ("if anyone calls me on this laptop, answer and assist"): `node "${CLAUDE_SKILL_DIR}/run.js" calls on --instructions "<their words>"` (add `--for 2h` or `--until 18:00` only when they named a time). It waits for their click on Allow once in the dialog. Exit 0: say until when, that the assistant says it is an AI and writes notes to the Desktop, and that `/anywhere calls off` stops it; exit 5: not allowed; exit 2: nobody clicked; exit 1: relay the printed reason and fix (e.g. `anywhere clone-voice install`).
+- "Stop answering calls": `node "${CLAUDE_SKILL_DIR}/run.js" calls off`. `calls status`, `calls doctor` and `calls notes` run the same way.
+
+## 7. Anything else: a task for the dialog
 
 1. Start (or reuse) the dialog for this project:
    ```bash
@@ -173,27 +180,12 @@ the Voice line says the natural voice is not installed (free and offline, about 
 
 ## Troubleshooting
 
-- **`node` not found or too old** (needs 18.17+): macOS `brew install node`; Windows
-  `winget install OpenJS.NodeJS.LTS`; Linux: the distro package or `nvm install --lts`. Then retry.
-- **"Claude Anywhere is not installed where this skill can find it"**: follow the printed install
-  commands, or from a clone run `node bin/anywhere.js install`.
-- **Claude CLI not found** (the dialog's session cannot start): find it with `which claude`
-  (Windows: `where claude`), then
-  `node "${CLAUDE_SKILL_DIR}/run.js" config set engine.claudePath "<that path>"` and
-  `node "${CLAUDE_SKILL_DIR}/run.js" restart`.
-- **macOS**: screen and input control need **Accessibility** and **Screen Recording** for the app
-  that runs Claude Code (Terminal, iTerm, VS Code…): System Settings → Privacy & Security. Quit and
-  reopen that app after granting. `doctor` prints the exact panes.
-- **Linux**: X11 needs `xdotool wmctrl xclip imagemagick` (Debian/Ubuntu:
-  `sudo apt install xdotool wmctrl xclip imagemagick x11-xserver-utils`). Wayland needs `ydotool`
-  >= 1.0 with `ydotoold` running (Debian 12 and Ubuntu up to 24.04 ship 0.1.8, which is not
-  supported; build 1.x from github.com/ReimuNotMoe/ydotool), plus `grim` or `gnome-screenshot` and
-  `wl-clipboard`. Without a display (SSH) the user runs the terminal dialog in a terminal of their
-  own: give them the `tui` command that `start` or `doctor` printed (it needs an interactive
-  terminal, so do not run it yourself).
-- **Windows / WSL**: works with built-in PowerShell; elevated (admin) windows can only be controlled
-  when Claude Code itself runs elevated.
+- **`node` not found or too old** (needs 18.17+): macOS `brew install node`; Windows `winget install OpenJS.NodeJS.LTS`; Linux: the distro package or `nvm install --lts`. Then retry.
+- **"Claude Anywhere is not installed where this skill can find it"**: follow the printed install commands, or from a clone run `node bin/anywhere.js install`.
+- **Claude CLI not found** (the dialog's session cannot start): find it with `which claude` (Windows: `where claude`), then `node "${CLAUDE_SKILL_DIR}/run.js" config set engine.claudePath "<that path>"` and `node "${CLAUDE_SKILL_DIR}/run.js" restart`.
+- **macOS**: screen and input control need **Accessibility** and **Screen Recording** for the app that runs Claude Code (Terminal, iTerm, VS Code…): System Settings → Privacy & Security. Quit and reopen that app after granting. `doctor` prints the exact panes.
+- **Linux**: X11 needs `xdotool wmctrl xclip imagemagick` (Debian/Ubuntu: `sudo apt install xdotool wmctrl xclip imagemagick x11-xserver-utils`). Wayland needs `ydotool` >= 1.0 with `ydotoold` running (Debian 12 and Ubuntu up to 24.04 ship 0.1.8, which is not supported; build 1.x from github.com/ReimuNotMoe/ydotool), plus `grim` or `gnome-screenshot` and `wl-clipboard`. Without a display (SSH) the user runs the terminal dialog in a terminal of their own: give them the `tui` command that `start` or `doctor` printed (it needs an interactive terminal, so do not run it yourself).
+- **Windows / WSL**: works with built-in PowerShell; elevated (admin) windows can only be controlled when Claude Code itself runs elevated.
 - **No window appeared**: `run.js show`, or open the URL from `run.js url` in a browser.
-- **Reading a screenshot asks for permission**: the skill may read `~/.claude-anywhere/run/` only. With a
-  custom `ANYWHERE_HOME`, the user approves the read once or adds a `Read(<that folder>/run/**)` allow rule.
+- **Reading a screenshot asks for permission**: the skill may read `~/.claude-anywhere/run/` only. With a custom `ANYWHERE_HOME`, the user approves the read once or adds a `Read(<that folder>/run/**)` allow rule.
 - **Anything else**: `run.js logs -n 80` shows the daemon log; `run.js doctor` checks everything.
