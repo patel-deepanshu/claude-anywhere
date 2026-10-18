@@ -171,4 +171,36 @@ function quoteWinArg(arg) {
   return `"${s.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1').replace(/%/g, '"%"')}"`;
 }
 
-module.exports = { run, which, clearWhichCache, spawnDetached, quoteWinArg };
+/**
+ * Plain text from Windows PowerShell's stderr. Windows PowerShell 5.1 serializes the error stream as
+ * CLIXML ("#< CLIXML" then <Objs><S S="Error">...</S></Objs>, CR/LF written as _x000D__x000A_) when
+ * it runs -EncodedCommand with redirected output, so a message built from stderr would show XML (and
+ * a tail of it only the closing tags). Returns the error and warning lines; text that is not CLIXML
+ * comes back unchanged.
+ * @param {string} stderr
+ * @returns {string}
+ */
+function psErrorText(stderr) {
+  const s = String(stderr == null ? '' : stderr);
+  const at = s.indexOf('#< CLIXML');
+  if (at < 0) return s;
+  const parts = [];
+  const re = /<S S="(?:Error|Warning)">([\s\S]*?)<\/S>/gi;
+  let m;
+  while ((m = re.exec(s))) parts.push(m[1]);
+  const text = parts
+    .join('')
+    .replace(/_x([0-9A-Fa-f]{4})_/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+  return `${s.slice(0, at)}${text}`
+    .split(/\r?\n/)
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim())
+    .join('\n');
+}
+
+module.exports = { run, which, clearWhichCache, spawnDetached, quoteWinArg, psErrorText };

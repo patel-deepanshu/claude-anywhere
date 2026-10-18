@@ -1160,7 +1160,7 @@ class UiHost {
       return { ok: false, reason: 'no Chrome, Edge or Brave found on the Windows side (Microsoft Edge ships with Windows)' };
     }
     const errLine = (/ANYWHERE_ERROR ([^\r\n]+)/.exec(out) || [])[1];
-    const why = errLine || (r.error && r.error.message) || String(r.stderr || '').trim().split(/\r?\n/)[0] || (r.timedOut ? 'timed out' : `exit code ${r.code}`);
+    const why = errLine || (r.error && r.error.message) || proc.psErrorText(r.stderr).trim().split(/\r?\n/)[0] || (r.timedOut ? 'timed out' : `exit code ${r.code}`);
     return { ok: false, reason: `powershell.exe could not open a Windows browser: ${why}` };
   }
 

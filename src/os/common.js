@@ -175,7 +175,9 @@ function lastJsonLine(stdout) {
 
 async function runPs(info, script, { timeoutMs = 20000, input } = {}) {
   const ps = requirePowershell(info);
-  return R.run(ps, psArgs(`${PS_PRELUDE}\n${script}`), { timeoutMs, input, cwd: psCwd(info) });
+  const res = await R.run(ps, psArgs(`${PS_PRELUDE}\n${script}`), { timeoutMs, input, cwd: psCwd(info) });
+  // Windows PowerShell writes the errors of an -EncodedCommand as CLIXML: keep their plain text.
+  return res && typeof res.stderr === 'string' ? { ...res, stderr: proc.psErrorText(res.stderr) } : res;
 }
 
 /** Quote one argument for CommandLineToArgvW (the C runtime convention). */
@@ -1025,7 +1027,8 @@ async function speak(text, { rate, voice } = {}) {
   }
   const done = new Promise((resolve) => {
     child.once('error', (error) => resolve({ code: null, error }));
-    child.once('exit', (code, signal) => resolve({ code, signal, stderr }));
+    // SAPI runs as a Windows PowerShell -EncodedCommand, whose errors arrive as CLIXML.
+    child.once('exit', (code, signal) => resolve({ code, signal, stderr: plan.engine === 'sapi' ? proc.psErrorText(stderr) : stderr }));
   });
   const entry = { child, engine: plan.engine, winPid: null };
   if (wantWinPid && child.stdout) {
