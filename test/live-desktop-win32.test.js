@@ -836,6 +836,8 @@ $r = [LiveClip]::Read()
       note(t, `VoiceService.speak failed: ${err.message}${err.hint ? ` (${err.hint})` : ''}`);
       assert.doesNotMatch(err.message, /CLIXML|<\/S>|_x000D_/, 'the voice error is plain text');
       if (!/Audio device error|AudioException/i.test(err.message)) throw err;
+      assert.match(err.message, /^sapi failed \(exit \d+\): Exception calling "Speak"/, 'the message starts with the PowerShell error');
+      assert.match(String(err.hint), /audio output device/, 'the hint names the missing audio device');
     }
 
     const common = require('../src/os/common');

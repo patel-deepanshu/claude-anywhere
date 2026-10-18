@@ -842,9 +842,16 @@ class VoiceService {
     }
     if (r.timedOut) return { ok: false, provider: tts.name, error: 'Speaking took too long and was stopped' };
     if (r.code !== 0) {
-      const hint =
-        tts.name === 'sapi' ? 'System.Speech needs Windows PowerShell 5.1 (powershell.exe) with a speech voice installed.' : undefined;
-      throw voiceError(502, `${tts.name} failed (exit ${r.code}): ${tail(r.stderr) || 'no output'}`, hint);
+      let detail = tail(r.stderr);
+      let hint;
+      if (tts.name === 'sapi') {
+        // A PowerShell error is its message followed by "At line:..." position lines: keep the message.
+        detail = tail(String(r.stderr || '').split(/\r?\n\s*At line:\d+/)[0]);
+        hint = /Audio device error|AudioException/i.test(String(r.stderr || ''))
+          ? 'Windows found no working audio output device. Connect or enable speakers or headphones (Settings > System > Sound).'
+          : 'System.Speech needs Windows PowerShell 5.1 (powershell.exe) with a speech voice installed.';
+      }
+      throw voiceError(502, `${tts.name} failed (exit ${r.code}): ${detail || 'no output'}`, hint);
     }
     return { ok: true, provider: tts.name };
   }
