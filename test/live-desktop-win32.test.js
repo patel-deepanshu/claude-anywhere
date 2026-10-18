@@ -121,10 +121,12 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     await driver.keyCombo(['ctrl', 'a']);
     await sleep(150);
     await driver.keyCombo(['ctrl', 'c']);
+    // Notepad's edit control is slow with long lines (each typed character re-lays out the line),
+    // so the copy can come several seconds after the keystrokes were queued.
     const got = await waitFor(async () => {
       const s = await driver.clipboardGet();
       return s !== sentinel ? { s } : null;
-    }, 4000, 150);
+    }, 15000, 150);
     const text = got ? got.s : null;
     note(t, 'Notepad text via ctrl+a, ctrl+c:', text == null ? '(clipboard unchanged: nothing was copied)' : text.length > 300 ? `${text.slice(0, 300)}... (${text.length} chars)` : text);
     return text == null ? null : text.replace(/\r\n/g, '\n');
@@ -190,6 +192,54 @@ public static class LiveDiag {
       windowsHide: true,
     });
     return `${String(r.stdout || '').trim()}${r.stderr ? ` stderr: ${require('../src/shared/proc').psErrorText(r.stderr).slice(0, 800)}` : ''}`;
+  }
+
+  /**
+   * Read the clipboard from another process (not the product's host), waiting at most 1 s to open
+   * it: {text} or {busy, holder} when some program keeps it open.
+   */
+  function externalClipboard() {
+    const script = `
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using System.Threading;
+public static class LiveClip {
+  [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr h);
+  [DllImport("user32.dll")] static extern bool CloseClipboard();
+  [DllImport("user32.dll")] static extern IntPtr GetClipboardData(uint f);
+  [DllImport("user32.dll")] static extern IntPtr GetOpenClipboardWindow();
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("kernel32.dll")] static extern IntPtr GlobalLock(IntPtr m);
+  [DllImport("kernel32.dll")] static extern bool GlobalUnlock(IntPtr m);
+  public static string Read() {
+    for (int i = 0; i < 50; i++) {
+      if (OpenClipboard(IntPtr.Zero)) {
+        try {
+          IntPtr h = GetClipboardData(13);
+          if (h == IntPtr.Zero) return "TEXT:";
+          IntPtr p = GlobalLock(h);
+          try { return "TEXT:" + Marshal.PtrToStringUni(p); } finally { GlobalUnlock(h); }
+        } finally { CloseClipboard(); }
+      }
+      Thread.Sleep(20);
+    }
+    uint pid = 0; IntPtr w = GetOpenClipboardWindow();
+    if (w != IntPtr.Zero) GetWindowThreadProcessId(w, out pid);
+    return "BUSY:" + pid;
+  }
+}
+'@
+$r = [LiveClip]::Read()
+[Console]::Out.WriteLine([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($r)))
+`;
+    const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
+      encoding: 'utf8',
+      timeout: 60000,
+      windowsHide: true,
+    });
+    const out = Buffer.from(String(r.stdout || '').trim(), 'base64').toString('utf8');
+    if (out.startsWith('TEXT:')) return { text: out.slice(5) };
+    if (out.startsWith('BUSY:')) return { busy: true, holderPid: Number(out.slice(5)) };
+    return { error: `${r.stdout || ''} ${require('../src/shared/proc').psErrorText(r.stderr || '')}`.trim() };
   }
 
   /** Type into a cleared Notepad, copy it back and compare. */
@@ -404,6 +454,22 @@ public static class LiveDiag {
     }
     await driver.clipboardSet('');
     assert.equal(await driver.clipboardGet(), '', 'an empty clipboard reads as ""');
+  });
+
+  it('live-desktop: after the host sets the clipboard, a copy in another app does not wait for the host', { timeout: 60000 }, async (t) => {
+    await clearNotepad(t);
+    await driver.typeText('copied-by-notepad-42');
+    await sleep(300);
+    await driver.clipboardSet('set by the host ü'); // the host is the last program that wrote the clipboard
+    await driver.keyCombo(['ctrl', 'a']);
+    await driver.keyCombo(['ctrl', 'c']);
+    // The host is now idle (blocked on stdin). Notepad's copy must finish without its help.
+    await sleep(1500);
+    const ext = externalClipboard();
+    note(t, 'clipboard read by another process:', ext);
+    assert.ok(!ext.busy, `the clipboard is still held open (by pid ${ext.holderPid}): Notepad's copy is waiting for the host`);
+    assert.equal(ext.text, 'copied-by-notepad-42', "Notepad's copy completed while the host was idle");
+    assert.equal(await driver.clipboardGet(), 'copied-by-notepad-42');
   });
 
   it('live-desktop: click into Notepad at a screenshot-space point and type more', { timeout: 60000 }, async (t) => {
