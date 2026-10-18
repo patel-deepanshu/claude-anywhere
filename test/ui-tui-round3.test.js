@@ -452,7 +452,8 @@ test('headless Chromium: a spoken "yes" never allows a critical card; voice deny
   const page = await openPage(chrome, { width: 1024, height: 768 });
   t.after(() => page.close());
   await page.send('Page.addScriptToEvaluateOnNewDocument', { source: FAKE_SPEECH });
-  await page.send('Page.navigate', { url: stub.url });
+  // Opened like Claude Anywhere opens its dialog window: a launch code that also gives the dialog credential.
+  await page.send('Page.navigate', { url: stub.launchUrl });
   assert.ok(await waitFor(page, `document.getElementById('mic')?.dataset.phase === 'wake'`), 'hands-free listens for the wake word');
 
   const card = (id, risk, summary) => ({ id, toolName: 'Bash', displayName: 'Run command', summary, input: { command: summary }, risk, reason: risk === 'critical' ? 'Writes to the Claude Anywhere settings (self-escalation)' : '', ts: new Date().toISOString(), timeoutSec: 600 });
@@ -492,6 +493,8 @@ test('headless Chromium: a spoken "yes" never allows a critical card; voice deny
   await page.evaluate(`document.querySelector('.card.approval[data-id="ap_crit2"] .btn-primary').click()`);
   assert.ok(await until(() => stub.state.decisions.length === 3), 'the click decided it');
   assert.deepEqual(stub.state.approvalBodies[2], { id: 'ap_crit2', decision: 'allow', via: 'click' });
+  assert.equal(stub.state.approvalHeaders[2].ui, stub.uiKey, 'the click carries the dialog credential (F3-SAFE-D1)');
+  assert.equal(stub.state.approvalHeaders[2].origin, `http://127.0.0.1:${stub.port}`);
   assert.deepEqual(stub.state.commands, [], 'no spoken phrase was sent to Claude as a request');
   assert.deepEqual(page.problems, [], page.problems.join('\n'));
 });

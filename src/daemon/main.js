@@ -651,6 +651,9 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
   }
   const instanceId = uuid();
   const token = randomToken();
+  // F3-SAFE-D1: the engines' MCP servers (written into run files an engine can read) get their own
+  // token, which cannot answer approval cards or questions, change settings or modes, or shut down.
+  const engineToken = randomToken();
   const startedAt = nowIso();
 
   // ---- optional modules
@@ -940,6 +943,7 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     getDriver,
     config,
     token,
+    engineToken,
     instanceId,
     version,
     applyConfig,
@@ -972,7 +976,7 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     questions,
     bridge,
     port: boundPort,
-    token,
+    token: engineToken,
     projectDir,
     mode: daemonMode,
     instanceId,

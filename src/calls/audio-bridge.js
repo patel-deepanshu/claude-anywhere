@@ -585,6 +585,9 @@ class AudioBridge extends EventEmitter {
     this._following = false;
     this._mode = null;
     this._lastCheck = null;
+    // F3-SAFE-F1: who holds the audio route ('call', 'selftest'): release() undoes the routing only when
+    // the last holder lets go, so a self-test ending cannot pull the route out from under a call.
+    this._owners = new Set();
     this.state = this._readState() || null;
     if (this.state && this.state.pid !== this.pid) this.state = null; // someone else's (restoreFromCrash handles it)
   }
@@ -937,7 +940,7 @@ class AudioBridge extends EventEmitter {
    * @param {{browserApp?:string}} [opts] the call app's browser/app key (chrome, brave, edge, firefox, teams, zoom ...); empty = any
    * @returns {Promise<{ok:true, mode:string, capture:object, playback:object, halfDuplex:boolean, startParams:object, moved?:object}>}
    */
-  async engage({ browserApp = '' } = {}) {
+  async engage({ browserApp = '', owner = 'call' } = {}) {
     await this._crashCheck();
     if (!this._mode) await this.check();
     if (this.platform === 'linux' && this._mode === 'virtual') await this.setup();
@@ -947,7 +950,9 @@ class AudioBridge extends EventEmitter {
       else if (this.platform === 'linux') r = await this._engageLinux(browserApp);
       else if (this.platform === 'win32') r = await this._engageWin();
       else r = await this._engageMac(browserApp);
-      this._browserApp = browserApp;
+      // A call's app wins over a self-test's "any browser".
+      if (owner === 'call' || !this._owners.has('call')) this._browserApp = browserApp;
+      this._owners.add(String(owner || 'call'));
       r.startParams = this.startParams();
       this.emit('engaged', { mode: this._mode, platform: this.platform });
       return r;
@@ -1138,10 +1143,23 @@ class AudioBridge extends EventEmitter {
     };
   }
 
-  /** Undo engage(): the user's microphone is the default again and the streams are back where they were. */
-  async release() {
-    this._stopFollowing();
-    return this._serial(() => this._release());
+  /**
+   * Undo engage() for one holder ('call' by default): when no other holder is left, the user's
+   * microphone is the default again and the streams are back where they were.
+   * @param {{owner?:string}} [opts]
+   */
+  async release({ owner = 'call' } = {}) {
+    return this._serial(() => {
+      this._owners.delete(String(owner || 'call'));
+      if (this._owners.size) return { ok: true, restored: false, keptFor: [...this._owners] };
+      this._stopFollowing();
+      return this._release();
+    });
+  }
+
+  /** Who holds the audio route now ('call', 'selftest'). */
+  holders() {
+    return [...this._owners];
   }
 
   async _release() {
@@ -1248,6 +1266,7 @@ class AudioBridge extends EventEmitter {
   async teardown() {
     this._stopFollowing();
     return this._serial(async () => {
+      this._owners.clear();
       const out = await this._release();
       const st = this.state;
       if (st && st.pulse && this.platform === 'linux') await this._unloadModules(st.pulse, out);
@@ -1530,7 +1549,7 @@ class AudioSelfTest extends EventEmitter {
     for (const [id, test] of this.tests) {
       if (test.expiresAt <= t) {
         this.tests.delete(id);
-        if (test.engaged) this.bridge.release().catch(() => {});
+        if (test.engaged) this.bridge.release({ owner: 'selftest' }).catch(() => {});
       }
     }
   }
@@ -1641,7 +1660,7 @@ class AudioSelfTest extends EventEmitter {
     // Route first: the page's getUserMedia must open the virtual mic, and its audio must reach our capture.
     let engaged = null;
     try {
-      engaged = await this.bridge.engage({ browserApp: '' });
+      engaged = await this.bridge.engage({ browserApp: '', owner: 'selftest' });
       test.engaged = true;
     } catch (err) {
       test.result.error = { code: err.code, message: err.message, hint: err.hint };
@@ -1733,7 +1752,7 @@ class AudioSelfTest extends EventEmitter {
     if (test.engaged) {
       test.engaged = false;
       try {
-        released = await this.bridge.release();
+        released = await this.bridge.release({ owner: 'selftest' });
       } catch (err) {
         released = { ok: false, error: err.message };
       }

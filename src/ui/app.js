@@ -203,6 +203,7 @@ async function copyText(text) {
 
 const state = {
   token: '',
+  uiKey: '',
   themeOverride: null,
   connected: false,
   everConnected: false,
@@ -283,6 +284,28 @@ function storedToken() {
 }
 
 /**
+ * The dialog window's own credential (F3-SAFE-D1): only a launch code minted for a dialog window
+ * gives one, and it is never written to a file. The daemon believes a click on a card (and allows
+ * critical cards) only from requests that carry it. Kept in this tab's sessionStorage for reloads.
+ */
+function rememberUiKey(key) {
+  state.uiKey = key;
+  try {
+    window.sessionStorage.setItem('anywhere.ui', key);
+  } catch {
+    /* storage blocked: keep it in memory */
+  }
+}
+
+function storedUiKey() {
+  try {
+    return window.sessionStorage.getItem('anywhere.ui') || '';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * Trade a single-use launch code (?launch=, minted by the daemon for browser command lines)
  * for the token. No auth header: the code is the credential.
  * @returns {Promise<string>} the token, or '' when the exchange failed
@@ -301,6 +324,7 @@ async function exchangeLaunchCode(code) {
     });
     if (!res.ok) return '';
     const data = await res.json().catch(() => ({}));
+    if (data && typeof data.ui === 'string' && data.ui) rememberUiKey(data.ui);
     return data && typeof data.token === 'string' ? data.token : '';
   } catch {
     return '';
@@ -337,7 +361,9 @@ async function initFromUrl() {
       /* file:// or sandboxed */
     }
   }
+  state.uiKey = storedUiKey();
   if (fromUrl) {
+    if (fromUrl !== storedToken()) state.uiKey = '';
     rememberToken(fromUrl);
     return;
   }
@@ -364,6 +390,7 @@ function applyTheme(preview) {
  */
 async function api(method, path, body, { timeoutMs = 30000, contentType } = {}) {
   const headers = { Authorization: `Bearer ${state.token}` };
+  if (state.uiKey) headers['X-Anywhere-UI'] = state.uiKey;
   let payload;
   if (body instanceof Blob || body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
     payload = body;
@@ -1340,9 +1367,21 @@ function buildApprovalCard(card) {
   });
   // Critical actions need a deliberate click: Enter on the card never allows them, nor does a
   // spoken "yes" (handleVoiceText).
+  // A critical card is allowed only by a click in the dialog window Claude Anywhere opened (the one
+  // that holds the dialog credential); a page opened from a copied link can still deny it.
+  const canClick = Boolean(state.uiKey);
   const allow =
     risk === 'critical'
-      ? h('button', { type: 'button', class: 'btn btn-primary', title: 'Critical actions need a click to allow' }, 'Allow once')
+      ? h(
+          'button',
+          {
+            type: 'button',
+            class: 'btn btn-primary',
+            disabled: !canClick,
+            title: canClick ? 'Critical actions need a click to allow' : 'Critical actions can be allowed only in the dialog window that Claude Anywhere opens (anywhere show)',
+          },
+          'Allow once'
+        )
       : h('button', { type: 'button', class: 'btn btn-primary' }, 'Allow once', h('kbd', null, '↵'));
   // "Always (session)" adds the card's session rule, shown as text so the user sees what it
   // covers. A card whose sessionRule is null (critical actions; delete, disable and IAM verbs;
@@ -1468,7 +1507,11 @@ async function resolveApproval(id, decision, message, via) {
   const n = cardNodes.get(id);
   if (n) n.classList.add('busy');
   try {
-    await api('POST', '/api/approval', { id, decision, ...(message ? { message } : {}), ...(via ? { via } : {}) });
+    // A click counts as one only from a window that holds the dialog credential (opened by Claude
+    // Anywhere itself); elsewhere the decision goes without `via`, which can still deny any card and
+    // allow ordinary ones.
+    const how = via === 'click' && !state.uiKey ? undefined : via;
+    await api('POST', '/api/approval', { id, decision, ...(message ? { message } : {}), ...(how ? { via: how } : {}) });
     removeCard(id, 'approval');
   } catch (err) {
     if (n) n.classList.remove('busy');

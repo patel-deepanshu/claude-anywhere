@@ -1176,6 +1176,10 @@ class Player(object):
         return min(chars, len(u.text))
 
     def _end(self, u, interrupted, error=None):
+        # An utterance that ended with an error (synthesis or the device failed) was not played in
+        # full: report it as interrupted, so the call never counts it as heard (F3-SAFE-B1).
+        if error:
+            interrupted = True
         with self.lock:
             if u.ended:
                 return

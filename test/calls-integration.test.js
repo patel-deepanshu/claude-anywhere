@@ -125,10 +125,14 @@ test('broker: the calls_arm tool call goes on to the route card in every mode; r
   // Even auto mode does not allow it, and neither voice nor a key press can.
   assert.throws(() => b.resolve(card.id, 'allow', undefined, { via: 'voice' }), (e) => e.code === 'CRITICAL_NEEDS_CLICK');
   assert.throws(() => b.resolve(card.id, 'allow', undefined, { via: 'key' }), (e) => e.code === 'CRITICAL_NEEDS_CLICK');
-  b.resolve(card.id, 'allow', undefined, { via: 'click' });
+  // F3-SAFE-D1: a "click" counts only from the dialog window (DaemonServer sets dialog for requests with its credential).
+  assert.throws(() => b.resolve(card.id, 'allow', undefined, { via: 'click' }), (e) => e.code === 'CRITICAL_NEEDS_CLICK');
+  assert.throws(() => b.resolve(card.id, 'allow'), (e) => e.code === 'CRITICAL_NEEDS_CLICK');
+  b.resolve(card.id, 'allow', undefined, { via: 'click', dialog: true });
   assert.equal((await pending).behavior, 'allow');
   const d = decisions.find((e) => e.toolUseId === 'calls_arm_1' && e.decision === 'allow');
   assert.equal(d.via, 'click');
+  assert.equal(d.dialog, true);
 });
 
 test('TUI: a calls_arm card can only be denied in the terminal', () => {

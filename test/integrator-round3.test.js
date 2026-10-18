@@ -297,10 +297,12 @@ test('approval via: a critical allow by voice or key is refused (409 CRITICAL_NE
   const hub = new Hub();
   const server = createServer({ hub, session: null, permissions: broker, questions: new QuestionBroker({ hub }), bridge: null, config: configMod.load(), token: 'tok-via', instanceId: 'i', version: '0' });
   const port = await server.listen(0);
-  const post = async (body) => {
-    const res = await fetch(`http://127.0.0.1:${port}/api/approval`, { method: 'POST', headers: { Authorization: 'Bearer tok-via', 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const post = async (body, extra = {}) => {
+    const res = await fetch(`http://127.0.0.1:${port}/api/approval`, { method: 'POST', headers: { Authorization: 'Bearer tok-via', 'Content-Type': 'application/json', ...extra }, body: JSON.stringify(body) });
     return { status: res.status, json: await res.json() };
   };
+  // The dialog window: its own credential (from POST /api/launch) and the daemon's origin (F3-SAFE-D1).
+  const dialog = () => ({ 'X-Anywhere-UI': server.uiKey, Origin: `http://127.0.0.1:${port}` });
   try {
     const p = broker.request({ tool_name: 'Bash', input: { command: 'gcloud projects delete prod-proj --quiet' } });
     const card = await pendingCard(broker);
@@ -315,8 +317,18 @@ test('approval via: a critical allow by voice or key is refused (409 CRITICAL_NE
     }
     assert.equal(broker.pending().length, 1, 'the card stays pending');
     assert.ok(audit.some((e) => e.decision === 'refused' && e.via === 'voice' && e.risk === 'critical'));
-    // An unknown via is ignored (treated like an older client); a click allows.
-    const ok = await post({ id: card.id, decision: 'allow', via: 'click' });
+    // A "click" from anything but the dialog window is refused; so is a critical allow with no via.
+    const forged = await post({ id: card.id, decision: 'allow', via: 'click' });
+    assert.equal(forged.status, 403);
+    assert.equal(forged.json.code, 'CLICK_NEEDS_DIALOG');
+    assert.equal((await post({ id: card.id, decision: 'allow', via: 'click' }, { 'X-Anywhere-UI': 'wrong', Origin: `http://127.0.0.1:${port}` })).status, 403);
+    assert.equal((await post({ id: card.id, decision: 'allow', via: 'click' }, { 'X-Anywhere-UI': server.uiKey })).status, 403, 'no Origin: not the dialog page');
+    const noVia = await post({ id: card.id, decision: 'allow' });
+    assert.equal(noVia.status, 409);
+    assert.equal(noVia.json.code, 'CRITICAL_NEEDS_CLICK');
+    assert.equal(broker.pending().length, 1, 'the card stays pending');
+    // A click in the dialog window allows.
+    const ok = await post({ id: card.id, decision: 'allow', via: 'click' }, dialog());
     assert.equal(ok.status, 200);
     assert.equal((await p).behavior, 'allow');
     const resolved = events.find((e) => e.type === 'approval_resolved');

@@ -46,6 +46,12 @@ export function createApi(win = globalThis.window) {
       throw e;
     }
     const headers = { Authorization: `Bearer ${token}` };
+    try {
+      const ui = win.sessionStorage.getItem('anywhere.ui');
+      if (ui) headers['X-Anywhere-UI'] = ui;
+    } catch {
+      /* storage blocked */
+    }
     let payload;
     if (body !== undefined) {
       payload = JSON.stringify(body);

@@ -1002,6 +1002,11 @@ function credentialSegments(raw) {
     if (sg === '.local' && next === 'share' && ['keyrings', 'kwalletd'].includes(segs[i + 2])) return { what: 'your keyring (saved passwords)', env: false };
     if (sg === 'library' && next === 'keychains') return { what: 'your keychain (saved passwords)', env: false };
     if (sg === '.claude-anywhere' && ['config.json', 'daemon.json'].includes(next)) return { what: 'a Claude Anywhere file that holds keys or tokens', env: false };
+    // F3-SAFE-D1: the run files (MCP configs with the daemon token) and a call engine's files.
+    if (sg === '.claude-anywhere' && next === 'run' && (i + 2 === segs.length - 1 ? /\.json$|[*?[]/.test(segs[i + 2] || '') : i + 2 < segs.length)) {
+      return { what: 'a Claude Anywhere run file that holds its access token', env: false };
+    }
+    if (sg === '.claude-anywhere' && next === 'calls' && segs[i + 3] === 'engine') return { what: "a call engine's files, which hold the Claude Anywhere access token", env: false };
     if (/^(\.pgpass|\.mylogin\.cnf|\.vault-token|\.git-credentials|\.netrc|_netrc)$/.test(sg) && i === segs.length - 1)
       return { what: 'a file with login tokens or passwords', env: false };
   }
@@ -1226,6 +1231,21 @@ function credentialKind(t, ctx) {
   if (inHome('.kube')) return { what: 'your Kubernetes credentials', env: false };
   if (inHome('.gnupg') || inHome('.password-store')) return { what: 'your GPG keys or password store', env: false };
   if (inHome('.config', 'gh') || inHome('.terraform.d')) return { what: 'CLI login tokens', env: false };
+  // F3-SAFE-D1: <state>/run/*.json (the MCP configs carry the daemon's token) and a call engine's
+  // folder <state>/calls/<id>/engine/ are credential files, like daemon.json.
+  for (const root of [home ? P.join(home, '.claude-anywhere') : null, ctx.anywhereHome || null]) {
+    if (!root) continue;
+    const r = normFor(t.win, root);
+    const runDir = normFor(t.win, P.join(r, 'run'));
+    if (isUnder(a, runDir, t.win) && a !== runDir && (/\.json$/.test(lbase) || /[*?[]/.test(lbase) || P.dirname(a) !== runDir)) {
+      return { what: 'a Claude Anywhere run file that holds its access token', env: false };
+    }
+    const callsDir = normFor(t.win, P.join(r, 'calls'));
+    if (isUnder(a, callsDir, t.win)) {
+      const rest = a.slice(callsDir.length + 1).split(/[\\/]+/);
+      if (rest[1] && rest[1].toLowerCase() === 'engine') return { what: "a call engine's files, which hold the Claude Anywhere access token", env: false };
+    }
+  }
   if (
     isHome('.docker', 'config.json') ||
     isHome('.netrc') ||
@@ -3528,7 +3548,9 @@ function credLocations(ctx, win) {
   if ((ctx.platform === 'win32') !== win) return [];
   // (_netrc and AppData are Windows names; elsewhere they would only make `cat ~/*` look risky.)
   const out = CRED_HOME_PATHS.filter((segs) => win || !/^(_netrc|AppData)$/.test(segs[0])).map((segs) => normFor(win, P.join(ctx.homeDir, ...segs)));
-  if (ctx.anywhereHome) for (const f of ['config.json', 'daemon.json']) out.push(normFor(win, P.join(ctx.anywhereHome, f)));
+  if (ctx.anywhereHome) {
+    for (const f of [['config.json'], ['daemon.json'], ['run', 'mcp.json'], ['calls', 'call', 'engine', 'mcp.json']]) out.push(normFor(win, P.join(ctx.anywhereHome, ...f)));
+  }
   return out;
 }
 
@@ -3983,6 +4005,13 @@ function classifyArgv(u, tk, ctx, raw) {
   if (NETWORK_PROGS.has(prog) || NETWORK_PROGS.has(psProg)) {
     if (args.some((a) => /\/api\/calls\/arm\b/i.test(a))) v = maxVerdict(v, V('critical', CALLS_ARM_REASON));
     else if (args.some((a) => /\/api\/clone\/delete\b/i.test(a))) v = maxVerdict(v, V('high', 'Deletes your cloned voice'));
+  }
+  // F3-SAFE-D1: any program (curl, node -e, python -c, a script given inline) that names the daemon
+  // routes which answer cards or change settings and modes is self-escalation, and so is one that
+  // names the calls arm route outside curl/wget.
+  if (namesDaemonRoute(str(raw), DAEMON_USER_API_RE)) v = maxVerdict(v, V('critical', DAEMON_USER_API_REASON));
+  else if (!(NETWORK_PROGS.has(prog) || NETWORK_PROGS.has(psProg)) && namesDaemonRoute(str(raw), /\/api\/calls\/arm\b/i)) {
+    v = maxVerdict(v, V('critical', 'Turns on answering your calls through the Claude Anywhere API'));
   }
   // Reading credential stores is not harmless, whatever program prints them (CLASSIFIER-R3-04),
   // and neither is a credential file fed on stdin (CLASSIFIER-R3-02).
@@ -5958,6 +5987,32 @@ function anywhereToolVerdict(tool, input, ctx) {
 // permission mode. The tool call that leads to it is therefore marked ownCard: decide() lets it reach that
 // card instead of showing a second critical card first (the user would have to click twice).
 const CALLS_ARM_REASON = 'Answer phone calls for you with your voice';
+// F3-SAFE-D1: the daemon routes that answer approval cards and questions, change settings or modes, or
+// trade launch codes for the dialog's credentials. Only the user's own dialog, terminal and CLI use them.
+const DAEMON_USER_API_RE = /\/api\/(approval|answer|config|mode|launch|shutdown)\b/i;
+const DAEMON_USER_API_REASON = 'Answers approval cards or changes Claude Anywhere settings through its API (self-escalation)';
+
+/**
+ * Does a command's text name one of the daemon's routes? A route on a named internet host
+ * (https://example.com/api/config) is someone else's API; anything else (localhost, an IP address,
+ * a port, a variable, a path built in a script) may be the daemon.
+ * @param {string} text
+ * @param {RegExp} routeRe
+ */
+function namesDaemonRoute(text, routeRe) {
+  const t = String(text || '');
+  if (!routeRe.test(t)) return false;
+  const re = new RegExp(routeRe.source, 'gi');
+  let m;
+  while ((m = re.exec(t))) {
+    const before = t.slice(Math.max(0, m.index - 300), m.index);
+    const url = /([a-z][a-z0-9+.-]*):\/\/([^\s'"`/]+)[^\s'"`]*$/i.exec(before);
+    const host = url ? url[2].replace(/^[^@]*@/, '').replace(/:\d*$/, '').toLowerCase() : '';
+    const internetHost = host && /^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(host) && !/(^|\.)localhost$/.test(host);
+    if (!internetHost) return true;
+  }
+  return false;
+}
 
 /** @returns {{risk:string, reason:string, ownCard?:boolean}|null} null: not a calls or clone-voice tool */
 function callsToolVerdict(tool) {
@@ -5987,6 +6042,8 @@ function anywhereCallsCliVerdict(w) {
     if (sub === 'delete') return V('high', 'Deletes your cloned voice');
     if (sub === 'install') return V('medium', 'Downloads the free voice runtime and models (about 425 MB)');
     if (sub === 'bench') return V('medium', 'Benchmarks the voice engines (uses the CPU for a minute)');
+    // F3-SAFE-B3: the cloned voice saying any text aloud, outside a call and without the disclosure.
+    if (sub === 'test' && w.slice(2).some((x) => !['pocket', 'zipvoice'].includes(x))) return V('high', 'Speaks text of your choice aloud in your cloned voice');
     if (['start', 'status', 'test', 'help'].includes(sub)) return V('low', 'Claude Anywhere command');
     return V('medium', `Runs anywhere clone-voice ${sub}`);
   }
@@ -6875,7 +6932,7 @@ class PermissionBroker extends EventEmitter {
    * @param {{toolName:string, input?:object, reason?:string, summary?:string, toolUseId?:string}} req
    * @returns {Promise<{behavior:'allow', updatedInput:object}|{behavior:'deny', message:string}>}
    */
-  requestCritical({ toolName, input, reason, summary, toolUseId } = {}) {
+  requestCritical({ toolName, input, reason, summary, toolUseId, clickOnly = false } = {}) {
     const name = str(toolName) || 'critical_action';
     const inp = isPlainObject(input) ? input : {};
     const cls = {
@@ -6883,6 +6940,9 @@ class PermissionBroker extends EventEmitter {
       reason: str(reason) || 'Needs your click',
       summary: truncate(oneLine(str(summary)), 600) || displayName(name),
       sensitive: true,
+      // F3-SAFE-D1: only a click in the dialog window (the request carries the dialog's credential)
+      // allows it; the terminal dialog's typed "allow" does not.
+      clickOnly: clickOnly === true,
     };
     return this.prompt(name, inp, cls, toolUseId, 'needs a click');
   }
@@ -6904,6 +6964,7 @@ class PermissionBroker extends EventEmitter {
       sessionRule: cls.risk === 'critical' ? null : sessionRuleFor(toolName, input, cls, this.ctxOpts()),
       timeoutSec,
       mode: this.mode,
+      ...(cls.clickOnly ? { clickOnly: true } : {}),
     };
     log.info(`approval needed (${cls.risk}, ${why}): ${card.summary}`);
     return new Promise((resolve) => {
@@ -6955,7 +7016,7 @@ class PermissionBroker extends EventEmitter {
    * @private settle a pending card
    * @param {string} [via] how the user answered: 'click', 'key', 'typed' or 'voice' (audit only)
    */
-  finish(id, decision, message, by, via) {
+  finish(id, decision, message, by, via, dialog) {
     const e = this.entries.get(id);
     if (!e) return false;
     this.entries.delete(id);
@@ -6972,6 +7033,7 @@ class PermissionBroker extends EventEmitter {
       decision: allow ? decision : 'deny',
       by,
       via,
+      dialog: dialog === true ? true : undefined,
       summary: e.card.summary,
       reason: e.card.reason,
       rule: rule || undefined,
@@ -6989,44 +7051,64 @@ class PermissionBroker extends EventEmitter {
    * Answer a pending approval card.
    *
    * A critical card is allowed only by a deliberate act: a click on "Allow once" in the dialog
-   * or the typed word "allow" in the terminal dialog. An allow that says it came from speech or
-   * from Enter on the card (opts.via 'voice' or 'key') is refused and the card stays pending;
-   * those can still deny. Clients that send no via (older ones) are not refused.
+   * window (opts.dialog: the request carried the dialog's own credential, which DaemonServer checks)
+   * or, for a critical card that is not click-only, the typed word "allow" in the terminal dialog.
+   * An allow by speech, by Enter on the card, without a `via`, or a "click" that did not come from
+   * the dialog is refused and the card stays pending; any of them can still deny. Click-only cards
+   * (answering calls) accept only the dialog's click.
    * @param {string} id
    * @param {'allow'|'allow_session'|'deny'} decision
    * @param {string} [message] optional note from the user (deny)
-   * @param {{via?:'click'|'key'|'typed'|'voice'}} [opts] how the user answered (anything else is ignored)
+   * @param {{via?:'click'|'key'|'typed'|'voice', dialog?:boolean}} [opts] how the user answered
+   *   (anything else is ignored); dialog: the request came from the dialog window
    * @returns {boolean} false if no such pending card
-   * @throws {Error} status 409, code CRITICAL_NEEDS_CLICK: a critical card allowed by voice or key
+   * @throws {Error} status 409, code CRITICAL_NEEDS_CLICK: a critical card allowed another way
    */
-  resolve(id, decision, message, { via } = {}) {
+  resolve(id, decision, message, { via, dialog } = {}) {
     if (!['allow', 'allow_session', 'deny'].includes(decision)) return false;
     const how = APPROVAL_VIA.includes(via) ? via : undefined;
+    const fromDialog = dialog === true;
     const entry = this.entries.get(id);
     if (!entry) return false;
-    if (decision !== 'deny' && entry.card.risk === 'critical' && (how === 'voice' || how === 'key')) {
-      this.record({
-        tool: entry.toolName,
-        risk: 'critical',
-        decision: 'refused',
-        by: 'user',
-        via: how,
-        summary: entry.card.summary,
-        reason: `${how === 'voice' ? 'a spoken' : 'a keyboard'} ${decision === 'allow_session' ? 'always' : 'allow'} does not allow a critical action`,
-        toolUseId: entry.card.toolUseId || undefined,
-      });
-      const err = new Error('Critical actions need a click on “Allow once”');
-      err.status = 409;
-      err.code = 'CRITICAL_NEEDS_CLICK';
-      err.hint = 'Click “Allow once” on the card in the dialog (or type allow in the terminal dialog). Voice and Esc can still deny it.';
-      throw err;
+    if (decision !== 'deny' && entry.card.risk === 'critical') {
+      const clicked = how === 'click' && fromDialog;
+      const typed = how === 'typed' && !entry.card.clickOnly;
+      if (!clicked && !typed) {
+        const what =
+          how === 'voice'
+            ? 'a spoken'
+            : how === 'key'
+              ? 'a keyboard'
+              : how === 'click'
+                ? 'a click that did not come from the dialog window:'
+                : how === 'typed'
+                  ? 'a typed'
+                  : 'an unspecified';
+        this.record({
+          tool: entry.toolName,
+          risk: 'critical',
+          decision: 'refused',
+          by: 'user',
+          via: how || 'none',
+          summary: entry.card.summary,
+          reason: `${what} ${decision === 'allow_session' ? 'always' : 'allow'} does not allow a critical action`,
+          toolUseId: entry.card.toolUseId || undefined,
+        });
+        const err = new Error('Critical actions need a click on “Allow once”');
+        err.status = 409;
+        err.code = 'CRITICAL_NEEDS_CLICK';
+        err.hint = entry.card.clickOnly
+          ? 'Click “Allow once” on the card in the Claude Anywhere dialog window. Voice, keys and the terminal can still deny it.'
+          : 'Click “Allow once” on the card in the dialog (or type allow in the terminal dialog). Voice and Esc can still deny it.';
+        throw err;
+      }
     }
     let msg;
     if (decision === 'deny') {
       const note = typeof message === 'string' ? message.trim() : '';
       msg = note ? `User denied: ${truncate(note, 2000)}` : 'User denied this action.';
     }
-    return this.finish(id, decision, msg, 'user', how);
+    return this.finish(id, decision, msg, 'user', how, fromDialog);
   }
 
   /**

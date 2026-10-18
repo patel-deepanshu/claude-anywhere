@@ -17,8 +17,11 @@
  * Safeguards kept here (§1.3 a): a take is accepted only from a real microphone (virtual and
  * loopback device labels are refused), as 24 kHz mono 16-bit WAV, 2–30 s, at most 5 MB, recorded
  * in an enrollment session; the consent take must be read first and pass local STT with the
- * session's single-use code; at build time every take and the consent take must match the
- * speaker centroid (3D-Speaker cosine ≥ 0.45). The profile is written 0700/0600 and nothing is
+ * session's single-use code; every script take is transcribed locally and must be its line
+ * (fuzzy alignment ≥ 0.8); at build time the speaker checks are anchored on the consent take:
+ * consent ↔ centroid ≥ 0.45, consent ↔ each take ≥ 0.40, no pair below 0.2 and no two-cluster
+ * split (a session of two people is refused), each take ↔ centroid ≥ 0.45, and consent ↔ the
+ * takes chosen for reference.wav ≥ 0.45 (3D-Speaker cosines). The profile is written 0700/0600 and nothing is
  * ever uploaded. The sidecar only ever gets a profile directory, never a free audio path to clone.
  *
  * Events: 'install' {stage, percent, message} and 'session' {sessionId, step, …} (never the code).
@@ -41,6 +44,17 @@ const log = createLogger('clone');
 const KINDS = Object.freeze(['consent', 'line']);
 const ENGINE_NAMES = Object.freeze(['pocket', 'zipvoice']);
 const MIN_SPEAKER_COSINE = 0.45;
+// Speaker checks anchored on the consent take (§2.6; 3D-Speaker cosines: same speaker about 0.64,
+// min 0.38; different speakers about 0.11, max 0.36). A centroid of two people's takes sits about
+// 0.59 from either of them, so the centroid rule alone cannot tell a mix from one speaker.
+const MIN_CONSENT_PAIR = 0.4; // every script take against the consent take itself
+const MIN_ANY_PAIR = 0.2; // any two recordings of the session (one person never drops this low)
+const MIN_BETWEEN_CLUSTERS = 0.3; // a 2-means split of the session whose halves differ this much is two people
+const MIN_CLUSTER = 3;
+// Every script take is transcribed locally and must be the line it claims to be (the consent
+// normalizer and fuzzy word alignment), so arbitrary recordings of someone else are refused.
+const MIN_LINE_SIMILARITY = 0.8;
+const LINE_WORDING_HINT = 'The words did not match the line. Read it exactly as shown, at a normal pace.';
 const AUDIO_ID_RE = /^[a-f0-9]{32}$/;
 const MAX_AUDIO = 40;
 const SIDECAR_IDLE_MS = 10 * 60 * 1000;
@@ -140,6 +154,136 @@ function childParams(sc, params) {
   return out;
 }
 
+/**
+ * The speaker checks of a session from its pairwise cosine matrix (§2.6). Index 0 is the consent
+ * take, 1..n-1 the script takes. Embeddings are unit vectors, so the cosine of x to the centroid of
+ * a set S is Σ_{j∈S} G[x][j] / √(Σ_{j,k∈S} G[j][k]).
+ * @param {number[][]} G symmetric, 1 on the diagonal
+ * @returns {{toCentroid:number[], consentToCentroid:number, consentPairs:number[], minPair:number,
+ *   minPairAt:number[], clusters:{a:number[], b:number[], between:number}|null, cosToSet:Function}}
+ */
+function speakerAnalysis(G) {
+  const n = Array.isArray(G) ? G.length : 0;
+  if (n < 2 || G.some((row) => !Array.isArray(row) || row.length !== n || row.some((x) => !Number.isFinite(Number(x))))) {
+    throw cloneError(502, 'The speaker check returned no usable scores', 'INTERNAL', 'Update Claude Anywhere: anywhere clone-voice install');
+  }
+  const g = (i, j) => (i === j ? 1 : (Number(G[i][j]) + Number(G[j][i])) / 2);
+  const setSum = (S) => {
+    let s = 0;
+    for (const j of S) for (const k of S) s += g(j, k);
+    return s;
+  };
+  const cosToSet = (x, S) => {
+    if (!S.length) return 0;
+    const norm = Math.sqrt(Math.max(setSum(S), 1e-9));
+    let dot = 0;
+    for (const j of S) dot += g(x, j);
+    return dot / norm;
+  };
+  const takes = [];
+  for (let i = 1; i < n; i += 1) takes.push(i);
+  let minPair = Infinity;
+  let minPairAt = [0, 0];
+  for (let i = 0; i < n; i += 1) {
+    for (let j = i + 1; j < n; j += 1) {
+      if (g(i, j) < minPair) {
+        minPair = g(i, j);
+        minPairAt = [i, j];
+      }
+    }
+  }
+  // 2-means on the whole session (consent included), seeded with the least similar pair.
+  let clusters = null;
+  if (n >= 2 * MIN_CLUSTER) {
+    let a = [minPairAt[0]];
+    let b = [minPairAt[1]];
+    for (let iter = 0; iter < 20; iter += 1) {
+      const na = [];
+      const nb = [];
+      for (let i = 0; i < n; i += 1) (cosToSet(i, a) >= cosToSet(i, b) ? na : nb).push(i);
+      if (!na.length || !nb.length) break;
+      const same = na.length === a.length && na.every((x, k) => x === a[k]);
+      a = na;
+      b = nb;
+      if (same) break;
+    }
+    if (a.length && b.length) {
+      let cross = 0;
+      for (const i of a) for (const j of b) cross += g(i, j);
+      clusters = { a, b, between: cross / Math.sqrt(Math.max(setSum(a) * setSum(b), 1e-9)) };
+    }
+  }
+  return {
+    toCentroid: takes.map((i) => cosToSet(i, takes)),
+    consentToCentroid: cosToSet(0, takes),
+    consentPairs: takes.map((i) => g(0, i)),
+    minPair,
+    minPairAt,
+    clusters,
+    cosToSet,
+  };
+}
+
+/** Does the session sound like two people (a pair far apart, or two clear clusters)? */
+function mixedSpeakers(an) {
+  if (an.minPair < MIN_ANY_PAIR) return { mixed: true, why: 'pair', score: an.minPair };
+  const c = an.clusters;
+  if (c && Math.min(c.a.length, c.b.length) >= MIN_CLUSTER && c.between < MIN_BETWEEN_CLUSTERS) return { mixed: true, why: 'clusters', score: c.between };
+  return { mixed: false };
+}
+
+const r3 = (x) => Math.round(x * 1000) / 1000;
+
+const CLONE_RENDER_RE = /^clone-[\w-]*\.wav$/;
+
+/**
+ * Remove renders in the cloned voice from a temporary folder (F3-SAFE-A2): `anywhere clone-voice delete`
+ * removes them all, and a daemon start removes those older than olderThanMs that an earlier run left.
+ * @param {string} dir <state>/run/voice-tmp
+ * @param {{olderThanMs?:number, now?:number}} [opts]
+ * @returns {string[]} the removed files
+ */
+function cleanupCloneRenders(dir, { olderThanMs = 0, now = Date.now() } = {}) {
+  const removed = [];
+  let names = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return removed;
+  }
+  for (const n of names) {
+    if (!CLONE_RENDER_RE.test(n)) continue;
+    const f = path.join(dir, n);
+    try {
+      if (olderThanMs > 0 && now - fs.statSync(f).mtimeMs < olderThanMs) continue;
+      fs.rmSync(f, { force: true });
+      removed.push(f);
+    } catch {
+      /* busy or gone */
+    }
+  }
+  return removed;
+}
+
+/** Texts that carry the call's AI disclosure (their cached render is checked by speech recognition). */
+function carriesDisclosure(text) {
+  return /\bAI assistant\b/i.test(String(text || '')) && /\btranscribing this call\b/i.test(String(text || ''));
+}
+
+/**
+ * Did speech recognition hear the disclosure in a render of `text`? (The clone sometimes garbles the end
+ * of a sentence; a cached greeting is played on every call, so it must be intelligible.)
+ * @param {string} text what was rendered
+ * @param {string} heard the local transcript
+ */
+function disclosureHeard(text, heard) {
+  const words = consentMod.normalizeWords(heard);
+  if (!words.length) return false;
+  const has = (w) => words.some((h) => consentMod.wordsMatch(w, h));
+  if (!has('assistant') || !has('transcribing')) return false;
+  return consentMod.alignWords(consentMod.normalizeWords(text), words).similarity >= 0.7;
+}
+
 /** The OS user's full name, best effort ('' when unknown). */
 function osFullName({ platform = process.platform, exec = require('child_process').execFileSync } = {}) {
   let user = '';
@@ -198,6 +342,7 @@ class CloneService extends EventEmitter {
     this.idleMs = opts.idleMs == null ? SIDECAR_IDLE_MS : opts.idleMs;
     this.sessions = new Map();
     this.audio = new Map();
+    this.renders = new Set(); // synthesize() outputs (calls delete them after use; delete() removes the rest)
     this.openSeq = 0;
     this.openAck = 0;
     this.openAt = 0;
@@ -564,6 +709,20 @@ class CloneService extends EventEmitter {
     return { scores, probe: probe ? num(r && r.probe) : null };
   }
 
+  /**
+   * Every pairwise speaker cosine of `wavs` (one embedding each).
+   * @returns {Promise<number[][]>}
+   */
+  async speakerMatrix(wavs) {
+    await this._ensureSpk();
+    const r = await this.request('spk.consistency', { wavs, matrix: true }, { timeoutMs: 300000 });
+    const m = r && r.matrix;
+    if (!Array.isArray(m) || m.length !== wavs.length) {
+      throw cloneError(502, 'The voice runtime did not return the speaker comparisons', 'INTERNAL', 'Update Claude Anywhere, then: anywhere clone-voice install');
+    }
+    return m.map((row) => (Array.isArray(row) ? row.map(Number) : []));
+  }
+
   // ---------------------------------------------------------------- owner name
 
   /**
@@ -856,13 +1015,7 @@ class CloneService extends EventEmitter {
       this._emitSession(s.id, 'take', { kind, index: idx, ok: false });
       return { ok: false, ...base };
     }
-    if (kind === 'line') {
-      const file = path.join(s.dir, `line-${pad2(idx + 1)}.wav`);
-      profile.writeFileSecure(file, wav);
-      s.takes.set(idx, { index: idx, text: script.LINES[idx], file, analysis, problems: v.problems, deviceLabel: label, at: this.clock() });
-      this._emitSession(s.id, 'take', { kind, index: idx, ok: true, done: s.takes.size, total: script.LINES.length });
-      return { ok: true, ...base, progress: { done: s.takes.size, total: script.LINES.length } };
-    }
+    if (kind === 'line') return this._addLineTake(s, idx, wav, { analysis, problems: v.problems, label, base });
     // The consent take: local STT, then the single-use code and the wording. One reading at a time;
     // each attempt has its own file, and only an accepted one becomes consent.wav.
     if (s.consentBusy) throw cloneError(409, 'The previous consent take is still being checked', 'BUSY');
@@ -896,6 +1049,48 @@ class CloneService extends EventEmitter {
       return { ok: r.ok, ...base, transcript, consent };
     } finally {
       s.consentBusy = false;
+    }
+  }
+
+  /**
+   * A script take: transcribed locally and kept only when it is the line it claims to be (§1.3 a:
+   * arbitrary recordings, such as someone else's voice from a call or a video, are refused).
+   * @private
+   */
+  async _addLineTake(s, idx, wav, { analysis, problems, label, base }) {
+    s.linesBusy = s.linesBusy || new Set();
+    if (s.linesBusy.has(idx)) throw cloneError(409, 'The previous take of this line is still being checked', 'BUSY');
+    s.linesBusy.add(idx);
+    const attempt = path.join(s.dir, `line-${pad2(idx + 1)}.check.wav`);
+    try {
+      profile.writeFileSecure(attempt, wav);
+      let transcript;
+      try {
+        transcript = await this.transcribe(attempt);
+      } catch (err) {
+        rmrf(attempt);
+        throw err;
+      }
+      if (!this.sessions.has(s.id) || s.state !== 'recording') {
+        rmrf(attempt);
+        throw cloneError(this.sessions.has(s.id) ? 409 : 404, 'The enrollment session changed while the take was checked', this.sessions.has(s.id) ? 'BUSY' : 'NO_SESSION');
+      }
+      const expected = script.LINES[idx];
+      const { similarity } = consentMod.alignWords(consentMod.normalizeWords(expected), consentMod.normalizeWords(transcript));
+      const wording = r3(similarity);
+      if (similarity < MIN_LINE_SIMILARITY) {
+        rmrf(attempt);
+        const failed = [...problems, { code: 'wording', level: 'fail', hint: LINE_WORDING_HINT }];
+        this._emitSession(s.id, 'take', { kind: 'line', index: idx, ok: false });
+        return { ok: false, ...base, problems: failed, transcript, wording };
+      }
+      const file = path.join(s.dir, `line-${pad2(idx + 1)}.wav`);
+      fs.renameSync(attempt, file);
+      s.takes.set(idx, { index: idx, text: expected, file, analysis, problems, deviceLabel: label, transcript, wording, at: this.clock() });
+      this._emitSession(s.id, 'take', { kind: 'line', index: idx, ok: true, done: s.takes.size, total: script.LINES.length });
+      return { ok: true, ...base, transcript, wording, progress: { done: s.takes.size, total: script.LINES.length } };
+    } finally {
+      s.linesBusy.delete(idx);
     }
   }
 
@@ -935,25 +1130,38 @@ class CloneService extends EventEmitter {
   }
 
   async _build(s, takes) {
-    // 1. Speaker consistency: every take and the consent take against the centroid of the takes.
-    const cons = await this.consistency(
-      takes.map((t) => t.file),
-      s.consentTake.file,
-    );
-    if (cons.scores.length !== takes.length || cons.scores.some((x) => x == null)) {
-      throw cloneError(502, 'The speaker check returned no usable scores', 'INTERNAL');
-    }
-    if (cons.probe == null || cons.probe < MIN_SPEAKER_COSINE) {
+    // 1. Speaker checks (§2.6), anchored on the consent take: the consent must match the script's
+    //    centroid, every script take must match the consent take itself, the session must not split
+    //    into two speakers, and every take must match the centroid.
+    const G = await this.speakerMatrix([s.consentTake.file, ...takes.map((t) => t.file)]);
+    const an = speakerAnalysis(G);
+    const mismatch = (score, extra = {}) => {
       s.state = 'failed';
       this._closeSession(s, 'consent_mismatch');
       return {
         ok: false,
         code: 'CONSENT_SPEAKER_MISMATCH',
         message: 'The consent sentence and the script must be read by the same person, in the same room. Start again.',
-        consentScore: cons.probe,
+        consentScore: score == null ? null : r3(score),
+        ...extra,
+      };
+    };
+    if (!(an.consentToCentroid >= MIN_SPEAKER_COSINE)) return mismatch(an.consentToCentroid);
+    const offConsent = takes.filter((t, i) => an.consentPairs[i] < MIN_CONSENT_PAIR);
+    if (offConsent.length * 2 > takes.length) return mismatch(an.consentToCentroid, { offConsent: offConsent.map((t) => t.index) });
+    const mixed = mixedSpeakers(an);
+    if (mixed.mixed) {
+      s.state = 'failed';
+      this._closeSession(s, 'mixed_speakers');
+      this.log.warn(`enrollment refused: the recordings sound like more than one person (${mixed.why} ${r3(mixed.score)})`);
+      return {
+        ok: false,
+        code: 'MIXED_SPEAKERS',
+        message: 'The recordings sound like more than one person. The consent sentence and every line must be read by you, in one room. Start again.',
       };
     }
-    const bad = takes.filter((t, i) => cons.scores[i] < MIN_SPEAKER_COSINE);
+    const cons = { scores: an.toCentroid, probe: an.consentToCentroid };
+    const bad = takes.filter((t, i) => cons.scores[i] < MIN_SPEAKER_COSINE || an.consentPairs[i] < MIN_CONSENT_PAIR);
     if (bad.length) {
       for (const t of bad) {
         s.takes.delete(t.index);
@@ -970,18 +1178,27 @@ class CloneService extends EventEmitter {
     }
     const scores = cons.scores;
     const consistency = {
-      min: Math.round(Math.min(...scores) * 1000) / 1000,
-      mean: Math.round((scores.reduce((a, b) => a + b, 0) / scores.length) * 1000) / 1000,
-      consent: Math.round(cons.probe * 1000) / 1000,
+      min: r3(Math.min(...scores)),
+      mean: r3(scores.reduce((a, b) => a + b, 0) / scores.length),
+      consent: r3(cons.probe),
+      consentMin: r3(Math.min(...an.consentPairs)),
     };
 
-    // 2. The reference clip (pure Node): the 3–4 best takes, 10–15 s, trimmed, joined, normalized.
+    // 2. The reference clip (pure Node): the 3–4 best takes, 10–15 s, trimmed, joined, normalized,
+    //    chosen only among takes that passed the transcript and speaker checks; the consent take
+    //    must match the voice that is actually cloned.
+    const passed = takes.filter((t, i) => typeof t.transcript === 'string' && t.wording >= MIN_LINE_SIMILARITY && cons.scores[i] >= MIN_SPEAKER_COSINE && an.consentPairs[i] >= MIN_CONSENT_PAIR);
+    if (passed.length !== takes.length) throw cloneError(409, 'Some lines were not checked; record them again', 'TAKES_UNCHECKED');
     const ref = quality.buildReference(
-      takes.map((t) => {
+      passed.map((t) => {
         const a = quality.readWav(fs.readFileSync(t.file));
         return { index: t.index, text: t.text, samples: a.samples, rate: a.rate, analysis: t.analysis, problems: t.problems };
       }),
     );
+    const refRows = ref.takes.map((i) => 1 + takes.findIndex((t) => t.index === i));
+    if (refRows.some((r) => r < 1)) throw cloneError(500, 'The reference clip used an unknown take', 'INTERNAL');
+    consistency.reference = r3(an.cosToSet(0, refRows));
+    if (!(consistency.reference >= MIN_SPEAKER_COSINE)) return mismatch(consistency.reference);
 
     // 3. The profile, written to a staging folder and swapped in (an older profile is replaced
     //    only once the new one is complete).
@@ -1182,12 +1399,42 @@ class CloneService extends EventEmitter {
     const eng = ENGINE_NAMES.includes(engine) ? engine : this.cloneConfig().engine;
     const texts = this.phraseTexts();
     let rendered = 0;
+    let unchecked = 0;
     for (const text of texts) {
       const dest = profile.phrasePath(eng, text, { root: this.root });
       if (fs.existsSync(dest)) continue;
       await this._ensureVoice(eng);
-      const out = this.tmpFile('clone-phrase');
-      await this.request('tts.synthesize', { text, out }, { timeoutMs: 180000 });
+      // The greeting (it carries the AI disclosure) is cached only when local speech recognition hears
+      // the disclosure in the render; otherwise it is rendered again (3 tries), else left to live speech.
+      const check = carriesDisclosure(text);
+      let out = null;
+      for (let attempt = 1; attempt <= (check ? 3 : 1); attempt += 1) {
+        const f = this.tmpFile('clone-phrase');
+        await this.request('tts.synthesize', { text, out: f }, { timeoutMs: 180000 });
+        if (!check) {
+          out = f;
+          break;
+        }
+        let heard = null;
+        try {
+          heard = await this.transcribe(f);
+        } catch (err) {
+          this.log.warn(`checking the greeting render failed (${err.message}); caching it unchecked`);
+          unchecked += 1;
+          out = f;
+          break;
+        }
+        if (disclosureHeard(text, heard)) {
+          out = f;
+          break;
+        }
+        rmrf(f);
+        this.log.warn(`the greeting render was not intelligible (heard "${String(heard).slice(0, 120)}"); try ${attempt} of 3`);
+      }
+      if (!out) {
+        this.log.warn('the greeting is not cached: no render passed the speech check (calls render it live)');
+        continue;
+      }
       profile.ensurePrivateDir(path.dirname(dest));
       const src = out;
       try {
@@ -1204,7 +1451,7 @@ class CloneService extends EventEmitter {
       rendered += 1;
     }
     this.emit('session', { sessionId: null, step: 'phrases', engine: eng, rendered, total: texts.length });
-    return { engine: eng, rendered, total: texts.length };
+    return { engine: eng, rendered, total: texts.length, unchecked };
   }
 
   /**
@@ -1229,6 +1476,8 @@ class CloneService extends EventEmitter {
       try {
         await this._ensureVoice(eng);
         const out = this.tmpFile('clone-say');
+        // Tracked, so delete() removes it even when the caller forgets to (F3-SAFE-A2).
+        this.renders.add(out);
         const r = await this.request('tts.synthesize', { text, out }, { timeoutMs: 180000 });
         return { file: out, cached: false, engine: eng, audioMs: r && r.audioMs, sampleRate: r && r.sampleRate };
       } catch (err) {
@@ -1237,6 +1486,14 @@ class CloneService extends EventEmitter {
       }
     }
     throw lastErr || cloneError(503, 'No clone engine is available', 'NOT_INSTALLED', NOT_INSTALLED_HINT);
+  }
+
+  /** A synthesize() output is no longer needed (cached phrases are kept). */
+  discardRender(file) {
+    if (!file || !this.renders.has(file)) return false;
+    this.renders.delete(file);
+    rmrf(file);
+    return true;
   }
 
   /** Live speech through the sidecar's playback (calls). */
@@ -1263,6 +1520,14 @@ class CloneService extends EventEmitter {
       this.audio.delete(id);
       rmrf(e.file);
     }
+    for (const f of this.renders) rmrf(f);
+    this.renders.clear();
+    // Renders of earlier daemon runs too: nothing in the cloned voice is left behind (§1.3 a 6).
+    try {
+      cleanupCloneRenders(this.tmpDir());
+    } catch {
+      /* no temp folder */
+    }
     this.saveConfig({ voice: { clone: { enabled: false } } });
     this.emit('session', { sessionId: null, step: 'deleted' });
     this.emit('deleted', { removed });
@@ -1284,7 +1549,16 @@ module.exports = {
   KINDS,
   ENGINE_NAMES,
   MIN_SPEAKER_COSINE,
+  MIN_CONSENT_PAIR,
+  MIN_ANY_PAIR,
+  MIN_BETWEEN_CLUSTERS,
+  MIN_LINE_SIMILARITY,
   AUDIO_ID_RE,
+  speakerAnalysis,
+  mixedSpeakers,
+  cleanupCloneRenders,
+  carriesDisclosure,
+  disclosureHeard,
   similarityLabel,
   publicAnalysis,
   osFullName,

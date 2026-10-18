@@ -78,18 +78,94 @@ function parseHm(s) {
   return h < 24 && min < 60 ? h * 60 + min : null;
 }
 
+function fmtHm(minutes) {
+  return `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
+}
+
 /**
- * Quiet hours in local time; start > end spans midnight (22:00–08:00).
+ * The quiet hours as they apply (F3-SAFE-D3): {enabled, start, end, valid, startMin, endMin}, start and end
+ * normalized to HH:MM. Enabled hours whose times do not parse are not valid: arming is refused and every
+ * minute counts as quiet (fail closed), never "no quiet hours".
+ * @param {{enabled?:boolean, start?:string, end?:string}} [qh]
+ */
+function quietHoursOf(qh) {
+  const q = qh && typeof qh === 'object' ? qh : {};
+  const enabled = q.enabled !== false;
+  const startMin = parseHm(q.start == null ? '22:00' : q.start);
+  const endMin = parseHm(q.end == null ? '08:00' : q.end);
+  const valid = startMin != null && endMin != null;
+  return {
+    enabled,
+    valid,
+    startMin,
+    endMin,
+    start: startMin != null ? fmtHm(startMin) : str(q.start),
+    end: endMin != null ? fmtHm(endMin) : str(q.end),
+  };
+}
+
+/** Why calls.quietHours cannot be used (null when it can). */
+function quietHoursProblem(qh) {
+  const q = quietHoursOf(qh);
+  if (!q.enabled || q.valid) return null;
+  return `the quiet hours ${JSON.stringify(q.start)}–${JSON.stringify(q.end)} are not times as HH:MM (00:00 to 23:59)`;
+}
+
+/**
+ * Quiet hours in local time; start > end spans midnight (22:00–08:00). Enabled hours with a time that
+ * does not parse count as quiet all day (fail closed); start === end is no quiet time.
  * @param {Date} date
  * @param {{enabled?:boolean, start?:string, end?:string}} qh
  */
 function inQuietHours(date, qh) {
   if (!qh || qh.enabled === false) return false;
-  const start = parseHm(qh.start);
-  const end = parseHm(qh.end);
-  if (start == null || end == null || start === end) return false;
+  const q = quietHoursOf(qh);
+  if (!q.valid) return true;
+  const { startMin: start, endMin: end } = q;
+  if (start === end) return false;
   const m = date.getHours() * 60 + date.getMinutes();
   return start < end ? m >= start && m < end : m >= start || m < end;
+}
+
+/**
+ * Why a calls setting cannot be saved (null when it can): quiet-hour times must be HH:MM, and
+ * calls.greeting is only a closing question (greeting.greetingSettingProblem). Used by POST /api/config
+ * and `anywhere config set` (F3-SAFE-B2, F3-SAFE-D3).
+ * @param {string} key dotted key
+ * @param {*} value
+ * @param {{ownerName?:string}} [ctx]
+ * @returns {string|null}
+ */
+function settingProblem(key, value, ctx = {}) {
+  if (key === 'calls.quietHours.start' || key === 'calls.quietHours.end') {
+    if (typeof value !== 'string' || parseHm(value) == null) return `"${key}" must be a time as HH:MM from 00:00 to 23:59 (got ${JSON.stringify(value)})`;
+  }
+  if (key === 'calls.greeting' && typeof value === 'string') {
+    const p = require('./greeting').greetingSettingProblem(value, { ownerName: ctx.ownerName });
+    if (p) return `"calls.greeting" is only the closing question after the AI disclosure, and ${p}`;
+  }
+  return null;
+}
+
+/**
+ * settingProblem() for every calls key in a partial config update.
+ * @param {object} partial
+ * @param {{ownerName?:string}} [ctx]
+ */
+function configProblem(partial, ctx = {}) {
+  const calls = partial && typeof partial === 'object' ? partial.calls : null;
+  if (!calls || typeof calls !== 'object') return null;
+  const owner = typeof calls.ownerName === 'string' && calls.ownerName.trim() ? calls.ownerName : ctx.ownerName;
+  if (calls.quietHours && typeof calls.quietHours === 'object') {
+    for (const k of ['start', 'end']) {
+      if (k in calls.quietHours) {
+        const p = settingProblem(`calls.quietHours.${k}`, calls.quietHours[k]);
+        if (p) return p;
+      }
+    }
+  }
+  if ('greeting' in calls) return settingProblem('calls.greeting', calls.greeting, { ownerName: owner });
+  return null;
 }
 
 /**
@@ -255,6 +331,23 @@ function sanitizeWriteText(text, { max = 500, singleLine = true, allowUrl = () =
   });
   const masked = stripSecrets(s);
   return { text: cap(masked.trim(), max), linksRemoved, secretsMasked: masked !== s };
+}
+
+/**
+ * The caller's display name as it may appear in text written for others (a Jira comment prefix, notes):
+ * the caller chooses it in the call app, so links are dropped, secrets masked, at most 60 characters
+ * (F3-SAFE-C2).
+ * @param {string} name
+ * @returns {string} '' when nothing is left
+ */
+function sanitizeCallerName(name) {
+  const one = new RegExp(URL_RE.source, 'i');
+  const kept = oneLine(name)
+    .split(' ')
+    .filter((w) => w && !one.test(w))
+    .join(' ');
+  const r = sanitizeWriteText(kept, { max: 60 });
+  return r.text.replace(/\[link removed\]/g, '').replace(/\s+/g, ' ').trim();
 }
 
 const WORD_RE = /[\p{L}\p{N}][\p{L}\p{N}'’.-]*/gu;
@@ -544,6 +637,10 @@ module.exports = {
   KNOWN_APPS,
   ARM_MINUTES_CAP,
   inQuietHours,
+  quietHoursOf,
+  quietHoursProblem,
+  settingProblem,
+  configProblem,
   parseHm,
   armWindow,
   armApps,
@@ -555,6 +652,8 @@ module.exports = {
   buildUnassignedJql,
   stripSecrets,
   sanitizeWriteText,
+  sanitizeCallerName,
+  URL_RE,
   sanitizeSpeechText,
   jiraIssueOfUrl,
   countWords,

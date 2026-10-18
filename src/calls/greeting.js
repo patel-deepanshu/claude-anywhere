@@ -7,10 +7,12 @@
  *     -> {text, disclosure, disclosureStart, disclosureEnd, salutation, rest, cloned, templateUsed, templateRejected?}
  *
  * The disclosure ("this is Deepanshu's AI assistant[, speaking in his voice]. I'm transcribing this call to
- * take notes for him.") is ALWAYS generated here and ALWAYS part of the text. calls.greeting is a user
- * template that may use {caller}, {owner}, {rest} and {disclosure}; without {disclosure} the disclosure is
- * prepended. A template can never remove the disclosure, and a template that contradicts it ("I'm not an
- * AI", "this is Deepanshu himself", "this call isn't recorded") is ignored in favour of the default.
+ * take notes for him.") is ALWAYS generated here and ALWAYS part of the text, and so is the salutation
+ * before it: the greeting is always "<salutation> <disclosure> <closing question>". calls.greeting sets only
+ * the closing question (F3-SAFE-B2: free text around the disclosure could take it back, as in "Just
+ * kidding, you have Deepanshu live"): one question of at most 80 characters that does not name the owner
+ * and has none of the words that could contradict the disclosure (not, real, human, person, live, kidding,
+ * ignore, AI, recorded …). Anything else is ignored in favour of the default "How can I help?".
  * When the cloned voice is not used, the disclosure drops "speaking in his voice".
  *
  * disclosureStart/disclosureEnd are character offsets in `text`: CallSession treats the disclosure as
@@ -21,9 +23,24 @@ const script = require('../voice/clone/script');
 
 const OBJECT_PRONOUN = Object.freeze({ his: 'him', her: 'her', their: 'them' });
 const DEFAULT_REST = 'How can I help?';
-const TEMPLATE_MAX = 300;
+const TEMPLATE_MAX = 80;
 const TEXT_MAX = 600;
 const KNOWN_PLACEHOLDERS = ['caller', 'owner', 'rest', 'disclosure'];
+
+/**
+ * Words a closing question may not contain (F3-SAFE-B2): anything that could take the disclosure back,
+ * claim a person is speaking, or talk about the AI, the recording or the instructions.
+ */
+const REST_BLOCKLIST = [
+  /\b(?:kidding|joke|jokes|joking|jk|prank\w*|gotcha|lol|haha\w*)\b/i,
+  /\b(?:real|really|actual|actually|truly|genuine\w*|honest\w*|seriously)\b/i,
+  /\b(?:himself|herself|themselves|themself|myself|yourself|in\s+person|live|human\w*|person\w*|people|man|woman|guy|girl|boy|lady)\b/i,
+  /\b(?:not|no|never|nobody|none|nothing|neither|nor|without|isn|aren|wasn|weren|don|doesn|didn|won|can['’]?t|cannot)\b|n['’]t\b/i,
+  /\b(?:ignore|disregard|forget|skip|omit|remove|drop|instead|pretend\w*|fake\w*|impersonat\w*|lie|lying|trick\w*)\b/i,
+  /\b(?:ai|a\.i\.?|bot|bots|robot\w*|machine\w*|automat\w*|assistant\w*|computer\w*|synthetic|voice\w*|clone\w*|deepfake\w*)\b/i,
+  /\b(?:record\w*|transcri\w*|notes?|note-taking|disclos\w*|notice|instruction\w*|message|said|earlier|above|before)\b/i,
+  /\b(?:owner|boss|me|i['’]m|i\s+am|this\s+is|it['’]s|here|speaking|himself|him|her|his|hers|he|she|they|them)\b/i,
+];
 
 /** Phrases that would contradict the disclosure: a template containing one is not used. */
 const CONTRADICTIONS = Object.freeze([
@@ -92,6 +109,36 @@ function templateProblem(expanded, ownerFirst) {
   return null;
 }
 
+function foldName(s) {
+  return str(s)
+    .normalize('NFKD')
+    .replace(/\p{M}+/gu, '')
+    .toLowerCase();
+}
+
+/**
+ * Why a closing question cannot be used as calls.greeting (null when it can). The greeting is always
+ * "<salutation> <disclosure> <closing question>"; the setting replaces only the question.
+ * @param {string} text the setting
+ * @param {{ownerName?:string, ownerFirst?:string}} [owner]
+ * @returns {string|null}
+ */
+function greetingSettingProblem(text, { ownerName, ownerFirst } = {}) {
+  const t = oneLine(text);
+  if (!t) return null;
+  if (t.length > TEMPLATE_MAX) return `it is longer than ${TEMPLATE_MAX} characters (it is only the closing question, such as "${DEFAULT_REST}")`;
+  if (/[{}<>[\]\\|@#*_~`^=+$%&]|https?:|www\./i.test(t)) return 'it may only be the closing question: no placeholders, links or symbols (the start of the greeting and the AI disclosure are always composed by Claude Anywhere)';
+  if (!/^[^.!?;:]+\?$/.test(t)) return 'it must be one short question that ends with "?"';
+  const words = foldName(t);
+  const names = [...new Set([ownerName, ownerFirst].flatMap((n) => foldName(script.cleanName(str(n))).split(/\s+/)).filter((w) => w.length >= 2))];
+  for (const n of names) if (new RegExp(`\\b${escapeRegExp(n)}\\b`, 'i').test(words)) return 'it may not name you (the disclosure already says whose assistant is speaking)';
+  for (const re of REST_BLOCKLIST) {
+    const m = re.exec(t);
+    if (m) return `it may not say "${m[0].trim()}" (a closing question cannot talk about who is speaking, the AI or the recording)`;
+  }
+  return null;
+}
+
 /**
  * Fill a template in one pass (a value is never expanded again). {disclosure} is replaced only once;
  * unknown placeholders and stray braces are removed.
@@ -132,51 +179,25 @@ function expandTemplate(template, values) {
  */
 function composeGreeting(opts = {}) {
   const parts = greetingParts(opts);
-  const rest = oneLine(opts.rest).slice(0, 200) || DEFAULT_REST;
-  const build = (text, start) => {
-    const end = start + parts.disclosure.length;
-    return { text, disclosure: text.slice(start, end), disclosureStart: start, disclosureEnd: end, salutation: parts.salutation, rest, cloned: parts.cloned };
-  };
-  const fallback = (rejected) => {
+  const codeRest = oneLine(opts.rest);
+  const compose = (rest, used, rejected) => {
     const head = `${parts.salutation} `;
     const text = `${head}${parts.disclosure} ${rest}`;
-    const out = { ...build(text, head.length), templateUsed: false };
+    const start = head.length;
+    const end = start + parts.disclosure.length;
+    const out = { text, disclosure: text.slice(start, end), disclosureStart: start, disclosureEnd: end, salutation: parts.salutation, rest, cloned: parts.cloned, templateUsed: used };
     if (rejected) out.templateRejected = rejected;
     return out;
   };
-
+  const fallbackRest = codeRest && !greetingSettingProblem(codeRest, opts) ? codeRest : DEFAULT_REST;
+  // F3-SAFE-B2: the setting is only the closing question; the salutation and the disclosure are code's.
   const template = oneLine(opts.template);
-  if (!template) return fallback(null);
-  if (template.length > TEMPLATE_MAX) return fallback(`it is longer than ${TEMPLATE_MAX} characters`);
-  const values = { caller: parts.callerFirst || 'there', owner: parts.ownerFirst || 'the owner', rest };
-  const { out, usedDisclosure, disclosureAt } = expandTemplate(template, values);
-  const withoutDisclosure = out.replace('\u0000', ' ');
-  const problem = templateProblem(withoutDisclosure, parts.ownerFirst);
-  if (problem) return fallback(problem);
-
-  let text;
-  let start;
-  if (usedDisclosure) {
-    const before = oneLine(out.slice(0, disclosureAt));
-    const after = oneLine(out.slice(disclosureAt + 1));
-    // At the start of a sentence the disclosure starts with a capital ("Hello! This is …").
-    const sentenceStart = !before || /[.!?]$/.test(before);
-    const disclosure = sentenceStart ? capitalizeFirst(parts.disclosure) : parts.disclosure;
-    const head = before ? `${before} ` : '';
-    text = `${head}${disclosure}${after ? ` ${after}` : ''}`;
-    start = head.length;
-  } else {
-    // Prepended: drop the template's own salutation so the caller is not greeted twice.
-    const body = oneLine(withoutDisclosure.replace(/^(?:hi|hello|hey|hiya|good\s+(?:morning|afternoon|evening))\b[^,.!?]{0,40}[,.!]\s*/i, ''));
-    const head = `${parts.salutation} `;
-    text = `${head}${parts.disclosure}${body ? ` ${body}` : ''}`;
-    start = head.length;
-  }
-  if (text.length > TEXT_MAX) return fallback(`the greeting would be longer than ${TEXT_MAX} characters`);
-  const res = build(text, start);
-  // Defense in depth: the disclosure must be in the text, verbatim (case aside).
-  if (res.disclosure.toLowerCase() !== parts.disclosure.toLowerCase() || !text.toLowerCase().includes(parts.disclosure.toLowerCase())) return fallback('the disclosure would be missing');
-  return { ...res, templateUsed: true };
+  if (!template) return compose(fallbackRest, false, null);
+  const problem = greetingSettingProblem(template, { ownerName: opts.ownerName, ownerFirst: parts.ownerFirst });
+  if (problem) return compose(fallbackRest, false, problem);
+  const res = compose(template, true, null);
+  if (res.text.length > TEXT_MAX || !hasDisclosure(res.text)) return compose(fallbackRest, false, 'the disclosure would be missing');
+  return res;
 }
 
 /**
@@ -200,4 +221,4 @@ function hasDisclosure(text) {
   return /\bAI assistant\b/i.test(t) && /\btranscribing this call\b/i.test(t);
 }
 
-module.exports = { composeGreeting, greetingParts, redisclosure, transcriptStoppedText, hasDisclosure, templateProblem, DEFAULT_REST, TEMPLATE_MAX, CONTRADICTIONS };
+module.exports = { composeGreeting, greetingParts, greetingSettingProblem, redisclosure, transcriptStoppedText, hasDisclosure, templateProblem, expandTemplate, DEFAULT_REST, TEMPLATE_MAX, CONTRADICTIONS, REST_BLOCKLIST };

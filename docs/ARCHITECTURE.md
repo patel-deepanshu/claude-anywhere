@@ -461,7 +461,10 @@ Every input-action tool posts fire-and-forget `POST /api/mcp/activity` `{tool, s
 server calls `GET /api/mcp/guard` (200 ms timeout; unreachable daemon → allowed).
 
 Environment: `ANYWHERE_DAEMON_URL`, `ANYWHERE_TOKEN`, `ANYWHERE_ROLE` (`engine` when spawned by the daemon's
-engine, else `interactive`).
+engine, else `interactive`). The daemon gives its engines' MCP servers a separate engine token, which the server
+refuses on `/api/approval`, `/api/answer`, `POST /api/config`, `/api/mode` and `/api/shutdown` (403
+`ENGINE_FORBIDDEN`); the plugin's MCP server in the user's own Claude Code uses the daemon token from
+`daemon.json`.
 
 While a blocking call (`ask_user`, `permission_prompt`) waits, the server sends
 `notifications/progress` (`{progressToken: params._meta.progressToken, progress: n, message}`) every 15 s when the
@@ -511,7 +514,7 @@ Bind `127.0.0.1` only. Security on **every** request:
 | GET `/api/state` | | snapshot |
 | POST `/api/command` | `{text, attachScreenshot?, images?:[{mediaType,data}], source?:'text'|'voice'|'cli'|'skill'}` | `{ok, id, mode, bridge:{listening}}` |
 | POST `/api/interrupt` | | `{ok}` |
-| POST `/api/approval` | `{id, decision:'allow'|'allow_session'|'deny', message?, via?:'click'|'key'|'typed'|'voice'}` | `{ok}`; 409 `{code:'CRITICAL_NEEDS_CLICK'}` for an allow of a critical card sent by voice or key (the card stays). `via` is how the user answered: the dialog sends click or key (Enter/Esc on the card) or voice, the TUI typed or voice; other values are ignored, and older clients send none |
+| POST `/api/approval` | `{id, decision:'allow'|'allow_session'|'deny', message?, via?:'click'|'key'|'typed'|'voice'}` | `{ok}`; 403 `{code:'CLICK_NEEDS_DIALOG'}` for `via:'click'` without the dialog's `X-Anywhere-UI` credential and origin; 409 `{code:'CRITICAL_NEEDS_CLICK'}` for an allow of a critical card that is not such a click (or the TUI's typed allow on a card that is not click-only): by voice, key or without `via` (the card stays). `via` is how the user answered: the dialog sends click or key (Enter/Esc on the card) or voice, the TUI typed or voice; other values are ignored, and older clients send none |
 | POST `/api/answer` | `{id, text}` | `{ok}` |
 | POST `/api/session/new` | | `{ok, sessionId}` |
 | POST `/api/project` | `{dir, force?}` | `{ok, project}` (restarts engine in the new cwd); 409 while a task runs unless `force:true`, which stops it first. Bridge commands that only wait for a terminal get their own 409 text ("A command is waiting for a Claude Code terminal…"); forced, they are dropped (`commands_cancelled` reason `reset`) |
@@ -917,10 +920,12 @@ header on fetch and `?token=` on EventSource. Features:
   Ctrl/Cmd+Alt+N starts a new session (Ctrl/Cmd+Shift+N also works in the app window and Electron; ordinary browser
   tabs keep it for a private window). On macOS these shortcuts use Cmd only, so Ctrl+K keeps its kill-line meaning
   in text fields.
-- Credentials: `?token=` (Electron, or a URL the user opened) or `?launch=<code>` (browsers the daemon starts) is read
-  once, the launch code is traded through `POST /api/launch` before the first API call, the token is kept in
-  sessionStorage, and both are removed from the address bar. A failed trade (used or expired code) falls back to the
-  stored token, so reloads keep working.
+- Credentials: `?launch=<code>` (every window the daemon starts, Electron included) or `?token=` (a URL the user
+  opened) is read once, the launch code is traded through `POST /api/launch` before the first API call, the token is
+  kept in sessionStorage, and both are removed from the address bar. A failed trade (used or expired code) falls back
+  to the stored token, so reloads keep working. A code minted for a dialog window also returns `ui`, the dialog's
+  own credential (sessionStorage `anywhere.ui`, sent as `X-Anywhere-UI`); only requests with it, from the daemon's
+  origin, may answer a card with `via: 'click'`, and a page without it shows a critical card's Allow disabled.
 - Transcript: a user item with source `handoff` (the task `switch_project` handed to the new session) is labelled
   "Handed over by Claude" and collapsed to its first line when long; ticket tools show a ticket icon, `find_repos` and
   `switch_project` a folder.
@@ -1051,7 +1056,8 @@ anywhere daemon
 ```
 
 - **Arming** is memory-only, expires, and needs a click on a critical card raised by `POST /api/calls/arm`
-  through `PermissionBroker.requestCritical()`; `CallManager` accepts only `via: 'click'`. `classify()` marks
+  through `PermissionBroker.requestCritical({clickOnly: true})`; `CallManager` accepts only `via: 'click'` with
+  `dialog: true` (the request carried the dialog window's credential). `classify()` marks
   `calls_arm` and `anywhere calls on` critical with `ownCard`, so the tool call reaches that card without a
   second one (§13.4 of the design). `calls_disarm` / `anywhere calls off` never ask.
 - **Roles.** The MCP server in role `call` (`ANYWHERE_ROLE=call`, `ANYWHERE_CALL_ID`) lists only

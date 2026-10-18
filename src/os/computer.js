@@ -131,7 +131,7 @@ class Computer {
    * @param {{driver:object, config?:object, guard?:()=>Promise<{allowed:boolean,reason?:string}>,
    *   geometryStore?:'memory'|'file', platform?:string}} opts
    */
-  constructor({ driver, config, guard, geometryStore = 'memory', platform: plat } = {}) {
+  constructor({ driver, config, guard, geometryStore = 'memory', platform: plat, protect } = {}) {
     if (!driver || typeof driver !== 'object') throw new TypeError('Computer needs a driver (see src/os/index.js getDriver())');
     if (geometryStore !== 'memory' && geometryStore !== 'file') {
       throw new TypeError(`geometryStore must be 'memory' or 'file' (got ${JSON.stringify(geometryStore)})`);
@@ -139,6 +139,10 @@ class Computer {
     this.driver = driver;
     this.config = normalizeConfig(config);
     this.guard = typeof guard === 'function' ? guard : null;
+    // protect(window) → true for windows that this Computer's input must never touch (F3-SAFE-D1:
+    // the Claude Anywhere dialog, for input an engine asks for): a click, drag or scroll on one, or a
+    // key or text while one has the focus, is refused.
+    this.protect = typeof protect === 'function' ? protect : null;
     this.geometryStore = geometryStore;
     this.platform = plat || platform.info().platform;
     this._mem = emptyStore();
@@ -365,6 +369,39 @@ class Computer {
     throw err;
   }
 
+  /** @private refuse a pointer action on a protected window (wherever it is in the stacking order) */
+  async _refuseProtectedAt(points) {
+    if (!this.protect || typeof this.driver.listWindows !== 'function') return;
+    let wins;
+    try {
+      wins = await this.driver.listWindows();
+    } catch {
+      return; // windows cannot be listed here: the daemon's guard still pauses input while a critical card waits
+    }
+    for (const w of Array.isArray(wins) ? wins : []) {
+      if (!w || w.minimized || !this.protect(w)) continue;
+      const b = { x: Number(w.x), y: Number(w.y), width: Number(w.width), height: Number(w.height) };
+      if (![b.x, b.y].every(Number.isFinite) || !(b.width > 0) || !(b.height > 0)) continue;
+      if (points.some((p) => p.x >= b.x && p.y >= b.y && p.x < b.x + b.width && p.y < b.y + b.height)) {
+        throw inputError('That point is inside the Claude Anywhere dialog, which Claude may not click', 'OWN_DIALOG', 'Only the user answers the dialog. Click somewhere else, or ask the user.');
+      }
+    }
+  }
+
+  /** @private refuse keys and text while a protected window has the focus */
+  async _refuseProtectedFocus() {
+    if (!this.protect || typeof this.driver.activeWindow !== 'function') return;
+    let w = null;
+    try {
+      w = await this.driver.activeWindow();
+    } catch {
+      return;
+    }
+    if (w && this.protect(w)) {
+      throw inputError('The Claude Anywhere dialog has the focus, and Claude may not type into it', 'OWN_DIALOG', 'Focus the window you want to type in first (focus_window), or ask the user.');
+    }
+  }
+
   _modifiers(modifiers) {
     if (modifiers == null || modifiers === '' || (Array.isArray(modifiers) && !modifiers.length)) return [];
     const list = keys.normalizeCombo(modifiers, { platform: this.platform });
@@ -514,6 +551,7 @@ class Computer {
     const mods = this._modifiers(modifiers);
     return this._act(async (displays) => {
       const t = await this._target(displays, display, x, y, ['x', 'y'], 'click');
+      await this._refuseProtectedAt([t.logical]);
       return async () => {
         const res = await this.driver.click(t.logical.x, t.logical.y, { button: btn, clicks: n, modifiers: mods });
         this._notePointer(t.logical);
@@ -543,6 +581,7 @@ class Computer {
       if ([fromX, fromY, toX, toY].some((v) => v == null)) throw inputError('drag needs fromX, fromY, toX and toY');
       const a = await this._target(displays, display, fromX, fromY, ['fromX', 'fromY'], 'drag');
       const b = await this._target(displays, display, toX, toY, ['toX', 'toY'], 'drag');
+      await this._refuseProtectedAt([a.logical, b.logical]);
       return async () => {
         const res = await this.driver.drag(a.logical.x, a.logical.y, b.logical.x, b.logical.y, { button: btn });
         this._notePointer(b.logical);
@@ -559,6 +598,7 @@ class Computer {
     if (n < 1 || n > MAX_SCROLL) throw inputError(`amount must be from 1 to ${MAX_SCROLL} notches (got ${amount})`);
     return this._act(async (displays) => {
       const t = await this._target(displays, display, x, y, ['x', 'y'], 'scroll');
+      await this._refuseProtectedAt([t.logical]);
       const [ux, uy] = DIRECTIONS[dir];
       return async () => {
         const res = await this.driver.scroll(t.logical.x, t.logical.y, ux * n, uy * n);
@@ -619,6 +659,7 @@ class Computer {
     if (!['auto', 'keys', 'paste'].includes(how)) throw inputError(`method must be auto, keys or paste (got ${JSON.stringify(method)})`);
     if (text === '') return { ok: true, action: 'type', method: 'none', chars: 0 };
     return this._act(async () => {
+      await this._refuseProtectedFocus();
       const terminal = how === 'keys' ? false : await this._activeIsTerminal();
       let use = how;
       if (use === 'auto') {
@@ -639,13 +680,16 @@ class Computer {
     }
     const list = keys.normalizeCombo(combo, { platform: this.platform });
     const n = toInt(repeat == null ? 1 : repeat, 'repeat', 1, MAX_REPEAT);
-    return this._act(async () => async () => {
-      const results = [];
-      for (let i = 0; i < n; i++) {
-        if (i) await sleep(REPEAT_GAP_MS);
-        results.push(await this.driver.keyCombo(list));
-      }
-      return { ok: true, action: 'key', keys: list, repeat: n, ...warningsOf(...results) };
+    return this._act(async () => {
+      await this._refuseProtectedFocus();
+      return async () => {
+        const results = [];
+        for (let i = 0; i < n; i++) {
+          if (i) await sleep(REPEAT_GAP_MS);
+          results.push(await this.driver.keyCombo(list));
+        }
+        return { ok: true, action: 'key', keys: list, repeat: n, ...warningsOf(...results) };
+      };
     });
   }
 

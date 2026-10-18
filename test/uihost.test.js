@@ -1103,7 +1103,7 @@ test('SECURITY-7: browsers get a fresh single-use launch URL per attempt; the to
   await host.close();
 });
 
-test('SECURITY-7: launchUrl is wired through the constructor; Electron gets the real URL in its environment only', async () => {
+test('SECURITY-7 / F3-SAFE-D1: launchUrl is wired through the constructor; Electron gets a launch URL (the dialog credential) in its environment only', async () => {
   const minter = fakeMinter();
   const spawn = fakeSpawn(() => ({}));
   const host = new U.UiHost({
@@ -1126,8 +1126,10 @@ test('SECURITY-7: launchUrl is wired through the constructor; Electron gets the 
     launchUrl: minter,
   });
   assert.equal((await host.open(URL_)).host, 'electron');
-  assert.equal(minter.minted.length, 0, 'Electron needs no launch code');
-  assert.equal(spawn.calls[0].opts.env[U.ELECTRON_URL_ENV], URL_);
+  // The page trades the code for the token and the dialog window's own credential.
+  assert.equal(minter.minted.length, 1, 'Electron gets a single-use launch code');
+  assert.equal(spawn.calls[0].opts.env[U.ELECTRON_URL_ENV], `${MINT_BASE}c1`);
+  assert.ok(!String(spawn.calls[0].opts.env[U.ELECTRON_URL_ENV]).includes('token='));
   assert.ok(!spawn.calls[0].args.some((a) => a.includes('127.0.0.1')));
   await host.close();
 });

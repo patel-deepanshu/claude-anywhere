@@ -173,7 +173,9 @@ test('inQuietHours: across midnight, same-day ranges, disabled and empty ranges'
   assert.equal(answer.inQuietHours(at(13), { start: '12:00', end: '13:00' }), false);
   assert.equal(answer.inQuietHours(at(23), { ...night, enabled: false }), false);
   assert.equal(answer.inQuietHours(at(23), { start: '10:00', end: '10:00' }), false);
-  assert.equal(answer.inQuietHours(at(23), { start: 'late', end: '08:00' }), false);
+  // F3-SAFE-D3: enabled hours that do not parse count as quiet (fail closed), never as "no quiet hours".
+  assert.equal(answer.inQuietHours(at(23), { start: 'late', end: '08:00' }), true);
+  assert.equal(answer.inQuietHours(at(12), { start: 'late', end: '08:00', enabled: false }), false);
   assert.equal(answer.inQuietHours(at(23), null), false);
 });
 

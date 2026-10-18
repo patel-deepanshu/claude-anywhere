@@ -680,7 +680,14 @@ async function createStubServer(opts = {}) {
     else fs.createReadStream(file).pipe(res);
   };
 
+  // F3-SAFE-D1: a dialog launch code (?launch=) trades for the token and the dialog's own credential.
+  const launchCode = 'stub-launch-code';
+  const uiKey = 'stub-dialog-ui-key';
   const routes = {
+    'POST /api/launch': ({ body }) => {
+      if (body.code !== launchCode) throw fail(401, 'Unauthorized');
+      return { token, ui: uiKey };
+    },
     'GET /api/health': () => ({ ok: true, app: 'claude-anywhere', version: '0.0.0-stub', instanceId, pid: process.pid }),
     'GET /api/state': () => snapshot(),
     'GET /api/events': ({ req, res }) => {
@@ -727,11 +734,13 @@ async function createStubServer(opts = {}) {
       later(300, () => setStatus('idle'));
       return { ok: true };
     },
-    'POST /api/approval': ({ body }) => {
+    'POST /api/approval': ({ body, req }) => {
       if (!['allow', 'allow_session', 'deny'].includes(body.decision)) throw fail(400, 'decision must be allow, allow_session or deny');
       if (!st.approvals.has(body.id)) throw fail(404, 'No pending approval with that id (it may have timed out or been cancelled)');
       st.approvals.delete(body.id);
       st.approvalBodies.push(JSON.parse(JSON.stringify(body)));
+      st.approvalHeaders = st.approvalHeaders || [];
+      st.approvalHeaders.push({ ui: req.headers['x-anywhere-ui'] || null, origin: req.headers.origin || null });
       st.decisions.push({ id: body.id, decision: body.decision, ...(body.message ? { message: body.message } : {}) });
       broadcast('approval_resolved', { id: body.id, decision: body.decision, by: 'user', ...(body.message ? { message: body.message } : {}) });
       setStatus(st.questions.size ? 'waiting_answer' : 'acting', st.questions.size ? 'Claude asked you a question' : 'Run command');
@@ -975,7 +984,7 @@ async function createStubServer(opts = {}) {
       }
       const key = `${method} ${url.pathname}`;
       const fn = routes[key];
-      if (key !== 'GET /api/health' && !tokenOk(req, url, key === 'GET /api/events')) throw fail(401, 'Unauthorized');
+      if (key !== 'GET /api/health' && key !== 'POST /api/launch' && !tokenOk(req, url, key === 'GET /api/events')) throw fail(401, 'Unauthorized');
       if (!fn) throw fail(404, 'Not found');
       let body = {};
       let raw = null;
@@ -1033,7 +1042,8 @@ async function createStubServer(opts = {}) {
       if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
     });
 
-  return { server, port, url, token, broadcast, close, state: st, snapshot, announce, makeClip };
+  const launchUrl = `http://127.0.0.1:${port}/?launch=${launchCode}`;
+  return { server, port, url, launchUrl, uiKey, token, broadcast, close, state: st, snapshot, announce, makeClip };
 }
 
 function parseArgs(argv) {

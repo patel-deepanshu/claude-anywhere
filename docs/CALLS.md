@@ -115,10 +115,10 @@ The enrollment opens in the Claude Anywhere dialog (or, when no dialog answers, 
    record: *"I, Deepanshu Patel, agree that Claude Anywhere may create a copy of my voice on this computer. My
    code is 4 7 2 9."* It is transcribed locally and must match.
 5. **Script**: 14 short lines (about 70 seconds of speech). Each take is checked at once (level, noise,
-   clipping, length) and can be re-recorded. At least 45 seconds of speech are needed in all; the consent
+   clipping, length, and a local transcript that must match the line) and can be re-recorded. At least 45 seconds of speech are needed in all; the consent
    sentence counts toward it.
-6. **Build**: the consent take and the lines must be the same speaker (speaker embeddings); the best takes
-   make a 10–15 second reference clip.
+6. **Build**: the lines must be the same speaker as the consent take, each of them and together (speaker
+   embeddings; a session with two voices is refused); the best takes make a 10–15 second reference clip.
 7. **Test**: a sentence plays in your cloned voice with a match score. **Keep**, **Redo**, or try the
    **quality voice** (ZipVoice: closer to your voice but slower, and its model is trained on data with a
    non-commercial license).
@@ -131,7 +131,7 @@ voice can only be the enrolled speaker's. Read in the language of your calls, in
 | `anywhere clone-voice` | opens the enrollment (`--standalone`: in a browser tab) |
 | `anywhere clone-voice install [--engine zipvoice]` | installs the runtime and models |
 | `anywhere clone-voice status` | runtime, voice profile, speed |
-| `anywhere clone-voice test "Some text"` | plays a sentence in your cloned voice |
+| `anywhere clone-voice test` | plays the test sentence in your cloned voice (sentences of your own: Test in the dialog's voice view) |
 | `anywhere clone-voice bench` | measures the voice engines on this computer |
 | `anywhere clone-voice delete` | deletes your voice (asks you to type `delete`; `--yes` skips that) |
 
@@ -213,10 +213,13 @@ transcription notice:
 > *"Hi Ankit, this is Deepanshu's AI assistant, speaking in his voice. I'm transcribing this call to take
 > notes for him. How can I help?"*
 
-You can change the rest of the greeting with `calls.greeting` (placeholders `{caller}`, `{owner}`, `{rest}`
-and `{disclosure}`), but no template can remove or contradict the disclosure: it is put back in front, and a
-template that claims to be a person is not used. The assistant says nothing else until the greeting has
-played, and when asked whether it is a person or a bot it says plainly that it is an AI assistant.
+You can change only the closing question with `calls.greeting` (for example *"What can I do for you
+today?"*): one question of at most 80 characters that does not name you and has none of the words that could
+take the disclosure back ("not", "real", "live", "kidding", "ignore", "AI", "recorded" and the like). The
+salutation and the disclosure are always composed by Claude Anywhere, and a setting that breaks these rules
+is refused when you save it (and ignored if it is in the file anyway). The assistant says nothing else until
+the disclosure has played in full, and when asked whether it is a person or a bot it says plainly that it is
+an AI assistant.
 
 Why: a cloned voice can make a caller believe they are talking to you. The disclosure keeps every call
 honest, lets the caller decide what to share, and covers the notice that transcription laws require in many
@@ -306,7 +309,7 @@ refuses, the window method is used. If Zoho answers 401/403, the error names the
 | `calls.defaultArmMinutes`, `calls.maxArmMinutes` | `120`, `720` | how long answering lasts |
 | `calls.answerAfterSec`, `calls.answerOnlyWhenIdleSec` | `8`, `0` | give yourself time to pick up; answer only when idle |
 | `calls.quietHours` | `{enabled: true, start: '22:00', end: '08:00'}` | never answer in these hours |
-| `calls.greeting` | (empty) | template for the rest of the greeting (the disclosure is enforced) |
+| `calls.greeting` | (empty) | the closing question after the disclosure (default "How can I help?"; at most 80 characters, one question) |
 | `calls.maxCallMinutes` | `15` | the assistant wraps up a minute before |
 | `calls.model` | `haiku` | the call assistant's model |
 | `calls.stt.model` | `moonshine` | `moonshine` · `whisper-tiny` · `whisper` · `parakeet` (more accurate, 482 MB) |
@@ -343,7 +346,7 @@ anywhere calls test-audio               the browser audio self-test
 anywhere calls learn [--app cliq] [--seconds 60]
 anywhere calls audio setup | teardown | check
 anywhere calls cliq setup | test | gui | status
-anywhere clone-voice [start | install | status | test [TEXT] | bench | delete] [--engine pocket|zipvoice]
+anywhere clone-voice [start | install | status | test | bench | delete] [--engine pocket|zipvoice]
 ```
 
 All of them take `--json`. `calls on` exits 0 when answering is on, 5 when you did not allow it, 2 when nobody

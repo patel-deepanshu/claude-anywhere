@@ -50,27 +50,49 @@ function within(r, p, margin = 0) {
   return Boolean(r && p && p.x >= r.x - margin && p.y >= r.y - margin && p.x < r.x + r.width + margin && p.y < r.y + r.height + margin);
 }
 
-function parseHm(s) {
-  const m = String(s == null ? '' : s).match(/^\s*(\d{1,2}):(\d{2})\s*$/);
-  if (!m) return null;
-  const h = Number(m[1]);
-  const min = Number(m[2]);
-  return h < 24 && min < 60 ? h * 60 + min : null;
-}
-
 /**
- * Quiet hours in local time, across midnight when start > end (22:00–08:00). A defensive copy of
- * the manager's policy check: answering is refused here too.
+ * Quiet hours in local time, across midnight when start > end (22:00–08:00): the manager's policy check,
+ * repeated here so answering is refused here too. Enabled hours whose times do not parse count as quiet
+ * (fail closed, F3-SAFE-D3).
  * @param {Date} date
  * @param {{enabled?:boolean, start?:string, end?:string}} qh
  */
 function inQuietHours(date, qh) {
-  if (!qh || qh.enabled === false) return false;
-  const start = parseHm(qh.start);
-  const end = parseHm(qh.end);
-  if (start == null || end == null || start === end) return false;
-  const m = date.getHours() * 60 + date.getMinutes();
-  return start < end ? m >= start && m < end : m >= start || m < end;
+  return require('./policy').inQuietHours(date, qh);
+}
+
+function nameWords(s) {
+  return String(s == null ? '' : s)
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean);
+}
+
+/**
+ * The caller's name from the call app (§7.3, F3-SAFE-C1). The deterministic name (window title,
+ * notification or learned signature) wins; vision's reading of the whole screenshot is used only when
+ * there is none. When both exist and neither contains the other (as whole words), the caller is unbound
+ * (null), so nothing is assigned to or sent to someone the screen merely mentions.
+ * @param {string|null} deterministic
+ * @param {string|null} fromVision
+ * @returns {{caller:string|null, conflict?:{deterministic:string, vision:string}}}
+ */
+function resolveCaller(deterministic, fromVision) {
+  const a = String(deterministic == null ? '' : deterministic).replace(/\s+/g, ' ').trim();
+  const b = String(fromVision == null ? '' : fromVision).replace(/\s+/g, ' ').trim();
+  if (!a) return { caller: b || null };
+  if (!b) return { caller: a };
+  const wa = nameWords(a);
+  const wb = nameWords(b);
+  if (!wa.length) return { caller: b };
+  if (!wb.length) return { caller: a };
+  const inside = (x, y) => x.every((w) => y.includes(w));
+  if (inside(wa, wb) || inside(wb, wa)) return { caller: wb.length > wa.length ? b : a };
+  return { caller: null, conflict: { deterministic: a, vision: b } };
 }
 
 /** Whether calls.apps allows an app id (no list configured = the default set of known apps). */
@@ -266,6 +288,7 @@ function ringState(windows, candidate, learned) {
 }
 
 function errorReason(err) {
+  if (err && err.code === 'ANSWER_ABORTED') return 'disarmed';
   if (err && err.code === 'PAUSED') return 'paused';
   if (err && err.code === 'FAILSAFE') return 'failsafe';
   if (err && err.code === 'VISION_RATE_LIMIT') return 'vision_rate_limit';
@@ -313,8 +336,42 @@ async function verifyAnswered({ candidate, driver, computer, vision, display = 0
  * @returns {Promise<{ok:boolean, method:string|null, reason?:string, point?:{x:number,y:number},
  *   verified?:string, video?:boolean, camera?:object, caller?:string|null, app?:string|null, attempts:object[]}>}
  */
+/**
+ * The Computer for answering, whose key presses and clicks first ask shouldContinue() (F3-SAFE-D2: the
+ * user may say "stop answering calls" while the answer routine runs; then no Accept is pressed).
+ */
+function guardedComputer(computer, shouldContinue) {
+  if (!computer || typeof shouldContinue !== 'function') return computer;
+  const check = () => {
+    let go = false;
+    try {
+      go = shouldContinue() !== false;
+    } catch {
+      go = false;
+    }
+    if (!go) {
+      const e = new Error('Answering was stopped (calls were turned off)');
+      e.code = 'ANSWER_ABORTED';
+      throw e;
+    }
+  };
+  return new Proxy(computer, {
+    get(target, prop) {
+      if (prop === 'key' || prop === 'click') {
+        return (...a) => {
+          check();
+          return target[prop](...a);
+        };
+      }
+      const v = target[prop];
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+}
+
 async function answerCall(opts = {}) {
-  const { candidate, computer, driver, vision, config } = opts;
+  const { candidate, driver, vision, config } = opts;
+  const computer = guardedComputer(opts.computer, opts.shouldContinue);
   const now = typeof opts.now === 'function' ? opts.now : Date.now;
   const sleep = typeof opts.sleep === 'function' ? opts.sleep : util.sleep;
   const attempts = [];
@@ -322,6 +379,7 @@ async function answerCall(opts = {}) {
   if (!candidate || typeof candidate !== 'object') return fail('no_candidate');
   // Safeguard (d): armed by a click, not expired, not in quiet hours, an allowed app.
   if (!(Number(opts.armedUntil) > now())) return fail('not_armed');
+  if (typeof opts.shouldContinue === 'function' && opts.shouldContinue() === false) return fail('disarmed');
   const c = callsConfig(config);
   if (inQuietHours(new Date(now()), c.quietHours)) return fail('quiet_hours');
   if (candidate.app && !appAllowed(candidate.app, config)) return fail('app_not_allowed');
@@ -426,7 +484,8 @@ async function answerCall(opts = {}) {
         if (video) {
           camera = await cameraOff({ app: appId, windowId: callWin ? callWin.id : candidate.windowId, display, computer, driver, vision, sleep, now }).catch((err) => ({ ok: false, reason: errorReason(err) }));
         }
-        return done('click', { point, verified: v.how, video, ...(camera ? { camera } : {}), caller: det.caller || candidate.caller || null, app: appId });
+        const who = resolveCaller(candidate.caller, det.caller);
+        return done('click', { point, verified: v.how, video, ...(camera ? { camera } : {}), caller: who.caller, ...(who.conflict ? { callerConflict: who.conflict } : {}), app: appId });
       }
       lastReason = v.how === 'still_ringing' ? 'still_ringing' : 'not_verified';
     }
@@ -613,6 +672,8 @@ module.exports = {
   topWindowAt,
   bannerZones,
   inQuietHours,
+  resolveCaller,
+  guardedComputer,
   appAllowed,
   ringState,
   DIFF_MARGIN,

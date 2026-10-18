@@ -124,7 +124,8 @@ function getCallManager(server) {
       getDriver: typeof deps.getDriver === 'function' ? deps.getDriver : async () => null,
       getComputer: computerGetter(server),
       piper: () => (server.deps.voice && server.deps.voice.piper) || null,
-      daemonInfo: () => ({ url: `http://127.0.0.1:${server.port}`, token: server.token }),
+      // The call engine's MCP server gets the engines' token (F3-SAFE-D1), never the daemon's own.
+      daemonInfo: () => ({ url: `http://127.0.0.1:${server.port}`, token: server.engineToken || server.token }),
       platformInfo: deps.platformInfo || undefined,
       // The dialog's pause also stops the after-call chat message (cliq.js types into the call app).
       checkGuard: async () => {
@@ -237,7 +238,9 @@ function register(add, server) {
       r.path,
       (ctx) => {
         const m = mgr();
-        if (m.call && r.step === 'begin') throw httpError(409, 'A call is in progress; run the audio test after it');
+        // F3-SAFE-F1: no step of the self-test (it speaks into, and records from, the call's audio route)
+        // while a call is being answered or is in progress.
+        if (m.call || m._answering || m.state === 'answering') throw httpError(409, 'A call is in progress; run the audio test after it');
         return m.selfTest().route(r.step, ctx);
       },
       { noAuth: true, raw: Boolean(r.raw), noBody: Boolean(r.noBody) }

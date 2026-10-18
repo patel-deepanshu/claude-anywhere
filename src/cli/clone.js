@@ -7,7 +7,7 @@
  *   anywhere clone-voice [start]         start the dialog if needed and open its enrollment view
  *   anywhere clone-voice install         the free voice runtime and models (~425 MB, once)
  *   anywhere clone-voice status          runtime, voice profile, speed
- *   anywhere clone-voice test [TEXT]     hear a sentence in your cloned voice
+ *   anywhere clone-voice test            hear the test sentence in your cloned voice (own text: the dialog only)
  *   anywhere clone-voice bench           measure the clone engines' speed on this computer
  *   anywhere clone-voice delete          delete the voice profile, its consent record and phrase cache
  *   flags: --engine pocket|zipvoice  --json  --yes (delete without the typed confirmation)  --standalone (start in a browser tab)
@@ -341,6 +341,11 @@ function commands(h) {
 
   async function doTest(p) {
     const text = [...p._.slice(1), ...(p.rest || [])].join(' ').trim();
+    // F3-SAFE-B3: the cloned voice says only the fixed test sentence from here (also with --local); text of
+    // your own is tried in the dialog, where you type it yourself.
+    if (text) {
+      throw cliError('Your own text can only be tried in the Claude Anywhere dialog (Test in the voice view).', 'Without text, this plays the test sentence: anywhere clone-voice test');
+    }
     const engine = engineFlag(p);
     const d = p.flags.local ? null : await maybeDaemon();
     let r = null;
@@ -471,12 +476,12 @@ function commands(h) {
       run,
       group: 'Setup',
       summary: 'Record and clone your own voice (consent-gated, stays on this computer)',
-      usage: 'anywhere clone-voice [start | install | status | test [TEXT] | bench | delete] [--engine pocket|zipvoice] [--json]',
+      usage: 'anywhere clone-voice [start | install | status | test | bench | delete] [--engine pocket|zipvoice] [--json]',
       details: [
         'start (the default) opens the enrollment view in the dialog: a consent sentence with a one-time code, then 14 short lines (about 3 minutes).',
         'install downloads the free voice runtime into a private venv under ~/.claude-anywhere/voice (about 425 MB, once; --engine zipvoice adds the quality voice).',
         'Only your own live microphone recording is used; nothing is uploaded. delete removes the profile, the consent recording and the phrase cache.',
-        'test plays a sentence in your cloned voice through the speakers; bench measures the engines on this computer.',
+        'test plays the test sentence in your cloned voice through the speakers (sentences of your own: Test in the dialog); bench measures the engines on this computer.',
       ],
       spec: spec({ string: ['engine'], boolean: ['yes', 'local', 'standalone'], alias: { y: 'yes' } }),
     },

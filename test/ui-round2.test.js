@@ -289,7 +289,10 @@ test('headless Chromium: Enter never allows a critical action; it needs a click'
   t.after(() => stub.close());
   const page = await openPage(chrome, { width: 1024, height: 768 });
   t.after(() => page.close());
-  await loadDialog(page, stub);
+  // The dialog window as Claude Anywhere opens it: a launch code that also gives the dialog's own credential,
+  // without which a critical card cannot be allowed at all (F3-SAFE-D1).
+  await page.send('Page.navigate', { url: stub.launchUrl });
+  assert.ok(await waitFor(page, `document.getElementById('status') && document.getElementById('status').dataset.state === 'idle'`), 'dialog connects');
 
   const card = { id: 'ap_crit', toolName: 'Bash', displayName: 'Run command', summary: 'rm -rf ~', input: { command: 'rm -rf ~' }, risk: 'critical', ts: new Date().toISOString(), timeoutSec: 600 };
   await page.evaluate(`document.getElementById('input').focus()`);
@@ -308,7 +311,20 @@ test('headless Chromium: Enter never allows a critical action; it needs a click'
   await page.evaluate(`document.querySelector('.card.approval .btn-primary').click()`);
   assert.ok(await until(() => stub.state.decisions.length === 1), 'the click decided it');
   assert.deepEqual(stub.state.decisions, [{ id: 'ap_crit', decision: 'allow' }]);
+  assert.equal(stub.state.approvalHeaders[0].ui, stub.uiKey, 'with the dialog credential');
   assert.deepEqual(page.problems, [], page.problems.join('\n'));
+
+  // A page opened from a copied token link has no dialog credential: its critical Allow is disabled.
+  const other = await openPage(chrome, { width: 1024, height: 768 });
+  t.after(() => other.close());
+  await other.send('Page.navigate', { url: stub.url });
+  assert.ok(await waitFor(other, `Boolean(document.getElementById('status') && document.getElementById('status').dataset.state)`), 'the second page connects');
+  const card2 = { ...card, id: 'ap_crit2' };
+  stub.state.approvals.set(card2.id, card2);
+  stub.broadcast('approval_request', card2);
+  assert.ok(await waitFor(other, `Boolean(document.querySelector('.card.approval[data-id="ap_crit2"]'))`));
+  assert.equal(await other.evaluate(`document.querySelector('.card.approval[data-id="ap_crit2"] .btn-primary').disabled`), true);
+  assert.match(await other.evaluate(`document.querySelector('.card.approval[data-id="ap_crit2"] .btn-primary').title`), /only in the dialog window/);
 });
 
 test('headless Chromium: Settings sends only what was edited, and the screenshot default wins over the chip (UI-DYNAMIC-3, -4, -6, -11)', async (t) => {

@@ -505,13 +505,18 @@ class CallManager extends EventEmitter {
     if (!this.permissions || (typeof this.permissions.prompt !== 'function' && typeof this.permissions.requestCritical !== 'function')) {
       return { ok: false, error: 'Approvals are not available, so calls cannot be turned on.', code: 'NO_APPROVALS' };
     }
+    // F3-SAFE-D3: quiet hours that do not parse never silently turn off: arming is refused until fixed.
+    const qhProblem = policyMod.quietHoursProblem(this.callsCfg().quietHours);
+    if (qhProblem) {
+      return { ok: false, error: `Calls cannot be answered: ${qhProblem}.`, hint: 'Fix them, e.g.: anywhere config set calls.quietHours.start 22:00 (and calls.quietHours.end 08:00)', code: 'QUIET_HOURS_INVALID' };
+    }
     const pre = await this._preflight();
     if (!pre.ok) return pre;
-    const qh = this.callsCfg().quietHours || {};
+    const qh = policyMod.quietHoursOf(this.callsCfg().quietHours);
     const names = appList.map(appName).join(', ');
     const summary = [
       `Answer calls for you until ${hhmm(win.until)} (${names})? The assistant says it is an AI and takes notes.`,
-      qh.enabled !== false && qh.start && qh.end ? `Not during quiet hours (${qh.start}–${qh.end}).` : '',
+      qh.enabled && qh.startMin !== qh.endMin ? `Not during quiet hours (${qh.start}–${qh.end}).` : '',
       instr ? `Your instructions: ${oneLine(instr, 160)}` : '',
     ]
       .filter(Boolean)
@@ -523,8 +528,10 @@ class CallManager extends EventEmitter {
       this._audit({ type: 'calls_arm', allowed: false, reason: decision.message || 'denied', via: origin });
       return { ok: false, denied: true, armed: false, message: decision.message || 'You did not allow answering calls.' };
     }
-    if (!this.armVia.includes(decision.via)) {
-      this._audit({ type: 'calls_arm', allowed: false, reason: `allowed by ${decision.via || 'an unknown method'}, not a click`, via: origin });
+    // F3-SAFE-D1: the click must come from the dialog window itself (DaemonServer checks the dialog's
+    // own credential, which engines never see), not just say via:'click'.
+    if (!this.armVia.includes(decision.via) || decision.dialog !== true) {
+      this._audit({ type: 'calls_arm', allowed: false, reason: `allowed by ${decision.via || 'an unknown method'}${decision.dialog === true ? '' : ' outside the dialog window'}, not a click`, via: origin });
       return { ok: false, denied: true, armed: false, code: 'CLICK_REQUIRED', error: 'Answering calls can only be turned on with a click on “Allow once” in the Claude Anywhere dialog.' };
     }
     if (signal && signal.aborted) return { ok: false, denied: true, armed: false, error: 'The request was withdrawn.' };
@@ -606,8 +613,12 @@ class CallManager extends EventEmitter {
     const perms = this.permissions;
     const toolUseId = `calls_arm_${crypto.randomBytes(12).toString('hex')}`;
     let via;
+    let dialog = false;
     const onDecision = (e) => {
-      if (e && e.toolUseId === toolUseId) via = e.via;
+      if (e && e.toolUseId === toolUseId) {
+        via = e.via;
+        dialog = e.dialog === true;
+      }
     };
     if (typeof perms.on === 'function') perms.on('decision', onDecision);
     const cls = { risk: 'critical', reason: ARM_REASON, summary, sensitive: true };
@@ -615,7 +626,7 @@ class CallManager extends EventEmitter {
     try {
       pending =
         typeof perms.requestCritical === 'function'
-          ? perms.requestCritical({ toolName: ARM_TOOL, input, reason: ARM_REASON, summary, toolUseId })
+          ? perms.requestCritical({ toolName: ARM_TOOL, input, reason: ARM_REASON, summary, toolUseId, clickOnly: true })
           : perms.prompt(ARM_TOOL, input, cls, toolUseId, 'answering calls needs a click');
     } catch (err) {
       if (typeof perms.removeListener === 'function') perms.removeListener('decision', onDecision);
@@ -635,7 +646,7 @@ class CallManager extends EventEmitter {
       else signal.addEventListener('abort', onAbort, { once: true });
     }
     return Promise.resolve(pending)
-      .then((d) => ({ behavior: d && d.behavior === 'allow' ? 'allow' : 'deny', message: d && d.message, via }))
+      .then((d) => ({ behavior: d && d.behavior === 'allow' ? 'allow' : 'deny', message: d && d.message, via, dialog }))
       .catch((err) => ({ behavior: 'deny', message: `The card failed: ${err && err.message}` }))
       .finally(() => {
         if (typeof perms.removeListener === 'function') perms.removeListener('decision', onDecision);
@@ -799,7 +810,10 @@ class CallManager extends EventEmitter {
     if (this._expiryTimer) this.clock.clearTimeout(this._expiryTimer);
     this._expiryTimer = null;
     if (this._ringAbort) this._ringAbort.abort();
-    if (!this.call) this._idle();
+    // F3-SAFE-D2: the answer routine in progress stops before it presses Accept; it releases the audio
+    // route itself (tearing it down under it would leave the call app on the wrong microphone).
+    if (this._answerAbort) this._answerAbort.abort();
+    if (!this.call && !this._answering) this._idle();
     if (was) {
       this._audit({ type: 'calls_disarm', why });
       log.info(`stopped answering calls (${why})`);
@@ -982,8 +996,34 @@ class CallManager extends EventEmitter {
 
   /** Accept the call (answer.js), with the audio routed first so the app opens our microphone. */
   async _answer(cand) {
+    const ac = new AbortController();
+    this._answerAbort = ac;
+    this._answering = true;
+    // The answer phase ends when the call starts (or the routine gives up), whichever comes first.
+    const done = () => {
+      if (this._answerAbort !== ac) return false;
+      this._answerAbort = null;
+      this._answering = false;
+      return true;
+    };
+    try {
+      return await this._answerInner(cand, ac.signal, done);
+    } finally {
+      // Turned off while answering: what disarm() left for later (detection, sidecar, virtual devices).
+      if (done() && !this.armed && !this.call) this._idle();
+    }
+  }
+
+  /** F3-SAFE-D2: calls were turned off (or expired) while the answer routine ran. */
+  _answerStopped(signal) {
+    return Boolean(signal && signal.aborted) || !this.armed || this.now() >= this.armed.until;
+  }
+
+  async _answerInner(cand, signal, done = () => {}) {
     const det = await this.detector();
     this._setState('answering');
+    // F3-SAFE-F1: an audio self-test still running ends now (its page would speak into the call).
+    if (this._selfTest && typeof this._selfTest.close === 'function') await this._selfTest.close().catch(() => {});
     const caller = cand.caller || null;
     const app = cand.app || null;
     if (typeof det.beginAnswer === 'function') det.beginAnswer();
@@ -995,6 +1035,13 @@ class CallManager extends EventEmitter {
       if (typeof det.answerFailed === 'function') det.answerFailed();
       this._recordRecent({ type: 'failed', reason: 'audio', caller, app, error: err.message });
       this._notify(`I couldn't answer ${caller || 'the'} call: the call audio could not be routed (${err.message}).`, 'warning', { speak: true });
+      this._setState(this.armed ? 'armed' : 'disarmed');
+      return;
+    }
+    if (this._answerStopped(signal)) {
+      await this.bridge().release().catch(() => {});
+      if (typeof det.answerFailed === 'function') det.answerFailed();
+      this._recordRecent({ type: 'not_answered', reason: 'disarmed', caller, app });
       this._setState(this.armed ? 'armed' : 'disarmed');
       return;
     }
@@ -1017,9 +1064,21 @@ class CallManager extends EventEmitter {
         armedUntil: this.armed ? this.armed.until : 0,
         detector: det,
         learned: det.learned || undefined,
+        // Checked right before Accept is pressed or clicked.
+        shouldContinue: () => !this._answerStopped(signal),
       });
     } catch (err) {
       res = { ok: false, reason: err.message };
+    }
+    if (res && res.ok && this._answerStopped(signal)) {
+      // Turned off after Accept was pressed: the call is connected, so the user takes it over at once
+      // (their microphone is restored) and the assistant says nothing.
+      await this.bridge().release().catch(() => {});
+      if (typeof det.answerFailed === 'function') det.answerFailed();
+      this._recordRecent({ type: 'taken_over', reason: 'disarmed', caller, app });
+      this._notify(`You turned off answering calls while I was picking up ${caller ? `${caller}'s` : 'a'} call. It is connected now: it's yours (your microphone is back).`, 'warning', { speak: true });
+      this._setState(this.armed ? 'armed' : 'disarmed');
+      return;
     }
     if (!res || !res.ok) {
       await this.bridge().release().catch(() => {});
@@ -1034,7 +1093,14 @@ class CallManager extends EventEmitter {
     if (res.video && typeof this.answer.cameraOff === 'function') {
       this.answer.cameraOff({ app, windowId: cand.windowId, computer, driver, vision: this.vision() }).catch((err) => log.warn(`turning the camera off failed: ${err.message}`));
     }
-    await this._runCall({ caller: res.caller || caller, app: res.app || app, windowId: cand.windowId || null, audioParams: engaged && engaged.startParams, engaged: true, computer, driver });
+    // F3-SAFE-C1: when the call app's own name and vision's reading disagree, the caller stays unbound.
+    if (res.callerConflict) {
+      log.warn(`the caller's name is uncertain (the call app says "${oneLine(res.callerConflict.deterministic, 60)}", the screen shows "${oneLine(res.callerConflict.vision, 60)}"): nothing will be assigned or sent to them`);
+      this._audit({ type: 'call_caller_conflict', deterministic: oneLine(res.callerConflict.deterministic, 80), vision: oneLine(res.callerConflict.vision, 80) });
+    }
+    const who = res.callerConflict ? null : res.caller || caller;
+    done();
+    await this._runCall({ caller: who, app: res.app || app, windowId: cand.windowId || null, audioParams: engaged && engaged.startParams, engaged: true, computer, driver });
   }
 
   // ------------------------------------------------------------------------------ the call
@@ -1157,7 +1223,8 @@ class CallManager extends EventEmitter {
       /* none */
     }
     const r = await this.answer.hangUp({ app: ctx.app, windowId: ctx.windowId, computer, driver, vision: this.vision() }).catch((err) => ({ ok: false, reason: err.message }));
-    if (!r || !r.ok) {
+    // The caller may have hung up while we looked for the button: then there is nothing to end.
+    if ((!r || !r.ok) && !(ctx.session && ctx.session.callerGone)) {
       this._notify(`Please end the call with ${ctx.caller || 'the caller'} yourself: I couldn't find the hang-up button.`, 'warning', { speak: true });
       log.warn(`hang-up failed (${reason}): ${r && r.reason}`);
     }
@@ -1332,7 +1399,8 @@ class CallManager extends EventEmitter {
         if (!this.policy.reserve(st, 'comment')) return err('The comment limit for this call is used up. Use call_defer.');
         let done = false;
         try {
-          const text = `(via phone call with ${callerName}, ${owner}'s assistant) ${args.text}`;
+          // F3-SAFE-C2: the caller picks their display name; it gets the same link and secret stripping.
+          const text = `(via phone call with ${policyMod.sanitizeCallerName(callerName) || 'the caller'}, ${owner}'s assistant) ${args.text}`;
           const r = await jira.comment(args.key, text);
           done = true;
           st.touched.add(args.key);
@@ -1608,7 +1676,9 @@ class CallManager extends EventEmitter {
   _notesActions(session) {
     const all = session.actions();
     const sent = all.some((x) => x.name === 'chat_sent');
-    return all.filter((x) => !(x.name === 'call_send_chat_to_caller' && x.status === 'queued' && sent));
+    // Not transcribed (the caller objected): the assistant's free-text notes can quote the caller, so the
+    // Desktop notes keep only the actions (F3-SAFE-E1).
+    return all.filter((x) => !(x.name === 'call_send_chat_to_caller' && x.status === 'queued' && sent) && !(x.name === 'call_note' && !session.saveTranscript));
   }
 
   /** <state>/calls/<id>/meta.json, transcript.jsonl, actions.jsonl (0600; kept calls.keepCallDataDays). */

@@ -522,7 +522,7 @@ class SessionManager extends EventEmitter {
    * @param {object} [opts.computer] Computer instance (or use getComputer for lazy creation)
    * @param {object} [opts.driver] Driver instance (or getDriver)
    * @param {number} opts.port daemon port (for the MCP config)
-   * @param {string} opts.token daemon token (for the MCP config)
+   * @param {string} opts.token the engines' daemon token for the MCP config (main.js passes engineToken: it cannot answer cards or change settings)
    * @param {string} opts.projectDir
    * @param {'companion'|'bridge'} [opts.mode]
    * @param {string} [opts.instanceId] names the per-instance run files
@@ -884,6 +884,16 @@ class SessionManager extends EventEmitter {
     // the Stop (its next reply is refused) and listens again.
     if (this.mode === 'bridge' && this.bridge && this.bridge.commandStopped && Date.now() - this.bridgeStoppedAt < BRIDGE_STOP_GUARD_MS) {
       return { allowed: false, reason: 'the user pressed Stop in the dialog, so this command was cancelled; abandon it and run "anywhere listen" for the next one' };
+    }
+    // F3-SAFE-D1: while a critical card waits for the user's click, no mouse or keyboard action may run
+    // (it could click that card's own "Allow once").
+    try {
+      const pending = this.permissions && typeof this.permissions.pending === 'function' ? this.permissions.pending() : [];
+      if (Array.isArray(pending) && pending.some((c) => c && c.risk === 'critical')) {
+        return { allowed: false, reason: 'a critical action is waiting for the user to decide in the Claude Anywhere dialog' };
+      }
+    } catch {
+      /* no broker */
     }
     return { allowed: true };
   }

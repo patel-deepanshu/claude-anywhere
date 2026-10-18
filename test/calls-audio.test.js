@@ -986,7 +986,8 @@ test('self-test: single-use code, both directions verified by transcript, result
   assert.deepEqual(b.issues, [], 'info notes are not shown on the page');
   assert.equal(b.clip.mime, 'audio/wav');
   assert.equal(Buffer.from(b.clip.base64, 'base64').toString('ascii', 0, 4), 'RIFF');
-  assert.deepEqual(bridge.log.slice(0, 2), ['check', ['engage', { browserApp: '' }]]);
+  // The self-test holds the route as its own owner, so its end never releases a call's route (F3-SAFE-F1).
+  assert.deepEqual(bridge.log.slice(0, 2), ['check', ['engage', { browserApp: '', owner: 'selftest' }]]);
   await assert.rejects(st.route('begin', { url: urlOf({ code: m.code }) }), (e) => e.status === 403, 'the code works once');
 
   const q = { url: urlOf({ test: b.test }) };

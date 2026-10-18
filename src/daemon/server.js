@@ -8,6 +8,11 @@
  * requests with an Origin must come from the daemon's own origin, bodies are
  * size-limited, and every response carries no-store/nosniff/no-referrer and
  * a strict CSP. Static UI files come from src/ui with traversal protection.
+ *
+ * Principals (F3-SAFE-D1): 'dialog' (the token plus X-Anywhere-UI, the dialog window's own
+ * credential from POST /api/launch, sent from the daemon's origin), 'user' (the token), 'engine'
+ * (the engines' MCP token: no approvals, answers, settings, modes or shutdown). Only 'dialog' can
+ * answer a card with via:'click', so only a real click allows a critical card.
  */
 
 const fs = require('fs');
@@ -120,6 +125,19 @@ function tokenMatches(given, expected) {
   return crypto.timingSafeEqual(a, b);
 }
 
+const CALLS_CHECKED_KEYS = ['calls.quietHours.start', 'calls.quietHours.end', 'calls.greeting'];
+
+/** src/calls/policy.js settingProblem (null when that module is missing from this install). */
+function callsSettingProblem(key, value, ctx) {
+  let policy = null;
+  try {
+    policy = require('../calls/policy');
+  } catch {
+    return null;
+  }
+  return typeof policy.settingProblem === 'function' ? policy.settingProblem(key, value, ctx) : null;
+}
+
 /**
  * Check a partial config update against DEFAULTS (types and enums).
  * @param {object} partial already passed through sanitizeUpdate()
@@ -150,6 +168,11 @@ function validateConfigUpdate(partial, defaults = configMod.DEFAULTS, prefix = '
       if (typeof v !== 'string') return `"${key}" must be a string`;
       if (v.length > 4096) return `"${key}" is too long`;
       if (ENUMS[key] && !ENUMS[key].includes(v)) return `"${key}" must be one of: ${ENUMS[key].join(', ')}`;
+      // Quiet-hour times must parse (F3-SAFE-D3); calls.greeting is only a closing question (F3-SAFE-B2).
+      if (CALLS_CHECKED_KEYS.includes(key)) {
+        const problem = callsSettingProblem(key, v);
+        if (problem) return problem;
+      }
     }
   }
   return null;
@@ -274,7 +297,14 @@ class DaemonServer {
       if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
     });
     this.claimedApprovals = new Set();
-    this.launchCodes = new Map(); // single-use launch code -> expiresAt (ms)
+    this.launchCodes = new Map(); // single-use launch code -> {exp (ms), grant}
+    // F3-SAFE-D1. The engines' MCP servers get their own token (engineToken), which cannot answer
+    // cards or questions, change settings or modes, or shut the daemon down. The dialog window gets
+    // its own credential (uiKey), only through POST /api/launch with a code minted for a dialog
+    // window: it is never written to a file, so a "click" (POST /api/approval via:'click') is
+    // believed only from a request that carries it.
+    this.engineToken = typeof deps.engineToken === 'string' && deps.engineToken && deps.engineToken !== deps.token ? deps.engineToken : null;
+    this.uiKey = crypto.randomBytes(24).toString('base64url');
     this.home = deps.home || homeId();
     this.stopping = false; // set by the daemon's shutdown: health answers 503, routes that start work refuse
     this.routes = this.buildRoutes();
@@ -291,14 +321,34 @@ class DaemonServer {
    * POST /api/launch.
    * @returns {string}
    */
-  launchUrl() {
+  launchUrl(_url, { grant = 'dialog' } = {}) {
     const now = Date.now();
-    for (const [c, exp] of this.launchCodes) if (exp <= now) this.launchCodes.delete(c);
+    for (const [c, e] of this.launchCodes) if (e.exp <= now) this.launchCodes.delete(c);
     // Bound the map: a runaway caller cannot grow it without limit.
     while (this.launchCodes.size >= MAX_LAUNCH_CODES) this.launchCodes.delete(this.launchCodes.keys().next().value);
     const code = crypto.randomBytes(18).toString('base64url');
-    this.launchCodes.set(code, now + LAUNCH_CODE_TTL_MS);
+    // 'dialog': the window host's own launch (token + the dialog credential); 'user': a page an API
+    // caller opens (the token only); 'engine': a page an engine opens (the engine's token only).
+    this.launchCodes.set(code, { exp: now + LAUNCH_CODE_TTL_MS, grant: ['dialog', 'user', 'engine'].includes(grant) ? grant : 'user' });
     return `http://127.0.0.1:${this.port}/?launch=${code}`;
+  }
+
+  /**
+   * Who sent a request: 'dialog' (the token plus the dialog's credential, from the daemon's own
+   * origin), 'user' (the token: CLI, terminal dialog, plugin), 'engine' (an engine's MCP server), or
+   * null (no valid credential).
+   * @private
+   */
+  principalOf(req, url, allowQuery) {
+    const given = this.tokenFrom(req, url, allowQuery);
+    if (tokenMatches(given, this.token)) {
+      const ui = req.headers['x-anywhere-ui'];
+      const origin = req.headers.origin;
+      if (typeof ui === 'string' && tokenMatches(ui.trim(), this.uiKey) && origin !== undefined && this.originAllowed(origin)) return 'dialog';
+      return 'user';
+    }
+    if (this.engineToken && tokenMatches(given, this.engineToken)) return 'engine';
+    return null;
   }
 
   /**
@@ -346,14 +396,14 @@ class DaemonServer {
     // notWhileStopping: work that would outlive a daemon that is shutting down (a new turn, a new window)
     add('POST', '/api/command', this.command, { notWhileStopping: true });
     add('POST', '/api/interrupt', this.interrupt);
-    add('POST', '/api/approval', this.approval);
-    add('POST', '/api/answer', this.answer);
+    add('POST', '/api/approval', this.approval, { noEngine: true });
+    add('POST', '/api/answer', this.answer, { noEngine: true });
     add('POST', '/api/session/new', this.newSession, { notWhileStopping: true });
     add('POST', '/api/project', this.project, { notWhileStopping: true });
     add('GET', '/api/projects', this.projects, { noBody: true });
     add('GET', '/api/config', () => configMod.publicConfig(this.deps.config), { noBody: true });
-    add('POST', '/api/config', this.saveConfig);
-    add('POST', '/api/mode', this.mode, { notWhileStopping: true });
+    add('POST', '/api/config', this.saveConfig, { noEngine: true });
+    add('POST', '/api/mode', this.mode, { notWhileStopping: true, noEngine: true });
     add('POST', '/api/stt', this.stt, { raw: true });
     add('POST', '/api/tts', this.tts);
     add('POST', '/api/tts/stop', this.ttsStop);
@@ -361,7 +411,7 @@ class DaemonServer {
     add('GET', '/api/permissions', this.osPermissions, { noBody: true });
     add('POST', '/api/show', this.show, { notWhileStopping: true });
     add('POST', '/api/ui/visibility', this.uiVisibility);
-    add('POST', '/api/shutdown', this.shutdown);
+    add('POST', '/api/shutdown', this.shutdown, { noEngine: true });
     add('POST', '/api/mcp/permission', this.mcpPermission);
     add('POST', '/api/mcp/ask', this.mcpAsk);
     add('POST', '/api/mcp/notify', this.mcpNotify);
@@ -449,7 +499,7 @@ class DaemonServer {
     const route = this.routes.get(`${method} ${url.pathname}`);
     if (!route) {
       // Unknown paths and methods still require auth so they reveal nothing.
-      if (!tokenMatches(this.tokenFrom(req, url, false), this.token)) throw httpError(401, 'Unauthorized');
+      if (!this.principalOf(req, url, false)) throw httpError(401, 'Unauthorized');
       const allowed = ['GET', 'POST'].filter((m) => this.routes.has(`${m} ${url.pathname}`));
       if (allowed.length) {
         res.setHeader('Allow', allowed.join(', '));
@@ -457,8 +507,13 @@ class DaemonServer {
       }
       throw httpError(404, 'Not found');
     }
-    if (!route.noAuth && !tokenMatches(this.tokenFrom(req, url, Boolean(route.queryToken)), this.token)) {
+    const principal = route.noAuth ? null : this.principalOf(req, url, Boolean(route.queryToken));
+    if (!route.noAuth && !principal) {
       throw httpError(401, 'Unauthorized');
+    }
+    if (principal === 'engine' && route.noEngine) {
+      req.resume();
+      throw httpError(403, 'Claude Code sessions run by Claude Anywhere cannot use this route', { code: 'ENGINE_FORBIDDEN' });
     }
     if (route.notWhileStopping && this.stopping) {
       req.resume();
@@ -489,7 +544,7 @@ class DaemonServer {
     } else {
       req.resume();
     }
-    const out = await route.fn({ req, res, url, body, raw });
+    const out = await route.fn({ req, res, url, body, raw, principal });
     if (out === HANDLED) return;
     sendJson(res, 200, out === undefined ? { ok: true } : out);
   }
@@ -571,13 +626,18 @@ class DaemonServer {
     return HANDLED;
   }
 
-  /** @private trade a single-use launch code (from launchUrl()) for the token */
+  /**
+   * @private trade a single-use launch code (from launchUrl()) for the token; a dialog window's code
+   * also carries the dialog's credential (`ui`), and an engine's page gets only the engine's token.
+   */
   launch({ body }) {
     const code = body && body.code;
-    const exp = typeof code === 'string' && code ? this.launchCodes.get(code) : undefined;
-    if (exp === undefined) throw httpError(401, 'Unauthorized');
+    const e = typeof code === 'string' && code ? this.launchCodes.get(code) : undefined;
+    if (e === undefined) throw httpError(401, 'Unauthorized');
     this.launchCodes.delete(code);
-    if (exp <= Date.now()) throw httpError(401, 'Unauthorized');
+    if (e.exp <= Date.now()) throw httpError(401, 'Unauthorized');
+    if (e.grant === 'engine') return { token: this.engineToken || this.token };
+    if (e.grant === 'dialog') return { token: this.token, ui: this.uiKey };
     return { token: this.token };
   }
 
@@ -607,16 +667,25 @@ class DaemonServer {
   }
 
   /** @private */
-  approval({ body }) {
+  approval({ body, principal }) {
     const { id, decision, message } = body;
     if (typeof id !== 'string' || !id) throw httpError(400, 'id is required');
     if (!['allow', 'allow_session', 'deny'].includes(decision)) throw httpError(400, 'decision must be allow, allow_session or deny');
     const perms = this.deps.permissions;
     if (!perms) throw httpError(503, 'Approvals are not available');
-    // How the user answered (optional: older clients send none). The broker records it and
-    // refuses a critical allow that came by voice or key (409 CRITICAL_NEEDS_CLICK).
+    // How the user answered (optional for ordinary cards). The broker records it and refuses a
+    // critical allow that is not a click in the dialog window (or, where allowed, the typed word in
+    // the terminal dialog): 409 CRITICAL_NEEDS_CLICK. A "click" is believed only from the dialog
+    // window, whose requests carry its own credential (F3-SAFE-D1).
     const via = APPROVAL_VIA.includes(body.via) ? body.via : undefined;
-    const ok = perms.resolve(id, decision, typeof message === 'string' ? message : undefined, via ? { via } : {});
+    const dialog = principal === 'dialog';
+    if (via === 'click' && !dialog) {
+      throw httpError(403, 'Only the Claude Anywhere dialog window can answer a card with a click', {
+        code: 'CLICK_NEEDS_DIALOG',
+        hint: 'Click the card in the dialog window (anywhere show opens it).',
+      });
+    }
+    const ok = perms.resolve(id, decision, typeof message === 'string' ? message : undefined, via ? { via, dialog } : { dialog });
     if (!ok) throw httpError(404, 'No pending approval with that id (it may have timed out or been cancelled)');
     return { ok: true };
   }
@@ -700,6 +769,12 @@ class DaemonServer {
     const partial = configMod.sanitizeUpdate(body);
     const problem = validateConfigUpdate(partial);
     if (problem) throw httpError(400, problem);
+    // The greeting's closing question may not name the owner (the name is in the saved settings).
+    if (isPlainObject(partial.calls) && typeof partial.calls.greeting === 'string') {
+      const owner = typeof partial.calls.ownerName === 'string' && partial.calls.ownerName.trim() ? partial.calls.ownerName : ((this.deps.config || {}).calls || {}).ownerName;
+      const greetingProblem = callsSettingProblem('calls.greeting', partial.calls.greeting, { ownerName: owner });
+      if (greetingProblem) throw httpError(400, greetingProblem);
+    }
     const prev = JSON.parse(JSON.stringify(this.deps.config));
     const next = configMod.save(partial);
     // Update the shared config object in place so every module sees the change.
