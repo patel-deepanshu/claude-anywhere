@@ -294,8 +294,19 @@ function token() {
  * @param {*} [body] JSON object, or a Blob sent raw
  * @param {{headers?:object, timeoutMs?:number}} [opts]
  */
+/** The dialog window's credential, when this page has one (F3-SAFE-D1; see app.js rememberUiKey). */
+function uiKey() {
+  try {
+    return window.sessionStorage.getItem('anywhere.ui') || '';
+  } catch {
+    return '';
+  }
+}
+
 export async function api(method, path, body, { headers = {}, timeoutMs = 60000 } = {}) {
   const h = { Authorization: `Bearer ${token()}`, ...headers };
+  const ui = uiKey();
+  if (ui) h['X-Anywhere-UI'] = ui;
   let payload;
   if (body instanceof Blob) {
     payload = body;
@@ -895,7 +906,7 @@ class CloneView {
         this.render();
         return;
       }
-      if (d.code === 'CONSENT_SPEAKER_MISMATCH') {
+      if (d.code === 'CONSENT_SPEAKER_MISMATCH' || d.code === 'MIXED_SPEAKERS') {
         this.session = null;
         this.buildResult = { failed: true, message: d.error || err.message };
         this.render();

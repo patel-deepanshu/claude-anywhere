@@ -1106,8 +1106,13 @@ class UiHost {
     });
     if (!found) return { ok: false, reason: 'Electron is not installed (optional: anywhere install --electron)' };
     const args = electronArgs({ ui: this._ui(), noSandbox: this._noSandbox() });
-    // The URL (with the token) goes through the environment, never the command line.
-    const env = electronEnv(this.env, url);
+    // The URL goes through the environment, never the command line. It is a single-use launch URL
+    // too, so the page gets the dialog window's own credential (F3-SAFE-D1); a running Electron that
+    // is only asked to show its window gets the same URL again, so it does not reload the page.
+    const live = this._ownedLive().some((o) => o.host === 'electron');
+    const launch = live && this._electronUrl ? this._electronUrl : await this._argvUrl(url);
+    this._electronUrl = launch;
+    const env = electronEnv(this.env, launch);
     const isShim = pi.platform === 'win32' && /\.(cmd|bat)$/i.test(found.path);
     // Last resort for a bare electron.cmd: without windowsHide its cmd.exe (and `node cli.js`)
     // would keep a console window open beside the dialog.

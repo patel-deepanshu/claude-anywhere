@@ -1280,6 +1280,34 @@ Pocket sometimes generated 14 s of audio in 17–33 s; the sidecar caps each sen
 The first `warmup` after load took 1.5 s and the second 0.55 s. With Piper-read takes the 14 lines gave
 42.2 s of voiced speech, 48.8 s with the consent take, which counts toward the 45 s minimum.
 
+**Safety review fixes (F3-SAFE).** Where these differ from §1.3–§7 above, these win.
+- Enrollment (§2.6): every script take is transcribed locally and must align ≥ 0.8 with its line (consent.js
+  normalizer). The speaker checks run on the session's pairwise cosine matrix (`spk.consistency {matrix:true}`)
+  and are anchored on the consent take: consent ↔ centroid ≥ 0.45, consent ↔ each take ≥ 0.40 (more than half
+  below → `CONSENT_SPEAKER_MISMATCH`), any pair < 0.2 or a 2-means split (both halves ≥ 3) whose centroids are
+  < 0.3 apart → `MIXED_SPEAKERS` (session closed), each take ↔ centroid ≥ 0.45, and consent ↔ the centroid of the
+  takes chosen for reference.wav ≥ 0.45.
+- Arming (§1.3 d): the engines' MCP servers get their own token (`engineToken`), refused on approvals, answers,
+  config, mode and shutdown. The dialog window gets its own credential (`X-Anywhere-UI`) only from a dialog launch
+  code (Electron included); `via:'click'` is believed only with it and the daemon's Origin, and critical allows
+  need it (or, except for click-only cards such as calls arming, the terminal's typed `allow`); an allow without
+  a `via` is refused. Run files are credential reads; commands naming the daemon's approval/config/mode/launch/
+  shutdown routes are critical. Engine input refuses points in or focus on the dialog, and the guard pauses input
+  while a critical card waits.
+- Disclosure (§7.1, §6): a `playback.end` with an error or `started:false` is not a heard utterance (audio_io.py
+  reports an error as interrupted); a failed disclosure is said again with the next voice and the call ends
+  (`disclosure_failed`) after 3 failures or with no voice left. `calls.greeting` is only the closing question
+  (≤ 80 characters, one question, no owner name, no contradicting words), checked when saved and when used. The
+  cached greeting is transcribed after rendering and rendered again (3 tries) when the disclosure is not heard.
+  `/api/clone/test` accepts free text only from the dialog; `anywhere clone-voice test` plays the test sentence.
+- Answering (§4.3, §7.3): disarming aborts the answer routine (answer.js asks `shouldContinue()` before every
+  Accept key or click); after a click the user takes over. Vision's caller name is used only without a
+  deterministic one; a disagreement leaves the caller unbound. Caller names lose link-like words before use.
+  Quiet-hour times must be HH:MM (validated on save; unparsable enabled hours block arming and count as quiet).
+- Notes (§8.3): after an objection the summary is action-only (no engine summary). The audio route is
+  owner-counted (`engage/release({owner})`), self-test steps are refused during a call, and a running self-test
+  ends before answering. `synthesize()` renders are tracked and removed on delete and at daemon start.
+
 **Still to verify on real machines** (no device here): Windows IPolicyConfig default switching, the
 `soundcard` WASAPI loopback with numpy 2 and the UIA toast host on Windows 11; macOS ScreenCaptureKit
 audio through PyObjC, the CoreAudio default-input switch and the TCC prompts; a PipeWire (`pipewire-pulse`)

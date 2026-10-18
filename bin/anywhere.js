@@ -2018,7 +2018,13 @@ async function openComputer() {
   const driver = await osIndex.getDriver();
   const config = shared('config').load();
   const daemon = daemonOnce();
-  const computer = new computerMod.Computer({ driver, config: config.computer, geometryStore: 'file', guard: makeGuard(daemon) });
+  // F3-SAFE-D1: `anywhere computer …` (bridge mode, scripts, an engine's Bash) never clicks or types in the dialog itself.
+  const desktopMod = optionalPkg('src/context/desktop.js');
+  const ownWindow =
+    desktopMod && typeof desktopMod.isOwnWindow === 'function'
+      ? desktopMod.isOwnWindow
+      : (w) => String((w && w.title) || '').includes('Claude Anywhere') || String((w && w.app) || '') === 'Claude Anywhere';
+  const computer = new computerMod.Computer({ driver, config: config.computer, geometryStore: 'file', guard: makeGuard(daemon), protect: ownWindow });
   const close = async () => {
     try {
       if (typeof osIndex.resetDriver === 'function') await withTimeout(osIndex.resetDriver(), 5000, 'closing the driver');
@@ -3117,6 +3123,12 @@ async function cmdConfig(p) {
     const raw = p._.slice(2).join(' ');
     const value = coerceForKey(key, raw);
     const partial = configMod.setPath({}, key, value);
+    // Calls settings with safety rules (F3-SAFE-B2, F3-SAFE-D3): quiet-hour times, the greeting's closing question.
+    const callsPolicy = optionalPkg('src/calls/policy.js');
+    if (callsPolicy && typeof callsPolicy.configProblem === 'function') {
+      const problem = callsPolicy.configProblem(partial, { ownerName: ((configMod.load() || {}).calls || {}).ownerName });
+      if (problem) throw usageError(problem, 'config');
+    }
     configMod.save(partial);
     let live = false;
     let busy = false;
@@ -3435,6 +3447,8 @@ Setup
   config [path | get KEY | set KEY VALUE | reset]
   voice install [ID] | list | use ID | test | status | remove ID   free natural voice (Piper, offline)
   jira setup | test | status | issue KEY | mine | search JQL | remove   connect Jira (free API token) for ticket work
+  clone-voice [start | install | status | test | bench | delete]   your own cloned voice (consent-gated, local)
+  calls on [--for 2h] | off | status | doctor | test-audio | learn | notes   answer calls for you (armed by a click)
   logs [--audit] [-n N] [-f]
   mcp                                MCP stdio server (Claude Code starts this)
   version | help [command]

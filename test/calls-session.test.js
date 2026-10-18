@@ -947,7 +947,8 @@ function makeManager(o = {}) {
 async function armByClick(t, req = {}) {
   const p = t.mgr.requestArm({ minutes: 30, via: 'test', ...req });
   const card = await waitFor(() => t.broker.pending()[0], { what: 'the arm card' });
-  t.broker.resolve(card.id, 'allow', undefined, { via: 'click' });
+  // A click in the dialog window (DaemonServer sets dialog:true only for requests with its credential).
+  t.broker.resolve(card.id, 'allow', undefined, { via: 'click', dialog: true });
   return { card, res: await p };
 }
 
@@ -966,13 +967,19 @@ test('manager: arming is a critical card that only a click allows; voice, keys a
   assert.equal(card.reason, 'Answer phone calls for you with your voice');
   assert.match(card.summary, /^Answer calls for you until \d\d:\d\d \(Zoho Cliq\)\? The assistant says it is an AI and takes notes\. Your instructions: Assign sprint tickets only$/);
   assert.equal(t.mgr.status().arming, true);
+  assert.equal(card.clickOnly, true);
   assert.throws(() => t.broker.resolve(card.id, 'allow', undefined, { via: 'voice' }), { code: 'CRITICAL_NEEDS_CLICK' });
   assert.throws(() => t.broker.resolve(card.id, 'allow_session', undefined, { via: 'key' }), { code: 'CRITICAL_NEEDS_CLICK' });
+  // F3-SAFE-D1: the terminal's typed allow, a "click" that did not come from the dialog window, and an
+  // allow without a via do not allow this card either.
+  assert.throws(() => t.broker.resolve(card.id, 'allow', undefined, { via: 'typed' }), { code: 'CRITICAL_NEEDS_CLICK' });
+  assert.throws(() => t.broker.resolve(card.id, 'allow', undefined, { via: 'click' }), { code: 'CRITICAL_NEEDS_CLICK' });
+  assert.throws(() => t.broker.resolve(card.id, 'allow', undefined, {}), { code: 'CRITICAL_NEEDS_CLICK' });
   assert.equal(t.broker.pending().length, 1, 'the card is still waiting');
-  t.broker.resolve(card.id, 'allow', undefined, { via: 'typed' });
-  const typed = await p;
-  assert.equal(typed.ok, false);
-  assert.equal(typed.code, 'CLICK_REQUIRED');
+  t.broker.resolve(card.id, 'deny', undefined, { via: 'key' });
+  const refused = await p;
+  assert.equal(refused.ok, false);
+  assert.equal(refused.denied, true);
   assert.equal(t.mgr.status().armed, false);
   assert.equal(t.det.state, 'stopped');
 
@@ -1283,6 +1290,11 @@ async function startDaemon({ manager, broker, hub }) {
   return { server, port, api };
 }
 
+/** The dialog window's request headers: its own credential and the daemon's origin (F3-SAFE-D1). */
+function dialogHeaders(d) {
+  return { 'X-Anywhere-UI': d.server.uiKey, Origin: `http://127.0.0.1:${d.port}` };
+}
+
 test('routes: status, arm blocks on the card (click only), tool calls need the call role and an active call', async () => {
   const { Hub } = require('../src/daemon/hub');
   const hub = new Hub();
@@ -1301,7 +1313,12 @@ test('routes: status, arm blocks on the card (click only), tool calls need the c
     const byVoice = await d.api('POST', '/api/approval', { id: card.id, decision: 'allow', via: 'voice' });
     assert.equal(byVoice.status, 409);
     assert.equal(byVoice.json.code, 'CRITICAL_NEEDS_CLICK');
-    assert.equal((await d.api('POST', '/api/approval', { id: card.id, decision: 'allow', via: 'click' })).status, 200);
+    // F3-SAFE-D1: any token holder can send via:'click'; only the dialog window's request counts.
+    const forged = await d.api('POST', '/api/approval', { id: card.id, decision: 'allow', via: 'click' });
+    assert.equal(forged.status, 403);
+    assert.equal(forged.json.code, 'CLICK_NEEDS_DIALOG');
+    assert.equal((await d.api('POST', '/api/approval', { id: card.id, decision: 'allow', via: 'typed' })).status, 409, 'the terminal cannot arm calls');
+    assert.equal((await d.api('POST', '/api/approval', { id: card.id, decision: 'allow', via: 'click' }, { headers: dialogHeaders(d) })).status, 200);
     const armed = await arming;
     assert.equal(armed.status, 200);
     assert.equal(armed.json.ok, true);
@@ -1430,7 +1447,7 @@ test('end to end: a call through the real MCP server (call role) and the fake ca
   try {
     const arming = d.api('POST', '/api/calls/arm', { minutes: 20, via: 'test' });
     const card = await waitFor(() => broker.pending()[0], { what: 'card' });
-    await d.api('POST', '/api/approval', { id: card.id, decision: 'allow', via: 'click' });
+    await d.api('POST', '/api/approval', { id: card.id, decision: 'allow', via: 'click' }, { headers: dialogHeaders(d) });
     assert.equal((await arming).json.armed, true);
     await waitFor(() => t.mgr.prewarmed, { timeoutMs: 10000, what: 'prewarmed engine' });
     await waitFor(() => fs.existsSync(log) && fs.readFileSync(log, 'utf8').includes('argv'), { timeoutMs: 10000, what: 'the engine launch' });

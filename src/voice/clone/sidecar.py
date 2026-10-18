@@ -1296,6 +1296,9 @@ def op_spk_consistency(p, ctx):
     cfile = output_file(out, (".json",), "centroid") if out else tmp_path(".json")
     write_private(cfile, json.dumps({"dim": dim, "count": len(embs), "centroid": [round(x, 7) for x in centroid]}).encode("utf-8"))
     res = {"centroid": cfile, "scores": scores, "mean": round(sum(scores) / len(scores), 4), "min": min(scores), "dim": dim}
+    if p.get("matrix") is True:
+        # Every pairwise cosine (the enrollment's consent-anchored and mixed-speaker checks, §2.6).
+        res["matrix"] = [[round(_cos(a, b), 4) for b in embs] for a in embs]
     if probe:
         res["probe"] = round(_cos(_embed(probe), centroid), 4)
     return res

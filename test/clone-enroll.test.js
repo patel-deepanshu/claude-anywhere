@@ -70,12 +70,36 @@ function take(seed, { seconds = 6, rate = RATE, noise = 0.0005, channels = 1 } =
 
 const CONSENT_READ = (code = '4729') => `I, Dipancio Patel, agree that Claude anywhere may create a copy of my voice on this computer. My code is ${code}.`;
 
+// Fake speaker embeddings (16 dims): one speaker is 0.95·e0 plus a little per-file noise on e1..e10,
+// so takes of one person have cosines of about 0.9. `vectors` maps a file name to its own vector.
+const EMB_DIM = 16;
+const round4 = (x) => Math.round(x * 1e4) / 1e4;
+const dotVec = (a, b) => a.reduce((sum, x, i) => sum + x * b[i], 0);
+const unitVec = (v) => {
+  const n = Math.sqrt(dotVec(v, v)) || 1;
+  return v.map((x) => x / n);
+};
+function speakerVec(main, mainWeight, noiseDim) {
+  const v = new Array(EMB_DIM).fill(0);
+  v[main] = mainWeight;
+  v[noiseDim] = Math.sqrt(1 - mainWeight * mainWeight);
+  return v;
+}
+function fakeEmbedding(file, vectors) {
+  const b = path.basename(file);
+  if (vectors[b]) return unitVec(vectors[b]);
+  let h = 0;
+  for (const ch of b) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return speakerVec(0, 0.95, 1 + (h % 10));
+}
+
 /** The B1 SidecarClient contract, faked: records every request. */
 class FakeSidecar extends EventEmitter {
-  constructor({ transcript = CONSENT_READ(), scores = {}, consentScore = 0.82, testScore = 0.61, fail = {} } = {}) {
+  constructor({ transcript = CONSENT_READ(), lineTranscript = null, vectors = {}, consentScore = 0.82, testScore = 0.61, fail = {} } = {}) {
     super();
     this.transcript = transcript;
-    this.scores = scores;
+    this.lineTranscript = lineTranscript;
+    this.vectors = vectors;
     this.consentScore = consentScore;
     this.testScore = testScore;
     this.fail = fail;
@@ -99,16 +123,29 @@ class FakeSidecar extends EventEmitter {
         const tone = new Float32Array(RATE);
         for (let i = 0; i < tone.length; i += 1) tone[i] = 0.1 * Math.sin((2 * Math.PI * 220 * i) / RATE);
         fs.writeFileSync(params.out, quality.writeWav(tone, RATE));
+        // A render "says" its text (the greeting render is checked by speech recognition before it is cached).
+        this.rendered = this.rendered || new Map();
+        this.rendered.set(params.out, typeof this.renderedSays === 'function' ? this.renderedSays(params.text) : params.text);
         return { out: params.out, audioMs: 1000, firstChunkMs: 5, totalMs: 9, sampleRate: RATE };
       }
       case 'asr.load':
       case 'spk.load':
         return { loadMs: 1 };
-      case 'asr.transcribe':
+      case 'asr.transcribe': {
+        if (this.rendered && this.rendered.has(params.wav)) return { text: this.rendered.get(params.wav) };
+        // A script take says its line (unless the test says otherwise); the consent take, the sentence.
+        const line = /^line-(\d\d)\./.exec(path.basename(params.wav));
+        if (line) {
+          const said = typeof this.lineTranscript === 'function' ? this.lineTranscript(Number(line[1]) - 1, params.wav) : null;
+          return { text: said != null ? said : script.LINES[Number(line[1]) - 1] };
+        }
         return { text: typeof this.transcript === 'function' ? this.transcript(params.wav) : this.transcript };
+      }
       case 'spk.consistency': {
-        const scores = params.wavs.map((w) => (this.scores[path.basename(w)] != null ? this.scores[path.basename(w)] : 0.9));
-        const out = { centroid: 'c.json', scores };
+        const embs = params.wavs.map((w) => fakeEmbedding(w, this.vectors));
+        const c = unitVec(embs[0].map((_, i) => embs.reduce((sum, e) => sum + e[i], 0)));
+        const out = { centroid: 'c.json', scores: embs.map((e) => round4(dotVec(e, c))) };
+        if (params.matrix) out.matrix = embs.map((a) => embs.map((b) => round4(dotVec(a, b))));
         if (params.probe) out.probe = path.basename(params.probe) === 'consent.wav' ? this.consentScore : this.testScore;
         return out;
       }
@@ -235,7 +272,8 @@ test('enrollment end to end: consent, 14 lines, build, private profile, test voi
   assert.equal(b.label, 'Very close');
   assert.equal(b.testText, "Hi, this is Deepanshu's AI assistant, speaking in his voice.");
   assert.ok(b.referenceSeconds >= 10 && b.referenceSeconds <= 15, `${b.referenceSeconds} s`);
-  assert.deepEqual(b.consistency, { min: 0.9, mean: 0.9, consent: 0.82 });
+  assert.ok(b.consistency.min > 0.9 && b.consistency.mean > 0.9, JSON.stringify(b.consistency));
+  assert.ok(b.consistency.consent > 0.9 && b.consistency.consentMin > 0.85 && b.consistency.reference > 0.9, JSON.stringify(b.consistency));
 
   // The profile: verified consent, the reference's sha256, 0700/0600, nothing else.
   const dir = path.join(root, 'profiles', 'default');
@@ -385,7 +423,8 @@ test('consent: a wrong code or paraphrase fails (file dropped); a fresh code aft
 });
 
 test('build: inconsistent takes are re-recorded; a different consent speaker stops the enrollment', async () => {
-  const { svc, root } = makeService({ sidecar: { scores: { 'line-03.wav': 0.3, 'line-09.wav': 0.2 } } });
+  // Two takes that sound off (cosine about 0.35 to the others, but like each other): re-record them.
+  const { svc, root } = makeService({ sidecar: { vectors: { 'line-03.wav': speakerVec(0, 0.4, 12), 'line-09.wav': speakerVec(0, 0.35, 12) } } });
   const s = await enroll(svc);
   const r = await svc.build(s.sessionId);
   assert.equal(r.ok, false);
@@ -397,7 +436,7 @@ test('build: inconsistent takes are re-recorded; a different consent speaker sto
   assert.equal(pub.ready, false);
   assert.equal(fs.existsSync(path.join(root, 'profiles', 'default')), false);
 
-  const other = makeService({ sidecar: { consentScore: 0.2 } });
+  const other = makeService({ sidecar: { vectors: { 'consent.wav': speakerVec(15, 1, 14) } } });
   const s2 = await enroll(other.svc);
   const r2 = await other.svc.build(s2.sessionId);
   assert.equal(r2.ok, false);
@@ -408,6 +447,93 @@ test('build: inconsistent takes are re-recorded; a different consent speaker sto
   assert.equal(profile.verifyProfile('default', { root: other.root }).exists, false);
   await svc.shutdown();
   await other.svc.shutdown();
+});
+
+// F3-SAFE-A1: a third party's voice must not be cloned by mixing their recordings into the script.
+// Embeddings with the measured 3D-Speaker geometry: one person's takes ≈ 0.64 apart, two people ≈ 0.07–0.11.
+function personVec(person, k) {
+  const v = new Array(64).fill(0);
+  if (person === 'A') v[0] = 0.8;
+  else {
+    v[0] = 0.8 * 0.11;
+    v[1] = 0.8 * Math.sqrt(1 - 0.11 * 0.11);
+  }
+  v[2 + k] = 0.6;
+  return v;
+}
+
+test('F3-SAFE-A1: a mixed-speaker session (attacker consent + victim lines) is refused, and no profile is written', async () => {
+  // The repro: the attacker reads the consent and lines 1-7 (noisier); lines 8-14 are the victim's clean clips.
+  const vectors = { 'consent.wav': personVec('A', 40) };
+  for (let i = 0; i < 14; i += 1) vectors[`line-${String(i + 1).padStart(2, '0')}.wav`] = personVec(i < 7 ? 'A' : 'B', i);
+  // The old rule (centroid of all takes ≥ 0.45 for every take and the consent) would have passed this.
+  const files = ['consent.wav', ...Object.keys(vectors).filter((k) => k !== 'consent.wav').sort()];
+  const unit = (v) => {
+    const n = Math.hypot(...v);
+    return v.map((x) => x / n);
+  };
+  const G = files.map((a) => files.map((b) => unit(vectors[a]).reduce((s, x, i) => s + x * unit(vectors[b])[i], 0)));
+  const { speakerAnalysis, mixedSpeakers } = require('../src/voice/clone');
+  const an = speakerAnalysis(G);
+  assert.ok(an.consentToCentroid >= 0.45 && Math.min(...an.toCentroid) >= 0.45, `centroid-only check passes: ${an.consentToCentroid} ${Math.min(...an.toCentroid)}`);
+  assert.equal(mixedSpeakers(an).mixed, true);
+  assert.ok(an.consentPairs.slice(7).every((c) => c < 0.4), 'the victim lines do not match the consent speaker');
+
+  const { svc, root } = makeService({ sidecar: { vectors } });
+  const s = await svc.startSession({});
+  assert.equal((await svc.addTake(s.sessionId, 'consent', 0, take(1, { seconds: 8 }), { deviceLabel: 'MacBook Pro Microphone' })).ok, true);
+  for (let i = 0; i < 14; i += 1) {
+    const r = await svc.addTake(s.sessionId, 'line', i, take(100 + i, { noise: i < 7 ? 0.03 : 0.0005 }), { deviceLabel: 'MacBook Pro Microphone' });
+    assert.equal(r.ok, true, JSON.stringify(r.problems));
+  }
+  const b = await svc.build(s.sessionId);
+  assert.equal(b.ok, false, JSON.stringify(b));
+  assert.ok(['MIXED_SPEAKERS', 'CONSENT_SPEAKER_MISMATCH'].includes(b.code), b.code);
+  assert.equal(b.code, 'MIXED_SPEAKERS');
+  assert.equal(profile.verifyProfile('default', { root }).exists, false, 'no voice profile');
+  assert.throws(() => svc.getSession(s.sessionId), (e) => e.code === 'NO_SESSION', 'the session (and its takes) is gone');
+  assert.equal(fs.existsSync(path.join(root, 'sessions', s.sessionId)), false);
+
+  // Victim-only lines behind an attacker's consent: the consent does not match the script.
+  const victim = { 'consent.wav': personVec('A', 40) };
+  for (let i = 0; i < 14; i += 1) victim[`line-${String(i + 1).padStart(2, '0')}.wav`] = personVec('B', i);
+  const other = makeService({ sidecar: { vectors: victim } });
+  const s2 = await enroll(other.svc);
+  const b2 = await other.svc.build(s2.sessionId);
+  assert.equal(b2.ok, false);
+  assert.equal(b2.code, 'CONSENT_SPEAKER_MISMATCH');
+  assert.equal(profile.verifyProfile('default', { root: other.root }).exists, false);
+
+  // One person (0.64 apart, like real takes): accepted; the reference takes match the consent speaker.
+  const one = { 'consent.wav': personVec('A', 40) };
+  for (let i = 0; i < 14; i += 1) one[`line-${String(i + 1).padStart(2, '0')}.wav`] = personVec('A', i);
+  const good = makeService({ sidecar: { vectors: one } });
+  const s3 = await enroll(good.svc);
+  const b3 = await good.svc.build(s3.sessionId);
+  assert.equal(b3.ok, true, JSON.stringify(b3));
+  assert.ok(b3.consistency.consentMin >= 0.6 && b3.consistency.reference >= 0.45, JSON.stringify(b3.consistency));
+  await Promise.all([svc.shutdown(), other.svc.shutdown(), good.svc.shutdown()]);
+});
+
+test('F3-SAFE-A1: every script take is transcribed locally; a recording that does not say its line is refused', async () => {
+  const said = new Map([[4, 'Hi mom, it is me, please call me back on this number.']]);
+  const { svc, root } = makeService({ sidecar: { lineTranscript: (i) => (said.has(i) ? said.get(i) : null) } });
+  const s = await svc.startSession({});
+  await svc.addTake(s.sessionId, 'consent', 0, take(1, { seconds: 8 }), { deviceLabel: 'Mic' });
+  const r = await svc.addTake(s.sessionId, 'line', 4, take(14), { deviceLabel: 'Mic' });
+  assert.equal(r.ok, false);
+  assert.equal(r.transcript, said.get(4));
+  assert.ok(r.wording < 0.8);
+  assert.ok(r.problems.some((p) => p.code === 'wording' && p.level === 'fail' && /Read it exactly/.test(p.hint)));
+  assert.equal(svc.getSession(s.sessionId).takes[4].ok, false);
+  assert.deepEqual(fs.readdirSync(path.join(root, 'sessions', s.sessionId)).sort(), ['consent.wav'], 'the refused recording is not kept');
+  // ASR spellings of the right line still pass (fuzzy words, digits for number words).
+  said.set(4, 'Judge Vivian measured the beige garaj with a zig zag ruler.');
+  said.set(2, 'Could you share the ticket number? Was it 4, 5, or 9?');
+  assert.equal((await svc.addTake(s.sessionId, 'line', 2, take(12), { deviceLabel: 'Mic' })).ok, true);
+  const fuzzy = await svc.addTake(s.sessionId, 'line', 4, take(14), { deviceLabel: 'Mic' });
+  assert.equal(fuzzy.ok, true, JSON.stringify(fuzzy));
+  await svc.shutdown();
 });
 
 test('a profile that was tampered with, or lacks verified consent, is refused', async () => {
@@ -676,7 +802,14 @@ test('routes: the whole enrollment over HTTP, with SSE events and the audio rout
     assert.equal((await api('GET', '/api/clone/audio?id=../../x')).status, 400);
     assert.equal((await api('GET', `/api/clone/audio?id=${'a'.repeat(32)}`)).status, 404);
 
-    const test2 = await api('POST', '/api/clone/test', { text: 'Testing one two three', score: true });
+    // F3-SAFE-B3: text of your own only from the dialog window (its credential and origin); others get 403.
+    const refused = await api('POST', '/api/clone/test', { text: 'Hi mom, please wire the money today', score: true });
+    assert.equal(refused.status, 403);
+    assert.equal(refused.json.code, 'TEXT_NEEDS_DIALOG');
+    const fixed = await api('POST', '/api/clone/test', { score: true });
+    assert.equal(fixed.json.ok, true);
+    assert.match(fixed.json.text, /AI assistant/, 'the fixed test sentence');
+    const test2 = await api('POST', '/api/clone/test', { text: 'Testing one two three', score: true }, { 'X-Anywhere-UI': t.server.uiKey, Origin: `http://127.0.0.1:${t.server.port}` });
     assert.equal(test2.json.ok, true);
     assert.equal(test2.json.text, 'Testing one two three');
     assert.equal((await api('POST', '/api/clone/test', { engine: 'xtts' })).status, 400);
@@ -696,7 +829,7 @@ test('routes: the whole enrollment over HTTP, with SSE events and the audio rout
 });
 
 test('routes: install progress over SSE, open/opened, the standalone page link, failed builds as 422', async () => {
-  const t = await startServer({ svcOpts: { installer: new FakeInstaller({ installed: false }), sidecar: { scores: { 'line-01.wav': 0.1 } } } });
+  const t = await startServer({ svcOpts: { installer: new FakeInstaller({ installed: false }), sidecar: { vectors: { 'line-01.wav': speakerVec(0, 0.35, 12) } } } });
   const { api } = t;
   try {
     const inst = await api('POST', '/api/clone/install', {});
@@ -795,7 +928,7 @@ test('CLI: clone-voice status, delete and usage errors work without the daemon',
   assert.equal(eng.code, 1);
   assert.match(eng.stderr, /--engine must be pocket or zipvoice/);
   const help = await run(process.execPath, [BIN, 'help', 'clone-voice'], { env });
-  assert.match(help.stdout, /anywhere clone-voice \[start \| install \| status \| test \[TEXT\] \| bench \| delete\]/);
+  assert.match(help.stdout, /anywhere clone-voice \[start \| install \| status \| test \| bench \| delete\]/);
 });
 
 test('skill: /anywhere:clone-voice follows §10.6 and its launcher forwards the exit code', async () => {
@@ -876,7 +1009,15 @@ test('with the real sidecar.py (fake mode): consent STT, speaker check, profile 
     const c = await svc.addTake(s.sessionId, 'consent', 0, take(1, { seconds: 8 }), { deviceLabel: 'Built-in Microphone' });
     assert.equal(c.ok, true, JSON.stringify(c));
     assert.equal(c.transcript, CONSENT_READ());
-    for (let i = 0; i < 14; i += 1) assert.equal((await svc.addTake(s.sessionId, 'line', i, take(60 + i), { deviceLabel: 'Built-in Microphone' })).ok, true);
+    // Every script take is transcribed too: an unrelated recording is refused, the line itself is kept.
+    fs.writeFileSync(path.join(sdir, 'line-01.check.wav.txt'), 'Sure, wire the money to the new account today.');
+    const wrongWords = await svc.addTake(s.sessionId, 'line', 0, take(60), { deviceLabel: 'Built-in Microphone' });
+    assert.equal(wrongWords.ok, false);
+    assert.ok(wrongWords.problems.some((p) => p.code === 'wording' && p.level === 'fail'), JSON.stringify(wrongWords.problems));
+    for (let i = 0; i < 14; i += 1) {
+      fs.writeFileSync(path.join(sdir, `line-${String(i + 1).padStart(2, '0')}.check.wav.txt`), script.LINES[i]);
+      assert.equal((await svc.addTake(s.sessionId, 'line', i, take(60 + i), { deviceLabel: 'Built-in Microphone' })).ok, true);
+    }
     const b = await svc.build(s.sessionId);
     assert.equal(b.ok, true, JSON.stringify(b));
     assert.ok(b.consistency.min > 0.9, JSON.stringify(b.consistency));

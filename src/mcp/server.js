@@ -575,7 +575,8 @@ function createComputerSource({ source, getDriver, log } = {}) {
       const created = (async () => {
         const driver = await startDriver();
         driverRef = driver;
-        return new Computer({ driver, config: source.config.computer, geometryStore: 'file' });
+        // F3-SAFE-D1: an engine never clicks, drags or types in the Claude Anywhere dialog itself.
+        return new Computer({ driver, config: source.config.computer, geometryStore: 'file', protect: require('../context/desktop').isOwnWindow });
       })();
       computerPromise = created;
       created.catch((err) => {

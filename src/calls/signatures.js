@@ -244,6 +244,13 @@ function cleanCallerName(raw) {
     .replace(/\s+(?:on|via|in|from) (?:zoho cliq|cliq|google meet|meet|microsoft teams|teams|slack|zoom)\b.*$/i, '')
     .replace(/[<>{}`\\]/g, '')
     .trim();
+  // F3-SAFE-C2: a word that is a link or a domain ("Ankit bit.ly/x1") is not part of a name.
+  const linkRe = new RegExp(require('./policy').URL_RE.source, 'i');
+  s = s
+    .split(/\s+/)
+    .filter((w) => w && !linkRe.test(w))
+    .join(' ')
+    .trim();
   if (s.length > 60) s = s.slice(0, 60).replace(/\s+\S*$/, '').trim();
   if (!s || !/\p{L}/u.test(s) || APP_WORDS_RE.test(s)) return null;
   if (GENERIC_RINGING_RE.test(s) || /^https?:|^www\.|\.(?:com|net|org|io)\b/i.test(s)) return null;

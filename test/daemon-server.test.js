@@ -286,7 +286,8 @@ test('SECURITY-7: launch URLs carry a single-use code that expires after 60 s', 
     assert.equal((await post({ code }, { Origin: 'http://evil.example' })).status, 403);
     const first = await post({ code });
     assert.equal(first.status, 200);
-    assert.deepEqual(await first.json(), { token: s.token });
+    // A dialog window's code also carries the dialog's own credential (F3-SAFE-D1).
+    assert.deepEqual(await first.json(), { token: s.token, ui: s.server.uiKey });
     const again = await post({ code });
     assert.equal(again.status, 401, 'single use');
     assert.equal((await again.json()).token, undefined);

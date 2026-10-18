@@ -15,7 +15,7 @@
  *        raw audio/wav body (24 kHz mono 16-bit, 2–30 s, ≤ 5 MB) + header X-Anywhere-Device-Label (URI-encoded)
  *        → {ok, quality, problems, transcript?, consent?}
  *   POST /api/clone/build?session=          → {ok, similarity, label, testAudioId, testText, consistency}; 422 with
- *                                             {ok:false, code:'TAKES_INCONSISTENT', retake} or 'CONSENT_SPEAKER_MISMATCH'
+ *                                             {ok:false, code:'TAKES_INCONSISTENT', retake}, 'CONSENT_SPEAKER_MISMATCH' or 'MIXED_SPEAKERS'
  *   POST /api/clone/test {text?, engine?, score?, play?:'local'} → {audioId, text, engine, similarity, label, played?}
  *   GET  /api/clone/audio?id=<32 hex>       → audio/wav (test and phrase playback in the dialog)
  *   POST /api/clone/engine {engine}         → {ok, engine}: use the installed pocket or zipvoice engine
@@ -162,6 +162,13 @@ async function streamFile(req, res, file) {
 function register(add, server) {
   const svc = () => getCloneService(server);
   const HANDLED = undefined;
+  // F3-SAFE-A2: renders in the cloned voice that an earlier daemon run left in run/voice-tmp.
+  try {
+    const removed = require('../voice/clone').cleanupCloneRenders(require('path').join(require('../shared/paths').runDir(), 'voice-tmp'), { olderThanMs: 60000 });
+    if (removed.length) log.info(`removed ${removed.length} leftover cloned-voice render(s)`);
+  } catch (err) {
+    log.debug(`cleaning up cloned-voice renders failed: ${err.message}`);
+  }
 
   add(
     'GET',
@@ -267,8 +274,16 @@ function register(add, server) {
     }
   });
 
-  add('POST', '/api/clone/test', async ({ body, res }) => {
+  add('POST', '/api/clone/test', async ({ body, res, principal }) => {
     if (body.text != null && typeof body.text !== 'string') throw httpError(400, 'text must be a string');
+    // F3-SAFE-B3: text of the caller's choice in the cloned voice only from the dialog window (where
+    // the user types it); the CLI, the plugin and engines get the fixed test sentence.
+    if (typeof body.text === 'string' && body.text.trim() && principal !== 'dialog') {
+      throw httpError(403, 'Your own text can only be tried in the Claude Anywhere dialog', {
+        code: 'TEXT_NEEDS_DIALOG',
+        hint: 'Without text, the test sentence plays: anywhere clone-voice test. To try other words, use Test in the voice view of the dialog.',
+      });
+    }
     if (body.engine != null && !ENGINES.includes(body.engine)) throw httpError(400, `engine must be ${ENGINES.join(' or ')}`);
     let out;
     try {
@@ -337,7 +352,7 @@ function register(add, server) {
       sendError(res, err);
       return HANDLED;
     }
-  });
+  }, { noEngine: true });
 
   add(
     'POST',
@@ -364,9 +379,10 @@ function register(add, server) {
   add(
     'POST',
     '/api/clone/standalone',
-    function standalone() {
+    function standalone({ principal }) {
       if (typeof this.launchUrl !== 'function') throw httpError(503, 'This daemon cannot mint launch codes');
-      const u = new URL(this.launchUrl());
+      // The page gets the caller's own kind of token, never the dialog window's credential.
+      const u = new URL(this.launchUrl(undefined, { grant: principal === 'engine' ? 'engine' : 'user' }));
       u.pathname = '/clone.html';
       return { ok: true, url: u.href };
     },

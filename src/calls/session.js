@@ -49,6 +49,7 @@ const DEFAULTS = Object.freeze({
   warnBeforeEndMs: 60000,
   tickMs: 500,
   speechStallMs: 30000, // an utterance that never reports its end counts as ended after this
+  maxDisclosureFailures: 3, // the disclosure failed to play this often: hang up without speaking (F3-SAFE-B1)
 });
 
 const FILLER = 'Okay, one moment.';
@@ -211,6 +212,7 @@ class VoiceChain {
     this.lastEngine = null;
     this._chain = Promise.resolve();
     this._tmp = [];
+    this._cloneRenders = [];
   }
 
   /** The cloned voice is in use (the disclosure says "speaking in his voice" only then). */
@@ -292,7 +294,7 @@ class VoiceChain {
         log.warn(`the Piper voice failed (${err && err.message}); using the OS voice for this call`);
       }
     }
-    if (this.osRender) {
+    if (this.osRender && !this.osBroken) {
       const out = this._tmpFile('os');
       await this.osRender(text, out);
       await this.request('tts.say', { text, utteranceId, wav: out });
@@ -312,6 +314,8 @@ class VoiceChain {
     if (this.cloned && typeof this.clone.synthesize === 'function') {
       try {
         const r = await this.clone.synthesize(text);
+        // A live render (not the phrase cache) is removed by cleanup() with this call's other renders.
+        if (r && r.file && !r.cached) this._cloneRenders.push(r.file);
         return { engine: 'clone', file: r.file };
       } catch (err) {
         this.cloneBroken = true;
@@ -338,6 +342,22 @@ class VoiceChain {
     throw e;
   }
 
+  /**
+   * An utterance this voice queued did not play (the sidecar could not synthesize or play it):
+   * use the next voice from now on (F3-SAFE-B1).
+   * @param {'clone'|'piper'|'os'|null} engine
+   */
+  markBroken(engine) {
+    if (engine === 'clone') this.cloneBroken = true;
+    else if (engine === 'piper') this.piperBroken = true;
+    else if (engine === 'os') this.osBroken = true;
+  }
+
+  /** Some voice is left to try. */
+  hasVoice() {
+    return this.cloned || Boolean(this.piper && !this.piperBroken) || Boolean(this.osRender && !this.osBroken);
+  }
+
   /** Stop speaking now and drop the queue (≤ 100 ms in the sidecar). */
   async stop() {
     try {
@@ -347,9 +367,13 @@ class VoiceChain {
     }
   }
 
-  /** Delete this call's temporary renders. */
+  /** Delete this call's temporary renders (the cloned voice's too, F3-SAFE-A2). */
   cleanup() {
     for (const f of this._tmp.splice(0)) this._rm(f);
+    for (const f of this._cloneRenders.splice(0)) {
+      if (this.clone && typeof this.clone.discardRender === 'function' && this.clone.discardRender(f)) continue;
+      this._rm(f);
+    }
   }
 }
 
@@ -648,14 +672,18 @@ class CallSession extends EventEmitter {
 
   /** Send one utterance to the voice chain now (no gating). */
   _sendUtt(u) {
-    this.voice.say(u.text, { utteranceId: u.id, kind: u.kind }).catch((err) => {
+    u.engine = null;
+    this.voice.say(u.text, { utteranceId: u.id, kind: u.kind }).then((r) => {
+      if (r && r.engine) u.engine = r.engine;
+    }).catch((err) => {
       log.warn(`speaking failed: ${err && err.message}`);
       this.speechFailures += 1;
       const dead = isAudioDead(err);
       // Several failures in a row (no playback device, every voice broken): the caller hears nothing.
       const mute = !dead && ((err && err.code === 'NO_VOICE') || this.speechFailures >= 3);
       if (mute) this.held = [];
-      this._uttEnded({ utteranceId: u.id, interrupted: true, started: false, playedChars: 0, error: { message: err && err.message } });
+      // fromSay: the whole voice chain failed (handled here: mute and hang up after repeated failures).
+      this._uttEnded({ utteranceId: u.id, interrupted: true, started: false, playedChars: 0, error: { message: err && err.message }, fromSay: true });
       if (dead) this._sidecarExit({ error: err });
       else if (mute) this.hangup(err && err.code === 'NO_VOICE' ? 'no_voice' : 'audio_failed', { goodbye: false }).catch(() => {});
     });
@@ -782,10 +810,17 @@ class CallSession extends EventEmitter {
     const u = this.utts.get(ev.utteranceId);
     if (!u || u.ended) return;
     u.ended = true;
-    u.started = u.started || Boolean(ev.started);
-    u.interrupted = Boolean(ev.interrupted);
+    if (ev.started === true) u.started = true;
+    // F3-SAFE-B1: an utterance that failed (synthesis or the device: ev.error) or never started
+    // (started:false) was not heard, whatever `interrupted` says; only one that started, ended without
+    // an error and was not cut counts as played in full.
+    const failed = Boolean(ev.error);
+    const notStarted = !u.started && ev.started === false;
+    const fullyPlayed = !ev.interrupted && !failed && !notStarted;
+    u.failed = failed || notStarted;
+    u.interrupted = !fullyPlayed;
     const chars = Number(ev.playedChars);
-    u.playedChars = u.interrupted ? (Number.isFinite(chars) ? Math.max(0, Math.min(u.text.length, chars)) : 0) : u.text.length;
+    u.playedChars = fullyPlayed ? u.text.length : notStarted ? 0 : Number.isFinite(chars) ? Math.max(0, Math.min(u.text.length, chars)) : 0;
     if (!u.interrupted && u.kind !== 'still_there') this.lastActivityAt = this.now();
     // What the caller heard goes to the transcript.
     if (u.started && u.playedChars > 0) {
@@ -793,18 +828,44 @@ class CallSession extends EventEmitter {
       this._addTranscript('assistant', heard, u.interrupted ? { interrupted: true } : {});
     }
     if (this.barge && u.interrupted) this.barge.ids.push(u.id);
+    let disclosureFailed = false;
     if (u.id === this.disclosureUtt) {
       this.disclosureUtt = null;
-      if (u.playedChars >= u.disclosureEnd) this.disclosureSpoken = true;
+      // Never from an utterance that failed: what the caller heard of it is not known.
+      if (!u.failed && u.playedChars >= u.disclosureEnd) this.disclosureSpoken = true;
+      else if (u.failed) disclosureFailed = true;
     }
     if ((u.kind === 'greeting' || u.kind === 'disclosure') && this.state === 'greeting') this._setState('active');
     // Keep the map small: forget ended utterances that no barge-in can still resume.
     if (!this.barge && this.utts.size > 200) {
       for (const [id, x] of this.utts) if (x.ended && this.utts.size > 100) this.utts.delete(id);
     }
+    if (disclosureFailed && !ev.fromSay) this._disclosureFailed(u, ev);
     this._flushHeld();
     this.emit('_utt_end', u);
     this._maybeEnd();
+  }
+
+  /**
+   * The greeting or a re-disclosure did not play (F3-SAFE-B1): the voice that failed is dropped, the
+   * disclosure is said again with the next one (Piper, then the OS voice), and after repeated failures,
+   * or with no voice left, the call is ended without another word.
+   */
+  _disclosureFailed(u, ev) {
+    if (this._stopped || this._ending) return;
+    this.disclosureFailures = (this.disclosureFailures || 0) + 1;
+    const engine = u.engine || this.voice.lastEngine || null;
+    if (typeof this.voice.markBroken === 'function') this.voice.markBroken(engine);
+    const why = (ev && ev.error && (ev.error.message || ev.error.code)) || 'it did not start';
+    log.warn(`the AI disclosure did not play (${engine || 'unknown voice'}: ${why}); attempt ${this.disclosureFailures}`);
+    this._emit('warning', { callId: this.id, code: 'DISCLOSURE_FAILED', message: `The greeting did not play (${oneLine(why, 120)})` });
+    const left = typeof this.voice.hasVoice === 'function' ? this.voice.hasVoice() : true;
+    if (this.disclosureFailures >= this.opts.maxDisclosureFailures || !left) {
+      this.held = [];
+      this.hangup('disclosure_failed', { goodbye: false }).catch(() => {});
+      return;
+    }
+    this._queueDisclosure(greetingMod.redisclosure({ ownerName: this.ownerName, ownerFirst: this.ownerFirst, pronoun: this.pronoun, cloned: Boolean(this.voice.cloned) }), 'disclosure');
   }
 
   // ------------------------------------------------------------------------------- barge-in (§6.5)
@@ -1048,8 +1109,16 @@ class CallSession extends EventEmitter {
     const turn = this.turn;
     if (msg.type === 'stream_event' && !msg.parent_tool_use_id) {
       const e = msg.event || {};
-      if (e.type === 'message_start' && e.message && turn) turn.msgId = e.message.id || null;
-      else if (e.type === 'content_block_delta' && e.delta && e.delta.type === 'text_delta' && turn) this._onText(str(e.delta.text), turn.msgId);
+      if (e.type === 'message_start' && e.message && turn) {
+        const id = e.message.id || null;
+        // A new model message within the turn (after a tool result) is a new reply with its own 40 words:
+        // "Sure, let me check" said before the tools ran must not crowd out the answer or its closing question.
+        if (turn.msgId && id && id !== turn.msgId) {
+          turn.words = 0;
+          turn.truncated = false;
+        }
+        turn.msgId = id;
+      } else if (e.type === 'content_block_delta' && e.delta && e.delta.type === 'text_delta' && turn) this._onText(str(e.delta.text), turn.msgId);
       else if (e.type === 'content_block_stop' && turn && turn.kind === 'caller' && !turn.cancelled) {
         // "Sure, let me check" before a tool call: say it now, not after the tools ran.
         const rest = turn.splitter.flush();
@@ -1229,6 +1298,8 @@ class CallSession extends EventEmitter {
    * @param {{goodbye?:boolean, text?:string}} [o]
    */
   hangup(reason = 'hangup', { goodbye = true, text } = {}) {
+    // The call app shows the call ended (perhaps while our own goodbye is under way): no End call click then.
+    if (reason === 'caller_hung_up' || reason === 'call_ended') this.callerGone = true;
     if (this._ending) return this._ending;
     if (this._stopped) return Promise.resolve();
     this._ending = (async () => {
@@ -1249,7 +1320,7 @@ class CallSession extends EventEmitter {
         }
       }
       const callerGone = reason === 'caller_hung_up' || reason === 'call_ended';
-      const mute = reason === 'audio_failed' || reason === 'no_voice';
+      const mute = reason === 'audio_failed' || reason === 'no_voice' || reason === 'disclosure_failed';
       if (!callerGone) {
         if (mute) {
           this.held = [];
@@ -1261,7 +1332,7 @@ class CallSession extends EventEmitter {
           }
           await this._waitSpeechDone(this.opts.goodbyeTimeoutMs);
         }
-        if (this.hangUpCall) {
+        if (this.hangUpCall && !this.callerGone) {
           try {
             await this.hangUpCall(reason);
           } catch (err) {
@@ -1315,6 +1386,9 @@ class CallSession extends EventEmitter {
    * @returns {Promise<{summary:string, followUps:string[], topics:string[], source:'engine'|'transcript'}>}
    */
   async summarize() {
+    // F3-SAFE-E1: after the caller objected to the transcription, the engine (whose context still holds
+    // the conversation) is not asked: the notes keep only what was done, from the action log.
+    if (!this.saveTranscript) return { ...this.actionOnlySummary(), source: 'actions' };
     const fallback = () => ({ ...this.fallbackSummary(), source: 'transcript' });
     if (!this.engine || this.engine.running === false) return fallback();
     if (this.turn && !this.turn.done) {
@@ -1332,6 +1406,22 @@ class CallSession extends EventEmitter {
 
   _setTimerRaw(fn, ms) {
     return unref(this.clock.setTimeout(fn, ms));
+  }
+
+  /**
+   * The summary of a call that is not transcribed: no words of the caller, no topics, only the actions
+   * and the requests deferred to the owner, as the daemon logged them.
+   */
+  actionOnlySummary() {
+    const who = this.caller.displayName || 'The caller';
+    const done = this._actions.filter((a) => a.ok !== false && a.summary && a.name !== 'call_defer' && a.name !== 'call_note').map((a) => oneLine(a.summary));
+    const followUps = this._actions
+      .filter((a) => a.name === 'call_defer' && a.args && a.args.request)
+      .map((a) => oneLine(a.args.request).slice(0, 300))
+      .filter(Boolean);
+    const parts = [`${who} asked not to be transcribed, so only what was done is kept.`];
+    parts.push(done.length ? `Done: ${done.join('; ')}.` : 'Nothing was done during the call.');
+    return { summary: parts.join(' '), followUps: [...new Set(followUps)], topics: [] };
   }
 
   /** A summary written from the transcript and the action log only. */
