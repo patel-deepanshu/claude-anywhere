@@ -202,10 +202,15 @@ and `ANYWHERE_ASCII=1` forces ASCII.
 ## Development
 
 ```bash
-npm test                     # about 850 node:test tests (Node 18+); no network or display needed
+npm test                     # about 980 node:test tests (Node 18+); no network or display needed
 node scripts/check-syntax.js
 ANYWHERE_DRIVER=mock node bin/anywhere.js computer screenshot --out /tmp/s.png
+ANYWHERE_LIVE_DESKTOP=1 node scripts/test.js --test-name-pattern=live-desktop   # drives YOUR real desktop
 ```
+
+CI (`.github/workflows/ci.yml`) runs the suite on Linux, macOS and Windows with Node 18 and 22. It also compiles
+the Win32 helper under Windows PowerShell 5.1, and drives the real desktops of the Windows and macOS runners
+(Notepad and TextEdit: screenshots, mouse, unicode typing, windows, clipboard, CLI and MCP) and an Xvfb X11 desktop.
 
 The repo is both the plugin (`.claude-plugin/`) and its marketplace. Validate them with `claude plugin validate .`.
 
