@@ -6,7 +6,9 @@
  * Each client first receives `retry: 2000` and a `snapshot` event (when a
  * snapshot provider is set). A comment line is written every 15 s so proxies
  * and the browser keep the stream open and dead sockets are detected. Clients
- * whose socket died or whose unsent buffer grew too large are dropped.
+ * whose socket died or whose unsent buffer grew too large are dropped; a
+ * snapshot frame (it carries the transcript's screenshots, often more than the
+ * limit) does not count toward that limit until it has drained.
  *
  * The hub is also an EventEmitter: every broadcast is re-emitted locally as
  * `('event', type, data)` so daemon components can react to each other's
@@ -50,7 +52,7 @@ class Hub extends EventEmitter {
     this.heartbeatMs = heartbeatMs;
     this.maxBufferedBytes = maxBufferedBytes;
     this.snapshotProvider = typeof snapshot === 'function' ? snapshot : null;
-    /** @type {Set<{id:number,res:import('http').ServerResponse,since:number}>} */
+    /** @type {Set<{id:number,res:import('http').ServerResponse,since:number,allowance:number,draining:boolean}>} */
     this.clients = new Set();
     this.nextId = 1;
     this.closed = false;
@@ -76,7 +78,7 @@ class Hub extends EventEmitter {
       res.end(JSON.stringify({ error: 'daemon is shutting down' }));
       return null;
     }
-    const client = { id: this.nextId++, res, since: Date.now() };
+    const client = { id: this.nextId++, res, since: Date.now(), allowance: 0, draining: false };
     if (!res.headersSent) {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
@@ -104,7 +106,10 @@ class Hub extends EventEmitter {
         snap = undefined;
       }
     }
-    if (snap !== undefined) this.write(client, formatEvent('snapshot', snap));
+    if (snap !== undefined) {
+      const frame = formatEvent('snapshot', snap);
+      this.write(client, frame, Buffer.byteLength(frame));
+    }
     this.emit('clients', this.clients.size);
     log.debug(`client ${client.id} connected (${this.clients.size} total)`);
     return { id: client.id };
@@ -127,24 +132,40 @@ class Hub extends EventEmitter {
     this.emit('clients', this.clients.size);
   }
 
-  /** @private @returns {boolean} false when the client was dropped */
-  write(client, chunk) {
+  /**
+   * @private
+   * @param {number} [exemptBytes] the frame's size when it is a snapshot: until the socket drains,
+   *   only what queues beyond it counts toward the slow-consumer limit
+   * @returns {boolean} false when the client was dropped
+   */
+  write(client, chunk, exemptBytes = 0) {
     const { res } = client;
     if (res.destroyed || res.writableEnded || (res.socket && res.socket.destroyed)) {
       this.removeClient(client, 'dead socket');
       return false;
     }
-    if (res.writableLength > this.maxBufferedBytes) {
+    if (res.writableLength > this.maxBufferedBytes + client.allowance) {
       this.removeClient(client, `slow consumer (${res.writableLength} bytes queued)`);
       return false;
     }
+    let flushed;
     try {
-      res.write(chunk);
-      return true;
+      flushed = res.write(chunk);
     } catch (err) {
       this.removeClient(client, `write failed: ${err.message}`);
       return false;
     }
+    if (exemptBytes > 0 && !flushed) {
+      client.allowance += exemptBytes;
+      if (!client.draining) {
+        client.draining = true;
+        res.once('drain', () => {
+          client.allowance = 0;
+          client.draining = false;
+        });
+      }
+    }
+    return true;
   }
 
   /**
@@ -155,7 +176,8 @@ class Hub extends EventEmitter {
   broadcast(type, data) {
     if (!this.closed && this.clients.size) {
       const frame = formatEvent(type, data);
-      for (const client of [...this.clients]) this.write(client, frame);
+      const exempt = type === 'snapshot' ? Buffer.byteLength(frame) : 0;
+      for (const client of [...this.clients]) this.write(client, frame, exempt);
     }
     try {
       this.emit('event', type, data);

@@ -67,6 +67,36 @@ var FN_KEYS = {
 };
 var KEY_V = 9;
 var KEY_CMD = 55;
+var KEY_SHIFT = 56;
+var KEY_ALT = 58;
+// Modifier key codes in the order keys.js presses them: ctrl, alt (option), shift, cmd, fn.
+var MODIFIER_RANK = { 59: 0, 62: 0, 58: 1, 61: 1, 56: 2, 60: 2, 55: 3, 54: 3, 63: 4 };
+
+// Keyboard layout lookups. keys.js sends a shifted US character as its base plus Shift
+// ('?' as '/' with Shift); this is what Shift types on each of those US keys.
+var US_SHIFTED = {
+  1: '!', 2: '@', 3: '#', 4: '$', 5: '%', 6: '^', 7: '&', 8: '*', 9: '(', 0: ')',
+  '-': '_', '=': '+', '[': '{', ']': '}', '\\': '|', ';': ':', "'": '"', ',': '<', '.': '>', '/': '?', '`': '~',
+};
+var US_SHIFTED_CHARS = {};
+for (var usBase in US_SHIFTED) {
+  if (Object.prototype.hasOwnProperty.call(US_SHIFTED, usBase)) US_SHIFTED_CHARS[US_SHIFTED[usBase]] = usBase;
+}
+// Key codes probed for layout maps: the character block (ANSI and ISO, 0x00-0x32) and the two
+// JIS character keys. Keypad codes are left out: kVK_ANSI_Keypad1 also types '1', but is not the '1' key.
+var LAYOUT_CODES = [0x5d, 0x5e];
+for (var layoutCode = 0x32; layoutCode >= 0; layoutCode--) LAYOUT_CODES.unshift(layoutCode);
+// Layouts that switch to a QWERTY keymap while Command is held ("Dvorak - QWERTY ⌘").
+var QWERTY_CMD_RE = /QWERTY[\s_-]*(CMD|COMMAND)|⌘/i;
+// ASCII-capable layouts without dead keys in their plain and Shift layers. On any other layout
+// (U.S. International - PC, German, French, Spanish...) these ASCII characters may be dead keys,
+// which System Events keystrokes would compose into the next letter ('"a' -> 'ä').
+var DEAD_KEY_FREE_RE = new RegExp(
+  '^com\\.apple\\.keylayout\\.(US|ABC|USExtended|ABC-India|British|British-PC|Australian|' +
+    'Dvorak|Dvorak-Left|Dvorak-Right|DVORAK-QWERTYCMD|Colemak|UnicodeHexInput)$',
+  'i',
+);
+var DEAD_KEY_CHARS = '\'"`^~';
 
 // Timings in seconds.
 var KEY_GAP = 0.008;
@@ -76,8 +106,11 @@ var MOVE_SETTLE = 0.02;
 var DRAG_HOLD = 0.06;
 var DRAG_STEP_GAP = 0.012;
 var SCROLL_GAP = 0.015;
-var PASTE_SETTLE = 0.15;
-var PASTE_RESTORE = 0.3;
+// The target app reads the pasteboard only when it handles Cmd+V, which a busy app (an
+// Electron terminal under load) can do long after the event was posted. The pasteboard must
+// not change before then, or the app pastes the next text or the restored clipboard.
+var PASTE_SETTLE = 0.4;
+var PASTE_RESTORE = 1.0;
 var AX_TITLE_BUDGET_MS = 2500;
 var AX_TITLE_MAX_APPS = 12;
 
@@ -424,12 +457,23 @@ function axProcess(se, pid) {
   return se.processes.whose({ unixId: pid })[0];
 }
 
-/** Name and frame of every accessibility window of a process (3 Apple events). */
+/**
+ * Name and frame of every accessibility window of a process (3 Apple events). Bulk getters on
+ * the unix-id specifier, so another process with the same name is never consulted. A frame
+ * that cannot be read is NaN.
+ */
 function axWindowFrames(se, pid) {
   var p = axProcess(se, pid);
   var names = p.windows.name();
-  var pos = p.windows.position();
-  var size = p.windows.size();
+  var pos = null;
+  var size = null;
+  try {
+    pos = p.windows.position();
+    size = p.windows.size();
+  } catch (e) {
+    pos = null;
+    size = null;
+  }
   var out = [];
   for (var i = 0; i < names.length; i++) {
     var xy = pos && pos[i] ? pos[i] : null;
@@ -500,36 +544,37 @@ function fillTitlesFromAX(wins, budgetMs) {
   return { filled: filled };
 }
 
-/** The System Events window of a process that matches a CG window (frame first, then title). */
-function findAxWindow(proc, info) {
-  var wins = proc.windows();
-  if (!wins || !wins.length) return null;
-  if (!info) return wins[0];
-  var byFrame = null;
-  var byTitle = null;
-  for (var i = 0; i < wins.length; i++) {
-    var w = wins[i];
-    var name = '';
-    var frame = null;
-    try {
-      var n = w.name();
-      name = n === null || n === undefined ? '' : String(n);
-    } catch (e) {
-      /* unnamed */
-    }
-    try {
-      var pos = w.position();
-      var size = w.size();
-      frame = { x: Number(pos[0]), y: Number(pos[1]), width: Number(size[0]), height: Number(size[1]) };
-    } catch (e) {
-      frame = null;
-    }
-    var frameMatch = frame !== null && near(frame, info);
-    if (frameMatch && (!info.title || name === info.title)) return w;
-    if (frameMatch && !byFrame) byFrame = w;
-    if (info.title && name === info.title && !byTitle) byTitle = w;
+/**
+ * The System Events window of a process that matches a CG window (frame first, then title),
+ * as an index into the process's windows; -1 if none. Act on it through
+ * axProcess(se, pid).windows[index]: the references `proc.windows()` returns name the
+ * process by name, so with two instances of an app (the dialog's browser next to the
+ * user's) every later Apple event would go to whichever instance comes first.
+ */
+function findAxWindowIndex(se, pid, info) {
+  var frames = axWindowFrames(se, pid);
+  if (!frames.length) return -1;
+  if (!info) return 0;
+  var byFrame = -1;
+  var byTitle = -1;
+  for (var i = 0; i < frames.length; i++) {
+    var f = frames[i];
+    var frameMatch = near(f, info);
+    if (frameMatch && (!info.title || f.name === info.title)) return i;
+    if (frameMatch && byFrame < 0) byFrame = i;
+    if (info.title && f.name === info.title && byTitle < 0) byTitle = i;
   }
-  return byFrame || byTitle;
+  return byFrame >= 0 ? byFrame : byTitle;
+}
+
+/** Whether no other process has the same name as `pid` (System Events references name processes by name). */
+function processNameIsUnique(se, pid) {
+  try {
+    var name = axProcess(se, pid).name();
+    return se.processes.whose({ name: name }).length === 1;
+  } catch (e) {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------- pasteboard
@@ -720,8 +765,11 @@ function inputSourceFromDefaults() {
  * input method, so anything but an ASCII-capable keyboard layout garbles ASCII
  * text: input methods (Japanese, Chinese, Korean...) compose it, non-Latin
  * layouts (Russian, Greek...) type other letters. safe is null when unknown.
+ * deadChars lists the ASCII characters that may be dead keys on a layout that is not
+ * known to be free of them ('' otherwise): keystrokes would compose them into the next
+ * letter ('"' then 'a' types 'ä' on U.S. International), so steps containing them are pasted.
  * @param {{id?:string, type?:string, ascii?:(boolean|null), inputMethod?:boolean, source?:string}} raw
- * @returns {{id:string, kind:string, ascii:(boolean|null), safe:(boolean|null), source:string}}
+ * @returns {{id:string, kind:string, ascii:(boolean|null), safe:(boolean|null), deadChars:string, source:string}}
  */
 function describeInputSource(raw) {
   var r = raw || {};
@@ -736,7 +784,8 @@ function describeInputSource(raw) {
   var safe = null;
   if (kind === 'inputMethod' || ascii === false) safe = false;
   else if (kind === 'layout' && ascii === true) safe = true;
-  return { id: id, kind: kind, ascii: ascii, safe: safe, source: r.source || '' };
+  var deadChars = kind === 'layout' && safe !== false && !DEAD_KEY_FREE_RE.test(id) ? DEAD_KEY_CHARS : '';
+  return { id: id, kind: kind, ascii: ascii, safe: safe, deadChars: deadChars, source: r.source || '' };
 }
 
 /** The active keyboard input source, or null if it cannot be read. Never throws. */
@@ -774,6 +823,39 @@ function pastePlan(steps) {
     else out.push({ kind: 'paste', text: text });
   }
   return out;
+}
+
+/**
+ * Typing steps with every keystroke step that contains one of `deadChars` pasted instead
+ * (adjacent pastes merged), or null when no step does.
+ * @param {Array<object>} steps
+ * @param {string} deadChars
+ * @returns {Array<object>|null}
+ */
+function pasteDeadKeySteps(steps, deadChars) {
+  if (!deadChars) return null;
+  var out = [];
+  var changed = false;
+  for (var i = 0; i < steps.length; i++) {
+    var s = steps[i] || {};
+    var text = s.text === undefined || s.text === null ? '' : String(s.text);
+    var kind = s.kind;
+    if (kind === 'keys') {
+      for (var j = 0; j < text.length && kind === 'keys'; j++) {
+        if (deadChars.indexOf(text.charAt(j)) >= 0) kind = 'paste';
+      }
+      if (kind === 'paste') changed = true;
+    }
+    if (kind !== 'paste') {
+      out.push(s);
+      continue;
+    }
+    if (!text) continue;
+    var last = out.length ? out[out.length - 1] : null;
+    if (last && last.kind === 'paste') last.text += text;
+    else out.push({ kind: 'paste', text: text });
+  }
+  return changed ? out : null;
 }
 
 // ---------------------------------------------------------------- errors
@@ -1025,49 +1107,175 @@ function cmdScroll(a) {
 
 // ---------------------------------------------------------------- keyboard layout
 
-/** The character key `code` types with no modifiers on the active layout (lower case; '' if none). */
-function layoutChar(code) {
+function hasOwn(o, k) {
+  return Object.prototype.hasOwnProperty.call(o, k);
+}
+
+/**
+ * The character key `code` types on the active layout with modifier `flags` ('' if none, or
+ * a dead key). The plain layer is read from charactersIgnoringModifiers and lower-cased, so
+ * Caps Lock does not matter. Other layers are read from `characters`, which follows the
+ * layout's Command keymap: Apple's non-Latin layouts and "Dvorak - QWERTY ⌘" switch to a
+ * QWERTY keymap while Command is held, which is what apps match Cmd shortcuts against.
+ */
+function layoutChar(code, flags) {
+  var f = flags | 0;
   try {
     var e = $.CGEventCreateKeyboardEvent(null, code, true);
-    $.CGEventSetFlags(e, 0);
+    $.CGEventSetFlags(e, f);
     var ns = $.NSEvent.eventWithCGEvent(e);
     if (isNil(ns)) return '';
-    var s = ObjC.unwrap(ns.charactersIgnoringModifiers);
-    return typeof s === 'string' && s.length === 1 ? s.toLowerCase() : '';
+    var s = ObjC.unwrap(f ? ns.characters : ns.charactersIgnoringModifiers);
+    if (typeof s !== 'string' || s.length !== 1) return '';
+    return (f & FLAG_SHIFT) !== 0 ? s : s.toLowerCase();
   } catch (err) {
     return '';
   }
 }
 
-/** Character -> the lowest key code that types it on the active layout. */
-function buildLayoutMap() {
+/** Character -> the lowest key code that types it with modifier `flags` on the active layout. */
+function buildLayoutMap(flags) {
   var map = {};
-  for (var code = 0; code < 128; code++) {
-    // Keypad codes are skipped: kVK_ANSI_Keypad1 also types '1', but is not the '1' key.
-    if (code >= 0x41 && code <= 0x5c) continue;
-    var s = layoutChar(code);
-    if (s && !Object.prototype.hasOwnProperty.call(map, s)) map[s] = code;
+  for (var i = 0; i < LAYOUT_CODES.length; i++) {
+    var s = layoutChar(LAYOUT_CODES[i], flags);
+    if (s && !hasOwn(map, s)) map[s] = LAYOUT_CODES[i];
   }
   return map;
 }
 
+function layoutMap(cache, flags) {
+  if (!cache.maps) cache.maps = {};
+  var k = String(flags | 0);
+  if (!hasOwn(cache.maps, k)) cache.maps[k] = buildLayoutMap(flags);
+  return cache.maps[k];
+}
+
+/** The selected keyboard layout's id from the HIToolbox preferences ('' if unknown). */
+function keyboardLayoutFromDefaults() {
+  if (typeof $.NSUserDefaults === 'undefined') return '';
+  var d = $.NSUserDefaults.alloc.initWithSuiteName('com.apple.HIToolbox');
+  if (isNil(d)) return '';
+  return str(d.stringForKey('AppleCurrentKeyboardLayoutInputSourceID'));
+}
+
 /**
- * The key code that types base character `ch` on the active keyboard layout. keys.js sends
- * US ANSI positions, so Cmd+A on AZERTY would otherwise press the key labelled Q. Returns
- * `ansiCode` when it already types `ch`, or when the layout has no key for `ch` (non-Latin
- * layouts, where macOS matches Cmd shortcuts by their QWERTY position anyway).
- * @param {string} ch one unshifted character ('/' for '?'; Shift is in the flags)
- * @param {number} ansiCode
- * @param {{map?:object}} [cache] shared within one request, so the map is built at most once
- * @returns {number}
+ * The active keyboard layout (under an input method, the layout it types with): its TIS id
+ * and whether it is ASCII-capable (null if unknown). Cached in `cache` for one request.
+ * Callers pump the run loop first: that is how TIS hears about input source switches.
  */
-function layoutKeyCode(ch, ansiCode, cache) {
-  if (typeof ch !== 'string' || ch.length !== 1 || !HAS_OBJC || typeof $.NSEvent === 'undefined') return ansiCode;
-  var want = ch.toLowerCase();
-  if (layoutChar(ansiCode) === want) return ansiCode;
+function keyboardLayout(cache) {
+  if (cache && cache.layout) return cache.layout;
+  var out = { id: '', ascii: null };
+  try {
+    importCarbon();
+    if (typeof $.TISCopyCurrentKeyboardLayoutInputSource !== 'undefined' && typeof $.TISGetInputSourceProperty !== 'undefined') {
+      var src = $.TISCopyCurrentKeyboardLayoutInputSource();
+      if (!isNil(src)) {
+        var id = tisProperty(src, 'kTISPropertyInputSourceID', TIS_PROP_ID);
+        out.id = id === null ? '' : String(id);
+        out.ascii = toBool(tisProperty(src, 'kTISPropertyInputSourceIsASCIICapable', TIS_PROP_ASCII));
+      }
+    }
+  } catch (e) {
+    /* unknown layout */
+  }
+  if (!out.id) {
+    try {
+      out.id = keyboardLayoutFromDefaults();
+    } catch (e) {
+      out.id = '';
+    }
+  }
+  if (out.ascii === null && NON_ASCII_LAYOUT_RE.test(out.id)) out.ascii = false;
+  if (cache) cache.layout = out;
+  return out;
+}
+
+/**
+ * Where the key that types character `ch` is on the active keyboard layout. keys.js sends US
+ * ANSI positions, so Cmd+A on AZERTY would otherwise press the key labelled Q.
+ *
+ * - The lookup uses the layer the key is pressed in: with Command held, the Command keymap.
+ *   When the layout is not ASCII-capable or is a "QWERTY ⌘" layout, a Command chord keeps the
+ *   US position, which is what those layouts' Command keymaps type.
+ * - With `mods` (a chord with a single key), the character may also be found with Shift (German
+ *   '/' is Shift+7, AZERTY '1' is Shift+&) or, when no Cmd, Ctrl or Option is held, with Option
+ *   (German '@' is Option+L).
+ * - A character that is shifted on US ('?', '+') is looked up as itself, and so is a US base
+ *   character held with Shift alone ('/' plus Shift for '?'): Shift is then set or cleared for
+ *   the key found. Otherwise the chord's own Shift is kept.
+ * - In Command and Control chords digits keep their number-row key: system hotkeys
+ *   (Cmd+Shift+3) and browsers (Cmd+1) match those by key code.
+ * Falls back to `ansiCode` and the chord's modifiers when the layout has no such key.
+ * @param {string} ch one character from keys.js ('/' for '?', with Shift in the flags)
+ * @param {number} ansiCode the US ANSI key code
+ * @param {number} flags the chord's CGEventFlags
+ * @param {object} cache shared within one request, so each map is built at most once
+ * @param {boolean} [mods] whether Shift and Option may change for this key
+ * @returns {{code:number, shift:(boolean|null), alt:boolean}} shift: press with (true) or
+ *   without (false) Shift, null keeps the chord's; alt: add Option
+ */
+function layoutKey(ch, ansiCode, flags, cache, mods) {
+  var keep = { code: ansiCode, shift: null, alt: false };
+  if (typeof ch !== 'string' || ch.length !== 1 || !HAS_OBJC || typeof $.NSEvent === 'undefined') return keep;
   var c = cache || {};
-  if (!c.map) c.map = buildLayoutMap();
-  return Object.prototype.hasOwnProperty.call(c.map, want) ? c.map[want] : ansiCode;
+  var f = flags | 0;
+  var cmd = (f & FLAG_CMD) !== 0;
+  var held = f & (FLAG_CMD | FLAG_CTRL | FLAG_ALT);
+  var want = ch;
+  var exact = hasOwn(US_SHIFTED_CHARS, ch);
+  if (!exact && mods && !held && (f & FLAG_SHIFT) !== 0 && hasOwn(US_SHIFTED, ch)) {
+    want = US_SHIFTED[ch];
+    exact = true;
+  }
+  if (exact && !mods) return keep;
+  if (!exact) {
+    want = ch.toLowerCase();
+    if ((f & (FLAG_CMD | FLAG_CTRL)) !== 0 && want >= '0' && want <= '9') return keep;
+  }
+  if (cmd) {
+    var layout = keyboardLayout(c);
+    if (layout.ascii === false || QWERTY_CMD_RE.test(layout.id)) return keep;
+  }
+  var found = function (code, shift, alt) {
+    return { code: code, shift: exact || shift ? shift : null, alt: alt };
+  };
+  var plain = cmd ? FLAG_CMD : 0;
+  if (layoutChar(ansiCode, plain) === want) return found(ansiCode, false, false);
+  if (mods && layoutChar(ansiCode, plain | FLAG_SHIFT) === want) return found(ansiCode, true, false);
+  var layers = [[plain, false, false]];
+  if (mods) layers.push([plain | FLAG_SHIFT, true, false]);
+  if (mods && !held) layers.push([FLAG_ALT, false, true], [FLAG_ALT | FLAG_SHIFT, true, true]);
+  for (var i = 0; i < layers.length; i++) {
+    var map = layoutMap(c, layers[i][0]);
+    if (hasOwn(map, want)) return found(map[want], layers[i][1], layers[i][2]);
+  }
+  return keep;
+}
+
+/** Modifier key codes with the modifier `flag` added (as `code`, in keys.js order) or removed. */
+function setModifier(codes, code, flag, on) {
+  var out = [];
+  var present = false;
+  for (var i = 0; i < codes.length; i++) {
+    if (modifierFlag(codes[i]) === flag) present = true;
+    else out.push(codes[i]);
+  }
+  if (!on) return out;
+  if (present) return codes.slice();
+  var at = out.length;
+  for (var j = 0; j < out.length; j++) {
+    if (MODIFIER_RANK[out[j]] > MODIFIER_RANK[code]) {
+      at = j;
+      break;
+    }
+  }
+  out.splice(at, 0, code);
+  return out;
+}
+
+function isLayoutChar(ch) {
+  return typeof ch === 'string' && ch.length === 1;
 }
 
 function cmdKey(a) {
@@ -1075,23 +1283,44 @@ function cmdKey(a) {
   if (!codes.length && a.keyCode !== undefined && a.keyCode !== null) codes = [int(a.keyCode, 'keyCode')];
   if (!codes.length) throw fail('BAD_ARGS', 'keyCode is required');
   var chars = a.chars && typeof a.chars.length === 'number' ? a.chars : [];
+  var flags = a.flags | 0;
+  var mods = intList(a.modifierKeyCodes);
   var cache = {};
+  var byLayout = false;
+  for (var j = 0; j < codes.length; j++) byLayout = byLayout || isLayoutChar(chars[j]);
+  // The in-process keyboard layout only follows input source switches while the run loop runs.
+  if (byLayout && HAS_OBJC && typeof $.NSEvent !== 'undefined') pump(0.01);
+  // Shift and Option can only change for the key of a single-key chord.
+  var single = codes.length === 1;
   for (var i = 0; i < codes.length; i++) {
-    if (typeof chars[i] === 'string' && chars[i].length === 1) codes[i] = layoutKeyCode(chars[i], codes[i], cache);
+    if (!isLayoutChar(chars[i])) continue;
+    var k = layoutKey(chars[i], codes[i], flags, cache, single);
+    codes[i] = k.code;
+    if (k.shift !== null) {
+      flags = k.shift ? flags | FLAG_SHIFT : flags & ~FLAG_SHIFT;
+      mods = setModifier(mods, KEY_SHIFT, FLAG_SHIFT, k.shift);
+    }
+    if (k.alt) {
+      flags |= FLAG_ALT;
+      mods = setModifier(mods, KEY_ALT, FLAG_ALT, true);
+    }
   }
-  pressCombo(codes, a.flags | 0, intList(a.modifierKeyCodes));
+  pressCombo(codes, flags, mods);
   return { keys: codes.length };
 }
 
 /**
  * Type a plan of steps: {kind:'keys',text} (printable ASCII via System Events
  * keystroke), {kind:'key',keyCode} (a bare key press such as Return or Tab) and
- * {kind:'paste',text} (via the pasteboard and cmd+v). The pasteboard is restored
- * 300 ms after the last paste. If System Events is not authorized (Automation),
+ * {kind:'paste',text} (via the pasteboard and cmd+v). Each paste is given
+ * PASTE_SETTLE before the next step, and the pasteboard is restored PASTE_RESTORE
+ * (1 s) after the last paste. If System Events is not authorized (Automation),
  * keystroke steps fall back to pasting when args.fallbackPaste is true.
  * Unless args.checkInputSource is false, keystroke steps are pasted when the
  * active input source would garble them (an input method or a non-Latin
- * layout); the result then says fallback 'paste', reason 'input-source'.
+ * layout); the result then says fallback 'paste', reason 'input-source'. On a
+ * layout that may have dead keys, just the steps containing one of
+ * inputSource.deadChars are pasted (reason 'dead-keys').
  */
 function cmdType(a) {
   var steps = a.steps && typeof a.steps.length === 'number' ? a.steps : [];
@@ -1114,6 +1343,12 @@ function cmdType(a) {
       if (source && source.safe === false) {
         steps = pastePlan(steps);
         reason = 'input-source';
+      } else if (source && source.deadChars) {
+        var withoutDeadKeys = pasteDeadKeySteps(steps, source.deadChars);
+        if (withoutDeadKeys) {
+          steps = withoutDeadKeys;
+          reason = 'dead-keys';
+        }
       }
     }
   }
@@ -1146,12 +1381,18 @@ function cmdType(a) {
       if (saved === null) saved = saveClipboard();
       lastChange = setClipboardText(text);
       sleep(0.03);
-      // Cmd+V by layout, not position: on Dvorak the US-position V key is K.
-      if (pasteKey === null) pasteKey = layoutKeyCode('v', KEY_V);
+      // Cmd+V by layout, not position: on Dvorak the US-position V key is K. The Command
+      // keymap decides, so "Dvorak - QWERTY ⌘" keeps the US position. Pump first: the
+      // in-process layout follows input source switches only while the run loop runs.
+      if (pasteKey === null) {
+        pump(0.01);
+        pasteKey = layoutKey('v', KEY_V, FLAG_CMD, {}, false).code;
+      }
       pressCombo([pasteKey], FLAG_CMD, [KEY_CMD]);
       lastPasteAt = Date.now();
       pasted++;
-      // Let the target app read the pasteboard before it changes again.
+      // Let the target app read the pasteboard before anything else happens, including a
+      // following Return: the next paste or the restore would change what it reads.
       if (i < steps.length - 1) sleep(PASTE_SETTLE);
     }
   } finally {
@@ -1276,15 +1517,17 @@ function cmdFocus(a) {
   var axError = null;
   var axPerm = null;
   try {
-    var proc = axProcess(systemEvents(), pid);
+    var se = systemEvents();
+    var proc = axProcess(se, pid);
     try {
       proc.frontmost = true;
     } catch (e) {
       /* activation above may already have worked */
     }
     if (number !== null) {
-      var w = findAxWindow(proc, info);
-      if (w) {
+      var index = findAxWindowIndex(se, pid, info);
+      if (index >= 0) {
+        var w = proc.windows[index];
         try {
           var minimized = w.attributes.byName('AXMinimized');
           if (minimized.value()) minimized.value = false;
@@ -1330,9 +1573,10 @@ function cmdMinimize(a) {
   var info = windowInfo(number);
   if (!info) return { ok: false, reason: 'window ' + number + ' not found' };
   if (info.pid !== pid) return { ok: false, reason: 'window ' + number + ' does not belong to process ' + pid };
-  var w = findAxWindow(axProcess(systemEvents(), pid), info);
-  if (!w) return { ok: false, reason: 'no matching accessibility window' };
-  w.attributes.byName('AXMinimized').value = true;
+  var se = systemEvents();
+  var index = findAxWindowIndex(se, pid, info);
+  if (index < 0) return { ok: false, reason: 'no matching accessibility window' };
+  axProcess(se, pid).windows[index].attributes.byName('AXMinimized').value = true;
   return { ok: true };
 }
 
@@ -1343,23 +1587,26 @@ function cmdClose(a) {
   var info = windowInfo(number);
   if (!info) return { ok: false, reason: 'window ' + number + ' not found' };
   if (info.pid !== pid) return { ok: false, reason: 'window ' + number + ' does not belong to process ' + pid };
-  var w = findAxWindow(axProcess(systemEvents(), pid), info);
-  if (!w) return { ok: false, reason: 'no matching accessibility window' };
+  var se = systemEvents();
+  var index = findAxWindowIndex(se, pid, info);
+  if (index < 0) return { ok: false, reason: 'no matching accessibility window' };
   // JXA element references are callable, so typeof is 'function' (or 'object' in tests).
   var isRef = function (v) {
     return v !== null && v !== undefined && (typeof v === 'object' || typeof v === 'function');
   };
+  // Through the unix-id specifier, so the button of this instance of the app is pressed.
   var button = null;
   try {
-    button = w.attributes.byName('AXCloseButton').value();
+    var list = axProcess(se, pid).windows[index].buttons.whose({ subrole: 'AXCloseButton' });
+    if (list.length) button = list[0];
   } catch (e) {
     button = null;
   }
-  if (!isRef(button)) {
-    button = null;
+  // The AXCloseButton attribute returns a reference that names the process by name, so it
+  // is only followed when no other process has that name.
+  if (!isRef(button) && processNameIsUnique(se, pid)) {
     try {
-      var list = w.buttons.whose({ subrole: 'AXCloseButton' });
-      if (list.length) button = list[0];
+      button = axProcess(se, pid).windows[index].attributes.byName('AXCloseButton').value();
     } catch (e) {
       button = null;
     }

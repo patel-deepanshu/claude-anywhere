@@ -27,12 +27,14 @@ const { Hub } = require('./hub');
 const { QuestionBroker } = require('./questions');
 const { Bridge } = require('./bridge');
 const { SessionManager, displayName, summary, READ_ONLY_TOOLS } = require('./session');
-const { createServer } = require('./server');
+const { createServer, homeId, currentUid } = require('./server');
 
 const log = createLogger('daemon');
 
 const ATTENTION_THROTTLE_MS = 3000;
 const SHUTDOWN_HARD_MS = 8000;
+const FALLBACK_PORTS = 19; // a busy configured port N falls back to N+1..N+19 before a random port
+const DYING_DAEMON_WAIT_MS = SHUTDOWN_HARD_MS + 2000; // how long a start waits for our previous daemon to free its port
 const UI_OPEN_TIMEOUT_MS = 20000;
 const START_LOCK_WAIT_MS = 10000; // how long a second start waits for the first to come up
 const START_LOCK_STALE_MS = 30000; // a start never holds the lock this long (it is released once daemon.json is written)
@@ -283,20 +285,134 @@ async function acquireStartLock({ waitMs = START_LOCK_WAIT_MS } = {}) {
 
 /**
  * GET /api/health on a local port.
- * @returns {Promise<object|null>} the health body when a Claude Anywhere daemon answers there
+ * @returns {Promise<object|null>} the health body when a Claude Anywhere daemon answers there (any daemon:
+ *   another user's or another state directory's too, see isOwnDaemon; a daemon that is shutting down
+ *   answers 503 with shuttingDown:true)
  */
 async function probeDaemon(port, timeoutMs = 1500) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: ctrl.signal });
-    const body = res.ok ? await res.json() : null;
+    const body = await res.json().catch(() => null);
     return body && body.app === 'claude-anywhere' ? body : null;
   } catch {
     return null;
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Whether a /api/health body comes from a daemon of this state directory and OS user. Every
+ * user's daemon defaults to the same port, so "a Claude Anywhere daemon answers" is not enough.
+ * @param {object|null} body
+ * @param {{home?:string, uid?:number|null}} [self]
+ * @returns {boolean}
+ */
+function isOwnDaemon(body, { home = homeId(), uid = currentUid() } = {}) {
+  if (!body || typeof body.home !== 'string' || body.home !== home) return false;
+  return body.uid == null || uid == null || body.uid === uid;
+}
+
+/** @returns {string} run/last-port.json: the port this state dir's daemon bound last, for a stable dialog origin */
+function lastPortPath() {
+  return path.join(paths.runDir(), 'last-port.json');
+}
+
+/** @returns {number|null} the port bound last time for this configured port */
+function readLastPort(wanted) {
+  try {
+    const j = JSON.parse(fs.readFileSync(lastPortPath(), 'utf8'));
+    const p = Number(j && j.port);
+    return j && j.wanted === wanted && Number.isInteger(p) && p > 0 && p <= 65535 ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeLastPort(wanted, port) {
+  try {
+    fs.writeFileSync(lastPortPath(), `${JSON.stringify({ wanted, port })}\n`, { mode: 0o600 });
+  } catch (err) {
+    log.debug(`could not record the port: ${err.message}`);
+  }
+}
+
+/**
+ * Ports to try for a configured port, in order: the one this state dir bound last time for it,
+ * the configured port, then its 19 neighbours in an order rotated by the state dir (two users who
+ * both lose the configured port do not race for the same fallback). A stable port keeps the
+ * dialog's origin, and with it the browser's microphone permission and the dialog's saved state.
+ * @param {number} wanted
+ * @param {{last?:number|null, home?:string}} [opts]
+ * @returns {number[]}
+ */
+function candidatePorts(wanted, { last = null, home = homeId() } = {}) {
+  const out = [];
+  const add = (p) => {
+    if (Number.isInteger(p) && p > 0 && p <= 65535 && !out.includes(p)) out.push(p);
+  };
+  add(last);
+  add(wanted);
+  const start = parseInt(String(home).slice(0, 8), 16) % FALLBACK_PORTS || 0;
+  for (let i = 0; i < FALLBACK_PORTS; i += 1) add(wanted + 1 + ((start + i) % FALLBACK_PORTS));
+  return out;
+}
+
+/** @returns {Promise<number|null>} the port, once listening on it succeeds within ms (null: still taken) */
+async function listenWhenFree(server, port, ms) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    await sleep(150);
+    try {
+      return await server.listen(port);
+    } catch (err) {
+      if (!err || err.code !== 'EADDRINUSE') throw err;
+    }
+  }
+  return null;
+}
+
+/**
+ * Listen on the configured port or a stable fallback (see candidatePorts), else a random one.
+ * A busy port held by this state dir's own daemon means it is running (ALREADY_RUNNING): a
+ * second daemon elsewhere would be an orphan. When that daemon is shutting down, wait for it
+ * to free the port and take it over. Any other holder (an unrelated app, another user's or another
+ * ANYWHERE_HOME's daemon) only moves this daemon to the next port.
+ * @returns {Promise<number>} the bound port
+ */
+async function bindPort(server, wanted, { allowMultiple = false } = {}) {
+  if (!wanted) return server.listen(0);
+  const self = { home: homeId(), uid: currentUid() };
+  const last = allowMultiple ? null : readLastPort(wanted);
+  const moved = (bound) => {
+    if (last && bound !== last) log.warn(`port ${last} is unavailable; the dialog moves to port ${bound} (the browser may ask for microphone access again)`);
+    return bound;
+  };
+  for (const p of candidatePorts(wanted, { last, home: self.home })) {
+    try {
+      return moved(await server.listen(p));
+    } catch (err) {
+      if (!err || (err.code !== 'EADDRINUSE' && err.code !== 'EACCES')) throw err;
+      if (allowMultiple || err.code !== 'EADDRINUSE') {
+        log.info(`port ${p} is unavailable (${err.code})`);
+        continue;
+      }
+      const other = await probeDaemon(p, p === wanted || p === last ? 1500 : 500);
+      if (!isOwnDaemon(other, self)) {
+        log.info(`port ${p} is in use${other ? " by another user's or state directory's Claude Anywhere" : ''}`);
+        continue;
+      }
+      if (!other.shuttingDown) throw alreadyRunningError({ pid: other.pid, port: p, url: null, instanceId: other.instanceId });
+      log.info(`the previous daemon (pid ${other.pid}) is shutting down; waiting for port ${p}`);
+      const bound = await listenWhenFree(server, p, DYING_DAEMON_WAIT_MS);
+      if (bound) return moved(bound);
+      log.warn(`the previous daemon (pid ${other.pid}) still holds port ${p}`);
+    }
+  }
+  log.warn(`port ${wanted} and its fallbacks are unavailable; using a random free port (the browser may ask for microphone access again)`);
+  return server.listen(0);
 }
 
 /**
@@ -478,7 +594,9 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
   let permissions = null;
   if (permMod) {
     try {
-      permissions = new permMod.PermissionBroker({ config, hub, onNeedAttention });
+      // The live project: the broker's own copy only follows 'project' broadcasts, which come
+      // after the git probe (up to 4 s), while the engine may already run in the new folder.
+      permissions = new permMod.PermissionBroker({ config, hub, onNeedAttention, projectDir, getProjectDir: () => (session ? session.projectDir : projectDir) });
     } catch (err) {
       log.error('PermissionBroker failed to start; using the basic always-ask broker:', err);
     }
@@ -511,11 +629,7 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     if (session) session.applyConfig(config);
     // The dialog's Settings (and `anywhere config set mode`) switch companion/bridge live.
     if (session && prev && config.mode !== prev.mode && (config.mode === 'companion' || config.mode === 'bridge')) {
-      try {
-        session.setMode(config.mode);
-      } catch (err) {
-        log.warn(`mode change failed: ${err.message}`);
-      }
+      session.setMode(config.mode).catch((err) => log.warn(`mode change failed: ${err.message}`));
     }
     if (voice) {
       try {
@@ -547,6 +661,10 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
 
   const shutdown = (reason = 'shutdown') => {
     if (shuttingDown) return shuttingDown;
+    // From now on /api/health answers 503 (shuttingDown) and daemon.json is gone, so /anywhere
+    // starts a fresh daemon (which waits for this one to free the port) instead of reusing this one.
+    if (server) server.stopping = true;
+    state.clearDaemonState(instanceId);
     shuttingDown = (async () => {
       log.info(`shutting down (${reason})`);
       audit({ type: 'daemon_stop', reason, instanceId });
@@ -606,22 +724,12 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
   const wanted = Number.isInteger(port) ? port : Number.isInteger(config.port) ? config.port : 47120;
   let boundPort;
   try {
-    boundPort = await server.listen(wanted);
+    boundPort = await bindPort(server, wanted, { allowMultiple });
   } catch (err) {
-    if (err && (err.code === 'EADDRINUSE' || err.code === 'EACCES') && wanted !== 0) {
-      // Our own port taken by another Claude Anywhere daemon (one whose daemon.json is missing
-      // or was overwritten) means it is running: a second daemon on a random port would be an orphan.
-      const other = !allowMultiple && err.code === 'EADDRINUSE' ? await probeDaemon(wanted) : null;
-      if (other) {
-        hub.close();
-        throw alreadyRunningError({ pid: other.pid, port: wanted, url: null, instanceId: other.instanceId });
-      }
-      log.warn(`port ${wanted} is unavailable (${err.code}); using a random free port`);
-      boundPort = await server.listen(0);
-    } else {
-      throw err;
-    }
+    hub.close();
+    throw err;
   }
+  if (wanted && !allowMultiple) writeLastPort(wanted, boundPort);
   const url = server.url;
 
   session = new SessionManager({
@@ -654,6 +762,7 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
   }
 
   const writeState = () => {
+    if (shuttingDown) return; // shutdown removed daemon.json for good
     try {
       state.writeDaemonState({
         pid: process.pid,
@@ -867,4 +976,7 @@ module.exports = {
   acquireStartLock,
   startLockPath,
   probeDaemon,
+  isOwnDaemon,
+  candidatePorts,
+  lastPortPath,
 };

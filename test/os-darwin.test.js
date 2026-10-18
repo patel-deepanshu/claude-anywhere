@@ -440,11 +440,18 @@ function makeJxa(opts = {}) {
   }
   if (opts.cgBounds) $.CGDisplayBounds = (id) => opts.cgBounds[id];
   if (opts.layout) {
-    // Keyboard layout: the character each key code types without modifiers.
+    // Keyboard layout: the character each key code types without modifiers (opts.layout), and
+    // what `characters` gives with other flags (opts.layers[flags]). The Command keymap is the
+    // plain layer unless a layer says otherwise.
+    const layer = (flags) => (opts.layers && opts.layers[flags]) || (flags === 0 || flags === 0x100000 ? opts.layout : {});
     $.NSEvent = {
       eventWithCGEvent: (e) => {
-        log.push(['layoutChar', e.code]);
-        return { isNil: () => false, charactersIgnoringModifiers: wrap(opts.layout[e.code] || '') };
+        log.push(['layoutChar', e.code, e.flags]);
+        return {
+          isNil: () => false,
+          charactersIgnoringModifiers: wrap(opts.layout[e.code] || ''),
+          characters: wrap(layer(e.flags)[e.code] || ''),
+        };
       },
     };
   }
@@ -513,14 +520,18 @@ function makeJxa(opts = {}) {
         log.push(['set', pid, w.name, name, v]);
       },
     });
+    const closeButton = { actions: { byName: (n) => ({ perform: () => log.push(['perform', pid, w.name, `AXCloseButton.${n}`]) }) } };
     return {
       name: () => w.name,
       position: () => [w.x, w.y],
       size: () => [w.w, w.h],
       attributes: { byName: attr },
       actions: { byName: (n) => ({ perform: () => log.push(['perform', pid, w.name, n]) }) },
+      buttons: { whose: (q) => (q.subrole === 'AXCloseButton' && !w.noCloseButton && !w.closeButtonAttributeOnly ? [closeButton] : []) },
     };
   }
+
+  const processName = (pid) => (opts.processNames && opts.processNames[pid]) || `process ${pid}`;
 
   function processFor(pid) {
     const wins = axWindows[pid];
@@ -536,8 +547,13 @@ function makeJxa(opts = {}) {
     Object.defineProperty(windows, 'name', { value: () => (fail(), wins.map((w) => w.name)), configurable: true });
     windows.position = () => (fail(), wins.map((w) => [w.x, w.y]));
     windows.size = () => (fail(), wins.map((w) => [w.w, w.h]));
+    // windows[i]: an element specifier that keeps the unix-id test.
+    (wins || []).forEach((w, i) => {
+      windows[i] = axWindow(pid, w);
+    });
     return {
       windows,
+      name: () => processName(pid),
       set frontmost(v) {
         log.push(['frontmost', pid, v]);
       },
@@ -550,7 +566,10 @@ function makeJxa(opts = {}) {
       log.push(['keystroke', t]);
     },
     processes: {
-      whose: (q) => [processFor(q.unixId)],
+      whose: (q) =>
+        q.unixId !== undefined
+          ? [processFor(q.unixId)]
+          : Object.keys(axWindows).filter((pid) => processName(Number(pid)) === q.name).map((pid) => processFor(Number(pid))),
       get length() {
         if (opts.automationError) throw opts.automationError;
         log.push(['countProcesses']);
@@ -961,7 +980,7 @@ const RUSSIAN = { id: 'com.apple.keylayout.Russian', type: 'TISTypeKeyboardLayou
 test('helper: describeInputSource marks input methods and non-Latin layouts unsafe for keystrokes', () => {
   const { ctx } = makeJxa();
   const d = (raw) => plain(ctx.describeInputSource(raw));
-  assert.deepEqual(d({ ...US_LAYOUT, source: 'tis' }), { id: US_LAYOUT.id, kind: 'layout', ascii: true, safe: true, source: 'tis' });
+  assert.deepEqual(d({ ...US_LAYOUT, source: 'tis' }), { id: US_LAYOUT.id, kind: 'layout', ascii: true, safe: true, deadChars: '', source: 'tis' });
   assert.equal(d(HIRAGANA).safe, false);
   assert.equal(d(HIRAGANA).kind, 'inputMethod');
   // Even an ASCII-capable input mode (Japanese "Romaji" alphanumerics) goes through the input method.
@@ -1027,7 +1046,7 @@ test('helper: without TIS the input source comes from the HIToolbox preferences'
     },
   });
   const src = japanese.call('inputSource', {}).result;
-  assert.deepEqual(src, { id: 'com.apple.inputmethod.Japanese', kind: 'inputMethod', ascii: null, safe: false, source: 'defaults' });
+  assert.deepEqual(src, { id: 'com.apple.inputmethod.Japanese', kind: 'inputMethod', ascii: null, safe: false, deadChars: '', source: 'defaults' });
   assert.deepEqual(japanese.imports.slice(-1), ['Carbon'], 'Carbon is imported lazily for TIS');
   japanese.call('inputSource', {});
   assert.equal(japanese.imports.filter((n) => n === 'Carbon').length, 1, 'and only once');
@@ -1342,11 +1361,17 @@ test('driver: focusWindow skips the LaunchServices fallback when several instanc
 
 test('driver: minimizeWindow falls back to focus + cmd+M', async () => {
   const { d, actions } = mkDriver({
-    handlers: { minimize: { ok: false, reason: 'no matching accessibility window' }, focus: { ok: true } },
+    handlers: { minimize: () => Promise.reject(Object.assign(new Error('AXMinimized is read-only'), { code: 'HELPER_ERROR' })), focus: { ok: true, raised: true } },
   });
   assert.equal(await d.minimizeWindow('777:55'), true);
   assert.deepEqual(actions().map((c) => c.cmd), ['minimize', 'focus', 'key']);
   assert.deepEqual(FAKE_KEYS.last, ['meta', 'm']);
+  // Cmd+M acts on the app's front window: never when the window itself was not raised (MACOS-2-5).
+  const notRaised = mkDriver({
+    handlers: { minimize: { ok: false, reason: 'no matching accessibility window' }, focus: { ok: true, raised: false } },
+  });
+  assert.equal(await notRaised.d.minimizeWindow('777:55'), false);
+  assert.deepEqual(notRaised.actions().map((c) => c.cmd), ['minimize', 'focus']);
 });
 
 test('driver: clipboard uses pbpaste/pbcopy with a UTF-8 locale and falls back to the helper', async () => {

@@ -28,6 +28,9 @@ const log = createLogger('session');
 
 const MAX_MESSAGES = 500;
 const MAX_IMAGES_IN_TRANSCRIPT = 12;
+// Image bytes (data URL characters) kept across the transcript: every snapshot carries them, and
+// a dialog that (re)connects receives the whole snapshot in one frame.
+const MAX_IMAGE_CHARS_IN_TRANSCRIPT = 8 * 1024 * 1024;
 const TOOL_OUTPUT_LIMIT = 4096;
 const INPUT_STRING_LIMIT = 2000;
 const GUARD_PAUSE_MS = 3000;
@@ -43,7 +46,8 @@ const PROJECTS_TIMEOUT_MS = 4000;
 const MAX_TEXT = 100000;
 const MAX_IMAGES = 10;
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
-const STATUSES = ['idle', 'starting', 'thinking', 'acting', 'waiting_approval', 'waiting_answer', 'stopping', 'error', 'offline'];
+// 'queued': bridge commands wait for a terminal to run "/anywhere here" (Stop drops them).
+const STATUSES = ['idle', 'starting', 'thinking', 'acting', 'waiting_approval', 'waiting_answer', 'stopping', 'queued', 'error', 'offline'];
 const NO_CONVERSATION_RE = /no conversation found|conversation .*not found|session .*not found|could not find (a )?(session|conversation)|no session found|invalid session id/i;
 const ID_IN_USE_RE = /already in use|already exists/i;
 
@@ -59,6 +63,9 @@ const READ_ONLY_TOOLS = [
   'ask_user',
   'clipboard_get',
 ].map((n) => `mcp__anywhere__${n}`);
+
+/** Tool prefix of the Claude Anywhere plugin's own MCP server ("anywhere" in plugin "anywhere"). */
+const PLUGIN_COPY_SERVER = 'mcp__plugin_anywhere_anywhere';
 
 // ------------------------------------------------------------------ display helpers
 
@@ -495,6 +502,8 @@ class SessionManager extends EventEmitter {
     this.engine = null;
     this.engineCostBase = 0;
     this.engineSent = [];
+    this.turnCommandIds = []; // ids of the commands the current turn answers (in the `result` payload)
+    this.detachedEngines = new WeakSet(); // engines of a previous conversation or project: output ignored
     this.engineSignature = null;
     this.engineStale = false;
     this.engineStopping = null; // promise while stopEngine() waits for the CLI to exit
@@ -512,7 +521,7 @@ class SessionManager extends EventEmitter {
     this.bridgeFiles = [];
     this.bridgeBusy = false;
     this.bridgeStartedAt = 0;
-    this.generation = 0; // bumped by interrupt(), newSession(), setProject(): commands still being prepared are dropped
+    this.generation = 0; // bumped by interrupt(), newSession(), setProject(), setMode(): commands still being prepared are dropped
 
     this.streamItems = new Map(); // `${msgId}:${index}` → item
     this.streamOrder = new Map(); // msgId → [items not yet finalized]
@@ -657,29 +666,50 @@ class SessionManager extends EventEmitter {
     }
   }
 
-  /** @private keep image data URLs only on the most recent tool items */
+  /** @private keep image data URLs only on the most recent tool items (by count and by total size; the newest always stays) */
   trimImages() {
     let kept = 0;
+    let chars = 0;
     for (let i = this.messages.length - 1; i >= 0; i -= 1) {
       const m = this.messages[i];
       if (m.role !== 'tool' || !m.image) continue;
+      if (kept > 0 && (kept >= MAX_IMAGES_IN_TRANSCRIPT || chars + m.image.length > MAX_IMAGE_CHARS_IN_TRANSCRIPT)) {
+        m.image = null;
+        continue;
+      }
       kept += 1;
-      if (kept > MAX_IMAGES_IN_TRANSCRIPT) m.image = null;
+      chars += m.image.length;
     }
   }
 
-  /** @private */
-  setScreenshot({ dataUrl, width, height }) {
+  /**
+   * @private
+   * @param {{dataUrl:string, width?:number, height?:number}} shot
+   * @param {{fromTool?:boolean}} [opts] fromTool: the MCP server's activity report and the tool
+   *   result carry the same image, so the second one is not sent again
+   */
+  setScreenshot({ dataUrl, width, height }, { fromTool = false } = {}) {
+    if (fromTool && this.latestScreenshot && this.latestScreenshot.dataUrl === dataUrl) return;
     this.latestScreenshot = { dataUrl, width: width || null, height: height || null, ts: nowIso() };
     this.broadcast('screenshot', this.latestScreenshot);
   }
 
   // ---------------------------------------------------------------- status
 
-  /** @private a status change driven by engine output; a Stop in progress keeps "stopping" */
+  /** @private a status change driven by engine output; a Stop in progress keeps "stopping", bridge mode its own status */
   engineStatus(status, detail = '') {
-    if (this.baseStatus === 'stopping') return;
+    if (this.baseStatus === 'stopping' || this.mode !== 'companion') return;
     this.setBase(status, detail);
+  }
+
+  /**
+   * Tell `anywhere send --wait` (and other watchers) that these commands will get no `result`:
+   * dropped before they reached Claude, or their turn ended without one.
+   * @private
+   */
+  cancelCommands(ids, reason) {
+    const commandIds = (ids || []).filter(Boolean);
+    if (commandIds.length) this.broadcast('commands_cancelled', { commandIds, reason });
   }
 
   /** @private */
@@ -753,7 +783,7 @@ class SessionManager extends EventEmitter {
       pending: { approvals: safePending(this.permissions), questions: safePending(this.questions) },
       config: publicConfig(this.config),
       voice: { ...this.voiceInfo },
-      bridge: { listening: this.bridge ? Boolean(this.bridge.listening) : false },
+      bridge: { listening: this.bridge ? Boolean(this.bridge.listening) : false, queued: this.bridge ? this.bridge.queueLength() : 0 },
       platform: {
         platform: this.platformInfo.platform,
         displayServer: this.platformInfo.displayServer,
@@ -951,6 +981,7 @@ class SessionManager extends EventEmitter {
     // the old conversation with the new folder (or the reverse).
     const epoch = this.resetEpoch;
     const projectDir = this.projectDir;
+    this.checkStartCurrent(epoch, projectDir);
     this.setBase('starting', 'Starting Claude Code…');
     const located = await this.locateClaude();
     this.checkStartCurrent(epoch, projectDir);
@@ -989,18 +1020,24 @@ class SessionManager extends EventEmitter {
       maxBudgetUsd: engineCfg.maxBudgetUsd,
       extraArgs: engineCfg.extraArgs,
       stripEnv: engineCfg.stripEnv,
-      // Lets other copies of the anywhere MCP server (a plugin or user-scope install) see they run
-      // under the daemon's engine and stay out of the way.
-      env: { ANYWHERE_ENGINE_CHILD: '1' },
+      // The plugin's copy of the anywhere server would duplicate the daemon's tools (without the
+      // engine role). It is disabled in engineSettings(); this also hides it when it is loaded
+      // some other way (--plugin-dir in engine.extraArgs). A user-scope "anywhere" server needs
+      // nothing: the --mcp-config server of the same name replaces it.
+      disallowedTools: [PLUGIN_COPY_SERVER],
+      // An environment marker would leak into every app and terminal the engine opens (and the
+      // Claude Code sessions started there). Drop one inherited from an older daemon version.
+      env: { ANYWHERE_ENGINE_CHILD: null },
     });
     this.engine = engine;
     this.engineCostBase = 0;
     this.engineSent = [];
+    this.turnCommandIds = [];
     this.engineStale = false;
     this.engineSignature = this.signature();
     this.warnedMcp = false;
     engine.on('message', (msg) => {
-      if (engine !== this.engine) return;
+      if (engine !== this.engine || this.detachedEngines.has(engine)) return;
       try {
         this.onEngineMessage(msg);
       } catch (err) {
@@ -1015,10 +1052,10 @@ class SessionManager extends EventEmitter {
     return engine;
   }
 
-  /** @private throws ENGINE_CANCELLED when the project or conversation changed during an engine start */
+  /** @private throws ENGINE_CANCELLED when the project, conversation or mode changed during an engine start */
   checkStartCurrent(epoch, projectDir) {
-    if (epoch === this.resetEpoch && projectDir === this.projectDir && !this.closed) return;
-    const e = new Error('The project or conversation changed while Claude Code was starting');
+    if (epoch === this.resetEpoch && projectDir === this.projectDir && this.mode === 'companion' && !this.closed) return;
+    const e = new Error('The project, conversation or mode changed while Claude Code was starting');
     e.code = 'ENGINE_CANCELLED';
     throw e;
   }
@@ -1043,17 +1080,25 @@ class SessionManager extends EventEmitter {
     }
   }
 
-  /** @private */
-  engineFailed(err) {
+  /** @private ids: the commands that failed with it (they get no result) */
+  engineFailed(err, ids = []) {
     log.error(`engine failed: ${err.message}`);
     this.turnActive = false;
-    this.system(`${err.message}${this.dropFollowUpsNote()}`, 'error');
+    this.cancelCommands(ids, 'failed');
+    this.system(`${err.message}${this.dropFollowUpsNote('failed')}`, 'error');
     this.setBase('error', err.code === 'CLAUDE_NOT_FOUND' ? 'Claude Code not found' : 'Claude Code failed to start');
   }
 
-  /** @private drop the queued follow-ups; returns a sentence for the transcript ('' when there were none) */
-  dropFollowUpsNote() {
-    const n = this.pendingFollowUps.splice(0).length;
+  /** @private drop the queued follow-ups (announced with commands_cancelled); returns how many */
+  dropFollowUps(reason) {
+    const queued = this.pendingFollowUps.splice(0);
+    this.cancelCommands(queued.map((q) => q.item.id), reason);
+    return queued.length;
+  }
+
+  /** @private dropFollowUps(), as a sentence for the transcript ('' when there were none) */
+  dropFollowUpsNote(reason) {
+    const n = this.dropFollowUps(reason);
     return n ? ` ${n} queued command${n === 1 ? ' was' : 's were'} not sent.` : '';
   }
 
@@ -1090,17 +1135,21 @@ class SessionManager extends EventEmitter {
     if (engine !== this.engine) return;
     this.engine = null;
     if (this.heldResult && this.heldResult.engine === engine) this.heldResult = null;
+    // A previous conversation's or project's engine: newSession()/setProject() already reset the turn state.
+    if (this.detachedEngines.has(engine)) return;
     const sent = this.engineSent;
     this.engineSent = [];
+    const sentIds = this.turnCommandIds.splice(0);
     const hadTurns = this.turnActive;
     this.turnActive = false;
     this.finalizeTurnItems('Interrupted: Claude Code stopped');
     // Only resume ids that refer to a real conversation.
     this.resumeNext = Boolean(this.sessionId) && (info.sawInit || engine.resume);
     if (info.expected) {
-      const dropped = this.pendingFollowUps.splice(0).length;
+      this.cancelCommands(sentIds, 'stopped');
+      const dropped = this.dropFollowUps('stopped');
       if (dropped) this.system(`${dropped} queued command${dropped === 1 ? ' was' : 's were'} not sent because Claude Code stopped.`, 'warning');
-      if (this.baseStatus !== 'stopping' && this.baseStatus !== 'error') this.setBase('idle');
+      if (this.baseStatus !== 'stopping' && this.baseStatus !== 'error' && this.mode === 'companion') this.setBase('idle');
       return;
     }
     const tail = String(info.stderrTail || '');
@@ -1127,20 +1176,26 @@ class SessionManager extends EventEmitter {
         if (gen !== this.generation) {
           // Stopped (or reset) while the fresh engine started: do not resend.
           this.turnActive = false;
+          this.cancelCommands(sentIds, 'stopped');
           return;
         }
         if (blocks.length) {
           next.send(blocks);
           this.engineSent.push(blocks);
+          this.turnCommandIds.push(...sentIds);
           this.turnActive = true;
           this.setBase('thinking');
-        } else if (!this.flushFollowUps()) {
-          this.setBase('idle');
+        } else {
+          this.cancelCommands(sentIds, 'engine_exit');
+          if (!this.flushFollowUps()) this.setBase('idle');
         }
       } catch (err) {
         this.turnActive = false;
-        if (err.code === 'ENGINE_CANCELLED') return;
-        this.engineFailed(err);
+        if (err.code === 'ENGINE_CANCELLED') {
+          this.cancelCommands(sentIds, 'stopped');
+          return;
+        }
+        this.engineFailed(err, sentIds);
       }
       return;
     }
@@ -1150,7 +1205,8 @@ class SessionManager extends EventEmitter {
     if (info.errorCode === 'ENOENT') text += ` ${claudeInstallHint()}`;
     if (lines) text += `\n${lines}`;
     if (this.resumeNext) text += '\nYour next command will resume the conversation.';
-    text += this.dropFollowUpsNote();
+    this.cancelCommands(sentIds, 'engine_exit');
+    text += this.dropFollowUpsNote('engine_exit');
     this.system(text, 'error');
     audit({ type: 'engine_exit', code: info.code, signal: info.signal, error: info.error, hadTurns });
     this.setBase('error', 'Claude Code stopped unexpectedly');
@@ -1327,7 +1383,7 @@ class SessionManager extends EventEmitter {
       this.broadcast('tool_update', { toolUseId: b.tool_use_id, status, output, image: res.image });
       if (res.image) {
         const size = res.mediaType === 'image/png' ? pngSizeFromBase64(res.imageB64) : { width: null, height: null };
-        this.setScreenshot({ dataUrl: res.image, width: size.width, height: size.height });
+        this.setScreenshot({ dataUrl: res.image, width: size.width, height: size.height }, { fromTool: true });
         this.trimImages();
       }
       if (!item || !item.parentToolUseId) this.engineStatus('thinking');
@@ -1368,6 +1424,8 @@ class SessionManager extends EventEmitter {
       sessionId: this.sessionId,
       numTurns: Number(msg.num_turns) || 0,
       subtype: msg.subtype || null,
+      // The commands this result answers: a command queued during a turn gets the next one.
+      commandIds: this.turnCommandIds.splice(0),
     };
     if (interrupted) payload.interrupted = true;
     this.broadcast('result', payload);
@@ -1383,7 +1441,7 @@ class SessionManager extends EventEmitter {
     this.persistSession();
     // A Stop in progress drops the queue and finishes the status itself.
     if (this.baseStatus !== 'stopping' && this.flushFollowUps()) return;
-    if (this.baseStatus !== 'stopping') this.setBase('idle');
+    if (this.baseStatus !== 'stopping' && this.mode === 'companion') this.setBase('idle');
     if (this.engineStale) {
       log.info('engine settings changed; restarting Claude Code before the next command');
       this.stopEngine().catch(() => {});
@@ -1400,7 +1458,7 @@ class SessionManager extends EventEmitter {
     const timer = setTimeout(() => {
       if (!this.heldResult || this.heldResult.engine !== engine) return;
       this.heldResult = null;
-      if (engine === this.engine && engine.running) this.onResult(msg, { held: true });
+      if (engine === this.engine && engine.running && !this.detachedEngines.has(engine)) this.onResult(msg, { held: true });
     }, HELD_RESULT_MS);
     if (timer.unref) timer.unref();
   }
@@ -1418,10 +1476,11 @@ class SessionManager extends EventEmitter {
     try {
       engine.send(blocks);
     } catch (err) {
-      this.engineFailed(err);
+      this.engineFailed(err, queued.map((q) => q.item.id));
       return true;
     }
     this.engineSent.push(blocks);
+    this.turnCommandIds.push(...queued.map((q) => q.item.id));
     this.turnActive = true;
     log.info(`sent ${queued.length} queued command${queued.length === 1 ? '' : 's'}`);
     this.setBase('thinking');
@@ -1491,7 +1550,14 @@ class SessionManager extends EventEmitter {
   /** @private */
   dropCancelled(item) {
     log.info(`dropping command ${item.id}: stopped before it was sent`);
+    this.cancelCommands([item.id], 'cancelled');
     this.system('That command was cancelled before it was sent.', 'info');
+  }
+
+  /** @private the screenshot counted in a user item's image count could not be taken */
+  uncountScreenshot(item) {
+    item.images = Math.max(0, (item.images || 1) - 1);
+    this.broadcast('message', item);
   }
 
   /**
@@ -1528,6 +1594,7 @@ class SessionManager extends EventEmitter {
         const shot = await this.captureScreenshot();
         blocks.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: shot.data } });
       } catch (err) {
+        this.uncountScreenshot(item);
         this.system(`Could not attach a screenshot: ${err.message}${err.hint ? ` ${err.hint}` : ''}`, 'warning');
       }
     }
@@ -1535,11 +1602,12 @@ class SessionManager extends EventEmitter {
     blocks.push({ type: 'text', text: item.text });
     const cancelled = () => {
       this.dropCancelled(item);
-      if (!this.turnActive) this.setBase('idle');
+      // After a switch to bridge mode the bridge owns the status.
+      if (!this.turnActive && this.mode === 'companion') this.setBase('idle');
     };
     const failed = (err) => {
       if (gen !== this.generation || err.code === 'ENGINE_CANCELLED') cancelled();
-      else this.engineFailed(err);
+      else this.engineFailed(err, [item.id]);
     };
     let engine;
     try {
@@ -1551,7 +1619,8 @@ class SessionManager extends EventEmitter {
     // Submitted after a Stop that is still settling: run once the CLI is idle again.
     if (this.interrupting) await this.interrupting.catch(() => {});
     for (let attempt = 0; ; attempt += 1) {
-      if (gen !== this.generation) {
+      // A Stop, reset or switch to bridge mode (all bump the generation) while this was prepared.
+      if (gen !== this.generation || this.mode !== 'companion') {
         cancelled();
         return;
       }
@@ -1564,7 +1633,7 @@ class SessionManager extends EventEmitter {
           failed(err);
           return;
         }
-        if (gen !== this.generation) {
+        if (gen !== this.generation || this.mode !== 'companion') {
           cancelled();
           return;
         }
@@ -1586,11 +1655,12 @@ class SessionManager extends EventEmitter {
           engine = null;
           continue;
         }
-        this.engineFailed(err);
+        this.engineFailed(err, [item.id]);
         return;
       }
     }
     this.engineSent.push(blocks);
+    this.turnCommandIds.push(item.id);
     this.turnActive = true;
     if (engine.sawInit) this.setBase('thinking');
     else this.setBase('starting', 'Starting Claude Code…');
@@ -1610,6 +1680,7 @@ class SessionManager extends EventEmitter {
         writePrivate(file, shot.png);
         files.push(file);
       } catch (err) {
+        this.uncountScreenshot(item);
         this.system(`Could not attach a screenshot: ${err.message}`, 'warning');
       }
     }
@@ -1627,7 +1698,9 @@ class SessionManager extends EventEmitter {
       this.system('Bridge mode is not available in this daemon.', 'error');
       return;
     }
-    if (gen !== this.generation) {
+    // Stopped, reset or switched to companion mode while this was prepared: a stopped bridge
+    // would keep it for the next "/anywhere here", maybe hours later.
+    if (gen !== this.generation || this.mode !== 'bridge' || this.bridge.stopped) {
       this.dropCancelled(item);
       return;
     }
@@ -1646,9 +1719,19 @@ class SessionManager extends EventEmitter {
     } else if (this.bridge.listening) {
       this.setBase('thinking', 'Sent to your Claude Code terminal');
     } else {
-      this.setBase('idle', 'Waiting for the terminal');
+      // A status the dialog offers Stop for: interrupt() drops the queue.
+      this.setBase('queued', 'Waiting for the terminal');
       this.system('No Claude Code terminal is listening yet. Run "/anywhere here" in Claude Code to pick up this command.', 'warning');
     }
+  }
+
+  /** @private drop the bridge's queued commands (announced with commands_cancelled); returns how many */
+  clearBridge(reason) {
+    if (!this.bridge) return 0;
+    const ids = this.bridge.queue.map((c) => c.id);
+    const n = this.bridge.clear();
+    this.cancelCommands(ids, reason);
+    return n;
   }
 
   /** @private terminal activity in bridge mode (a tool call, notification, question) counts as a sign of life */
@@ -1663,7 +1746,7 @@ class SessionManager extends EventEmitter {
       this.bridgeStartedAt = Date.now();
       this.setBase('thinking', 'Claude Code (terminal) is working');
     });
-    this.bridge.on('reply', ({ text, final, speak }) => {
+    this.bridge.on('reply', ({ text, final, speak, commandId }) => {
       // A terminal that missed the switch to companion mode must not end the companion turn.
       if (this.mode !== 'bridge') {
         log.info('ignoring a bridge reply: the dialog is in companion mode');
@@ -1681,6 +1764,7 @@ class SessionManager extends EventEmitter {
           sessionId: null,
           numTurns: 1,
           speak: speak !== false,
+          commandIds: commandId ? [commandId] : [],
         };
         this.bridgeBusy = this.bridge.queueLength() > 0;
         this.broadcast('result', payload);
@@ -1710,7 +1794,7 @@ class SessionManager extends EventEmitter {
       else if (/^[A-Za-z0-9+/=]+$/.test(a.image.slice(0, 4096))) dataUrl = `data:image/png;base64,${a.image}`;
       if (dataUrl) {
         const size = pngSizeFromBase64(dataUrl.slice(dataUrl.indexOf(',') + 1));
-        this.setScreenshot({ dataUrl, width: Number(a.width) || size.width, height: Number(a.height) || size.height });
+        this.setScreenshot({ dataUrl, width: Number(a.width) || size.width, height: Number(a.height) || size.height }, { fromTool: true });
       }
     }
     const warning = typeof a.warning === 'string' && a.warning ? a.warning : null;
@@ -1774,13 +1858,13 @@ class SessionManager extends EventEmitter {
       log.warn(`cancelling questions failed: ${err.message}`);
     }
     if (this.mode === 'bridge') {
-      const dropped = this.bridge ? this.bridge.clear() : 0;
+      const dropped = this.clearBridge('stopped');
       this.bridgeBusy = false;
       this.system(`Stopped.${dropped ? ` Dropped ${dropped} queued command${dropped === 1 ? '' : 's'}.` : ''} Screen actions are paused for a moment.`, 'info');
       this.setBase('idle');
       return { ok: true };
     }
-    const dropped = this.pendingFollowUps.splice(0).length;
+    const dropped = this.dropFollowUps('stopped');
     const droppedNote = dropped ? ` Dropped ${dropped} queued command${dropped === 1 ? '' : 's'}.` : '';
     // A second Stop while the first still waits for the CLI joins it.
     if (this.interrupting) return this.interrupting;
@@ -1800,6 +1884,8 @@ class SessionManager extends EventEmitter {
         log.warn(`interrupt failed: ${err.message}`);
       }
       this.turnActive = false;
+      // Normally the interrupted result took them; without one they get no answer.
+      this.cancelCommands(this.turnCommandIds.splice(0), 'stopped');
       this.finalizeTurnItems('Stopped by the user');
       if (res.killed) {
         this.resumeNext = Boolean(this.sessionId);
@@ -1817,36 +1903,58 @@ class SessionManager extends EventEmitter {
     }
   }
 
-  /** @private before a new conversation or project: drop commands in preparation and wait out an engine start */
-  async resetForSwitch() {
+  /**
+   * @private Start a new conversation or project switch, synchronously: drop the commands being
+   * prepared or queued, make an engine start in progress give up, and ignore the current engine's
+   * output from now on. The caller resets the conversation before its first await, so a command
+   * typed during the switch (and its bubble) belongs to the new conversation; finishSwitch() then
+   * stops the old engine.
+   */
+  beginSwitch() {
     this.generation += 1;
     this.resetEpoch += 1;
-    this.pendingFollowUps = [];
+    this.dropFollowUps('reset');
+    this.cancelCommands(this.turnCommandIds.splice(0), 'reset');
+    if (this.engine) this.detachedEngines.add(this.engine);
+  }
+
+  /** @private second half of beginSwitch(): wait out an engine start in progress, stop the old engine */
+  async finishSwitch() {
     if (this.startingPromise) await this.startingPromise.catch(() => {});
+    // An engine whose start had passed its last check belongs to the old conversation too.
+    if (this.engine) this.detachedEngines.add(this.engine);
     await this.stopEngine();
     this.clearSessionRules();
   }
 
+  /** @private an empty transcript for a new conversation */
+  resetTranscript() {
+    this.messages = [];
+    this.toolItems.clear();
+    this.streamItems.clear();
+    this.streamOrder.clear();
+    this.currentMsgId = null;
+    this.turnActive = false;
+  }
+
   /** Stop the engine and start a fresh conversation. */
   async newSession() {
-    await this.resetForSwitch();
+    this.beginSwitch();
     this.sessionId = uuid();
     this.resumeNext = false;
     this.freshRetried = false;
     this.costUsd = 0;
     this.turns = 0;
-    this.messages = [];
-    this.toolItems.clear();
-    this.streamItems.clear();
-    this.streamOrder.clear();
-    this.turnActive = false;
+    this.resetTranscript();
     this.forgetSession();
-    if (this.bridge && this.mode === 'bridge') this.bridge.clear();
-    audit({ type: 'new_session', sessionId: this.sessionId, project: this.projectDir });
+    if (this.mode === 'bridge') this.clearBridge('reset');
+    const { sessionId } = this;
+    audit({ type: 'new_session', sessionId, project: this.projectDir });
     this.setBase('idle');
-    this.broadcast('session', { id: this.sessionId, model: this.model });
+    this.broadcast('session', { id: sessionId, model: this.model });
     this.broadcast('snapshot', this.snapshot());
-    return { sessionId: this.sessionId };
+    await this.finishSwitch();
+    return { sessionId };
   }
 
   /**
@@ -1866,52 +1974,58 @@ class SessionManager extends EventEmitter {
     }
     if (!st.isDirectory()) throw httpError(400, `Not a directory: ${abs}`);
     if (abs === this.projectDir) return this.project;
-    await this.resetForSwitch();
+    this.beginSwitch();
     // Folder and conversation change together, before any await, so an engine start never
-    // sees one without the other.
+    // sees one without the other (and a command typed meanwhile runs in the new folder).
     this.projectDir = abs;
     this.initSessionId();
     this.project = { dir: abs, name: path.basename(abs) || abs, git: null };
     this.freshRetried = false;
     this.costUsd = 0;
     this.turns = 0;
-    this.messages = [];
-    this.toolItems.clear();
-    this.streamItems.clear();
-    this.streamOrder.clear();
-    this.turnActive = false;
+    this.resetTranscript();
     this.located = null;
-    this.setBase('idle');
-    // A command submitted while this runs may already be starting the engine in the new folder.
-    const info = await this.projectInfo(abs);
-    if (this.projectDir === abs) this.project = info;
     audit({ type: 'project', project: abs });
+    this.setBase('idle');
     this.system(`Switched to ${this.project.name} (${abs}).`, 'info');
+    // Announced now (the approval policy judges paths against it); again below with git details.
     this.broadcast('project', this.project);
     this.broadcast('session', { id: this.sessionId, model: this.model });
     this.broadcast('snapshot', this.snapshot());
     this.emit('project', this.project);
+    await this.finishSwitch();
+    const info = await this.projectInfo(abs);
+    if (this.projectDir !== abs) return info; // switched again meanwhile
+    this.project = info;
+    this.broadcast('project', this.project);
     return this.project;
   }
 
   /**
-   * Switch between companion and bridge mode.
+   * Switch between companion and bridge mode. Commands still being prepared or queued for the
+   * old mode are dropped; switching to bridge mode stops the companion Claude Code session.
    * @param {'companion'|'bridge'} mode
-   * @returns {{mode:string}}
+   * @returns {Promise<{mode:string}>}
    */
-  setMode(mode) {
+  async setMode(mode) {
     if (mode !== 'companion' && mode !== 'bridge') throw httpError(400, 'mode must be "companion" or "bridge"');
     if (mode === this.mode) return { mode };
     this.mode = mode;
+    this.generation += 1;
+    this.resetEpoch += 1; // an engine start in progress gives up
+    const droppedNote = this.dropFollowUpsNote('reset');
     audit({ type: 'mode', mode });
     if (mode === 'bridge') {
-      this.stopEngine().catch(() => {});
-      if (this.bridge) this.bridge.resume();
-      this.system('Bridge mode: commands go to the Claude Code terminal that runs "/anywhere here".', 'info');
+      if (this.bridge) {
+        this.clearBridge('reset');
+        this.bridge.resume();
+      }
+      this.system(`Bridge mode: commands go to the Claude Code terminal that runs "/anywhere here".${droppedNote}`, 'info');
       this.setBase('idle', this.bridge && this.bridge.listening ? 'Terminal connected' : 'Waiting for the terminal');
     } else {
       if (this.bridge) {
-        this.bridge.clear();
+        if (this.bridge.current) this.cancelCommands([this.bridge.current.id], 'reset');
+        this.clearBridge('reset');
         this.bridge.stop();
       }
       this.bridgeBusy = false;
@@ -1920,6 +2034,11 @@ class SessionManager extends EventEmitter {
     }
     this.broadcast('mode', { mode });
     this.emit('mode', mode);
+    if (mode === 'bridge') {
+      // A companion session left running would keep operating the desktop next to the terminal.
+      if (this.startingPromise) await this.startingPromise.catch(() => {});
+      if (this.mode === 'bridge') await this.stopEngine();
+    }
     return { mode };
   }
 

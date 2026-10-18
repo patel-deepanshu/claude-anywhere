@@ -8,7 +8,8 @@
  *          --include-partial-messages (--session-id <uuid> | --resume <id>)
  *          --mcp-config <file> --permission-prompt-tool mcp__anywhere__permission_prompt
  *          --permission-mode default [--settings <file>]
- *          --append-system-prompt-file <file> --allowedTools <list> [...] [--add-dir <dir>...]
+ *          --append-system-prompt-file <file> --allowedTools <list> [--disallowedTools <list>]
+ *          [...] [--add-dir <dir>...]
  *
  * One process serves many turns: each send() writes a JSONL user message,
  * interrupt() sends a control_request and the process stays alive. The engine
@@ -22,7 +23,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const { EventEmitter } = require('events');
 const { StringDecoder } = require('string_decoder');
 const proc = require('../shared/proc');
@@ -33,6 +34,7 @@ const log = createLogger('engine');
 
 const STDERR_TAIL_LINES = 50;
 const INTERRUPT_TIMEOUT_MS = 4000;
+const INTERRUPT_KILL_AFTER_MS = 1500; // SIGTERM first (the CLI cleans up its commands), then SIGKILL
 const STOP_KILL_AFTER_MS = 3000;
 const MAX_LINE_BYTES = 128 * 1024 * 1024;
 const PERMISSION_TOOL = 'mcp__anywhere__permission_prompt';
@@ -207,6 +209,8 @@ function buildArgs(o = {}) {
   if (o.systemPromptPath) args.push('--append-system-prompt-file', o.systemPromptPath);
   const allowed = Array.isArray(o.allowedTools) ? o.allowedTools.filter(Boolean) : [];
   if (allowed.length) args.push('--allowedTools', allowed.join(','));
+  const disallowed = Array.isArray(o.disallowedTools) ? o.disallowedTools.filter(Boolean) : [];
+  if (disallowed.length) args.push('--disallowedTools', disallowed.join(','));
   if (o.model) args.push('--model', String(o.model));
   if (o.fallbackModel) args.push('--fallback-model', String(o.fallbackModel));
   if (o.effort) args.push('--effort', String(o.effort));
@@ -296,6 +300,75 @@ class LineSplitter {
   }
 }
 
+/**
+ * pid → {ppid, pgid} for every process (POSIX): /proc on Linux, else `ps`.
+ * @returns {Map<number,{ppid:number,pgid:number}>|null} null when the table cannot be read
+ */
+function processTable(platform = process.platform) {
+  const table = new Map();
+  if (platform === 'linux') {
+    try {
+      for (const name of fs.readdirSync('/proc')) {
+        if (!/^\d+$/.test(name)) continue;
+        try {
+          // "pid (comm) state ppid pgrp …": comm may contain spaces and parentheses.
+          const stat = fs.readFileSync(`/proc/${name}/stat`, 'utf8');
+          const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+          table.set(Number(name), { ppid: Number(rest[1]), pgid: Number(rest[2]) });
+        } catch {
+          /* exited meanwhile */
+        }
+      }
+      if (table.size) return table;
+    } catch {
+      /* no /proc: ps below */
+    }
+  }
+  try {
+    const out = execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] });
+    for (const line of out.split('\n')) {
+      const [pid, ppid, pgid] = line.trim().split(/\s+/).map(Number);
+      if (pid > 0) table.set(pid, { ppid, pgid });
+    }
+  } catch {
+    return null;
+  }
+  return table.size ? table : null;
+}
+
+/**
+ * The processes of the commands a CLI runs (POSIX). Claude Code starts each Bash tool command
+ * and background task in a session of its own, so signalling the CLI (or its process group)
+ * never reaches them, and once the CLI is dead they are reparented and cannot be found. Its
+ * other children share its process group (MCP servers): they exit on stdin EOF, and what they
+ * launched on purpose (an app opened with the open tool) must outlive the engine, so their
+ * trees are left alone.
+ * @param {number} rootPid
+ * @param {Map<number,{ppid:number,pgid:number}>} table see processTable()
+ * @returns {{pids:number[], groups:number[]}} the command processes, and the process groups they lead
+ */
+function commandTree(rootPid, table) {
+  const children = new Map();
+  for (const [pid, p] of table) {
+    if (!children.has(p.ppid)) children.set(p.ppid, []);
+    children.get(p.ppid).push(pid);
+  }
+  const root = table.get(rootPid);
+  const own = table.get(process.pid);
+  const seen = new Set();
+  const groups = new Set();
+  const stack = (children.get(rootPid) || []).filter((pid) => !root || table.get(pid).pgid !== root.pgid);
+  while (stack.length) {
+    const pid = stack.pop();
+    if (seen.has(pid) || pid === process.pid) continue;
+    seen.add(pid);
+    const p = table.get(pid);
+    if (p && p.pgid === pid && (!own || own.pgid !== pid)) groups.add(pid);
+    stack.push(...(children.get(pid) || []));
+  }
+  return { pids: [...seen], groups: [...groups] };
+}
+
 function killTree(child, signal) {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   if (process.platform === 'win32') {
@@ -318,10 +391,20 @@ function killTree(child, signal) {
     }
     return;
   }
+  // Collected before the CLI dies: afterwards its commands are orphans nobody stops.
+  const table = child.pid ? processTable() : null;
+  const tree = table ? commandTree(child.pid, table) : { pids: [], groups: [] };
   try {
     child.kill(signal);
   } catch {
     /* already gone */
+  }
+  for (const target of [...tree.groups.map((g) => -g), ...tree.pids]) {
+    try {
+      process.kill(target, signal);
+    } catch {
+      /* already gone */
+    }
   }
 }
 
@@ -384,8 +467,8 @@ class ClaudeCliEngine extends EventEmitter {
 
   /**
    * @param {{claudePath:string, cwd?:string, sessionId?:string, resume?:boolean, mcpConfigPath?:string,
-   *   systemPromptPath?:string, allowedTools?:string[], model?:string, fallbackModel?:string, effort?:string,
-   *   chrome?:boolean, addDirs?:string[], maxBudgetUsd?:number, extraArgs?:string[], env?:object,
+   *   systemPromptPath?:string, allowedTools?:string[], disallowedTools?:string[], model?:string,
+   *   fallbackModel?:string, effort?:string, chrome?:boolean, addDirs?:string[], maxBudgetUsd?:number, extraArgs?:string[], env?:object,
    *   stripEnv?:string[], baseEnv?:object, permissionMode?:string, settingsPath?:string, platform?:string}} opts
    */
   constructor(opts = {}) {
@@ -579,10 +662,12 @@ class ClaudeCliEngine extends EventEmitter {
       const requestId = uuid();
       let done = false;
       let killing = false;
+      let hardKill = null;
       const finish = () => {
         if (done) return;
         done = true;
         clearTimeout(timer);
+        clearTimeout(hardKill);
         this.resultWaiters.delete(onResult);
         this.removeListener('exit', onExit);
         this.removeListener('message', onMessage);
@@ -605,9 +690,11 @@ class ClaudeCliEngine extends EventEmitter {
         log.warn(`no result ${timeoutMs} ms after interrupt; killing claude`);
         killing = true;
         this.expectedExit = true;
-        killTree(this.child, 'SIGKILL');
+        // SIGTERM lets the CLI end the commands it runs; whatever is left then gets SIGKILL.
+        killTree(this.child, 'SIGTERM');
+        hardKill = setTimeout(() => killTree(this.child, 'SIGKILL'), INTERRUPT_KILL_AFTER_MS);
         // Safety net when the OS never reports the exit.
-        setTimeout(finish, 2000).unref();
+        setTimeout(finish, INTERRUPT_KILL_AFTER_MS + 2000).unref();
       }, timeoutMs);
       this.resultWaiters.add(onResult);
       this.once('exit', onExit);
@@ -665,6 +752,8 @@ module.exports = {
   parseVersion,
   knownInstallPaths,
   LineSplitter,
+  processTable,
+  commandTree,
   PERMISSION_TOOL,
   DEFAULT_PERMISSION_MODE,
   DEFAULT_STRIP_ENV,
