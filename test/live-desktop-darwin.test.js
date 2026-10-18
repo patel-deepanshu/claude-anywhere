@@ -218,26 +218,6 @@ after(async () => {
   await require('../src/os/index').resetDriver();
 });
 
-/** TEMPORARY diagnostics: who has keyboard focus, and what TextEdit's text view holds. */
-async function focusDiag(d, label) {
-  let act = null;
-  try {
-    act = await d._call('active', { axTitles: false });
-  } catch (err) {
-    act = { error: err.message };
-  }
-  const te = sh(
-    'osascript',
-    ['-e', 'tell application "System Events" to tell process "TextEdit" to get {value, value of attribute "AXSelectedText"} of text area 1 of scroll area 1 of window 1'],
-    { timeoutMs: 10000 },
-  );
-  note(`DIAG ${label}:`, {
-    helperPid: d._transport.pid,
-    front: act && (act.error || `${act.app} pid ${act.pid}`),
-    textEdit: (te.stdout || te.stderr).trim(),
-  });
-}
-
 // ---------------------------------------------------------------- a. capabilities
 
 test('live-desktop darwin a: capabilities() report the macOS permission state', { skip: SKIP, timeout: 90000 }, async () => {
@@ -262,27 +242,6 @@ test('live-desktop darwin a: capabilities() report the macOS permission state', 
   assert.equal(caps.mouse, state.perms.accessibility !== false);
   assert.equal(caps.keyboard, state.perms.accessibility !== false);
   assert.ok(Array.isArray(caps.notes) && caps.notes.length > 0);
-
-  // Diagnostics: what the runner image grants (TCC), and who macOS holds responsible for us.
-  const query =
-    "select service, client, auth_value from access where service in " +
-    "('kTCCServiceAccessibility','kTCCServiceScreenCapture','kTCCServicePostEvent','kTCCServiceAppleEvents','kTCCServiceListenEvent')";
-  for (const db of ['/Library/Application Support/com.apple.TCC/TCC.db', path.join(os.homedir(), 'Library/Application Support/com.apple.TCC/TCC.db')]) {
-    const r = sh('sqlite3', [db, query]);
-    note(`TCC ${db}:`, r.code === 0 ? r.stdout.trim().split('\n').join(' | ') : `unreadable (${(r.stderr || r.error || '').trim()})`);
-  }
-  const chain = [];
-  let pid = process.pid;
-  for (let i = 0; i < 12 && pid > 1; i++) {
-    const r = sh('ps', ['-o', 'ppid=,comm=', '-p', String(pid)]);
-    const m = /^\s*(\d+)\s+(.*)$/.exec(r.stdout.trim());
-    if (!m) break;
-    chain.push(`${pid}:${m[2]}`);
-    pid = Number(m[1]);
-  }
-  note('process ancestry:', chain.join(' <- '));
-  const bridged = sh('osascript', ['-l', 'JavaScript', '-e', "ObjC.import('CoreGraphics'); [typeof $.CGPreflightScreenCaptureAccess, typeof $.CGRequestScreenCaptureAccess, typeof $.CGEventPost].join(',')"]);
-  note('DIAG bridged CG functions (preflight, request, CGEventPost):', (bridged.stdout || bridged.stderr).trim());
 });
 
 // ---------------------------------------------------------------- b. displays
@@ -490,22 +449,9 @@ test('live-desktop darwin h: typeText, then Cmd+A / Cmd+C put the typed text on 
   const t0 = Date.now();
   await d.typeText(TYPED);
   note(`typeText(${JSON.stringify(TYPED)}) took ${Date.now() - t0} ms; automation consent: ${JSON.stringify(d._automation)}`);
-  await focusDiag(d, 'after typeText');
   await sleep(300);
-  await d.clipboardSet('sentinel-1');
-  await d.keyCombo(['meta', 'a']);
-  await sleep(250);
-  await focusDiag(d, 'after Cmd+A');
-  await d.keyCombo(['meta', 'c']);
-  const copied = await clipboardAfterCopy(d, 'sentinel-1');
+  const copied = await selectAllAndCopy(d, 'sentinel-1');
   note('clipboard after Cmd+A, Cmd+C:', JSON.stringify(copied));
-  if (copied !== TYPED) {
-    await focusDiag(d, 'copy failed');
-    await d.focusWindow(state.textEdit.id);
-    await sleep(300);
-    note('DIAG retry after focusWindow:', JSON.stringify(await selectAllAndCopy(d, 'sentinel-1b')));
-    await focusDiag(d, 'after retry');
-  }
   assert.equal(copied, TYPED);
 
   // Non-ASCII text goes through the paste path; it replaces the selection.
@@ -850,3 +796,56 @@ test('live-desktop darwin n: the MCP server returns a real screenshot image', { 
   const txt = content.find((c) => c.type === 'text');
   assert.ok(txt && /Screenshot of display 0/.test(txt.text), 'a text block describing the screenshot');
 });
+
+// ---------------------------------------------------------------- o. permissions revoked
+
+// Revoking privacy permissions is only done on a throwaway GitHub-hosted VM, never on a developer's Mac.
+const EPHEMERAL_VM = process.env.GITHUB_ACTIONS === 'true' && process.env.RUNNER_ENVIRONMENT === 'github-hosted';
+
+test(
+  'live-desktop darwin o: with Screen Recording and Accessibility revoked, the driver fails with PERMISSION and a hint',
+  { skip: SKIP || (EPHEMERAL_VM ? false : 'revokes privacy permissions: GitHub-hosted runners only'), timeout: 120000 },
+  async (t) => {
+    // The last test: the permissions stay revoked for the rest of this VM's life.
+    await require('../src/os/index').resetDriver();
+    state.driver = null;
+    for (const service of ['ScreenCapture', 'Accessibility']) {
+      const user = sh('tccutil', ['reset', service]);
+      const system = sh('sudo', ['-n', 'tccutil', 'reset', service]);
+      note(`tccutil reset ${service}: user exit ${user.code}, system exit ${system.code}`, (user.stderr + system.stderr).trim());
+    }
+    const fresh = require('../src/os/darwin').createDriver();
+    t.after(() => fresh.close());
+    const caps = await fresh.capabilities();
+    note('capabilities() after revoking:', { permissions: caps.permissions, screenshot: caps.screenshot, mouse: caps.mouse, notes: caps.notes });
+    const { accessibility, screenRecording } = caps.permissions;
+    if (accessibility !== false && screenRecording !== false) {
+      t.skip(`macOS still reports the permissions after tccutil reset (accessibility=${accessibility}, screenRecording=${screenRecording})`);
+      return;
+    }
+    if (screenRecording === false) {
+      assert.equal(caps.screenshot, false);
+      assert.ok(caps.notes.some((n) => /Screen Recording is not granted/.test(n) && /Privacy_ScreenCapture/.test(n)), 'a note explains how to grant it');
+      await expectPermission(fresh.captureDisplay(0), 'screenRecording');
+      const r = childProcess.spawnSync(
+        process.execPath,
+        [path.join(ROOT, 'bin', 'anywhere.js'), 'computer', 'screenshot', '--out', path.join(HOME, 'denied.png')],
+        { encoding: 'utf8', timeout: 60000, env: childEnv() },
+      );
+      note(`CLI screenshot without Screen Recording: exit ${r.status}: ${(r.stdout || '').trim()}`);
+      assert.notEqual(r.status, 0);
+      const err = JSON.parse(r.stdout);
+      assert.equal(err.code, 'PERMISSION');
+      assert.match(err.hint, /Screen Recording/);
+    }
+    if (accessibility === false) {
+      assert.equal(caps.mouse, false);
+      assert.equal(caps.keyboard, false);
+      assert.ok(caps.notes.some((n) => /Accessibility is not granted/.test(n) && /Privacy_Accessibility/.test(n)), 'a note explains how to grant it');
+      await expectPermission(fresh.moveMouse(100, 100), 'accessibility');
+      await expectPermission(fresh.click(100, 100), 'accessibility');
+      await expectPermission(fresh.typeText('x'), 'accessibility');
+      await expectPermission(fresh.keyCombo(['meta', 'a']), 'accessibility');
+    }
+  },
+);
