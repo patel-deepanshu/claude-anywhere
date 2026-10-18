@@ -5973,6 +5973,8 @@ function anywhereToolVerdict(tool, input, ctx) {
     if (args.length && t) v = maxVerdict(v, openArgsVerdict(t, args, ctx));
     return v;
   }
+  const desk = desktopToolVerdict(tool, input, ctx);
+  if (desk) return desk;
   const ticket = ticketToolVerdict(tool, input, ctx);
   if (ticket) return ticket;
   const calls = callsToolVerdict(tool);
@@ -6048,6 +6050,304 @@ function anywhereCallsCliVerdict(w) {
     return V('medium', `Runs anywhere clone-voice ${sub}`);
   }
   return null;
+}
+
+// ------------------------------------------------------------------ desktop assistant tools
+
+// The virtual-assistant tools (tools-ui, tools-ocr, tools-desktop) and batch_actions. Reads are low
+// (most are pre-approved for the engine; browser_tabs is not, since {cycle: true} uses the keyboard
+// and is medium); input and app control is medium, high where it can run code,
+// leak a secret or lose work. A session rule ("Always") never covers a high call of these tools:
+// none is offered for one, and an "Always" given on a medium call does not stretch to it.
+const DESKTOP_READS = {
+  ui_find: 'Reads the controls of an app window (accessibility, read-only)',
+  ui_tree: 'Reads the controls of an app window (accessibility, read-only)',
+  find_text: 'Reads text on the screen (OCR, read-only)',
+  read_screen_text: 'Reads text on the screen (OCR, read-only)',
+  list_apps: 'Lists apps on this computer (read-only)',
+  browser_bookmarks: 'Reads browser bookmarks (read-only)',
+  browser_tabs: 'Lists open browser tabs (read-only)',
+  wait_for: 'Waits for a window or text on the screen (read-only)',
+};
+const DESKTOP_TOOLS = new Set([
+  ...Object.keys(DESKTOP_READS),
+  'ui_click',
+  'ui_set_value',
+  'launch_app',
+  'quit_app',
+  'set_window',
+  'browser_open',
+  'browser_switch_tab',
+  'batch_actions',
+]);
+
+// batch_actions: each step is classified as its single tool (must agree with batchStepCall in src/mcp/tools.js).
+const BATCH_STEP_TOOL = {
+  click: 'click',
+  double_click: 'click',
+  right_click: 'click',
+  move: 'mouse_move',
+  drag: 'drag',
+  type: 'type_text',
+  key: 'key',
+  scroll: 'scroll',
+  wait: 'wait',
+  focus_window: 'focus_window',
+  ui_click: 'ui_click',
+};
+
+/**
+ * The single tool a batch_actions step runs as, with that tool's arguments.
+ * @returns {{type:string, tool:string, args:object}|null} null for an unknown step
+ */
+function batchStepCall(step) {
+  if (!isPlainObject(step)) return null;
+  const type = str(step.type).trim().toLowerCase();
+  const tool = Object.prototype.hasOwnProperty.call(BATCH_STEP_TOOL, type) ? BATCH_STEP_TOOL[type] : null;
+  if (!tool) return null;
+  const pick = (...keys) => {
+    const o = {};
+    for (const k of keys) if (step[k] !== undefined && step[k] !== null) o[k] = step[k];
+    return o;
+  };
+  const idText = (o) => {
+    if (o.id != null) o.id = String(o.id);
+    return o;
+  };
+  let args;
+  switch (type) {
+    case 'click':
+      args = pick('x', 'y', 'button', 'clicks', 'modifiers', 'display');
+      break;
+    case 'double_click':
+      args = { ...pick('x', 'y', 'modifiers', 'display'), clicks: 2 };
+      break;
+    case 'right_click':
+      args = { ...pick('x', 'y', 'modifiers', 'display'), button: 'right' };
+      break;
+    case 'move':
+      args = pick('x', 'y', 'display');
+      break;
+    case 'drag':
+      args = pick('fromX', 'fromY', 'toX', 'toY', 'button', 'display');
+      break;
+    case 'type':
+      args = pick('text', 'method');
+      break;
+    case 'key':
+      args = pick('combo', 'repeat');
+      break;
+    case 'scroll':
+      args = pick('direction', 'amount', 'x', 'y', 'display');
+      break;
+    case 'wait':
+      args = pick('seconds');
+      break;
+    case 'focus_window':
+      args = idText(pick('id', 'title', 'app'));
+      break;
+    default: // ui_click
+      args = idText(pick('id', 'name', 'text', 'role', 'window', 'exact'));
+  }
+  return { type, tool, args };
+}
+
+/**
+ * batch_actions: as risky as its riskiest step (each classified as its single tool), with every
+ * step listed on the card.
+ * @returns {{verdict:{risk:string, reason:string}, steps:string[]}}
+ */
+function batchClassification(input, ctx) {
+  const steps = Array.isArray(input.actions) ? input.actions : [];
+  if (!steps.length) return { verdict: V('low', 'Runs no actions'), steps: [] };
+  let worst = null;
+  let worstIndex = -1;
+  const lines = [];
+  steps.forEach((s, i) => {
+    const call = batchStepCall(s);
+    let v;
+    if (!call) {
+      v = V('medium', 'A step of unknown type (the batch is rejected before anything runs)');
+      lines.push(`unknown step '${truncate(oneLine(isPlainObject(s) ? s.type : s), 30)}'`);
+    } else {
+      v = anywhereToolVerdict(call.tool, call.args, ctx);
+      lines.push(anywhereSummary(call.tool, call.args, ctx));
+    }
+    if (!worst || RANK[v.risk] > RANK[worst.risk]) {
+      worst = v;
+      worstIndex = i;
+    }
+  });
+  let reason;
+  if (steps.length === 1) reason = worst.reason;
+  else if (RANK[worst.risk] >= RANK.high) reason = `Step ${worstIndex + 1} of ${steps.length}: ${worst.reason}`;
+  else if (worst.risk === 'medium') reason = `Runs ${steps.length} mouse, keyboard or window actions in a row`;
+  else reason = 'Only waits or reads the screen';
+  return { verdict: V(worst.risk, reason), steps: lines };
+}
+
+/** Card summary of a batch: every step, numbered, cut to a readable length. */
+function batchSummary(input, ctx) {
+  const { steps } = batchClassification(input, ctx);
+  if (!steps.length) return 'Run actions (none listed)';
+  const max = 400;
+  let out = `Run ${steps.length} action${steps.length === 1 ? '' : 's'}: `;
+  for (let i = 0; i < steps.length; i += 1) {
+    const part = `${i ? '; ' : ''}${i + 1}. ${steps[i]}`;
+    if (out.length + part.length > max) return `${out}; +${steps.length - i} more`;
+    out += part;
+  }
+  return out;
+}
+
+// System processes and desktop shells: quitting one can log the user out or break the desktop.
+const SYSTEM_APP_RE =
+  /^(finder|dock|systemuiserver|loginwindow|windowserver|controlcenter|launchd|kernel_task|explorer|dwm|winlogon|csrss|lsass|services|svchost|smss|wininit|sihost|fontdrvhost|ctfmon|taskhostw|startmenuexperiencehost|shellexperiencehost|searchhost|gnome-shell|gnome-session(-binary)?|plasmashell|kwin(_x11|_wayland)?|ksmserver|xorg|xwayland|mutter|systemd|init|sddm|gdm3?|lightdm|xfwm4|xfce4-panel|xfce4-session|openbox|lxsession|mate-session|cinnamon(-session)?|budgie-wm|i3|sway|hyprland|weston|wayfire|labwc|pulseaudio|pipewire|dbus-daemon)$/i;
+
+function quitAppVerdict(input) {
+  const name = oneLine(input.name);
+  const base = name.replace(/\.(exe|app)$/i, '').trim();
+  const shown = truncate(name, 40) || 'an app';
+  if (base && SYSTEM_APP_RE.test(base)) return V('high', `Quits a system process (${shown}), which can log you out or break the desktop`);
+  if (/\b(claude|anywhere)\b/i.test(base)) return V('high', 'Quits Claude Anywhere or Claude Code itself');
+  if (input.force === true) return V('high', `Force-quits ${shown}: unsaved work is lost`);
+  return V('medium', `Quits ${shown} (it may ask to save unsaved work)`);
+}
+
+/** browser_open: web pages are medium; other schemes and local executables are high, as for open. */
+function browserOpenVerdict(input) {
+  const u = str(input.url).trim();
+  const where = input.browser ? ` in ${truncate(oneLine(input.browser), 30)}` : ' in the browser';
+  if (!u) return V('medium', `Opens a new tab or window${where}`);
+  if (/^https?:\/\//i.test(u)) return V('medium', `Opens a web page${where}`);
+  if (/^about:/i.test(u)) return V('medium', `Opens a browser page${where}`);
+  const localPath = /^file:/i.test(u) ? u.replace(/^file:(\/\/)?/i, '') : /^([a-z]:[\\/]|[\\/~])/i.test(u) ? u : null;
+  if (localPath != null) {
+    let p = localPath.replace(/[?#].*$/, '');
+    try {
+      p = decodeURIComponent(p);
+    } catch {
+      /* keep it encoded */
+    }
+    if (EXEC_EXT.test(p.replace(/[\\/]+$/, ''))) return V('high', 'Opens a local executable, script or installer through the browser');
+    return V('medium', `Opens a local file${where}`);
+  }
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(u);
+  // "localhost:3000/x" and "example.com:8443" are hosts with a port, not schemes.
+  if (scheme && !/^[a-z0-9.-]+:\d+(?:[/?#]|$)/i.test(u)) {
+    return V('high', `Opens a ${scheme[1].toLowerCase()}: link, which can run code or launch other programs`);
+  }
+  return V('medium', `Opens a web page${where}`);
+}
+
+/** launch_app: an app by name is medium; arguments, executables and links are judged as for open. */
+function launchAppVerdict(input, ctx) {
+  const name = str(input.name).trim();
+  const args = Array.isArray(input.args) ? input.args.map(String) : [];
+  const v = anywhereToolVerdict('open', { target: name, kind: 'app', args }, ctx);
+  if (v.risk === 'medium') return V('medium', args.length ? 'Launches an app with arguments' : 'Launches an app');
+  return v;
+}
+
+/** @returns {{risk:string, reason:string}|null} null: not a desktop-assistant tool */
+function desktopToolVerdict(tool, input, ctx) {
+  // browser_tabs {cycle: true} steps through the tabs with Ctrl+PageDown where they cannot be read.
+  if (tool === 'browser_tabs' && input.cycle === true) return V('medium', 'Steps through the browser tabs with the keyboard (brings the browser to the front)');
+  if (Object.prototype.hasOwnProperty.call(DESKTOP_READS, tool)) return V('low', DESKTOP_READS[tool]);
+  switch (tool) {
+    case 'ui_click':
+      return V('medium', 'Presses a control in an app window');
+    case 'ui_set_value': {
+      const value = str(input.value);
+      const why = secretLike(value);
+      const v = why ? V('high', `Enters text into a field that ${why}`) : V('medium', 'Sets the text of a field in an app window');
+      // It types into whatever field it finds (a terminal's too): the same scrutiny as type_text.
+      return maxVerdict(v, typedTextVerdict(value, ctx, { typed: true }));
+    }
+    case 'launch_app':
+      return launchAppVerdict(input, ctx);
+    case 'quit_app':
+      return quitAppVerdict(input);
+    case 'set_window':
+      return V('medium', 'Moves, resizes, maximizes or minimizes a window');
+    case 'browser_open':
+      return browserOpenVerdict(input);
+    case 'browser_switch_tab':
+      return V('medium', 'Switches to another browser tab');
+    case 'batch_actions':
+      return batchClassification(input, ctx).verdict;
+    default:
+      return null;
+  }
+}
+
+function quotedArg(s, max = 40) {
+  return `'${truncate(oneLine(s), max)}'`;
+}
+
+/** Card summaries of the desktop-assistant tools (null: not one of them). */
+function desktopSummary(tool, input, ctx) {
+  const i = input;
+  const named = (v) => v != null && str(v).trim() !== '';
+  const win = (w) => (named(w) ? ` in ${quotedArg(w, 40)}` : '');
+  switch (tool) {
+    case 'ui_find': {
+      const what = i.name || i.text;
+      return `Find ${named(i.role) ? `${truncate(oneLine(i.role), 20)} ` : ''}${named(what) ? quotedArg(what) : 'elements'}${win(i.window)}`;
+    }
+    case 'ui_tree':
+      return `Read the controls of ${named(i.window) ? quotedArg(i.window) : 'the active window'}`;
+    case 'ui_click':
+      if (named(i.id) && !named(i.name) && !named(i.text)) return `Press UI element ${truncate(oneLine(i.id), 50)}`;
+      return `Press ${quotedArg(i.name || i.text || i.id)}${named(i.role) ? ` (${truncate(oneLine(i.role), 20)})` : ''}${win(i.window)}`;
+    case 'ui_set_value': {
+      const field = named(i.id) && !named(i.name) && !named(i.text) ? `UI element ${truncate(oneLine(i.id), 40)}` : quotedArg(i.name || i.text || i.id || 'a field');
+      const value = str(i.value);
+      if (secretLike(value)) return `Set ${field} to a secret-looking value (${value.length} characters)`;
+      return value === '' ? `Clear ${field}` : `Set ${field} to ${quotedArg(value)}`;
+    }
+    case 'find_text':
+      return `Find ${quotedArg(i.text)} on the screen`;
+    case 'read_screen_text':
+      return i.region ? 'Read the text in a region of the screen' : 'Read the text on the screen';
+    case 'list_apps':
+      return named(i.query) ? `List apps matching ${quotedArg(i.query)}` : 'List apps';
+    case 'launch_app': {
+      const args = Array.isArray(i.args) ? i.args.map((a) => (/^[\w@%+=:,./-]+$/.test(String(a)) ? String(a) : `'${String(a)}'`)) : [];
+      return `Launch ${truncate(oneLine([str(i.name), ...args].join(' ')), 140)}`;
+    }
+    case 'quit_app':
+      return `${i.force === true ? 'Force-quit' : 'Quit'} ${truncate(oneLine(i.name), 60) || 'an app'}`;
+    case 'set_window': {
+      const w = truncate(oneLine(i.window), 60) || 'a window';
+      const state = str(i.state).toLowerCase().trim();
+      if (state) return `${state === 'fullscreen' ? 'Make full screen' : humanize(state)}: ${w}`;
+      const b = isPlainObject(i.bounds) ? i.bounds : {};
+      const size = b.width != null && b.height != null ? `, ${Math.round(Number(b.width))}x${Math.round(Number(b.height))}` : '';
+      return `Move ${w} to ${pt(b.x, b.y) || 'a new place'}${size}`;
+    }
+    case 'wait_for': {
+      const sec = Number(i.timeoutSec) > 0 ? ` (up to ${Number(i.timeoutSec)} s)` : '';
+      const what = named(i.text) ? `the text ${quotedArg(i.text)}` : named(i.window) ? `the window ${quotedArg(i.window)}` : 'the screen';
+      return `Wait for ${what}${i.gone === true ? ' to go away' : ''}${sec}`;
+    }
+    case 'browser_bookmarks':
+      return `Read ${named(i.browser) ? `${truncate(oneLine(i.browser), 30)} ` : ''}bookmarks${named(i.query) ? ` matching ${quotedArg(i.query)}` : ''}${named(i.folder) ? ` in ${quotedArg(i.folder, 30)}` : ''}`;
+    case 'browser_open': {
+      const how = i.newWindow === true ? ' (new window)' : i.newTab === false ? ' (current tab)' : '';
+      return `Open ${truncate(oneLine(i.url), 120)} in ${named(i.browser) ? truncate(oneLine(i.browser), 30) : 'the browser'}${how}`;
+    }
+    case 'browser_tabs':
+      return `List the tabs of ${named(i.browser) ? truncate(oneLine(i.browser), 30) : 'the browser'}${i.cycle === true ? ' (stepping through them with the keyboard)' : ''}`;
+    case 'browser_switch_tab': {
+      const which = named(i.match) ? `the tab ${quotedArg(i.match)}` : i.index != null && Number.isFinite(Number(i.index)) ? `tab ${Number(i.index)}` : 'another tab';
+      return `Switch ${named(i.browser) ? truncate(oneLine(i.browser), 30) : 'the browser'} to ${which}`;
+    }
+    case 'batch_actions':
+      return batchSummary(i, ctx);
+    default:
+      return null;
+  }
 }
 
 // The ticket workflow's tools (tools-browser, tools-jira, tools-project). Reads are low; Jira writes
@@ -6131,6 +6431,8 @@ function firstLineOf(s) {
 
 function anywhereSummary(tool, input, ctx) {
   const i = input;
+  const desk = desktopSummary(tool, i, ctx);
+  if (desk != null) return desk;
   switch (tool) {
     case 'read_browser_tab':
       return `Read the ${i.browser ? `${truncate(oneLine(i.browser), 30)} ` : ''}browser tab${i.includeText === true ? ' and copy its text' : ''}`;
@@ -6349,6 +6651,22 @@ function displayName(name) {
     calls_status: 'Calls status',
     clone_voice_status: 'Voice clone status',
     clone_voice_open: 'Clone my voice',
+    ui_find: 'Find UI elements',
+    ui_tree: 'Read window controls',
+    ui_click: 'Click UI element',
+    ui_set_value: 'Set field value',
+    find_text: 'Find text on screen',
+    read_screen_text: 'Read screen text',
+    list_apps: 'List apps',
+    launch_app: 'Launch app',
+    quit_app: 'Quit app',
+    set_window: 'Arrange window',
+    wait_for: 'Wait for screen',
+    browser_bookmarks: 'Read bookmarks',
+    browser_open: 'Open in browser',
+    browser_tabs: 'List browser tabs',
+    browser_switch_tab: 'Switch browser tab',
+    batch_actions: 'Run several actions',
   };
   const m = /^mcp__(.+?)__(.+)$/.exec(n);
   if (m) {
@@ -6463,6 +6781,8 @@ function classify(toolName, input, opts = {}) {
       const out = { risk: v.risk, reason: v.reason, summary: anywhereSummary(tool, inp, ctx) };
       if (v.ownCard) out.ownCard = true;
       if (v.sensitive) out.sensitive = true;
+      // A high desktop-assistant call gets its own card: no session rule covers it.
+      if (DESKTOP_TOOLS.has(tool) && RANK[v.risk] >= RANK.high) out.sensitive = true;
       return out;
     }
     if (TRACKER_SERVER_RE.test(server)) {
@@ -6690,6 +7010,14 @@ function sessionRuleFor(toolName, input, cls, opts = {}) {
     // Each hand-off names its own folder; a secret in a Jira comment always gets its own card.
     if (mcp[2] === 'switch_project') return null;
     if (mcp[2] === 'jira_comment' && secretLike(str(isPlainObject(input) ? input.text : ''))) return null;
+    // A batch can hold any steps: an "Always" for one would approve every later batch.
+    if (mcp[2] === 'batch_actions') return null;
+    // A high desktop-assistant call (a secret typed into a field, a force-quit, a non-web link, an
+    // executable) is approved one at a time.
+    if (DESKTOP_TOOLS.has(mcp[2])) {
+      const c = cls && RISKS.includes(cls.risk) ? cls : classify(name, input, opts);
+      if (RANK[c.risk] >= RANK.high) return null;
+    }
   }
   return name;
 }
@@ -7198,6 +7526,8 @@ module.exports = {
   sessionRuleFor,
   exposesCredentials,
   displayName,
+  batchStepCall,
+  DESKTOP_TOOLS,
   secretLike,
   normalizeKeyCombo,
   maxRisk,
