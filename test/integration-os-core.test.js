@@ -39,7 +39,7 @@ test('real X11 driver: screenshot mapping, mouse move and region zoom', { skip }
     if (prevHome === undefined) delete process.env.ANYWHERE_HOME;
     else process.env.ANYWHERE_HOME = prevHome;
     if (prevDriver !== undefined) process.env.ANYWHERE_DRIVER = prevDriver;
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   assert.notEqual(driver.name, 'unsupported', driver.reason);
   const original = await driver.cursorPosition();

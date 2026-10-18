@@ -27,7 +27,7 @@ const MODELS = path.join(HOME, 'models-empty');
 fs.mkdirSync(MODELS, { recursive: true });
 
 test.after(() => {
-  fs.rmSync(HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 const OK = { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, aborted: false, error: null };

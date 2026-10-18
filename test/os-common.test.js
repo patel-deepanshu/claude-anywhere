@@ -10,7 +10,7 @@ const { spawnSync } = require('child_process');
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-common-'));
 process.env.ANYWHERE_HOME = HOME;
-test.after(() => fs.rmSync(HOME, { recursive: true, force: true }));
+test.after(() => fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
 
 const common = require('../src/os/common');
 

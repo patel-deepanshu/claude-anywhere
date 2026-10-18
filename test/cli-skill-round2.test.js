@@ -125,7 +125,7 @@ function snapshot(over = {}) {
 
 test('an npm claude.cmd shim runs as node cli.js, without cmd.exe', (t) => {
   const dir = tmpDir();
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const shim = path.join(dir, 'claude.cmd');
   fs.writeFileSync(shim, '@ECHO off\r\n"%_prog%"  "%dp0%\\node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n');
   const cliJs = path.join(dir, 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js');
@@ -170,7 +170,7 @@ function sandbox(t, extra = {}) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   return { base, home, state: set.ANYWHERE_HOME, binDir: set.ANYWHERE_BIN_DIR };
 }
@@ -326,7 +326,7 @@ test('a busy dialog keeps its project unless --switch; symlinked paths are the s
   );
   t.after(async () => {
     await d.close();
-    for (const p of [a, b]) fs.rmSync(p, { recursive: true, force: true });
+    for (const p of [a, b]) fs.rmSync(p, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   const held = await runCli(['start', '--no-open', '--project', b, '--json'], { env: d.env });
@@ -380,7 +380,7 @@ test('send --project refuses to hand a task to a dialog busy elsewhere', { skip:
   );
   t.after(async () => {
     await d.close();
-    for (const p of [a, b]) fs.rmSync(p, { recursive: true, force: true });
+    for (const p of [a, b]) fs.rmSync(p, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   const r = await runCli(['send', '--project', b, 'deploy it'], { env: d.env });
   assert.equal(r.code, 1);
@@ -428,7 +428,7 @@ test('start without --mode takes a bridge dialog nobody listens to back to compa
   );
   t.after(async () => {
     await d.close();
-    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   const r = await runCli(['start', '--no-open', '--project', dir, '--json'], { env: d.env });
   assert.equal(r.code, 0, r.stderr);
@@ -581,7 +581,7 @@ test('Windows stops a hung daemon tree with taskkill /T before TerminateProcess'
 
 function doctorEnv(t, extra = {}) {
   const dir = tmpDir('anywhere-r2-doc-');
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const fakeBin = path.join(dir, 'bin');
   fs.mkdirSync(fakeBin);
   // A stand-in claude: answers --version, has no MCP registration.
@@ -645,7 +645,7 @@ test('with Electron as the dialog, doctor does not promise browser speech', { sk
 
 test('findPluginInstall trusts installed_plugins.json, not a marketplace clone or cache leftovers', (t) => {
   const home = tmpDir('anywhere-r2-claude-');
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const pluginCopy = (rel) => {
     const dir = path.join(home, 'plugins', ...rel.split('/'));
     fs.mkdirSync(path.join(dir, '.claude-plugin'), { recursive: true });
@@ -706,7 +706,7 @@ test('hints name the full node command unless this package is "anywhere" on PATH
 
   // A link in a PATH folder (install.sh / anywhere install): plain "anywhere".
   const binDir = tmpDir('anywhere-r2-bin-');
-  t.after(() => fs.rmSync(binDir, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(binDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   fs.symlinkSync(path.join(ROOT, 'bin', 'anywhere'), path.join(binDir, 'anywhere'));
   const linked = await runCli(['url'], { env: { ...env, PATH: `${binDir}${path.delimiter}${env.PATH}` } });
   assert.match(linked.stderr, /or run: anywhere start/);

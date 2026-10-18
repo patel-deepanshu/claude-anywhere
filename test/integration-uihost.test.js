@@ -27,7 +27,7 @@ delete process.env.ANYWHERE_DAEMON_URL;
 delete process.env.ANYWHERE_TOKEN;
 
 test.after(() => {
-  fs.rmSync(HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

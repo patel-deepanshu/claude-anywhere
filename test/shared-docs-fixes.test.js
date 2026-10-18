@@ -50,7 +50,7 @@ function readAudit() {
 test.after(() => {
   log.setRedactLogs(true);
   log.setAuditEnabled(true);
-  fs.rmSync(HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('string log messages are redacted (approval summaries carry raw commands)', () => {

@@ -46,7 +46,7 @@ function fileUri(p) {
 }
 
 test.after(() => {
-  fs.rmSync(tmpHome, { recursive: true, force: true });
+  fs.rmSync(tmpHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 // ---------------------------------------------------------------- editor titles
@@ -277,7 +277,7 @@ test('readVsCodeWorkspaces reads storage.json and keeps existing paths', async (
   const leg = list.find((x) => x.name === 'legacy');
   assert.equal(leg.product, 'VSCodium');
   assert.equal(leg.source, 'backup');
-  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('readJetBrainsRecent parses recentProjects.xml', async () => {
@@ -296,7 +296,7 @@ test('readJetBrainsRecent parses recentProjects.xml', async () => {
   assert.equal(list.length, 1);
   assert.equal(list[0].path, proj);
   assert.equal(list[0].name, 'demo');
-  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 // ---------------------------------------------------------------- cloud configs
@@ -333,8 +333,8 @@ test('parseIni and gcloud config (CLOUDSDK_CONFIG, overrides)', async () => {
     assert.ok(expected.includes('gcloud'));
     await desktop.readGcloud(winSys); // must not throw on foreign separators
   }
-  fs.rmSync(dir, { recursive: true, force: true });
-  fs.rmSync(appData, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  fs.rmSync(appData, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('aws, azure (BOM) and kubectl configs', async () => {
@@ -370,7 +370,7 @@ test('aws, azure (BOM) and kubectl configs', async () => {
   // KUBECONFIG is a PATH-style list: ';' on Windows (drive letters contain ':'), ':' elsewhere.
   k = await desktop.readKubectl({ ...sys, env: { KUBECONFIG: [path.join(home, 'nope'), k2].join(path.delimiter) } });
   assert.equal(k.context, 'kind-dev');
-  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 // ---------------------------------------------------------------- project
@@ -412,7 +412,7 @@ test('detectStack recognises languages, frameworks and deploy files', async () =
   write(path.join(flask, 'pyproject.toml'), '[project]\ndependencies = ["flask>=3"]\n');
   assert.deepEqual(await desktop.detectStack(flask), ['Python (Flask)']);
   assert.deepEqual(await desktop.detectStack(path.join(flask, 'missing')), []);
-  for (const d of [dir, next, flask]) fs.rmSync(d, { recursive: true, force: true });
+  for (const d of [dir, next, flask]) fs.rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('stripCredentials, shortRemote and git status parsing', () => {
@@ -461,8 +461,8 @@ test('projectInfo on a real git repo', { skip: hasGit ? false : 'git is not inst
   assert.equal(p2.git, null);
   const p3 = await desktop.projectInfo(path.join(plain, 'nope'));
   assert.equal(p3.exists, false);
-  fs.rmSync(dir, { recursive: true, force: true });
-  fs.rmSync(plain, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  fs.rmSync(plain, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 // ---------------------------------------------------------------- windows & gather
@@ -549,7 +549,7 @@ test('gatherContext with editors, browsers, storage mapping and cloud', async ()
   assert.match(text, /Other windows: Slack \u2014 "deploys - Slack"/);
   assert.match(text, /Project \(cwd\): .*Node \(Express\), Docker/);
   assert.match(text, /Cloud: gcloud account d@x\.com project my-proj/);
-  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('gatherContext never throws and times out slow probes', async () => {
@@ -631,7 +631,7 @@ test('detectProjects merges open editors, cwd and history', async () => {
     ]
   );
   assert.equal(list[0].dir, a);
-  fs.rmSync(home, { recursive: true, force: true });
+  fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 test('withTimeout labels the timeout', async () => {

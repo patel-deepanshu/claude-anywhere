@@ -316,7 +316,7 @@ $r = [LiveClip]::Read()
       /* ignore */
     }
     try {
-      fs.rmSync(HOME, { recursive: true, force: true });
+      fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     } catch {
       /* ignore */
     }

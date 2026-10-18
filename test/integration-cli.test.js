@@ -48,7 +48,7 @@ test('start → status → bridge send/listen/reply → stop with the real daemo
   const e = env(home);
   t.after(async () => {
     await runCli(['stop'], e).catch(() => {});
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
   const start = await runCli(['start', '--no-open', '--port', '0', '--mode', 'bridge', '--project', ROOT, '--json'], e);
@@ -120,7 +120,7 @@ test('config set mode switches the running daemon; start-up settings say restart
   const e = env(home);
   t.after(async () => {
     await runCli(['stop'], e).catch(() => {});
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   const start = await runCli(['start', '--no-open', '--port', '0', '--mode', 'bridge', '--project', ROOT, '--json'], e);
   assert.equal(start.code, 0, `${start.stdout}\n${start.stderr}`);
@@ -136,7 +136,7 @@ test('config set mode switches the running daemon; start-up settings say restart
 
 test('start reports a clear error with the log tail when the daemon cannot start', { skip: haveDaemon ? false : 'daemon modules are not present yet', timeout: 60000 }, async (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-int-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   // An invalid port makes the daemon exit during startup.
   const r = await runCli(['start', '--no-open', '--port', '99999'], env(home));
   assert.equal(r.code, 1);
@@ -147,7 +147,7 @@ const haveDoctorDeps = has('src/os/index.js');
 
 test('doctor --json returns a structured report and a matching exit code', { skip: haveDoctorDeps ? false : 'src/os is not present yet', timeout: 120000 }, async (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-int-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
   const r = await runCli(['doctor', '--json'], env(home));
   const report = JSON.parse(r.stdout);
   assert.equal(r.code, report.ok ? 0 : 1);

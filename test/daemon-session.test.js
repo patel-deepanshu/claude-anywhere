@@ -31,7 +31,7 @@ const {
 } = require('../src/daemon/session');
 
 test.after(() => {
-  fs.rmSync(HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 // ------------------------------------------------------------------ helpers

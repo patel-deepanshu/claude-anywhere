@@ -109,7 +109,7 @@ function spawnServer(t, extraEnv = {}) {
     peer.close();
     if (child.exitCode === null) child.kill('SIGKILL');
     await exited;
-    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
   return { child, peer, exited, stderr: () => stderr };
 }

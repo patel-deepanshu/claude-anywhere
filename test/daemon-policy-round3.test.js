@@ -19,7 +19,7 @@ const path = require('path');
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-policy-r3-'));
 process.env.ANYWHERE_HOME = HOME;
-test.after(() => fs.rmSync(HOME, { recursive: true, force: true }));
+test.after(() => fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
 
 const { classify, PermissionBroker, sessionRuleFor, splitCommands, matchRule } = require('../src/daemon/permissions');
 const { buildSystemPrompt, MAX_CHARS } = require('../src/daemon/prompt');

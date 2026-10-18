@@ -26,7 +26,7 @@ const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-ui-int-'));
 process.env.ANYWHERE_HOME = HOME;
 
 test.after(() => {
-  fs.rmSync(HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 function get(port, p, headers = {}) {

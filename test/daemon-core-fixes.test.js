@@ -30,7 +30,7 @@ const { Bridge } = require('../src/daemon/bridge');
 const { SessionManager, readSessions } = require('../src/daemon/session');
 
 test.after(() => {
-  fs.rmSync(HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 // ------------------------------------------------------------------ helpers

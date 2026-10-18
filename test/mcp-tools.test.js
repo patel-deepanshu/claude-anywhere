@@ -18,7 +18,7 @@ const { DaemonClient } = require('../src/shared/client');
 const TOKEN = 'test-token-123';
 const PNG_1PX = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360f8cfc0f01f0005000201a5f5d3b50000000049454e44ae426082', 'hex');
 
-test.after(() => fs.rmSync(tmpHome, { recursive: true, force: true }));
+test.after(() => fs.rmSync(tmpHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }));
 
 // ---------------------------------------------------------------- fakes
 

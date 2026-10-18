@@ -36,7 +36,7 @@ const main = require('../src/daemon/main');
 const { ClaudeCliEngine, buildEnv, buildArgs } = require('../src/daemon/engine-cli');
 
 test.after(() => {
-  fs.rmSync(HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 // ------------------------------------------------------------------ helpers

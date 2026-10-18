@@ -27,7 +27,7 @@ delete process.env.ANYWHERE_TOKEN;
 delete process.env.FAKE_CLAUDE_ARGS_FILE;
 
 test.after(() => {
-  fs.rmSync(HOME, { recursive: true, force: true });
+  fs.rmSync(HOME, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 function sleep(ms) {
