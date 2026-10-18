@@ -1,10 +1,10 @@
 'use strict';
 
 // Live Windows desktop: drives the REAL desktop through the real win32 driver (the persistent
-// PowerShell host), Computer, the `anywhere computer` CLI and the MCP server. Opt-in: it runs only
-// on Windows with ANYWHERE_LIVE_DESKTOP=1 (CI job "Live desktop (windows-latest)"), because it moves
-// the mouse, types into Notepad and overwrites the clipboard. Screenshots of key steps are saved to
-// ANYWHERE_LIVE_OUT for debugging.
+// PowerShell host), Computer, the `anywhere computer` CLI, the MCP server and src/os/common.js.
+// Opt-in: it runs only on Windows with ANYWHERE_LIVE_DESKTOP=1 (CI job "Live desktop
+// (windows-latest)"), because it moves the mouse, types into Notepad, overwrites the clipboard and
+// ends every notepad.exe at the end. Screenshots of key steps go to ANYWHERE_LIVE_OUT.
 //
 // The tests share one driver and one Notepad window and run in order.
 
@@ -67,7 +67,7 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
   let Computer;
   let driver;
   let displays;
-  let notepad = null; // window record
+  let notepad = null; // window record of the Notepad these tests type into
   let notepadChild = null;
   let preexisting = new Set();
   const logLines = [];
@@ -106,7 +106,15 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     assert.fail(`could not focus Notepad ${show(notepad)}; active window is ${show(aw)}`);
   }
 
-  /** Select all in Notepad, copy, and return the clipboard text (CRLF as LF). */
+  /** Focus Notepad and delete everything in it. */
+  async function clearNotepad(t) {
+    await ensureNotepadFocused(t);
+    await driver.keyCombo(['ctrl', 'a']);
+    await driver.keyCombo(['delete']);
+    await sleep(150);
+  }
+
+  /** Select all in the focused Notepad, copy, and return the clipboard text (CRLF as LF). */
   async function copyNotepadText(t) {
     const sentinel = `sentinel-${Date.now()}`;
     await driver.clipboardSet(sentinel);
@@ -117,11 +125,15 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
       const s = await driver.clipboardGet();
       return s !== sentinel ? s : null;
     }, 4000, 150);
-    note(t, 'Notepad text via ctrl+a, ctrl+c:', text);
+    note(t, 'Notepad text via ctrl+a, ctrl+c:', text == null ? null : text.length > 300 ? `${text.slice(0, 300)}... (${text.length} chars)` : text);
     return text == null ? null : text.replace(/\r\n/g, '\n');
   }
 
-  function killNotepad() {
+  async function newNotepadWindows() {
+    return (await windowsNow()).filter((w) => isNotepad(w) && !preexisting.has(w.id));
+  }
+
+  function killNotepads() {
     if (notepadChild && notepadChild.exitCode === null) {
       try {
         notepadChild.kill();
@@ -129,7 +141,17 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
         /* already gone */
       }
     }
+    // Windows 11 Notepad (and anything openTarget started) is not our child: end it by name.
     spawnSync('taskkill', ['/IM', 'notepad.exe', '/F'], { stdio: 'ignore', windowsHide: true, timeout: 15000 });
+  }
+
+  function cli(t, args, timeout = 110000) {
+    const env = { ...process.env, ANYWHERE_HOME: HOME };
+    for (const k of ['ANYWHERE_DRIVER', 'ANYWHERE_DAEMON_URL', 'ANYWHERE_TOKEN']) delete env[k];
+    const r = spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf8', timeout, windowsHide: true });
+    note(t, `anywhere ${args.join(' ')} -> exit ${r.status}${r.error ? ` (${r.error.message})` : ''}; stdout: ${String(r.stdout || '').slice(0, 1500)}${r.stderr ? `; stderr: ${r.stderr.slice(0, 1500)}` : ''}`);
+    assert.equal(r.status, 0, `anywhere ${args.join(' ')} failed: ${r.stderr || r.stdout}`);
+    return JSON.parse(r.stdout);
   }
 
   before(async () => {
@@ -147,7 +169,7 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
 
   after(async () => {
     try {
-      killNotepad();
+      killNotepads();
     } catch {
       /* ignore */
     }
@@ -177,6 +199,7 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     assert.equal(info.windows, true);
     assert.equal(info.native, true, info.nativeError || 'native bridge failed');
     assert.equal(info.sta, true, 'host runs in STA (clipboard)');
+    assert.match(String(info.dpi), /^permonitor/, 'the host is per-monitor DPI aware');
     const caps = await driver.capabilities();
     note(t, 'capabilities:', caps);
     for (const k of ['screenshot', 'mouse', 'keyboard', 'windows', 'clipboard']) assert.equal(caps[k], true, `capability ${k}`);
@@ -209,6 +232,7 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     const colours = pixelVariety(img);
     note(t, `capture ${cap.width}x${cap.height}, ${cap.png.length} bytes, ${colours} distinct sampled colours`);
     assert.ok(colours > 1, 'the capture is not a single colour (is there an interactive desktop?)');
+    await assert.rejects(driver.captureDisplay(displays.length), (e) => e.code === 'BAD_DISPLAY', 'a missing display is refused');
   });
 
   it('live-desktop: moveMouse and cursorPosition round-trip', { timeout: 60000 }, async (t) => {
@@ -227,6 +251,19 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     }
   });
 
+  it('live-desktop: the failsafe stops Computer while the pointer is parked top-left', { timeout: 60000 }, async (t) => {
+    const computer = new Computer({ driver, config: { actionDelayMs: 0 }, platform: 'win32' });
+    await driver.moveMouse(0, 0); // as if the user slammed the pointer into the corner
+    const p = await driver.cursorPosition();
+    note(t, 'pointer parked at', p);
+    await assert.rejects(computer.moveMouse({ x: 300, y: 300 }), (e) => e.code === 'FAILSAFE', 'FAILSAFE while the pointer is top-left');
+    await driver.moveMouse(400, 300);
+    const r = await computer.moveMouse({ x: 300, y: 300 });
+    assert.equal(r.ok, true);
+    const q = await driver.cursorPosition();
+    assert.ok(near(q.x, 300, 1) && near(q.y, 300, 1), `moved after the pointer left the corner: ${show(q)}`);
+  });
+
   it('live-desktop: start Notepad, find it with listWindows and focus it', { timeout: 90000 }, async (t) => {
     const before0 = await windowsNow();
     note(t, `windows before Notepad (${before0.length}):`, before0.map((w) => ({ id: w.id, app: w.app, process: w.process, title: w.title, focused: w.focused })));
@@ -235,18 +272,17 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     notepadChild.on('error', (err) => note(null, `notepad spawn error: ${err.message}`));
     note(t, `spawned notepad.exe pid ${notepadChild.pid}`);
     notepad = await waitFor(async () => {
-      const list = await windowsNow();
-      const mine = list.filter((w) => isNotepad(w) && !preexisting.has(w.id));
+      const mine = await newNotepadWindows();
       return mine.find((w) => w.pid === notepadChild.pid) || mine[0] || null;
     }, 30000, 300);
     if (!notepad) {
-      const list = await windowsNow();
-      note(t, 'no Notepad window; windows now:', list);
+      note(t, 'no Notepad window; windows now:', await windowsNow());
       await snap(t, '02-notepad-missing.png');
     }
     assert.ok(notepad, 'a Notepad window appeared');
     note(t, 'Notepad window:', notepad, `spawned pid ${notepadChild.pid}`);
     assert.ok(notepad.width > 100 && notepad.height > 100, `Notepad has a real size: ${notepad.width}x${notepad.height}`);
+    assert.ok(/^\d+$/.test(notepad.id), `window ids are decimal strings: ${notepad.id}`);
     const aw = await ensureNotepadFocused(t);
     note(t, 'active after focus:', aw);
     // Give a just-started Notepad (new Notepad restores tabs) a moment to settle.
@@ -268,7 +304,7 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
   });
 
   it('live-desktop: typeText (unicode SendInput), ctrl+a, ctrl+c and clipboardGet', { timeout: 60000 }, async (t) => {
-    await ensureNotepadFocused(t);
+    await clearNotepad(t);
     const r = await driver.typeText(TYPED);
     note(t, 'typeText result:', r === undefined ? 'undefined' : r);
     await sleep(400);
@@ -278,7 +314,7 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
   });
 
   it('live-desktop: clipboardSet/clipboardGet round-trip with unicode', { timeout: 30000 }, async (t) => {
-    const samples = ['plain ascii', 'ü€ 日本語 Ελληνικά', 'emoji 🎉 astral 𝄞', 'quotes "double" \'single\' back\\slash <&> \t tab', 'line1\nline2\nline3'];
+    const samples = ['plain ascii', 'ü€ 日本語 Ελληνικά', 'emoji 🎉 astral 𝄞', 'quotes "double" \'single\' back\\slash <&> \t tab', 'line1\nline2\nline3', ' leading and trailing spaces  '];
     for (const s of samples) {
       await driver.clipboardSet(s);
       const got = await driver.clipboardGet();
@@ -290,7 +326,8 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
   });
 
   it('live-desktop: click into Notepad at a screenshot-space point and type more', { timeout: 60000 }, async (t) => {
-    await ensureNotepadFocused(t);
+    await clearNotepad(t);
+    await driver.typeText(TYPED);
     // A small maxWidth forces a downscaled screenshot, so the mapping is not the identity.
     const computer = new Computer({ driver, config: { maxWidth: 800, maxHeight: 600, actionDelayMs: 100 }, platform: 'win32' });
     const shot = await computer.screenshot();
@@ -327,16 +364,15 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     await sleep(300);
     await snap(t, '05-clicked-typed.png');
     const text = await copyNotepadText(t);
-    assert.ok(text && text.includes(TYPED), `Notepad still holds the first text: ${show(text)}`);
-    assert.ok(text.includes(CLICKED.trim()), `the text typed after the click arrived: ${show(text)}`);
+    // Clicking below the last line puts the caret at the end of the text.
+    assert.equal(text, `${TYPED}${CLICKED}`, 'the text typed after the click arrived after the first text');
   });
 
   it('live-desktop: Computer paste path types multi-line text and restores the clipboard', { timeout: 60000 }, async (t) => {
-    await ensureNotepadFocused(t);
+    await clearNotepad(t);
     const computer = new Computer({ driver, config: { actionDelayMs: 100 }, platform: 'win32' });
-    await computer.key({ combo: 'ctrl+end' });
     await driver.clipboardSet('saved-user-clipboard ü');
-    const res = await computer.typeText({ text: '\npasted line A\npasted line B ü€', method: 'auto' });
+    const res = await computer.typeText({ text: 'pasted line A\npasted line B ü€ 🎉', method: 'auto' });
     note(t, 'paste typeText result:', res);
     assert.equal(res.method, 'paste', 'multi-line text is pasted');
     const restored = await driver.clipboardGet();
@@ -344,12 +380,48 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     assert.equal(restored, 'saved-user-clipboard ü', "the user's clipboard is restored after pasting");
     await sleep(200);
     const text = await copyNotepadText(t);
-    assert.ok(text && text.includes('pasted line A\npasted line B ü€'), `the pasted text arrived: ${show(text)}`);
+    assert.equal(text, 'pasted line A\npasted line B ü€ 🎉', 'the pasted text arrived');
     await snap(t, '06-pasted.png');
   });
 
-  it('live-desktop: scroll, drag, mouseDown/mouseUp do not throw', { timeout: 60000 }, async (t) => {
-    await ensureNotepadFocused(t);
+  it('live-desktop: key combos with named, extended and shifted keys; tab and newline typing', { timeout: 60000 }, async (t) => {
+    await clearNotepad(t);
+    const computer = new Computer({ driver, config: { actionDelayMs: 40 }, platform: 'win32' });
+    await driver.typeText('abc');
+    await computer.key({ combo: 'shift+a' }); // A
+    await computer.key({ combo: '?' }); // shift+/ on a US layout
+    await computer.key({ combo: 'left' }); // extended arrow key: caret before '?'
+    await computer.key({ combo: 'backspace' }); // deletes 'A'
+    await computer.key({ combo: 'home' });
+    await driver.typeText('X');
+    await computer.key({ combo: 'end' });
+    await computer.key({ combo: 'b' }); // lower case: no modifier was left pressed
+    await computer.key({ combo: 'enter' });
+    await driver.typeText('t1\tt2\nline3');
+    await computer.key({ combo: 'left', repeat: 3 });
+    await computer.key({ combo: 'primary+shift+end' }); // select "ne3"
+    await computer.key({ combo: 'delete' });
+    const text = await copyNotepadText(t);
+    assert.equal(text, 'Xabc?b\nt1\tt2\nli');
+  });
+
+  it('live-desktop: long typed text is chunked without losing characters or splitting surrogates', { timeout: 120000 }, async (t) => {
+    await clearNotepad(t);
+    // 'x' * 999 puts the emoji's surrogate pair across the driver's 1000-unit chunk boundary.
+    const long = `${'x'.repeat(999)}🎉${'y'.repeat(300)} ü€ 日本 end`;
+    const started = Date.now();
+    await driver.typeText(long);
+    note(t, `typed ${long.length} UTF-16 units in ${Date.now() - started} ms`);
+    await sleep(500);
+    const text = await copyNotepadText(t);
+    assert.ok(text != null, 'copied something');
+    assert.equal(text.length, long.length, 'same length');
+    assert.equal(text, long);
+  });
+
+  it('live-desktop: scroll, drag, mouseDown/mouseUp and a region zoom', { timeout: 60000 }, async (t) => {
+    await clearNotepad(t);
+    await driver.typeText('drag over this text to select some of it\n'.repeat(40));
     const computer = new Computer({ driver, config: { actionDelayMs: 80 }, platform: 'win32' });
     await computer.screenshot();
     const w = (await windowsNow()).find((x) => x.id === notepad.id) || notepad;
@@ -365,34 +437,48 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     assert.equal(drag.ok, true);
     const p = await driver.cursorPosition();
     assert.ok(near(p.x, drag.logicalTo.x, 1) && near(p.y, drag.logicalTo.y, 1), `drag ended at ${show(drag.logicalTo)}, cursor ${show(p)}`);
+    // The drag selected text: copying it gives a non-empty part of what was typed.
+    await driver.clipboardSet('before-drag-copy');
+    await driver.keyCombo(['ctrl', 'c']);
+    const sel = await waitFor(async () => {
+      const s = await driver.clipboardGet();
+      return s !== 'before-drag-copy' ? s : null;
+    }, 3000, 150);
+    note(t, 'drag selection:', sel);
+    assert.ok(sel && sel.length > 0 && 'drag over this text to select some of it\r\n'.repeat(40).includes(sel), `the drag selected text: ${show(sel)}`);
+    await snap(t, '07-after-drag.png');
     await driver.mouseDown('left');
     await sleep(50);
     await driver.mouseUp('left');
-    await snap(t, '07-after-drag.png');
+
+    const zoom = await computer.screenshot({ region: { x: 10, y: 10, width: 200, height: 100 } });
+    fs.writeFileSync(path.join(OUT, '07-zoom.png'), zoom.png);
+    note(t, 'zoom:', { width: zoom.width, height: zoom.height, region: zoom.region, scale: zoom.scale });
+    assert.deepEqual(zoom.region, { x: 10, y: 10, width: 200, height: 100 });
+    assert.ok(zoom.width >= 200 && zoom.height >= 100, 'the zoom is at least as sharp as the region');
   });
 
-  it('live-desktop: close Notepad without saving', { timeout: 60000 }, async (t) => {
-    assert.ok(notepad, 'Notepad was started');
-    killNotepad();
-    const gone = await waitFor(async () => !(await windowsNow()).some((w) => w.id === notepad.id), 15000, 300);
-    if (!gone) {
-      note(t, 'Notepad is still open:', (await windowsNow()).filter(isNotepad));
-      await snap(t, '08-notepad-still-open.png');
-    }
-    assert.ok(gone, 'the Notepad window closed');
-    const left = (await windowsNow()).filter((w) => isNotepad(w) && !preexisting.has(w.id));
-    assert.deepEqual(left, [], 'no Notepad window of ours is left (no save prompt)');
-    notepad = null;
+  it('live-desktop: minimizeWindow, focusWindow restores it, setTopmost', { timeout: 60000 }, async (t) => {
+    assert.equal(await driver.minimizeWindow(notepad.id), true, 'minimizeWindow');
+    const w1 = (await windowsNow()).find((w) => w.id === notepad.id);
+    note(t, 'minimized:', w1);
+    assert.ok(w1 && w1.minimized === true, 'listed as minimized');
+    assert.ok(w1.width > 100 && w1.height > 100, 'a minimized window keeps its normal size');
+    await snap(t, '08-minimized.png');
+    assert.equal(await driver.focusWindow(notepad.id), true, 'focusWindow restores and focuses it');
+    await sleep(300);
+    const w2 = (await windowsNow()).find((w) => w.id === notepad.id);
+    note(t, 'restored:', w2);
+    assert.ok(w2 && !w2.minimized && w2.focused, 'restored and focused');
+    assert.equal(await driver.setTopmost(notepad.id, true), true, 'setTopmost on');
+    assert.equal(await driver.setTopmost(notepad.id, false), true, 'setTopmost off');
+    assert.equal(await driver.focusWindow('0'), false, 'focusWindow(0) is false');
+    assert.equal(await driver.focusWindow('not-a-window'), false, 'a bad id is false');
   });
 
-  it('live-desktop: CLI `computer screenshot --out` writes a PNG and prints JSON', { timeout: 120000 }, async (t) => {
+  it('live-desktop: CLI computer screenshot, capabilities, clipboard, windows, focus, type and key', { timeout: 300000 }, async (t) => {
     const file = path.join(HOME, 'cli-shot.png');
-    const env = { ...process.env, ANYWHERE_HOME: HOME };
-    delete env.ANYWHERE_DRIVER;
-    const r = spawnSync(process.execPath, [CLI, 'computer', 'screenshot', '--out', file], { env, encoding: 'utf8', timeout: 110000, windowsHide: true });
-    note(t, `CLI exit ${r.status}${r.error ? ` (${r.error.message})` : ''}; stdout: ${r.stdout}; stderr: ${r.stderr}`);
-    assert.equal(r.status, 0, r.stderr || r.stdout);
-    const out = JSON.parse(r.stdout);
+    const out = cli(t, ['computer', 'screenshot', '--out', file]);
     assert.equal(path.resolve(out.path), path.resolve(file));
     assert.ok(out.width > 0 && out.height > 0 && out.display === 0, show(out));
     const buf = fs.readFileSync(file);
@@ -401,15 +487,32 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     assert.deepEqual([hdr.width, hdr.height], [out.width, out.height]);
     fs.copyFileSync(file, path.join(OUT, '09-cli-screenshot.png'));
 
-    const caps = spawnSync(process.execPath, [CLI, 'computer', 'capabilities'], { env, encoding: 'utf8', timeout: 110000, windowsHide: true });
-    note(t, `CLI capabilities exit ${caps.status}; stdout: ${caps.stdout}; stderr: ${caps.stderr}`);
-    assert.equal(caps.status, 0, caps.stderr || caps.stdout);
-    const c = JSON.parse(caps.stdout);
-    assert.equal(c.driver, 'win32');
-    assert.equal(c.screenshot, true);
+    const caps = cli(t, ['computer', 'capabilities']);
+    assert.equal(caps.driver, 'win32');
+    assert.equal(caps.screenshot, true);
+
+    const clip = 'cli ü€ 日本 🎉 "quoted"';
+    const set = cli(t, ['computer', 'clipboard', 'set', clip]);
+    assert.equal(set.ok, true);
+    assert.equal(cli(t, ['computer', 'clipboard', 'get']).text, clip, 'unicode survives argv and stdout');
+
+    const wins = cli(t, ['computer', 'windows', '--filter', 'notepad']);
+    assert.ok(wins.count >= 1 && wins.windows.some((w) => w.id === notepad.id), `the CLI lists our Notepad: ${show(wins)}`);
+    const focused = cli(t, ['computer', 'focus', '--id', notepad.id]);
+    assert.equal(focused.ok, true);
+    cli(t, ['computer', 'key', 'ctrl+a', 'delete']);
+    cli(t, ['computer', 'type', 'cli-typed ü€']);
+    cli(t, ['computer', 'key', 'ctrl+a', 'ctrl+c']);
+    const got = await waitFor(async () => {
+      const s = await driver.clipboardGet();
+      return s === 'cli-typed ü€' ? s : null;
+    }, 3000, 200);
+    assert.equal(got || (await driver.clipboardGet()), 'cli-typed ü€', 'text typed through the CLI reached Notepad');
+    const screens = cli(t, ['computer', 'screens']);
+    assert.ok(Array.isArray(screens.displays) && screens.displays.length === displays.length, show(screens));
   });
 
-  it('live-desktop: MCP server screenshot tool returns an image', { timeout: 120000 }, async (t) => {
+  it('live-desktop: MCP server: screenshot, list_windows, focus_window, click, type_text, key, clipboard_get', { timeout: 300000 }, async (t) => {
     const env = { ...process.env, ANYWHERE_HOME: HOME };
     for (const k of ['ANYWHERE_DRIVER', 'ANYWHERE_DAEMON_URL', 'ANYWHERE_TOKEN', 'ANYWHERE_ROLE', 'ANYWHERE_ENGINE_CHILD']) delete env[k];
     const child = spawn(process.execPath, [MCP_SERVER], { env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
@@ -455,16 +558,27 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
         });
         child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
       });
+    const call = async (name, args = {}) => {
+      const res = await request('tools/call', { name, arguments: args }, 90000);
+      const result = res.result || {};
+      const content = Array.isArray(result.content) ? result.content : [];
+      const texts = content.filter((c) => c.type === 'text').map((c) => c.text).join('\n');
+      note(t, `MCP ${name} ${JSON.stringify(args)} ->`, { isError: Boolean(result.isError), error: res.error, text: texts.slice(0, 600), images: content.filter((c) => c.type === 'image').length });
+      assert.ok(!res.error && !result.isError, `MCP ${name} failed: ${show(res.error || texts)}; stderr: ${stderr.slice(-1500)}`);
+      return { content, text: texts };
+    };
     try {
       const init = await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'live-desktop-test', version: '1' } });
       assert.ok(init.result && init.result.serverInfo, show(init));
       child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
-      const res = await request('tools/call', { name: 'screenshot', arguments: {} }, 90000);
-      const result = res.result || {};
-      const content = Array.isArray(result.content) ? result.content : [];
-      note(t, 'MCP screenshot:', { isError: result.isError, content: content.map((c) => (c.type === 'image' ? { type: c.type, mimeType: c.mimeType, bytes: c.data.length } : c)) });
-      assert.ok(!result.isError, `screenshot tool failed: ${show(content)}; stderr: ${stderr.slice(-2000)}`);
-      const image = content.find((c) => c.type === 'image');
+      const listed = await request('tools/list', {});
+      const names = (listed.result && listed.result.tools ? listed.result.tools : []).map((x) => x.name);
+      for (const n of ['screenshot', 'click', 'type_text', 'key', 'list_windows', 'focus_window', 'clipboard_get', 'screen_info', 'cursor_position', 'mouse_move']) {
+        assert.ok(names.includes(n), `tools/list has ${n}`);
+      }
+
+      const shot = await call('screenshot');
+      const image = shot.content.find((c) => c.type === 'image');
       assert.ok(image, 'an image content block');
       assert.equal(image.mimeType, 'image/png');
       const data = Buffer.from(image.data, 'base64');
@@ -472,8 +586,34 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
       const hdr = png.readHeader(data);
       assert.ok(hdr.width > 0 && hdr.height > 0);
       fs.writeFileSync(path.join(OUT, '10-mcp-screenshot.png'), data);
-      const text = content.find((c) => c.type === 'text');
-      assert.ok(text && /\d+x\d+/.test(text.text), 'a text block describing the shot');
+      assert.match(shot.text, /\d+x\d+/, 'a text block describing the shot');
+
+      const info = await call('screen_info');
+      assert.match(info.text, /Display 0/);
+      const listedWins = await call('list_windows', { filter: 'notepad' });
+      assert.ok(listedWins.text.includes(notepad.id), 'list_windows shows our Notepad');
+      const focus = await call('focus_window', { id: notepad.id });
+      assert.match(focus.text, /Focused/);
+      await call('key', { combo: 'primary+a' });
+      await call('key', { combo: 'delete' });
+      await call('type_text', { text: 'mcp-typed ü€' });
+      // Click inside Notepad (screenshot pixels = physical px here: no downscale at this size).
+      const w = (await windowsNow()).find((x) => x.id === notepad.id) || notepad;
+      const scale = displays[0].width / hdr.width;
+      const cx = Math.round((w.x + w.width / 2) / scale);
+      const cy = Math.round((w.y + w.height * 0.6) / scale);
+      await call('click', { x: cx, y: cy });
+      await call('type_text', { text: ' +clicked' });
+      const moved = await call('mouse_move', { x: cx + 10, y: cy + 5 });
+      assert.match(moved.text, /./);
+      const cur = await call('cursor_position');
+      assert.match(cur.text, new RegExp(`\\(${cx + 10}, ${cy + 5}\\)`), 'cursor_position reports the mouse_move target');
+      await call('key', { combo: 'primary+a' });
+      await call('key', { combo: 'primary+c' });
+      await sleep(300);
+      const clip = await call('clipboard_get');
+      assert.equal(clip.text.replace(/\r\n/g, '\n'), 'mcp-typed ü€ +clicked', 'type_text, click and key went through MCP to Notepad');
+      await snap(t, '10-mcp-typed.png');
     } finally {
       try {
         child.stdin.end();
@@ -484,5 +624,58 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
       if (!done) child.kill();
       note(t, `MCP server exit: ${show(done)}`);
     }
+  });
+
+  it('live-desktop: openTarget (file and app), notify and speak', { timeout: 180000 }, async (t) => {
+    const common = require('../src/os/common');
+    const beforeIds = new Set((await newNotepadWindows()).map((w) => w.id));
+    const file = path.join(HOME, 'live ü test.txt');
+    fs.writeFileSync(file, 'opened-by-openTarget ü€\r\n', 'utf8');
+    const opened = await common.openTarget(file);
+    note(t, 'openTarget(file):', opened);
+    assert.equal(opened.opened, true);
+    assert.equal(opened.kind, 'path');
+    const fileWin = await waitFor(async () => (await windowsNow()).find((w) => !beforeIds.has(w.id) && /live ü test/.test(w.title)), 20000, 300);
+    note(t, 'file window:', fileWin || (await windowsNow()));
+    assert.ok(fileWin, 'a window shows the opened file (unicode and spaces in the path)');
+    assert.equal(await driver.focusWindow(fileWin.id), true);
+    await sleep(300);
+    const text = await copyNotepadText(t);
+    assert.equal(text, 'opened-by-openTarget ü€\n', 'the file opened with its content');
+    beforeIds.add(fileWin.id);
+
+    const app = await common.openTarget('notepad', { kind: 'app' });
+    note(t, 'openTarget(notepad app):', app);
+    assert.equal(app.opened, true);
+    assert.equal(app.kind, 'app');
+    const appWin = await waitFor(async () => (await newNotepadWindows()).find((w) => !beforeIds.has(w.id) && w.id !== notepad.id), 20000, 300);
+    note(t, 'app window:', appWin);
+    assert.ok(appWin, 'openTarget started another Notepad');
+    await snap(t, '11-opened.png');
+
+    const n = await common.notify('Claude Anywhere live test', 'notify ü€ from the live desktop test');
+    note(t, 'notify:', n);
+    assert.equal(n.ok, true);
+    await driver.notify('Claude Anywhere host notify', 'ü€');
+
+    const s = await common.speak('Claude Anywhere live desktop test');
+    note(t, 'speak:', s);
+    assert.equal(s.engine, 'sapi');
+    const done = await Promise.race([s.done, sleep(60000).then(() => ({ timedOut: true }))]);
+    note(t, 'speak done:', { code: done.code, signal: done.signal, timedOut: done.timedOut, stderr: done.stderr, error: done.error && done.error.message });
+    assert.ok(!done.timedOut, 'speech finished');
+    assert.equal(done.code, 0, `SAPI speech failed: ${done.stderr || (done.error && done.error.message) || ''}`);
+  });
+
+  it('live-desktop: close Notepad without saving', { timeout: 60000 }, async (t) => {
+    assert.ok(notepad, 'Notepad was started');
+    killNotepads();
+    const gone = await waitFor(async () => (await newNotepadWindows()).length === 0, 15000, 300);
+    if (!gone) {
+      note(t, 'Notepad windows still open:', await newNotepadWindows());
+      await snap(t, '12-notepad-still-open.png');
+    }
+    assert.ok(gone, 'every Notepad window of ours closed (no save prompt)');
+    notepad = null;
   });
 });

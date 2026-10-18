@@ -280,6 +280,22 @@ test('paste saves and restores the clipboard', async () => {
   assert.equal(driver.state.clipboard, '');
 });
 
+test('paste restores the clipboard when the OS stores the pasted text with CRLF (Windows)', async () => {
+  // The Windows clipboard keeps CRLF: after writing "a\nb" the driver reads back "a\r\nb". That is
+  // still the pasted text, so the user's clipboard must be restored (found on a real Windows desktop).
+  const { driver, computer } = make({ mock: { clipboard: 'user data' }, platform: 'win32' });
+  const set = driver.clipboardSet;
+  driver.clipboardSet = (text) => set(String(text).replace(/\r?\n/g, '\r\n'));
+  const res = await computer.typeText({ text: 'line one\nline two' });
+  assert.equal(res.method, 'paste');
+  assert.equal(driver.state.typed, 'line one\r\nline two');
+  assert.equal(driver.state.clipboard, 'user data');
+  // A saved clipboard that equals the pasted text up to line endings needs no restore.
+  driver.state.clipboard = 'x\r\ny';
+  await computer.typeText({ text: 'x\ny', method: 'paste' });
+  assert.equal(driver.state.clipboard, 'x\r\ny');
+});
+
 test('paste does not clobber a clipboard the user changed meanwhile', async () => {
   const { driver, computer } = make({ mock: { clipboard: 'old' } });
   const orig = driver.keyCombo;
