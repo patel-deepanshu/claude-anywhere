@@ -749,9 +749,16 @@ test('X11: listWindows falls back to xdotool search without wmctrl', async () =>
   assert.equal(wins[1].title, 'Second — ü');
   assert.equal(wins[1].focused, true);
   assert.equal(wins[1].pid, process.pid);
-  // The app name comes from /proc/<pid>/comm, which only Linux has (the driver's real home).
-  if (process.platform === 'linux') assert.ok(wins[1].app.length > 0, 'app from /proc/<pid>/comm');
-  else assert.equal(wins[1].app, '', 'no /proc on this host: no app name, and no error');
+  // The app name is read from the real /proc/<pid>/comm of this test process. /proc is Linux-only
+  // (this suite also runs on the macOS CI leg), and without it the driver leaves the name blank.
+  let comm = '';
+  try {
+    comm = fs.readFileSync(`/proc/${process.pid}/comm`, 'utf8').trim();
+  } catch {
+    // no /proc on this platform
+  }
+  if (process.platform === 'linux') assert.ok(comm.length > 0 && wins[1].app.length > 0, 'app from /proc/<pid>/comm');
+  assert.equal(wins[1].app, L.prettifyApp(comm), 'app from /proc/<pid>/comm');
 });
 
 test('X11: activeWindow via xprop, null when nothing is focused', async () => {
