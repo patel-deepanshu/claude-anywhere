@@ -140,6 +140,58 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     return `lengths ${a.length}/${expected.length}, first difference at ${i}: actual [${codes(a)}] expected [${codes(expected)}]`;
   }
 
+  /**
+   * Ground truth for a failed typing check, read without the clipboard: each child control of the
+   * window with its class, WM_GETTEXTLENGTH, EM_GETSEL and the ends of its text, plus the formats
+   * on the clipboard. Diagnostics only (a separate Windows PowerShell, not the product's host).
+   */
+  function windowDiagnostics(hwnd) {
+    const script = `
+Add-Type -TypeDefinition @'
+using System; using System.Text; using System.Collections.Generic; using System.Runtime.InteropServices;
+public static class LiveDiag {
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr p, EnumProc cb, IntPtr l);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder sb, int n);
+  [DllImport("user32.dll", EntryPoint = "SendMessageW")] static extern IntPtr Send(IntPtr h, int m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll", EntryPoint = "SendMessageW", CharSet = CharSet.Unicode)] static extern IntPtr SendSb(IntPtr h, int m, IntPtr w, StringBuilder l);
+  [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr h);
+  [DllImport("user32.dll")] static extern bool CloseClipboard();
+  [DllImport("user32.dll")] static extern uint EnumClipboardFormats(uint f);
+  public static string Run(long hwnd) {
+    StringBuilder o = new StringBuilder();
+    EnumProc cb = delegate(IntPtr h, IntPtr l) {
+      StringBuilder c = new StringBuilder(256); GetClassName(h, c, 256);
+      int len = (int)Send(h, 0x000E, IntPtr.Zero, IntPtr.Zero);
+      StringBuilder t = new StringBuilder(len + 2); SendSb(h, 0x000D, new IntPtr(len + 1), t);
+      long sel = Send(h, 0x00B0, IntPtr.Zero, IntPtr.Zero).ToInt64();
+      string s = t.ToString();
+      string ends = s.Length > 60 ? s.Substring(0, 25) + " ... " + s.Substring(s.Length - 25) : s;
+      o.Append("child " + c + " len=" + len + " sel=" + (sel & 0xFFFF) + ".." + ((sel >> 16) & 0xFFFF) + " text=[" + ends + "]\\n");
+      return true;
+    };
+    EnumChildWindows(new IntPtr(hwnd), cb, IntPtr.Zero);
+    GC.KeepAlive(cb);
+    if (OpenClipboard(IntPtr.Zero)) {
+      List<string> f = new List<string>(); uint x = 0;
+      while ((x = EnumClipboardFormats(x)) != 0) f.Add(x.ToString());
+      CloseClipboard();
+      o.Append("clipboard formats: " + string.Join(",", f.ToArray()));
+    } else o.Append("clipboard: could not open");
+    return o.ToString();
+  }
+}
+'@
+[Console]::Out.WriteLine([LiveDiag]::Run(${Number(hwnd)}))
+`;
+    const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
+      encoding: 'utf8',
+      timeout: 60000,
+      windowsHide: true,
+    });
+    return `${String(r.stdout || '').trim()}${r.stderr ? ` stderr: ${require('../src/shared/proc').psErrorText(r.stderr).slice(0, 800)}` : ''}`;
+  }
+
   /** Type into a cleared Notepad, copy it back and compare. */
   async function typeAndCompare(t, text, label) {
     await clearNotepad(t);
@@ -148,9 +200,13 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     note(t, `${label}: typed ${text.length} UTF-16 units in ${Date.now() - started} ms; result ${show(r === undefined ? null : r)}`);
     await sleep(500);
     note(t, `${label}: active window after typing:`, await driver.activeWindow());
+    note(t, `${label}: before copying: ${windowDiagnostics(notepad.id)}`);
     await snap(t, `${label}.png`);
     const got = await copyNotepadText(t);
-    if (got !== text) note(t, `${label}: ${firstDiff(got, text)}`);
+    if (got !== text) {
+      note(t, `${label}: ${firstDiff(got, text)}`);
+      note(t, `${label}: after copying: ${windowDiagnostics(notepad.id)}`);
+    }
     return got;
   }
 
@@ -433,6 +489,13 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
   it('live-desktop: typeText of astral characters (surrogate pairs) through SendInput', { timeout: 60000 }, async (t) => {
     const text = 'astral 🎉 ok 𝄞 end';
     const got = await typeAndCompare(t, text, '06b-astral');
+    assert.equal(got, text);
+  });
+
+  it('live-desktop: a 1000-character typed line arrives whole', { timeout: 120000 }, async (t) => {
+    // Within one driver chunk (1000 UTF-16 units), but many 64-character SendInput batches.
+    const text = 'klmnopqrst'.repeat(100);
+    const got = await typeAndCompare(t, text, '06c0-line-1000');
     assert.equal(got, text);
   });
 
