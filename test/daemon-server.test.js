@@ -259,7 +259,8 @@ test('health needs no token and reports the instance', async () => {
     const res = await fetch(`${s.base}/api/health`);
     assert.equal(res.status, 200);
     const body = await res.json();
-    assert.deepEqual(body, { ok: true, app: 'claude-anywhere', version: '9.9.9', instanceId: 'inst-1', pid: process.pid });
+    const { homeId, currentUid } = require('../src/daemon/server');
+    assert.deepEqual(body, { ok: true, app: 'claude-anywhere', version: '9.9.9', instanceId: 'inst-1', pid: process.pid, home: homeId(), uid: currentUid() });
     assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
     assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
     assert.equal(res.headers.get('cache-control'), 'no-store');

@@ -525,7 +525,9 @@ test("the engine runs with the dialog's permission mode and without the user's a
     await s.submit({ text: 'hi' });
     await s.drain();
     const e = await engine();
-    assert.equal(e.opts.env.ANYWHERE_ENGINE_CHILD, '1');
+    // No inheritable marker (it leaked into every app the engine opened); the plugin copy's tools are denied instead.
+    assert.ok('ANYWHERE_ENGINE_CHILD' in e.opts.env && e.opts.env.ANYWHERE_ENGINE_CHILD == null);
+    assert.deepEqual(e.opts.disallowedTools, ['mcp__plugin_anywhere_anywhere']);
     assert.equal(e.opts.permissionMode, undefined, 'buildArgs pins "default"');
     const settings = JSON.parse(fs.readFileSync(e.opts.settingsPath, 'utf8'));
     assert.deepEqual(settings, { enabledPlugins: { 'anywhere@anywhere-marketplace': false, 'anywhere@my-fork': false, 'anywhere@team': false } });
@@ -533,6 +535,7 @@ test("the engine runs with the dialog's permission mode and without the user's a
     const { buildArgs } = require('../src/daemon/engine-cli');
     const args = buildArgs(e.opts);
     assert.equal(args[args.indexOf('--permission-mode') + 1], 'default');
+    assert.equal(args[args.indexOf('--disallowedTools') + 1], 'mcp__plugin_anywhere_anywhere');
     assert.equal(args[args.indexOf('--settings') + 1], e.opts.settingsPath);
     const file = e.opts.settingsPath;
     await s.shutdown();

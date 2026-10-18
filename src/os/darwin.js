@@ -42,6 +42,9 @@ const PERM_TTL_MS = 60000;
 const FRESH_PERM_RECHECK_MS = 3000;
 const DISPLAY_CACHE_MS = 1500;
 const TYPE_CHUNK = 50;
+// Per paste and once per typing request: match PASTE_SETTLE and PASTE_RESTORE in darwin-helper.js.
+const PASTE_STEP_MS = 800;
+const PASTE_RESTORE_MS = 1500;
 const KEY_RETURN = 36;
 const KEY_TAB = 48;
 const MAX_NOTCHES = 200;
@@ -365,7 +368,10 @@ function parseWindowId(id) {
  * every run is pasted (keystroke follows the keyboard layout and input method,
  * which garbles ASCII on non-Latin layouts such as Russian or Greek and under
  * input methods such as Japanese or Korean; the helper detects those and
- * pastes such steps itself).
+ * pastes such steps itself). On layouts with dead keys (U.S. International,
+ * German, French...) the helper also pastes the keystroke steps that contain
+ * a quote, backtick, caret or tilde, which a dead key would compose into the
+ * next letter.
  * @param {string} text
  * @param {{chunk?:number, pasteAll?:boolean}} [opts]
  * @returns {Array<{kind:'keys'|'paste',text:string}|{kind:'key',keyCode:number}>}
@@ -400,14 +406,22 @@ function planTyping(text, { chunk = TYPE_CHUNK, pasteAll = false } = {}) {
   return steps;
 }
 
-/** Time budget for a typing plan. */
+/**
+ * Time budget for a typing plan. A paste takes about half a second (the helper lets the
+ * target app read the pasteboard before the next step) and the clipboard is restored 1 s
+ * after the last one. The helper may paste keystroke steps itself (input methods, dead keys),
+ * so those are budgeted as pastes at least.
+ */
 function typingTimeoutMs(steps) {
   let ms = REQUEST_TIMEOUT_MS;
+  let text = false;
   for (const s of steps) {
-    if (s.kind === 'keys') ms += 40 * s.text.length + 100;
-    else if (s.kind === 'paste') ms += 700;
+    if (s.kind === 'keys') ms += Math.max(40 * s.text.length + 100, PASTE_STEP_MS);
+    else if (s.kind === 'paste') ms += PASTE_STEP_MS;
     else ms += 60;
+    if (s.kind === 'keys' || s.kind === 'paste') text = true;
   }
+  if (text) ms += PASTE_RESTORE_MS;
   return Math.min(ms, 10 * 60 * 1000);
 }
 
@@ -1442,6 +1456,13 @@ class DarwinDriver {
         'info',
         `The active input source${src.id ? ` (${src.id})` : ''} would garble System Events keystrokes, so text was pasted instead.`,
       );
+    } else if (why === 'dead-keys') {
+      const src = (res && res.inputSource) || {};
+      this._logOnce(
+        `dead-keys:${src.id || ''}`,
+        'info',
+        `The keyboard layout${src.id ? ` (${src.id})` : ''} may have dead keys, so text with quotes, backticks, carets or tildes was pasted instead of typed.`,
+      );
     }
   }
 
@@ -1453,8 +1474,9 @@ class DarwinDriver {
     await this._call('key', {
       keyCode: k.keyCode,
       keyCodes,
-      // Base characters per key: the helper presses the key that types them on the active
-      // layout (Cmd+Z on AZERTY is not the US-position Z key). null = position-independent key.
+      // Characters per key: the helper presses the key that types them on the active layout
+      // (Cmd+Z on AZERTY is not the US-position Z key), looked up in the Command keymap for Cmd
+      // chords, and may set Shift or Option for that key. null = position-independent key.
       chars: Array.isArray(k.chars) ? k.chars : [],
       flags: Number(k.flags) || 0,
       modifierKeyCodes: Array.isArray(k.modifierKeyCodes) ? k.modifierKeyCodes : [],
@@ -1477,8 +1499,19 @@ class DarwinDriver {
   }
 
   async focusWindow(id) {
+    return (await this._focus(id)).ok;
+  }
+
+  /**
+   * Activate a window's app and raise the window itself.
+   * @returns {Promise<{ok:boolean, raised:boolean}>} ok: the app is frontmost; raised: the
+   *   window was found through accessibility and raised (otherwise another window of the app,
+   *   or of another instance of it, may be in front)
+   */
+  async _focus(id) {
+    const no = { ok: false, raised: false };
     const ref = parseWindowId(id);
-    if (!ref) return false;
+    if (!ref) return no;
     let res = null;
     try {
       res = await this._call('focus', ref, { timeoutMs: 15000 });
@@ -1486,23 +1519,23 @@ class DarwinDriver {
       if (err.code === 'PERMISSION' || err.code === 'UNSUPPORTED') throw err;
       log.warn(`focusing window ${id} failed: ${err.message}`);
     }
-    if (res && res.ok) return true;
-    if (!res || /not running|does not belong/.test(res.reason || '')) return false;
+    if (res && res.ok) return { ok: true, raised: res.raised === true };
+    if (!res || /not running|does not belong/.test(res.reason || '')) return no;
     // With several instances of the app running (the dialog's own browser next to the user's),
     // LaunchServices would activate whichever it picks, likely the wrong one.
-    if (Number(res.instances) > 1) return false;
+    if (Number(res.instances) > 1) return no;
     // Activation can be refused (cooperative activation on macOS 14+): ask LaunchServices instead.
     const target = res.bundlePath ? ['-a', res.bundlePath] : res.bundleId ? ['-b', res.bundleId] : null;
-    if (!target) return false;
+    if (!target) return no;
     const r = await this._runImpl(this._tool('open', '/usr/bin/open') || 'open', target, { timeoutMs: 8000, env: this._env });
-    if (r.error || r.timedOut || r.code !== 0) return false;
+    if (r.error || r.timedOut || r.code !== 0) return no;
     await sleep(250);
     try {
       const again = await this._call('focus', ref, { timeoutMs: 15000 });
-      return Boolean(again && again.ok);
+      return { ok: Boolean(again && again.ok), raised: Boolean(again && again.ok && again.raised === true) };
     } catch (err) {
       if (err.code === 'PERMISSION') throw err;
-      return false;
+      return no;
     }
   }
 
@@ -1517,8 +1550,10 @@ class DarwinDriver {
       if (err.code === 'PERMISSION' || err.code === 'UNSUPPORTED') throw err;
       log.debug(`AXMinimized failed for ${id}: ${err.message}`);
     }
-    // Fall back to the standard Minimize shortcut on the focused window.
-    if (!(await this.focusWindow(id))) return false;
+    // Fall back to the standard Minimize shortcut, but only once the window itself is raised:
+    // Cmd+M acts on the front window of the app, which may be another window or instance.
+    const focused = await this._focus(id);
+    if (!focused.ok || !focused.raised) return false;
     await this.keyCombo(['meta', 'm']);
     return true;
   }

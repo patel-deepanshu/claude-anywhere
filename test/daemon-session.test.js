@@ -813,11 +813,11 @@ test('newSession, setProject and setMode', async () => {
     const proj = await s.setProject(dir);
     assert.equal(proj.dir, path.resolve(dir));
     assert.equal(of('project').pop().dir, path.resolve(dir));
-    assert.throws(() => s.setMode('weird'), /mode/);
-    s.setMode('bridge');
+    await assert.rejects(s.setMode('weird'), /mode/);
+    assert.deepEqual(await s.setMode('bridge'), { mode: 'bridge' });
     assert.deepEqual(of('mode').pop(), { mode: 'bridge' });
     assert.equal(s.snapshot().mode, 'bridge');
-    s.setMode('companion');
+    await s.setMode('companion');
     assert.deepEqual(await s.bridge.next(10), { stop: true });
   } finally {
     await s.shutdown();

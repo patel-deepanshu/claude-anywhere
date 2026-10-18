@@ -95,12 +95,17 @@ class Bridge extends EventEmitter {
   }
 
   /**
-   * Queue a command for the terminal session.
+   * Queue a command for the terminal session. A stopped bridge (companion mode) takes none: it
+   * would hand them to the next "/anywhere here", maybe hours later.
    * @param {{id?:string, text:string, images?:string[], context?:string, source?:string}} cmd
    * @param {{front?:boolean}} [opts]
-   * @returns {object} the queued command (with id and ts)
+   * @returns {object|null} the queued command (with id and ts), or null while stopped
    */
   enqueue(cmd, { front = false } = {}) {
+    if (this.stopped) {
+      log.info(`dropping bridge command ${(cmd && cmd.id) || '?'}: bridge mode is off`);
+      return null;
+    }
     const item = {
       id: (cmd && cmd.id) || uuid(),
       text: truncate(String((cmd && cmd.text) || ''), 100000),
@@ -133,6 +138,7 @@ class Bridge extends EventEmitter {
   requeue(cmd) {
     if (!cmd) return;
     if (this.current && this.current.id === cmd.id) this.current = null;
+    if (this.stopped) return; // enqueue() would drop it anyway
     log.info(`re-queueing bridge command ${cmd.id}: the listener disconnected before receiving it`);
     this.emit('requeued', cmd);
     this.enqueue(cmd, { front: true });

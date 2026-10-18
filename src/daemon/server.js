@@ -145,6 +145,23 @@ function validateConfigUpdate(partial, defaults = configMod.DEFAULTS, prefix = '
   return null;
 }
 
+/**
+ * A non-secret id of a state directory (and so of one user's install) for /api/health, so a
+ * starting daemon can tell its own daemon on a port from another user's or ANYWHERE_HOME's.
+ * @param {string} [dir]
+ * @returns {string}
+ */
+function homeId(dir = paths.stateDir()) {
+  let p = path.resolve(dir);
+  if (process.platform === 'win32') p = p.toLowerCase();
+  return crypto.createHash('sha256').update(p).digest('hex').slice(0, 16);
+}
+
+/** @returns {number|null} this process's uid (null on Windows) */
+function currentUid() {
+  return typeof process.getuid === 'function' ? process.getuid() : null;
+}
+
 function contentTypeOf(req) {
   return String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
 }
@@ -245,6 +262,8 @@ class DaemonServer {
     });
     this.claimedApprovals = new Set();
     this.launchCodes = new Map(); // single-use launch code -> expiresAt (ms)
+    this.home = deps.home || homeId();
+    this.stopping = false; // set by the daemon's shutdown: health answers 503, routes that start work refuse
     this.routes = this.buildRoutes();
   }
 
@@ -311,22 +330,23 @@ class DaemonServer {
     add('POST', '/api/launch', this.launch, { noAuth: true });
     add('GET', '/api/events', this.events, { queryToken: true, noBody: true });
     add('GET', '/api/state', () => this.session.snapshot(), { noBody: true });
-    add('POST', '/api/command', this.command);
+    // notWhileStopping: work that would outlive a daemon that is shutting down (a new turn, a new window)
+    add('POST', '/api/command', this.command, { notWhileStopping: true });
     add('POST', '/api/interrupt', this.interrupt);
     add('POST', '/api/approval', this.approval);
     add('POST', '/api/answer', this.answer);
-    add('POST', '/api/session/new', this.newSession);
-    add('POST', '/api/project', this.project);
+    add('POST', '/api/session/new', this.newSession, { notWhileStopping: true });
+    add('POST', '/api/project', this.project, { notWhileStopping: true });
     add('GET', '/api/projects', this.projects, { noBody: true });
     add('GET', '/api/config', () => configMod.publicConfig(this.deps.config), { noBody: true });
     add('POST', '/api/config', this.saveConfig);
-    add('POST', '/api/mode', this.mode);
+    add('POST', '/api/mode', this.mode, { notWhileStopping: true });
     add('POST', '/api/stt', this.stt, { raw: true });
     add('POST', '/api/tts', this.tts);
     add('POST', '/api/tts/stop', this.ttsStop);
     add('GET', '/api/context', this.context, { noBody: true });
     add('GET', '/api/permissions', this.osPermissions, { noBody: true });
-    add('POST', '/api/show', this.show);
+    add('POST', '/api/show', this.show, { notWhileStopping: true });
     add('POST', '/api/shutdown', this.shutdown);
     add('POST', '/api/mcp/permission', this.mcpPermission);
     add('POST', '/api/mcp/ask', this.mcpAsk);
@@ -414,6 +434,10 @@ class DaemonServer {
     }
     if (!route.noAuth && !tokenMatches(this.tokenFrom(req, url, Boolean(route.queryToken)), this.token)) {
       throw httpError(401, 'Unauthorized');
+    }
+    if (route.notWhileStopping && this.stopping) {
+      req.resume();
+      throw httpError(503, 'Claude Anywhere is shutting down', { hint: 'Run /anywhere (or: anywhere start) again in a moment.' });
     }
     let body = {};
     let raw = null;
@@ -509,9 +533,14 @@ class DaemonServer {
 
   // ---------------------------------------------------------------- handlers
 
-  /** @private */
-  health() {
-    return { ok: true, app: 'claude-anywhere', version: this.deps.version, instanceId: this.deps.instanceId, pid: process.pid };
+  /** @private home and uid tell a starting daemon whether this one is its own (see main.js isOwnDaemon) */
+  health({ res }) {
+    const body = { ok: true, app: 'claude-anywhere', version: this.deps.version, instanceId: this.deps.instanceId, pid: process.pid, home: this.home, uid: currentUid() };
+    if (!this.stopping) return body;
+    // Not "running" for findRunningDaemon (any non-2xx is not), so /anywhere does not reuse a daemon
+    // that is going away; the body still lets a new daemon wait for this one to free the port.
+    sendJson(res, 503, { ...body, ok: false, shuttingDown: true });
+    return HANDLED;
   }
 
   /** @private trade a single-use launch code (from launchUrl()) for the token */
@@ -649,8 +678,8 @@ class DaemonServer {
   }
 
   /** @private */
-  mode({ body }) {
-    const { mode } = this.session.setMode(body.mode);
+  async mode({ body }) {
+    const { mode } = await this.session.setMode(body.mode);
     return { ok: true, mode };
   }
 
@@ -928,4 +957,4 @@ function createServer(deps) {
   return new DaemonServer(deps);
 }
 
-module.exports = { createServer, DaemonServer, tokenMatches, validateConfigUpdate, SECURITY_HEADERS, CSP, MIME };
+module.exports = { createServer, DaemonServer, tokenMatches, validateConfigUpdate, homeId, currentUid, SECURITY_HEADERS, CSP, MIME };
