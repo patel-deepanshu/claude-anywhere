@@ -367,6 +367,34 @@ test('symlinks out of the project count as outside', (t) => {
   }
 });
 
+test('symlinks out of the project are caught when the home folder itself sits behind a symlink', (t) => {
+  if (process.platform === 'win32') return t.skip('symlinks need privileges on Windows');
+  // Like macOS, where os.tmpdir() is /var/folders/... and /var links to /private/var: home, project
+  // and the escape link are all reached through `alias`, but realpath answers with `real`.
+  const real = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-perm-alias-')));
+  const alias = `${real}-alias`;
+  try {
+    fs.symlinkSync(real, alias);
+    const home = path.join(alias, 'home');
+    const proj = path.join(alias, 'proj');
+    const ssh = path.join(home, '.ssh');
+    fs.mkdirSync(proj);
+    fs.mkdirSync(ssh, { recursive: true });
+    fs.symlinkSync(ssh, path.join(proj, 'escape'));
+    const opts = { projectDir: proj, homeDir: home, platform: process.platform };
+    assert.equal(classify('Write', { file_path: path.join(proj, 'ok.txt') }, opts).risk, 'medium');
+    const r = classify('Write', { file_path: path.join(proj, 'escape', 'authorized_keys') }, opts);
+    assert.equal(r.risk, 'high', r.reason);
+    assert.match(r.reason, /SSH/);
+    assert.equal(classify('Bash', { command: `echo key >> ${path.join(proj, 'escape', 'authorized_keys')}` }, opts).risk, 'high');
+    // The home folder given by its real path works the same.
+    assert.equal(classify('Write', { file_path: path.join(proj, 'escape', 'authorized_keys') }, { ...opts, homeDir: path.join(real, 'home') }).risk, 'high');
+  } finally {
+    fs.rmSync(alias, { force: true });
+    fs.rmSync(real, { recursive: true, force: true });
+  }
+});
+
 test('read-only tools are low', () => {
   const tools = [
     ['Read', { file_path: '/home/u/proj/README.md' }],

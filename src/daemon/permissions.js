@@ -810,14 +810,21 @@ function classifyContext(opts = {}) {
   const projectDir = opts.projectDir ? P.resolve(String(opts.projectDir)) : null;
   const real = platform === process.platform && !opts.noRealpath;
   const env = opts.env || process.env;
+  const home = P.resolve(homeDir);
+  const anywhereHome = env.ANYWHERE_HOME ? P.resolve(env.ANYWHERE_HOME) : null;
+  const claudeHome = env.CLAUDE_CONFIG_DIR ? P.resolve(env.CLAUDE_CONFIG_DIR) : null;
   return {
     platform,
-    homeDir: P.resolve(homeDir),
+    homeDir: home,
     projectDir,
     projectReal: projectDir && real ? realish(projectDir) : projectDir,
     extraDirs: (Array.isArray(opts.extraDirs) ? opts.extraDirs : []).filter(Boolean).map((d) => P.resolve(String(d))),
-    anywhereHome: env.ANYWHERE_HOME ? P.resolve(env.ANYWHERE_HOME) : null,
-    claudeHome: env.CLAUDE_CONFIG_DIR ? P.resolve(env.CLAUDE_CONFIG_DIR) : null,
+    anywhereHome,
+    claudeHome,
+    // The same roots with symlinks resolved, to compare with a resolved target (realSensitiveKind).
+    homeReal: real ? realish(home) : home,
+    anywhereReal: anywhereHome && real ? realish(anywhereHome) : anywhereHome,
+    claudeReal: claudeHome && real ? realish(claudeHome) : claudeHome,
     tmpDir: opts.tmpDir || (platform === process.platform ? os.tmpdir() : null),
     real,
     shell: 'bash',
@@ -929,6 +936,23 @@ function isUnder(child, dir, win) {
 function realOf(t, ctx) {
   if (!ctx.real || t.win !== (process.platform === 'win32')) return t.abs;
   return realish(t.abs);
+}
+
+/**
+ * sensitiveKind for where a written path really lands: symlinks resolved in the target and, to
+ * match, in the home, state and config roots it is compared with. Resolving only the target
+ * misses a link into ~/.ssh whenever the home folder itself sits behind a symlink (macOS
+ * /var -> /private/var, /home -> /var/home on Fedora Atomic, automounted home folders).
+ */
+function realSensitiveKind(t, ctx) {
+  if (!ctx.real) return null;
+  const roots = {
+    ...ctx,
+    homeDir: ctx.homeReal ?? ctx.homeDir,
+    anywhereHome: ctx.anywhereReal ?? ctx.anywhereHome,
+    claudeHome: ctx.claudeReal ?? ctx.claudeHome,
+  };
+  return sensitiveKind({ ...t, abs: realOf(t, ctx) }, roots);
 }
 
 /** Is a resolved target inside the project (or an extra allowed directory)? */
@@ -2753,7 +2777,7 @@ function targetVerdict(raw, ctx, verb = 'Writes to') {
   const t = resolveTarget(r, ctx, ctx.cwd);
   if (!t) return null;
   if (!t.win && DISK_DEVICE_RE.test(t.abs)) return V('critical', `Writes directly to the disk device ${t.abs}`);
-  const sens = sensitiveKind(t, ctx) || (ctx.real ? sensitiveKind({ ...t, abs: realOf(t, ctx) }, ctx) : null);
+  const sens = sensitiveKind(t, ctx) || realSensitiveKind(t, ctx);
   if (sens && sens.level === 'critical') return V('critical', `${verb} ${sens.what} (self-escalation)`);
   if (sens) return V('high', `${verb} ${sens.what}`);
   if (insideProject(t, ctx) || isTempPath(t, ctx)) return null;
@@ -4571,7 +4595,7 @@ function classify(toolName, input, opts = {}) {
     if (!raw) return { risk: 'medium', reason: 'Edits a file (no path given)', summary };
     const t = resolveTarget(raw, ctx, ctx.projectDir);
     if (!t) return { risk: 'high', reason: 'Edits a file whose location could not be resolved', summary };
-    const sens = sensitiveKind(t, ctx) || (ctx.real ? sensitiveKind({ ...t, abs: realOf(t, ctx) }, ctx) : null);
+    const sens = sensitiveKind(t, ctx) || realSensitiveKind(t, ctx);
     if (sens && sens.level === 'critical') return { risk: 'critical', reason: `Modifies ${sens.what} (self-escalation)`, summary };
     if (sens) return { risk: 'high', reason: `Modifies ${sens.what}`, summary };
     if (insideProject(t, ctx)) return { risk: 'medium', reason: 'Edits a file inside the project', summary };
