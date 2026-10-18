@@ -105,8 +105,9 @@ function isUsableFile(p) {
   }
 }
 
-function isExecutable(p) {
-  if (process.platform === 'win32') return true;
+/** Windows has no execute bit; elsewhere (the target `platform`, not the host's) it must be set. */
+function isExecutable(p, platform = process.platform) {
+  if (platform === 'win32') return true;
   try {
     fs.accessSync(p, fs.constants.X_OK);
     return true;
@@ -159,7 +160,7 @@ function resolveCmdShim(shimPath) {
  * @returns {{command:string, args:string[], shell:boolean}}
  */
 function launchSpec(cliPath, args, platform = process.platform) {
-  if (SCRIPT_EXT.test(cliPath) && (platform === 'win32' || !isExecutable(cliPath))) {
+  if (SCRIPT_EXT.test(cliPath) && (platform === 'win32' || !isExecutable(cliPath, platform))) {
     return { command: process.execPath, args: [cliPath, ...args], shell: false };
   }
   if (platform === 'win32' && WIN_SHELL_EXT.test(cliPath)) {

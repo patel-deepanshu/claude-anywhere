@@ -358,11 +358,13 @@ test('anywhere start prints the token URL only when no window opened; SSH sessio
 test('CLI screenshots: the newest 30 are kept, none older than an hour (JOURNEYS-DOCS-8)', () => {
   const dir = fs.mkdtempSync(path.join(HOME, 'shots-'));
   const now = Date.now() / 1000;
-  for (let i = 0; i < 5; i += 1) {
+  // A minute either side of the one-hour limit: a file exactly 60 minutes old raced the clock
+  // (kept when pruneScreenshots ran in the same millisecond as `now`, removed otherwise).
+  [0, 20, 59, 61, 80].forEach((minutes, i) => {
     const f = path.join(dir, `screenshot-${i}.png`);
     fs.writeFileSync(f, 'x');
-    fs.utimesSync(f, now - i * 1200, now - i * 1200); // 0, 20, 40, 60, 80 minutes old
-  }
+    fs.utimesSync(f, now - minutes * 60, now - minutes * 60);
+  });
   fs.writeFileSync(path.join(dir, 'bridge-1.png'), 'x');
   cli.pruneScreenshots(dir, 30);
   assert.deepEqual(fs.readdirSync(dir).sort(), ['bridge-1.png', 'screenshot-0.png', 'screenshot-1.png', 'screenshot-2.png']);
