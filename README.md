@@ -76,6 +76,8 @@ plugin launcher) and the user PATH entry that install.ps1 added; `--purge` also 
 | `/anywhere here` | **Bridge mode**: *this* terminal session takes the dialog's commands, so you can watch it work. |
 | `/anywhere status` · `/anywhere stop` | Shows what it's doing, or shuts it down. |
 | `/anywhere doctor` · `/anywhere setup` | Checks this machine, or installs the personal skill and MCP tools. |
+| `/anywhere:clone-voice` · `/anywhere clone-voice` | Records your own voice (consent sentence + 14 short lines, about 3 minutes) for answering calls. It stays on this computer; `delete` removes it. |
+| `/anywhere answer my calls until 6` | After **your click** in the dialog, an AI assistant answers your Zoho Cliq, Meet, Teams, Slack and Zoom calls in your voice, says it is an AI, helps with safe requests and leaves notes on your Desktop. `calls off` stops it. |
 
 In the dialog:
 - **Type** and press Enter, or **talk**: click the mic, or hold Space for push-to-talk. Say "stop" to interrupt.
@@ -155,6 +157,32 @@ ticket straight from the page. Add the folders where you keep code under Setting
 
 ---
 
+## Answer calls in your own voice
+
+> *"If anyone calls me on this laptop, answer and assist."*
+
+Claude Anywhere can answer your calls while you are away: it detects the ring, waits a few seconds so you can pick
+up yourself, answers, and talks to the caller in your cloned voice. It can look up an unassigned Jira ticket and
+assign it to the caller, message them on Cliq after the call, and note everything else for you. Every call starts
+with *"Hi Ankit, this is Deepanshu's AI assistant, speaking in his voice. I'm transcribing this call to take notes
+for him."*, composed in code so no setting can remove it. Notes land in `<Desktop>/Claude Call Notes/`.
+
+```bash
+anywhere clone-voice install       # free local voice runtime and models (~425 MB, once)
+anywhere clone-voice               # record your voice in the dialog (or /anywhere:clone-voice)
+anywhere calls doctor              # virtual microphone (free: PulseAudio/PipeWire, VB-CABLE, BlackHole), detection, notes
+anywhere calls on --for 2h         # shows a card: only a click on "Allow once" turns it on
+anywhere calls off
+```
+
+Safeguards: only your own voice, after a spoken consent with a one-time code; answering is off by default, armed
+only by a click, expires, and respects quiet hours (22:00–08:00); during calls the assistant can use only a few
+call tools, and treats everything the caller says as a request, not an instruction. Everything runs locally
+except the call app, your Jira and your Claude Code login. Setup per OS, Zoho Cliq, notes and settings:
+[docs/CALLS.md](docs/CALLS.md).
+
+---
+
 ## Safety
 
 - The dialog's API listens on **127.0.0.1 only**. It requires a per-run random token and checks Host/Origin headers, so web pages and other local software can't drive your computer.
@@ -204,6 +232,10 @@ Per-OS setup and permissions: [docs/PLATFORMS.md](docs/PLATFORMS.md).
 | `voice.piperVoice` | `en_US-lessac-medium` | The Piper voice (`anywhere voice use …`) |
 | `voice.announce.done` / `.permission` / `.question` / `.error`, `voice.chime` | `true` | What is said aloud, and the chime before it |
 | `jira.baseUrl`, `jira.email`, `jira.apiToken` | (empty) | Jira connection (`anywhere jira setup`); the token is never shown |
+| `voice.clone.enabled`, `voice.clone.engine` | `false`, `pocket` | Your cloned voice (set by the enrollment; `zipvoice` is the slower quality voice) |
+| `calls.apps`, `calls.answerAfterSec`, `calls.quietHours` | all five apps, `8`, `22:00`–`08:00` | Which call apps are answered, after how long, and never when ([docs/CALLS.md](docs/CALLS.md)) |
+| `calls.ownerName`, `calls.ownerPronoun`, `calls.greeting` | (Jira/OS name), `their`, (empty) | How the greeting names you; the disclosure is always kept |
+| `calls.notesDir`, `calls.cliq.mode` | (Desktop), `gui` | Where call notes go; `api` after `anywhere calls cliq setup` |
 | `workspace.roots` | `[]` | Folders searched first for repositories when Claude asks where to work |
 | `context.attachDesktopContext` | `true` | Send the active window, editors, browser tabs, git and cloud CLI state with each command |
 | `computer.maxWidth` / `maxHeight` | `1366` / `768` | Screenshot size sent to the model |
@@ -213,7 +245,8 @@ Per-OS setup and permissions: [docs/PLATFORMS.md](docs/PLATFORMS.md).
 Environment variables: `ANYWHERE_HOME`, `ANYWHERE_CLAUDE_PATH`, `ANYWHERE_BROWSER`, `ANYWHERE_ELECTRON`,
 `ANYWHERE_DRIVER`, `ANYWHERE_STT_API_KEY` / `ANYWHERE_STT_BASE_URL` / `ANYWHERE_STT_MODEL`,
 `GROQ_API_KEY`, `OPENAI_API_KEY`, `ANYWHERE_PIPER_PATH`, `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN`,
-`ANYWHERE_DEBUG=1`, and `ANYWHERE_UNICODE=1` / `ANYWHERE_ASCII=1`.
+`ANYWHERE_PYTHON`, `ANYWHERE_CLONE_ASSET_BASE` / `ANYWHERE_CLONE_UV_BASE` (download mirrors for the voice runtime),
+`ANYWHERE_CLONE_WSL=linux`, `ANYWHERE_DEBUG=1`, and `ANYWHERE_UNICODE=1` / `ANYWHERE_ASCII=1`.
 
 `anywhere tui` and the `anywhere` CLI use ASCII symbols unless the locale (`LC_ALL`, `LC_CTYPE`, then `LANG`) is
 UTF-8: on Linux an unset locale means ASCII, while macOS defaults to Unicode. `ANYWHERE_UNICODE=1` forces the symbols
@@ -231,7 +264,9 @@ and `ANYWHERE_ASCII=1` forces ASCII.
                                          │        windows · open · clipboard · context · ask_user · notify ·
                                          │        read_browser_tab · jira_* · find_repos · switch_project
                                          ├─ approvals (--permission-prompt-tool) · questions · bridge queue
-                                         └─ voice (server STT, Piper/OS TTS, announcer) · desktop context · audit log
+                                         ├─ voice (server STT, Piper/OS TTS, announcer) · desktop context · audit log
+                                         └─ calls: ring detection · voice sidecar (clone TTS, local STT) · virtual mic ·
+                                            claude -p haiku with call-only tools · notes on the Desktop
 ```
 
 - The plan, with every design decision and its rationale: [docs/PLAN.md](docs/PLAN.md)
@@ -248,13 +283,14 @@ and `ANYWHERE_ASCII=1` forces ASCII.
 - **Voice button greyed out**: use Chrome or Edge, or set `GROQ_API_KEY` or `OPENAI_API_KEY` (see [docs/VOICE.md](docs/VOICE.md)).
 - **No spoken announcements**: check `anywhere voice status` (engine, voice, audio player) and Settings → Voice → Speak answers; `anywhere voice test` plays a sample.
 - **Jira**: `anywhere jira test` explains a failed connection (wrong token, SSO, proxy); see [docs/JIRA.md](docs/JIRA.md).
+- **Calls**: `anywhere calls doctor` checks the voice runtime, the virtual microphone, ring detection and the notes folder, and `anywhere calls test-audio` tests the audio in your browser; see [docs/CALLS.md](docs/CALLS.md).
 
 ---
 
 ## Development
 
 ```bash
-npm test                     # about 1,140 node:test tests (Node 18+); no network or display needed
+npm test                     # about 1,480 node:test tests (Node 18+); no network, display or audio device needed
 node scripts/check-syntax.js
 ANYWHERE_DRIVER=mock node bin/anywhere.js computer screenshot --out /tmp/s.png
 ANYWHERE_LIVE_DESKTOP=1 node scripts/test.js --test-name-pattern=live-desktop   # drives YOUR real desktop

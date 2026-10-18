@@ -44,10 +44,16 @@ const MAX_NOTCHES = 200;
 const KILL_GRACE_MS = 3000;
 
 /** Read-only commands that are safe to resend once after a host crash. */
-const RETRYABLE = new Set(['ping', 'displays', 'capture', 'cursor', 'windows', 'active', 'clipget', 'browsertab']);
+const RETRYABLE = new Set(['ping', 'displays', 'capture', 'cursor', 'windows', 'active', 'clipget', 'browsertab', 'audioDefaultGet', 'toastTexts', 'desktopPath']);
 /** UI Automation walk of a browser window: the host stops looking after BROWSER_TAB_BUDGET_MS. */
 const BROWSER_TAB_BUDGET_MS = 4000;
 const BROWSER_TAB_TIMEOUT_MS = 15000;
+
+/** Call audio (docs/CALLS-DESIGN.md §5.2): the first call compiles the Core Audio bridge (Add-Type). */
+const AUDIO_TIMEOUT_MS = 20000;
+const AUDIO_FLOWS = new Set(['capture', 'render', 'all']);
+const AUDIO_ROLES = ['console', 'multimedia', 'communications'];
+const AUDIO_ID_RE = /^\{[0-9.]+\}\.\{[0-9A-Fa-f-]{36}\}$/;
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const BUTTONS = new Set(['left', 'right', 'middle', 'x1', 'x2']);
@@ -778,6 +784,24 @@ function hostWarnings(...results) {
   return { warnings };
 }
 
+function endpointRecord(e) {
+  if (!e || typeof e !== 'object' || !e.id) return null;
+  return { id: String(e.id), name: String(e.name || '') };
+}
+
+/** One flow of audioDefaultGet: {flow, console, multimedia, communications, devices:[{id, name}]}. */
+function audioFlowRecord(r) {
+  const o = r && typeof r === 'object' ? r : {};
+  const list = Array.isArray(o.devices) ? o.devices : o.devices && typeof o.devices === 'object' ? [o.devices] : [];
+  return {
+    flow: o.flow || null,
+    console: endpointRecord(o.console),
+    multimedia: endpointRecord(o.multimedia),
+    communications: endpointRecord(o.communications),
+    devices: list.map(endpointRecord).filter(Boolean),
+  };
+}
+
 function windowRecord(w) {
   return {
     id: String(w.hwnd),
@@ -1009,6 +1033,100 @@ class Win32Driver {
   /** Show a tray balloon / toast (not part of the Driver contract). */
   async notify(title, body = '') {
     await this.host.request('notify', { title: String(title == null ? '' : title), body: String(body == null ? '' : body) });
+  }
+
+  // ------------------------------------------------ call audio, notifications, Desktop (docs/CALLS-DESIGN.md §5.2, §4.1B, §8.1)
+  // Not part of the Driver contract; used by src/calls (audio-bridge.js, notifications, notes).
+
+  /**
+   * Default audio endpoints and the active devices (Core Audio).
+   * @param {'capture'|'render'|'all'|{flow?:string}} [flow='capture']
+   * @returns {Promise<{flow:string, console:{id,name}|null, multimedia:{id,name}|null, communications:{id,name}|null,
+   *   devices:Array<{id:string,name:string}>}|{capture:object, render:object}>}
+   */
+  async audioDefaultGet(flow = 'capture') {
+    const f = flow && typeof flow === 'object' ? flow.flow || 'capture' : flow || 'capture';
+    if (!AUDIO_FLOWS.has(f)) throw makeError(`Unknown audio flow ${f} (capture, render or all)`, 'BAD_ARGS');
+    const r = await this.host.request('audioDefaultGet', { flow: f }, { timeoutMs: AUDIO_TIMEOUT_MS });
+    if (f === 'all') return { capture: audioFlowRecord(r && r.capture), render: audioFlowRecord(r && r.render) };
+    return audioFlowRecord(r);
+  }
+
+  /**
+   * Make a device the default for some roles (IPolicyConfig). With `onlyIf`, a role changes only while its
+   * current default is that device id (restoring must not undo a choice the user made meanwhile).
+   * @param {{id?:string, name?:string, flow?:'capture'|'render', roles?:string[], onlyIf?:string}} opts
+   * @returns {Promise<{ok:boolean, id:string, name:string, flow:string, roles:string[], skipped:string[]}>}
+   */
+  async audioDefaultSet({ id, name, flow = 'capture', roles = AUDIO_ROLES, onlyIf } = {}) {
+    if (flow !== 'capture' && flow !== 'render') throw makeError(`Unknown audio flow ${flow} (capture or render)`, 'BAD_ARGS');
+    const args = { flow, roles: [] };
+    if (id != null && id !== '') {
+      if (typeof id !== 'string' || !AUDIO_ID_RE.test(id)) throw makeError('Invalid audio device id', 'BAD_ARGS');
+      args.id = id;
+    } else if (typeof name === 'string' && name.trim() && name.length <= 256) {
+      args.name = name.trim();
+    } else {
+      throw makeError('Pass the device id or name', 'BAD_ARGS');
+    }
+    for (const r of Array.isArray(roles) ? roles : [roles]) {
+      if (!AUDIO_ROLES.includes(r)) throw makeError(`Unknown audio role ${r}`, 'BAD_ARGS');
+      if (!args.roles.includes(r)) args.roles.push(r);
+    }
+    if (!args.roles.length) throw makeError('No audio role to change', 'BAD_ARGS');
+    if (onlyIf != null && onlyIf !== '') {
+      if (typeof onlyIf !== 'string' || !AUDIO_ID_RE.test(onlyIf)) throw makeError('Invalid onlyIf device id', 'BAD_ARGS');
+      args.onlyIf = onlyIf;
+    }
+    const r = (await this.host.request('audioDefaultSet', args, { timeoutMs: AUDIO_TIMEOUT_MS })) || {};
+    const arr = (v) => (Array.isArray(v) ? v.map(String) : v ? [String(v)] : []);
+    return { ok: r.ok !== false, id: String(r.id || ''), name: String(r.name || ''), flow: r.flow || flow, roles: arr(r.roles), skipped: arr(r.skipped) };
+  }
+
+  /**
+   * Texts of the toast notifications on screen (UI Automation of the toast host; Chromium browsers and
+   * Electron apps show native toasts for web notifications).
+   * @param {{budgetMs?:number, maxNodes?:number, processes?:string[], classes?:string[]}} [opts]
+   * @returns {Promise<Array<{process:string, pid:number, className:string, name:string, texts:string[],
+   *   bounds:{x,y,width,height}|null}>>}
+   */
+  async toastTexts({ budgetMs = 1500, maxNodes = 400, processes, classes } = {}) {
+    const args = { budgetMs: Math.max(100, Math.min(10000, toInt(budgetMs, 'budgetMs'))), maxNodes: Math.max(10, Math.min(5000, toInt(maxNodes, 'maxNodes'))) };
+    const names = (v, what) => {
+      const list = (Array.isArray(v) ? v : [v]).map((x) => String(x == null ? '' : x).trim()).filter(Boolean);
+      if (!list.length || list.length > 16 || list.some((x) => x.length > 128)) throw makeError(`Invalid ${what}`, 'BAD_ARGS');
+      return list;
+    };
+    if (processes != null) args.processes = names(processes, 'processes');
+    if (classes != null) args.classes = names(classes, 'classes');
+    const r = await this.host.request('toastTexts', args, { timeoutMs: args.budgetMs + 10000 });
+    const list = r && Array.isArray(r.toasts) ? r.toasts : r && r.toasts && typeof r.toasts === 'object' ? [r.toasts] : [];
+    return list.map((t) => ({
+      process: String(t.process || ''),
+      pid: Number(t.pid) || 0,
+      className: String(t.className || ''),
+      name: String(t.name || ''),
+      texts: (Array.isArray(t.texts) ? t.texts : t.texts ? [t.texts] : []).map(String),
+      bounds: t.bounds && typeof t.bounds === 'object' ? { x: Number(t.bounds.x) || 0, y: Number(t.bounds.y) || 0, width: Number(t.bounds.width) || 0, height: Number(t.bounds.height) || 0 } : null,
+    }));
+  }
+
+  /**
+   * The Desktop folder as Explorer resolves it ([Environment]::GetFolderPath('Desktop'): OneDrive Known
+   * Folder Move, GPO redirection), plus fallbacks. In WSL `wslPath` is its /mnt/<drive>/... path.
+   * @returns {Promise<{path:string, exists:boolean, registry:string|null, oneDrive:string|null, userProfile:string|null, wslPath?:string|null}>}
+   */
+  async desktopPath() {
+    const r = (await this.host.request('desktopPath')) || {};
+    const out = {
+      path: typeof r.path === 'string' ? r.path : '',
+      exists: Boolean(r.exists),
+      registry: typeof r.registry === 'string' && r.registry ? r.registry : null,
+      oneDrive: typeof r.oneDrive === 'string' && r.oneDrive ? r.oneDrive : null,
+      userProfile: typeof r.userProfile === 'string' && r.userProfile ? r.userProfile : null,
+    };
+    if (this.wsl) out.wslPath = out.path ? winToWslPath(out.path) : null;
+    return out;
   }
 
   async close() {

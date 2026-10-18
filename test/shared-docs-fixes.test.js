@@ -172,7 +172,8 @@ test('ARCHITECTURE file layout and doc references point at files that exist', ()
   const ci = arch.match(/\.github\/workflows\/[\w.-]+\.ya?ml/g) || [];
   for (const f of ci) assert.ok(fs.existsSync(path.join(ROOT, f)), `${f} exists`);
   for (const text of [arch, plan]) {
-    for (const ref of new Set(text.match(/\b[A-Z][A-Z_]+\.md\b/g) || [])) {
+    // Hyphenated names too (CALLS-DESIGN.md), so their whole name is checked.
+    for (const ref of new Set(text.match(/\b[A-Z][A-Z_-]+\.md\b/g) || [])) {
       if (ref === 'SKILL.md' || ref === 'README.md' || ref === 'CLAUDE.md') continue;
       assert.ok(fs.existsSync(path.join(ROOT, 'docs', ref)), `referenced docs/${ref} exists`);
     }

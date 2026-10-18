@@ -93,6 +93,32 @@ The classifier still enforces approvals, even if the model is tricked.
 - Jira: the API token is stored in `config.json` (0600), shown nowhere (`anywhere config`, the dialog, `/api/config` and `/api/jira/status` mask it; `--reveal` is needed to print it), redacted in logs (including `Authorization: Basic …` and `ATATT…` tokens), and sent only to the Jira site it was saved for. Moving, assigning and commenting on issues are medium-risk actions (an approval card in `ask` mode); a comment containing something that looks like a secret always asks.
 - `read_browser_tab` reads the address of a browser window without input on macOS (Apple Events) and Windows (UI Automation); elsewhere, and for the page text, it briefly focuses the browser and uses Ctrl/Cmd+L, A and C, then restores your clipboard and focus. Reading the page text is a medium-risk action; the pause and the top-left-corner failsafe stop it before any key.
 
+## 6. Calls and the cloned voice
+
+Details in [CALLS.md](CALLS.md); the enforcement points are listed in [CALLS-DESIGN.md](CALLS-DESIGN.md) §1.3.
+
+- **Your voice only, with consent.** The enrollment accepts only takes recorded live in its view (virtual and
+  loopback microphones are refused, in the page and again in the daemon), starts with a spoken consent sentence
+  carrying a one-time code that is checked by local speech recognition, and checks that the consent and the script
+  are the same speaker. The voice sidecar has no operation that clones an arbitrary audio file: it loads a voice
+  only from the profile folder, after checking the consent record and the reference's sha256. The profile is
+  0700/0600, never uploaded, and `anywhere clone-voice delete` removes it with the consent recording.
+- **Disclosure.** Every greeting is composed in code with "this is <you>'s AI assistant" and the transcription
+  notice; templates cannot remove it, and the assistant says nothing before it has played.
+- **Arming.** Answering is never stored and never on by default. It is turned on only by a click on **Allow once**
+  on a critical card (no "Always" rule, no voice, no key, no permission mode, no typed `allow`), expires after at
+  most 12 hours, and respects quiet hours; `calls off` stops it without a confirmation.
+- **During a call** the assistant is a separate `claude -p --model haiku` with no built-in tools and only the
+  call tools (look up and assign unassigned tickets to the bound caller, comment, a chat message after the call,
+  defer, end). The daemon checks each call: the active call, the caller's Jira account (from the call app, never
+  from speech), per-call budgets, allowed projects, server-built JQL, and text without secrets or foreign links.
+  Everything the caller says is untrusted input; everything else becomes a follow-up in your notes. Answering
+  clicks only inside the call's window or popup (never the dialog, a terminal or an editor), and is verified.
+- **Data.** Speech recognition and synthesis run locally. Transcripts and action logs stay in
+  `~/.claude-anywhere/calls/<id>/` (0600, 30 days); the notes go to your Desktop folder, which OneDrive or iCloud
+  may sync (set `calls.notesDir` to avoid that). The Cliq client secret and refresh token are stored like the
+  Jira token (0600, masked, never accepted as command-line arguments).
+
 ## Reporting
 
 Please report vulnerabilities privately through GitHub Security Advisories on

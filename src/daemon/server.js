@@ -80,6 +80,13 @@ const ENUMS = {
   'voice.tts': ['auto', 'browser', 'server', 'off'],
   'voice.sttProvider': ['auto', 'openai', 'groq', 'custom', 'whisper.cpp'],
   'voice.ttsEngine': ['auto', 'piper', 'browser', 'os'],
+  'voice.clone.engine': ['pocket', 'zipvoice'],
+  'voice.clone.provider': ['cpu', 'cuda', 'coreml'],
+  'calls.ownerPronoun': ['his', 'her', 'their'],
+  'calls.stt.model': ['moonshine', 'whisper-tiny', 'whisper', 'parakeet'],
+  'calls.audio.mode': ['auto', 'virtual', 'speakers'],
+  'calls.cliq.mode': ['gui', 'api'],
+  'calls.cliq.dc': ['com', 'eu', 'in', 'com.au', 'jp', 'ca'],
 };
 
 const FALLBACK_HTML = `<!doctype html>
@@ -460,7 +467,10 @@ class DaemonServer {
     let body = {};
     let raw = null;
     if (route.raw) {
-      raw = await readBody(req, AUDIO_LIMIT);
+      // A route may lower the limit (routes-clone: 5 MB per enrollment take), so an oversized upload
+      // is refused before 25 MB of it is buffered.
+      const limit = Number.isFinite(route.rawLimit) && route.rawLimit > 0 ? Math.min(route.rawLimit, AUDIO_LIMIT) : AUDIO_LIMIT;
+      raw = await readBody(req, limit);
     } else if (!route.noBody) {
       const ct = contentTypeOf(req);
       if (ct && ct !== 'application/json' && !ct.endsWith('+json')) {

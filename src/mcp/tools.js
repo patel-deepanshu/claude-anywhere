@@ -235,7 +235,7 @@ function annotations(title, { readOnly = false, destructive = false, idempotent 
 /**
  * Build the anywhere tool set.
  * @param {{computer: object|(()=>Promise<object>), getClient?: ()=>Promise<object|null>, config?: object,
- *   role?: 'engine'|'interactive', progressIntervalMs?: number,
+ *   role?: 'engine'|'interactive'|'call', progressIntervalMs?: number,
  *   deps?: {notify?:Function, speak?:Function, openTarget?:Function, gatherContext?:Function}}} opts
  *   computer: a Computer, a promise of one, or a lazy factory returning one.
  * @returns {{name:string,title:string,description:string,inputSchema:object,annotations:object,handler:Function}[]}
@@ -983,6 +983,14 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
     if (mod && typeof mod.createTools === 'function') tools.push(...mod.createTools(ext));
   }
 
+  // The call engine (ANYWHERE_ROLE=call, CALLS-DESIGN §13.5) gets the call tools and nothing else: no
+  // screen, mouse, keyboard, Jira or project tools. Defense in depth: its --allowedTools and the
+  // always-deny call_permission already refuse the rest.
+  if (role === 'call') {
+    const callTools = loadOptional('./tools-calls');
+    const allowed = callTools && Array.isArray(callTools.CALL_TOOL_NAMES) ? callTools.CALL_TOOL_NAMES : [];
+    return tools.filter((t) => allowed.includes(t.name));
+  }
   return role === 'engine' ? tools : tools.filter((t) => t.name !== 'permission_prompt');
 }
 

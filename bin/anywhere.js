@@ -2816,6 +2816,20 @@ async function runDoctor() {
     return { detail: have.join(' '), notes: ['Cloud CLIs are optional; Claude uses whichever is installed (gcloud for GCP deploys) and falls back to the browser.'] };
   });
 
+  // Feature 3 (CALLS-DESIGN §5.6, §13.11): the calls rows, when src/cli/calls.js is installed. No network
+  // (the Cliq token is not refreshed here; `anywhere calls doctor` does that) and no recording.
+  const callsCli = optionalPkg('src/cli/calls.js');
+  if (callsCli && typeof callsCli.doctorChecks === 'function') {
+    try {
+      const d = daemon ? await getDaemon().catch(() => null) : null;
+      const rows = await withTimeout(callsCli.doctorChecks({ config, platformInfo: pinfo, network: false, daemon: d, call }), 60000, 'the calls checks');
+      // Calls are optional: here a problem is a warning (`anywhere calls doctor` shows it as a failure).
+      if (Array.isArray(rows)) checks.push(...rows.map((r) => (r && r.status === 'fail' ? { ...r, status: 'warn', critical: false } : r)));
+    } catch (err) {
+      checks.push({ id: 'calls', label: 'Calls', status: 'warn', detail: (err && err.message) || String(err), fix: `Run: ${cliCmd('calls doctor')}`, notes: [], critical: false });
+    }
+  }
+
   if (osIndex && typeof osIndex.resetDriver === 'function') {
     try {
       await withTimeout(osIndex.resetDriver(), 5000, 'closing the driver');

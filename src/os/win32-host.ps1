@@ -1473,6 +1473,378 @@ function Get-BrowserTab($A) {
   return [ordered]@{ found = $true; url = $value; title = $title; name = [string]$bar.name; editing = $editing }
 }
 
+# ---------------------------------------------------------------- call audio and notifications (docs/CALLS-DESIGN.md 5.2, 4.1B, 8.1)
+
+# Default audio endpoints through the Core Audio API (MMDeviceEnumerator) and the undocumented but
+# widely used IPolicyConfig (the same approach as AudioDeviceCmdlets and EarTrumpet). Compiled on
+# first use only, separately from the input bridge, so a failure here never affects desktop control.
+$AudioSource = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class AnywhereAudio
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROPERTYKEY { public Guid fmtid; public int pid; }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct PROPVARIANT
+    {
+        [FieldOffset(0)] public ushort vt;
+        [FieldOffset(8)] public IntPtr p;
+        [FieldOffset(16)] public IntPtr p2;
+    }
+
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumerator
+    {
+        [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IMMDeviceCollection devices);
+        [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice endpoint);
+        [PreserveSig] int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id, out IMMDevice device);
+        [PreserveSig] int RegisterEndpointNotificationCallback(IntPtr client);
+        [PreserveSig] int UnregisterEndpointNotificationCallback(IntPtr client);
+    }
+
+    [ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceCollection
+    {
+        [PreserveSig] int GetCount(out int count);
+        [PreserveSig] int Item(int index, out IMMDevice device);
+    }
+
+    [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDevice
+    {
+        [PreserveSig] int Activate(ref Guid iid, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object iface);
+        [PreserveSig] int OpenPropertyStore(int access, out IPropertyStore store);
+        [PreserveSig] int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
+        [PreserveSig] int GetState(out int state);
+    }
+
+    [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPropertyStore
+    {
+        [PreserveSig] int GetCount(out int count);
+        [PreserveSig] int GetAt(int index, out PROPERTYKEY key);
+        [PreserveSig] int GetValue(ref PROPERTYKEY key, out PROPVARIANT value);
+        [PreserveSig] int SetValue(ref PROPERTYKEY key, ref PROPVARIANT value);
+        [PreserveSig] int Commit();
+    }
+
+    // Windows 7+ IPolicyConfig: only SetDefaultEndpoint is called; the slots before it keep the vtable order.
+    [ComImport, Guid("F8679F50-850A-41CF-9C72-430F290290C8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPolicyConfig
+    {
+        [PreserveSig] int GetMixFormat([MarshalAs(UnmanagedType.LPWStr)] string id, IntPtr format);
+        [PreserveSig] int GetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string id, int useDefault, IntPtr format);
+        [PreserveSig] int ResetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string id);
+        [PreserveSig] int SetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string id, IntPtr endpointFormat, IntPtr mixFormat);
+        [PreserveSig] int GetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string id, int useDefault, IntPtr defaultPeriod, IntPtr minimumPeriod);
+        [PreserveSig] int SetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string id, IntPtr period);
+        [PreserveSig] int GetShareMode([MarshalAs(UnmanagedType.LPWStr)] string id, IntPtr mode);
+        [PreserveSig] int SetShareMode([MarshalAs(UnmanagedType.LPWStr)] string id, IntPtr mode);
+        [PreserveSig] int GetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string id, int fxStore, IntPtr key, IntPtr value);
+        [PreserveSig] int SetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string id, int fxStore, IntPtr key, IntPtr value);
+        [PreserveSig] int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string id, int role);
+        [PreserveSig] int SetEndpointVisibility([MarshalAs(UnmanagedType.LPWStr)] string id, int visible);
+    }
+
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    class MMDeviceEnumeratorCom { }
+
+    [ComImport, Guid("870AF99C-171D-4F9E-AF0D-E63DF40C2BC9")]
+    class PolicyConfigClientCom { }
+
+    [DllImport("ole32.dll")]
+    static extern int PropVariantClear(ref PROPVARIANT value);
+
+    public class Endpoint
+    {
+        public string Id;
+        public string Name;
+        public int State;
+    }
+
+    const int DEVICE_STATE_ACTIVE = 1;
+    const ushort VT_LPWSTR = 31;
+
+    static PROPERTYKEY FriendlyNameKey()
+    {
+        PROPERTYKEY k = new PROPERTYKEY();
+        k.fmtid = new Guid("A45C254E-DF1C-4EFD-8020-67D146A850E0");
+        k.pid = 14;
+        return k;
+    }
+
+    static void Check(int hr, string what)
+    {
+        if (hr != 0) throw new InvalidOperationException(what + " failed (HRESULT 0x" + hr.ToString("X8") + ")");
+    }
+
+    static IMMDeviceEnumerator NewEnumerator()
+    {
+        return (IMMDeviceEnumerator)(object)new MMDeviceEnumeratorCom();
+    }
+
+    static string NameOf(IMMDevice dev)
+    {
+        IPropertyStore store = null;
+        if (dev.OpenPropertyStore(0, out store) != 0 || store == null) return "";
+        try
+        {
+            PROPERTYKEY key = FriendlyNameKey();
+            PROPVARIANT v;
+            if (store.GetValue(ref key, out v) != 0) return "";
+            try
+            {
+                if (v.vt != VT_LPWSTR || v.p == IntPtr.Zero) return "";
+                return Marshal.PtrToStringUni(v.p) ?? "";
+            }
+            finally { PropVariantClear(ref v); }
+        }
+        finally { Marshal.ReleaseComObject(store); }
+    }
+
+    static Endpoint Describe(IMMDevice dev)
+    {
+        string id;
+        int state;
+        Check(dev.GetId(out id), "IMMDevice.GetId");
+        if (dev.GetState(out state) != 0) state = 0;
+        Endpoint e = new Endpoint();
+        e.Id = id;
+        e.Name = NameOf(dev);
+        e.State = state;
+        return e;
+    }
+
+    // flow: 0 render (playback), 1 capture (recording). Active endpoints only.
+    public static Endpoint[] List(int flow)
+    {
+        IMMDeviceEnumerator en = NewEnumerator();
+        IMMDeviceCollection col = null;
+        List<Endpoint> list = new List<Endpoint>();
+        try
+        {
+            Check(en.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, out col), "EnumAudioEndpoints");
+            int n;
+            Check(col.GetCount(out n), "IMMDeviceCollection.GetCount");
+            for (int i = 0; i < n; i++)
+            {
+                IMMDevice d = null;
+                if (col.Item(i, out d) != 0 || d == null) continue;
+                try { list.Add(Describe(d)); }
+                finally { Marshal.ReleaseComObject(d); }
+            }
+        }
+        finally
+        {
+            if (col != null) Marshal.ReleaseComObject(col);
+            Marshal.ReleaseComObject(en);
+        }
+        return list.ToArray();
+    }
+
+    // role: 0 eConsole, 1 eMultimedia, 2 eCommunications. Null when there is no such device.
+    public static Endpoint Default(int flow, int role)
+    {
+        IMMDeviceEnumerator en = NewEnumerator();
+        IMMDevice d = null;
+        try
+        {
+            int hr = en.GetDefaultAudioEndpoint(flow, role, out d);
+            if (hr != 0 || d == null) return null;
+            return Describe(d);
+        }
+        finally
+        {
+            if (d != null) Marshal.ReleaseComObject(d);
+            Marshal.ReleaseComObject(en);
+        }
+    }
+
+    public static void SetDefault(string id, int role)
+    {
+        IPolicyConfig pc = (IPolicyConfig)(object)new PolicyConfigClientCom();
+        try { Check(pc.SetDefaultEndpoint(id, role), "IPolicyConfig.SetDefaultEndpoint"); }
+        finally { Marshal.ReleaseComObject(pc); }
+    }
+}
+'@
+
+$script:AudioRoles = [ordered]@{ console = 0; multimedia = 1; communications = 2 }
+
+function Use-Audio {
+  Assert-Windows
+  if (-not ('AnywhereAudio' -as [type])) {
+    try {
+      Add-Type -TypeDefinition $AudioSource -Language CSharp
+    } catch {
+      throw (New-HostError ('The Windows audio bridge failed to compile: ' + $_.Exception.Message) 'NATIVE_UNAVAILABLE' 'Check that PowerShell can run Add-Type (it needs the .NET C# compiler and a writable TEMP folder).')
+    }
+  }
+}
+
+function Get-AudioFlowNumber([string]$Flow) {
+  if ($Flow -eq 'capture' -or $Flow -eq 'recording' -or $Flow -eq 'input') { return 1 }
+  if ($Flow -eq 'render' -or $Flow -eq 'playback' -or $Flow -eq 'output') { return 0 }
+  throw (New-HostError ("Unknown audio flow '" + $Flow + "' (capture or render).") 'BAD_ARGS' $null)
+}
+
+function ConvertTo-EndpointRecord($E) {
+  if ($null -eq $E) { return $null }
+  return [ordered]@{ id = [string]$E.Id; name = [string]$E.Name }
+}
+
+function Get-AudioFlow([int]$FlowNumber) {
+  $devices = New-Object System.Collections.ArrayList
+  foreach ($e in [AnywhereAudio]::List($FlowNumber)) { [void]$devices.Add((ConvertTo-EndpointRecord $e)) }
+  $flowName = 'render'
+  if ($FlowNumber -eq 1) { $flowName = 'capture' }
+  $r = [ordered]@{ flow = $flowName }
+  foreach ($role in $script:AudioRoles.Keys) {
+    $r[$role] = (ConvertTo-EndpointRecord ([AnywhereAudio]::Default($FlowNumber, [int]$script:AudioRoles[$role])))
+  }
+  $r['devices'] = $devices
+  return $r
+}
+
+# {flow:'capture'|'render'|'all'} -> {flow, console, multimedia, communications, devices:[{id, name}]}
+# ('all': {capture:{...}, render:{...}})
+function Get-AudioDefaults($A) {
+  Use-Audio
+  $flow = [string](Get-Arg $A 'flow' 'capture')
+  if ($flow -eq 'all') { return [ordered]@{ capture = (Get-AudioFlow 1); render = (Get-AudioFlow 0) } }
+  return (Get-AudioFlow (Get-AudioFlowNumber $flow))
+}
+
+# {flow, id | name, roles:['console','multimedia','communications'], onlyIf?:<id>} -> {ok, id, name, roles, skipped}
+# onlyIf: change a role only while its current default is that device (crash restore after the user
+# picked another microphone must not undo the user's choice).
+function Set-AudioDefault($A) {
+  Use-Audio
+  $flowName = [string](Get-Arg $A 'flow' 'capture')
+  $flow = Get-AudioFlowNumber $flowName
+  $id = [string](Get-Arg $A 'id' '')
+  $name = [string](Get-Arg $A 'name' '')
+  if ($id.Length -gt 512 -or $name.Length -gt 256) { throw (New-HostError 'Device id or name is too long.' 'BAD_ARGS' $null) }
+  if (-not $id -and -not $name) { throw (New-HostError 'Pass the device id or name.' 'BAD_ARGS' $null) }
+  $list = [AnywhereAudio]::List($flow)
+  $target = $null
+  if ($id) {
+    foreach ($e in $list) { if ($e.Id -eq $id) { $target = $e; break } }
+  } else {
+    foreach ($e in $list) { if ($e.Name -eq $name) { $target = $e; break } }
+    if ($null -eq $target) { foreach ($e in $list) { if ($e.Name.StartsWith($name, [StringComparison]::OrdinalIgnoreCase)) { $target = $e; break } } }
+    if ($null -eq $target) { foreach ($e in $list) { if ($e.Name.IndexOf($name, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $target = $e; break } } }
+  }
+  if ($null -eq $target) {
+    $what = $id
+    if (-not $what) { $what = $name }
+    throw (New-HostError ('No active ' + $flowName + ' device ' + $what + '.') 'DEVICE_NOT_FOUND' 'Check Sound settings; a virtual cable needs VB-CABLE installed and a reboot.')
+  }
+  $roles = @(Get-Arg $A 'roles' @('console', 'multimedia', 'communications'))
+  $onlyIf = [string](Get-Arg $A 'onlyIf' '')
+  $changed = New-Object System.Collections.ArrayList
+  $skipped = New-Object System.Collections.ArrayList
+  foreach ($role in $roles) {
+    $roleName = [string]$role
+    if (-not $script:AudioRoles.Contains($roleName)) { throw (New-HostError ("Unknown audio role '" + $roleName + "'.") 'BAD_ARGS' $null) }
+    $ri = [int]$script:AudioRoles[$roleName]
+    if ($onlyIf) {
+      $cur = [AnywhereAudio]::Default($flow, $ri)
+      if ($null -eq $cur -or $cur.Id -ne $onlyIf) { [void]$skipped.Add($roleName); continue }
+    }
+    [AnywhereAudio]::SetDefault($target.Id, $ri)
+    [void]$changed.Add($roleName)
+  }
+  return [ordered]@{ ok = $true; id = [string]$target.Id; name = [string]$target.Name; flow = $flowName; roles = $changed; skipped = $skipped }
+}
+
+# Texts of the toast notifications on screen: top-level CoreWindow elements of the toast host
+# process (ShellExperienceHost), matched by class and process rather than by the localized title.
+# Every descendant's Name is read, bounded by time and node count.
+function Get-ToastTexts($A) {
+  Assert-Windows
+  Use-Uia
+  $budget = Get-IntArg $A 'budgetMs' 1500
+  $maxNodes = Get-IntArg $A 'maxNodes' 400
+  $procNames = @(Get-Arg $A 'processes' @('ShellExperienceHost'))
+  $classNames = @(Get-Arg $A 'classes' @('Windows.UI.Core.CoreWindow'))
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  $toasts = New-Object System.Collections.ArrayList
+  $root = [System.Windows.Automation.AutomationElement]::RootElement
+  $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+  $top = $null
+  try { $top = $walker.GetFirstChild($root) } catch { $top = $null }
+  $procCache = @{}
+  while ($null -ne $top -and $sw.ElapsedMilliseconds -lt $budget) {
+    $cls = ''
+    $procId = 0
+    try { $cls = [string]$top.Current.ClassName } catch { $cls = '' }
+    try { $procId = [int]$top.Current.ProcessId } catch { $procId = 0 }
+    if ($classNames -contains $cls -and $procId -gt 0) {
+      if (-not $procCache.ContainsKey($procId)) {
+        $pn = ''
+        try { $pn = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { $pn = '' }
+        $procCache[$procId] = $pn
+      }
+      $procName = [string]$procCache[$procId]
+      if ($procNames -contains $procName) {
+        $texts = New-Object System.Collections.ArrayList
+        $queue = New-Object 'System.Collections.Generic.Queue[object]'
+        $queue.Enqueue($top)
+        $seen = 0
+        while ($queue.Count -gt 0 -and $seen -lt $maxNodes -and $sw.ElapsedMilliseconds -lt $budget) {
+          $node = $queue.Dequeue()
+          $child = $null
+          try { $child = $walker.GetFirstChild($node) } catch { $child = $null }
+          while ($null -ne $child -and $seen -lt $maxNodes) {
+            $seen++
+            $nm = ''
+            try { $nm = [string]$child.Current.Name } catch { $nm = '' }
+            if ($nm -and $nm.Trim().Length -gt 0 -and $texts.Count -lt 64) {
+              $t = $nm.Trim()
+              if ($t.Length -gt 500) { $t = $t.Substring(0, 500) }
+              if ($texts.Count -eq 0 -or [string]$texts[$texts.Count - 1] -ne $t) { [void]$texts.Add($t) }
+            }
+            $queue.Enqueue($child)
+            try { $child = $walker.GetNextSibling($child) } catch { $child = $null }
+          }
+        }
+        $name = ''
+        try { $name = [string]$top.Current.Name } catch { $name = '' }
+        $b = $null
+        try {
+          $rc = $top.Current.BoundingRectangle
+          if (-not $rc.IsEmpty) { $b = [ordered]@{ x = [int]$rc.X; y = [int]$rc.Y; width = [int]$rc.Width; height = [int]$rc.Height } }
+        } catch { $b = $null }
+        [void]$toasts.Add([ordered]@{ process = $procName; pid = $procId; className = $cls; name = $name; texts = $texts; bounds = $b })
+      }
+    }
+    try { $top = $walker.GetNextSibling($top) } catch { $top = $null }
+  }
+  return [ordered]@{ toasts = $toasts; ms = [int]$sw.ElapsedMilliseconds }
+}
+
+# The Desktop folder as Explorer resolves it (follows OneDrive Known Folder Move and GPO redirection),
+# with the registry value and the environment as fallbacks for the notes writer.
+function Get-DesktopPath {
+  $p = ''
+  try { $p = [string][Environment]::GetFolderPath('Desktop') } catch { $p = '' }
+  $reg = $null
+  if ($script:IsWin) {
+    try {
+      $v = (Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -Name 'Desktop' -ErrorAction Stop).Desktop
+      if ($v) { $reg = [Environment]::ExpandEnvironmentVariables([string]$v) }
+    } catch { $reg = $null }
+  }
+  $exists = $false
+  if ($p) { try { $exists = [bool](Test-Path -LiteralPath $p -PathType Container) } catch { $exists = $false } }
+  return [ordered]@{ path = $p; exists = $exists; registry = $reg; oneDrive = $env:OneDrive; userProfile = $env:USERPROFILE }
+}
+
 # ---------------------------------------------------------------- dispatcher
 
 function Invoke-HostCommand([string]$Cmd, $A) {
@@ -1594,6 +1966,10 @@ function Invoke-HostCommand([string]$Cmd, $A) {
     'clipget' { return @{ text = (Get-ClipText) } }
     'clipset' { return (Set-ClipText ([string](Get-Arg $A 'text' ''))) }
     'notify' { return (Show-Notification ([string](Get-Arg $A 'title' '')) ([string](Get-Arg $A 'body' ''))) }
+    'audioDefaultGet' { return (Get-AudioDefaults $A) }
+    'audioDefaultSet' { return (Set-AudioDefault $A) }
+    'toastTexts' { return (Get-ToastTexts $A) }
+    'desktopPath' { return (Get-DesktopPath) }
     default {
       throw (New-HostError ("Unknown command '" + $Cmd + "'.") 'UNKNOWN_COMMAND' 'Update Claude Anywhere so the driver and host versions match.')
     }

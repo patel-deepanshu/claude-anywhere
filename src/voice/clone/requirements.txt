@@ -1,0 +1,11 @@
+# Claude Anywhere: cloned voice and call audio sidecar (docs/CALLS-DESIGN.md §3.3).
+# Installed only into the private venv <state>/voice/clone-venv with --only-binary=:all:
+# (never into the user's own Python). All packages are free and open source.
+sherpa-onnx==1.13.8
+numpy>=1.24,<3
+sounddevice==0.5.6 ; sys_platform == "win32" or sys_platform == "darwin"
+soundcard==0.4.6 ; sys_platform == "win32" or sys_platform == "linux"
+# macOS: ScreenCaptureKit captures the caller's audio (its CMSampleBuffers need CoreMedia); the default
+# microphone is switched through CoreAudio with ctypes, so pyobjc-framework-CoreAudio is not needed.
+pyobjc-framework-ScreenCaptureKit==12.2.2 ; sys_platform == "darwin"
+pyobjc-framework-CoreMedia==12.2.2 ; sys_platform == "darwin"
