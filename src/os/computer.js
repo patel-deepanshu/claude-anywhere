@@ -56,6 +56,15 @@ function warningsOf(...results) {
   return out.length ? { warnings: out } : {};
 }
 
+/**
+ * Whether two clipboard texts are the same up to line endings: the OS may store text with its own
+ * (Windows keeps CRLF, so the driver reads back "a\r\nb" after writing "a\nb").
+ */
+function sameClipText(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  return a === b || a.replace(/\r\n?/g, '\n') === b.replace(/\r\n?/g, '\n');
+}
+
 function inputError(message, code = 'INVALID_INPUT', hint) {
   const err = new Error(message);
   err.code = code;
@@ -583,7 +592,7 @@ class Computer {
     const combo = terminal ? ['ctrl', 'shift', 'v'] : keys.normalizeCombo('primary+v', { platform: this.platform });
     const pressed = await this.driver.keyCombo(combo);
     await sleep(PASTE_RESTORE_MS);
-    if (typeof saved !== 'string' || saved === text) return pressed;
+    if (typeof saved !== 'string' || sameClipText(saved, text)) return pressed;
     try {
       let now = text;
       try {
@@ -591,8 +600,9 @@ class Computer {
       } catch {
         /* assume unchanged */
       }
-      // Only restore if nobody copied something else in the meantime.
-      if (now === text) await this.driver.clipboardSet(saved);
+      // Only restore if nobody copied something else in the meantime. Compared up to line endings:
+      // Windows hands back the pasted "a\nb" as "a\r\nb", which is still our text.
+      if (sameClipText(now, text)) await this.driver.clipboardSet(saved);
     } catch (err) {
       log.warn('could not restore the clipboard:', err.message);
     }
