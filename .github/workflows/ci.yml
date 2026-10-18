@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [18, 22]
+    steps:
+      # Keep the runner's git defaults: windows-latest, like a default Git for Windows install,
+      # has core.autocrlf=true, so this checkout gets the same line endings as users' clones and
+      # plugin installs. .gitattributes must pin LF for shell scripts (Git Bash runs bin/anywhere)
+      # and CRLF for .cmd; test/shared-docs-round2.test.js fails if a checkout gets that wrong.
+      - uses: actions/checkout@v4
+      - name: Line endings as checked out
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git config --show-origin --get core.autocrlf || echo "core.autocrlf is not set"
+          git ls-files --eol bin/anywhere bin/anywhere.cmd scripts/install.sh skills/anywhere/SKILL.md
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax check
+        run: npm run lint
+      - name: Tests
+        run: npm test
+      - name: CLI smoke test (mock desktop)
+        shell: bash
+        env:
+          ANYWHERE_DRIVER: mock
+          ANYWHERE_HOME: ${{ runner.temp }}/anywhere-home
+        run: |
+          node bin/anywhere.js version
+          node bin/anywhere.js computer screenshot --out "$RUNNER_TEMP/shot.png"
+          node bin/anywhere.js doctor --json > "$RUNNER_TEMP/doctor.json" || true
+          node -e "JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'))" "$RUNNER_TEMP/doctor.json"
+
+  windows-host:
+    name: Win32 helper compiles under Windows PowerShell 5.1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile src/os/win32-host.ps1
+        shell: powershell
+        env:
+          ANYWHERE_HOST_SELFTEST: compile
+        run: powershell -NoProfile -ExecutionPolicy Bypass -STA -File src/os/win32-host.ps1
+
+  linux-desktop:
+    name: Live X11 desktop (Xvfb)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install X11 tools
+        run: sudo apt-get update && sudo apt-get install -y xvfb openbox xterm xdotool wmctrl xclip x11-utils x11-xserver-utils imagemagick
+      - name: Live driver tests
+        run: |
+          node --test test/os-linux.test.js test/integration-os-linux.test.js
+          xvfb-run -a node --test test/integration-os-core.test.js
+
+  live-desktop:
+    name: Live desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Drive the runner's real desktop
+        env:
+          ANYWHERE_LIVE_DESKTOP: '1'
+          ANYWHERE_LIVE_OUT: ${{ runner.temp }}/anywhere-live
+        run: node scripts/test.js --test-name-pattern=live-desktop
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-desktop-${{ matrix.os }}
+          path: ${{ runner.temp }}/anywhere-live
+          if-no-files-found: ignore
