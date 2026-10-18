@@ -66,20 +66,38 @@ bin/anywhere.js                     CLI entry point
 bin/anywhere, bin/anywhere.cmd      tiny shims (plugin bin/ dirs are added to the Bash PATH while the plugin is enabled)
 src/shared/{paths,config,log,state,client,proc,platform,util}.js
 src/os/{index,computer,png,keys,common,darwin,win32,linux}.js
+src/os/audio.js                     WAV playback (afplay / SoundPlayer / pw-play|paplay|aplay|ffplay)
 src/os/darwin-helper.js             JXA script run via `osascript -l JavaScript`
 src/os/win32-host.ps1               persistent PowerShell JSON-lines host
 src/context/desktop.js
 src/mcp/{server,tools}.js
+src/mcp/tools-{browser,jira,project}.js   feature tools: read_browser_tab · jira_* · find_repos, switch_project
 src/daemon/{main,server,hub,session,engine-cli,permissions,questions,bridge,prompt,voice,uihost}.js
+src/daemon/{piper,announcer,chime,routes-voice}.js   free neural voice (Piper), spoken announcements, chimes, voice routes
+src/daemon/routes-{jira,project}.js  GET /api/jira/status, POST /api/jira/test · POST /api/mcp/switch-project
+src/integrations/jira.js            Jira Cloud / Server REST client (zero dependencies)
+src/cli/{voice,jira}.js             anywhere voice … · anywhere jira …
 src/ui/{index.html,app.css,app.js,voice.js,wav-recorder.js,markdown.js}
 src/electron/{main,preload}.js
 src/tui/tui.js
 scripts/{install.js,install.sh,install.ps1}
 scripts/{check-syntax,test}.js          npm run lint / npm test
 test/*.test.js, test/fixtures/fake-claude.js
-docs/{PLAN,ARCHITECTURE}.md
+docs/{PLAN,ARCHITECTURE,VOICE,JIRA,PLATFORMS,SECURITY}.md
 package.json, README.md, .github/workflows/ci.yml
 ```
+
+**Feature modules.** New features live in their own files, loaded when present (a missing file is skipped,
+any other load error still throws):
+- `src/mcp/tools.js` loads `src/mcp/tools-{browser,jira,project,calls}.js`; each exports
+  `createTools(ext) -> tool[]` with `ext = {computer, getClient, config, role, progressIntervalMs, deps, getComputer,
+  getDriver, client, checkGuard, postActivity, keepAlive, ok, fail, daemonRequest, objectSchema, annotations}`.
+- `src/daemon/server.js` loads `src/daemon/routes-{voice,jira,project,calls}.js`; each exports `register(add, server)`.
+  Handlers are bound to the DaemonServer and get `({req, res, url, body, raw})` like the built-in ones; paths match
+  exactly (ids go in the query string).
+- `bin/anywhere.js` loads `src/cli/{voice,jira,calls}.js`; each exports `commands(helpers) -> {name: {run, group,
+  summary, usage, spec, details?}}` with `helpers = {spec, shared, call, requireDaemon, ensureDaemon, writeOut,
+  writeErr, printJson, sym, color, EXIT}`.
 
 ---
 
@@ -112,7 +130,8 @@ save(partial)     -> config   // deep-merge into current, write 0600, return mer
 get(cfg, 'a.b.c')             // dotted path read
 setPath(cfg, 'a.b', value)    // dotted path write (returns cfg)
 coerce(str)                   // 'true'/'false'/numbers/JSON → typed
-publicConfig(cfg) -> object   // secrets replaced: voice.sttApiKey → '' plus voice.sttApiKeySet: bool
+publicConfig(cfg) -> object   // secrets replaced: voice.sttApiKey → '' plus voice.sttApiKeySet: bool,
+                              // jira.apiToken → '' plus jira.apiTokenSet: bool
 ```
 `DEFAULTS`:
 ```js
@@ -136,7 +155,13 @@ publicConfig(cfg) -> object   // secrets replaced: voice.sttApiKey → '' plus v
            language: 'en-US', autoSend: true, speakResponses: true, handsFree: false,
            wakeWord: 'hey claude', ttsRate: 1.0, ttsVoice: '',
            sttProvider: 'auto',      // 'auto'|'openai'|'groq'|'custom'|'whisper.cpp'
-           sttBaseUrl: '', sttApiKey: '', sttModel: '', whisperCppPath: '', whisperModel: '' },
+           sttBaseUrl: '', sttApiKey: '', sttModel: '', whisperCppPath: '', whisperModel: '',
+           ttsEngine: 'auto',        // 'auto' (Piper when installed, else browser/OS) | 'piper' | 'browser' | 'os'
+           piperVoice: 'en_US-lessac-medium',
+           announce: { done: true, permission: true, question: true, error: true },   // what is said aloud
+           chime: true },            // a short tone before announcements
+  jira: { baseUrl: '', email: '', apiToken: '' },   // optional; env JIRA_BASE_URL/JIRA_EMAIL/JIRA_API_TOKEN… also work
+  workspace: { roots: [] },          // folders find_repos searches first ('~', POSIX, C:\…, UNC)
   privacy: { redactSecretsInLogs: true,   // masks secrets in daemon/MCP log lines and the audit log
              auditLog: true }
 }
@@ -149,8 +174,9 @@ createLogger(name) -> { debug, info, warn, error }   // writes "[ts] [name] leve
                                                      // debug only when env ANYWHERE_DEBUG=1
 audit(event)                                         // JSONL append {ts, ...redact(event)} to auditLogPath()
 redact(value) -> value                               // deep; masks secrets in strings (API keys, tokens, bearer
-                                                     // headers, key=value passwords, private keys), masks the
-                                                     // values of token/apiKey/password/secret/authorization keys,
+                                                     // headers, Basic auth headers, Atlassian ATATT… tokens, key=value
+                                                     // passwords, private keys), masks the values of
+                                                     // token/apiKey/apiToken/sttApiKey/password/secret/authorization keys,
                                                      // and elides Buffers and long image/data strings. Always masks.
 setAuditEnabled(on)                                  // privacy.auditLog
 setRedactLogs(on)                                    // privacy.redactSecretsInLogs (default on)
@@ -241,8 +267,24 @@ Driver {
   async close()                         // stop persistent helpers
   windowsZOrdered?                      // optional flag: true when listWindows() is front to back on every backend
   async closeWindow?(id) -> bool        // optional (macOS): press the window's close button; the app keeps running
+  async browserTab({ app?, windowId?, window?, includeText? = false, maxChars? = 20000, keyboard? = true, beforeInput?, timing? })
+    -> { browser, app, title, url: string|null, method: 'applescript'|'uia'|'keyboard'|'title', windowId, tookFocus,
+         clipboard?: 'restored'|'changed'|'unknown'|'lost', text?, truncated?, textChars?, textMethod?, tabTitle?,
+         hint?, permission?: 'automation'|'accessibility', settingsUrl?, notes?: string[] }
 }
 ```
+`browserTab` reads a browser window's address (and with `includeText` its page text). `app` is a browser query
+("brave", "Google Chrome", "ff"), `window` a `listWindows()` entry the caller already picked, `keyboard: false`
+never sends input. Native first: macOS asks the browser through the helper command `browserTab` (`darwin-helper.js`;
+`{app, pid?, kind:'chromium'|'safari', title?, wantText?}`, PERMISSION -1743 → Automation hint), Windows and WSL read
+the address bar through UI Automation (host command `browsertab` `{hwnd, budgetMs?, maxNodes?}` in `win32-host.ps1`).
+Otherwise (X11, Wayland, or a native miss) the shared keyboard reader in `src/os/linux.js` (`readBrowserTab`,
+`keyboardReadTab`) saves the clipboard, focuses the window, checks it is active, sends primary+L / primary+C (and
+primary+A / primary+C for the text, F6 between attempts until the copy is page text), collapses the selection,
+restores the clipboard unless something else changed it, and refocuses the previous window. `beforeInput` runs before
+the first keystroke and again before select-all; a PAUSED/FAILSAFE error aborts with no further input. No matching
+browser → NOT_FOUND with a hint; other failures degrade to method `title` with notes. `src/os/linux.js` also exports
+`browserWindows`, `identifyBrowser`, `normalizeTabUrl`, `cleanPageText`, `BROWSERS` for reuse.
 Unsupported operations throw `Error` with `.code = 'UNSUPPORTED'` and an
 actionable `.hint` (e.g. "Install xdotool: sudo apt install xdotool").
 - `stackIndex` (optional) is the window's place in the stacking order, 0 = frontmost: X11 reads it
@@ -309,6 +351,7 @@ class Computer {
   async cursorPosition() -> { x, y, display }      // shot space
   async screenInfo() -> { displays, lastShot }
   toLogical(display, x, y) -> { x, y }; toShot(display, lx, ly) -> { x, y }
+  async browserTab(opts) -> driver.browserTab(opts)   // in the action queue; opts.beforeInput, then the guard and failsafe, before any key
 }
 ```
 - Mapping: `logical = display.x + shotX * (display.width / shot.width)` (same for y). If
@@ -332,6 +375,7 @@ async gatherContext({ driver, projectDir, config }) -> {
   windows: [{ app, title }],                         // ≤ 25, excludes our own "Claude Anywhere" window
   editors: [{ app, workspaceName, path | null, active }],   // VS Code / Cursor / Windsurf / VSCodium / Zed / JetBrains from titles + VS Code storage.json
   browsers: [{ app, title, url | null }],
+  tickets: [{ key, summary, browser, tracker: 'jira'|'linear'|'github'|'gitlab'|'azure', active? }],  // ≤ 8, from tab titles
   project: { dir, name, git: { branch, remote, dirty } | null, stack: string[] },
   cloud: { gcloud: { account, project } | null, aws: { profile, region } | null, az: { subscription } | null,
            kubectl: { context } | null, docker: { running, accessible? } | null },  // accessible:false = daemon up, socket not readable by the user
@@ -342,6 +386,11 @@ async detectProjects({ driver }) -> [{ dir, name, source: 'vscode'|'recent'|'cwd
 async projectInfo(dir) -> ctx.project
 ```
 Every probe has a 2.5 s timeout and never throws.
+`tickets` come from `parseTicketTitle(title)` (also exported, with `ticketsFromBrowsers`): Jira ("[ABC-1] Summary - Jira",
+"ABC-1: Summary - Jira", "Summary - ABC-1 - Jira", Server "… - Acme JIRA"), Linear, GitHub and GitLab issues, and Azure
+Boards ("AB#1234"); unbracketed keys count only next to a tracker's name. `formatContext` adds a line
+`Tickets (from tab titles): ABC-1 "Summary" (Jira in Brave) [active]`. `read_browser_tab` falls back to the same parser,
+so the tool and the context agree.
 
 ---
 
@@ -376,6 +425,28 @@ Every probe has a 2.5 s timeout and never throws.
 | `notify_user` | `{message, level?, speak?}` | POST /api/mcp/notify; falls back to OS notification |
 | `ask_user` | `{question, options?, timeoutSec?}` | POST /api/mcp/ask (blocks); an answer → text, a timeout or a cancelled/dismissed question → error result; without a daemon → error "dialog not running" |
 | `permission_prompt` | `{tool_name, input, tool_use_id?}` | POST /api/mcp/permission (blocks) → text JSON `{"behavior":"allow","updatedInput":…}` or `{"behavior":"deny","message":…}`; without a daemon → allow |
+| `read_browser_tab` | `{browser?, includeText?, maxChars? (200..200000, default 20000), windowId?}` | text JSON `{browser, title, url, jira: {key, baseUrl\|null, summary?}\|null, method, note?, hint?, settingsUrl?, windowId, otherWindows?, truncated?, text?}` (text last). `Computer.browserTab` (guard + failsafe before keys); isError when no (matching) browser window. Read-only annotations unless `includeText` |
+| `jira_status` | `{}` | text JSON: `{configured:true, connected:true, baseUrl, email, deployment:'Cloud'\|'Server', user}`, `{configured:true, connected:false, …, error, hint}` or `{configured:false, how, missing?}`; never isError |
+| `jira_get_issue` | `{key}` (ABC-123 or a Jira URL) | Markdown: facts (type, status, priority, assignee, reporter, sprint, points, labels, components, fix versions, parent, dates, link, `**Suggested branch:** \`KEY-slug\``), then Description, Acceptance criteria, Steps to Reproduce…, Subtasks, Linked issues, Attachments, last 10 Comments |
+| `jira_search` | `{jql, max? (1..100, default 20)}` | "N issues match: <jql>" then `- KEY [Status] Summary (Type · Priority · Assignee)` lines |
+| `jira_my_issues` | `{status?}` | open (default) \| todo \| in progress \| done \| all \| a status name; same lines |
+| `jira_transition` | `{key, to}` | by status or transition name, case-insensitive; a miss is isError listing the valid ones |
+| `jira_assign` | `{key, user}` | `me` \| `none` \| email \| accountId \| username \| display name; several matches → isError listing them (use ask_user) |
+| `jira_comment` | `{key, text}` | Markdown, sent as ADF (Cloud) or wiki markup (Server) |
+| `jira_find_user` | `{query}` | display name, email, accountId (Cloud) or username (Server) |
+| `find_repos` | `{query?, limit? (1..50, default 12)}` | text JSON `{query, repos:[{name, path, remote, branch, lastCommit, source: editor\|current\|recent\|workspace\|scan\|home\|query, score?, …}], searched, timedOut?, hint?}`: git repositories (open editors, `workspace.roots`, common code folders, the current project), ranked; read-only, no git process except `git log -1` |
+| `switch_project` | `{dir, task, create?, gitInit?}` | POST /api/mcp/switch-project; the daemon switches when the turn ends, a fresh session there gets `task` with source `handoff` |
+
+Jira tools without a connection (config `jira.*`, else env `JIRA_BASE_URL`/`JIRA_URL`, `JIRA_EMAIL`/`JIRA_USER`,
+`JIRA_API_TOKEN`/`JIRA_TOKEN` and `ATLASSIAN_*` equivalents) return isError with exactly: "Jira isn't connected: run
+\`anywhere jira setup\`, or add it in Settings → Jira, or read the ticket from the browser with read_browser_tab."
+Writes (`jira_transition`, `jira_assign`, `jira_comment`, `switch_project`) call the guard first and post activity.
+The client (`src/integrations/jira.js`, `JiraClient({baseUrl, email, apiToken, deployment?, timeoutMs=15000})`) uses
+Basic email:token with REST v3 on Cloud and a Bearer personal access token with REST v2 on Server/Data Center (on a
+401 it retries once with Basic username:password when a username is set), follows redirects only within the site, honours
+`HTTPS_PROXY`/`NO_PROXY`, and never puts the token in an error. `server.js` `buildInstructions()` tells Claude when to
+use `read_browser_tab`, the Jira tools (or an Atlassian MCP server, or the page) and `find_repos`, and, for the
+engine role, `switch_project`.
 
 Every input-action tool posts fire-and-forget `POST /api/mcp/activity` `{tool, summary, ok, error?}` and
 `screenshot` also posts `{tool:'screenshot', image: <base64 png>, width, height}`. Before each input action the
@@ -441,7 +512,17 @@ Bind `127.0.0.1` only. Security on **every** request:
 | POST `/api/mode` | `{mode, force?}` | `{ok, mode, moved?}`; 409 while a task runs unless `force:true`. Bridge commands that only wait for a terminal (none listens, none took a command, no card is open) do not make it busy: a switch to companion mode sends them to the dialog's own session under their ids (`moved`: how many) |
 | POST `/api/stt` | raw `audio/wav` (also webm/ogg/mp4 pass-through) `?language=` | `{text, provider}` |
 | POST `/api/tts` | `{text}` | `{ok, provider}` |
-| POST `/api/tts/stop` | | `{ok}` |
+| POST `/api/tts/stop` | | `{ok}`: stops daemon speech and playback, and drops the announcements still queued (barge-in) |
+| GET `/api/tts/audio?id=` | | `audio/wav` bytes of a `/api/tts/synthesize` id (32 hex) or a chime (`chime-done\|info\|permission\|question\|error`); 400 malformed id, 404 unknown (gone from the cache of the last 60); HEAD supported |
+| POST `/api/tts/synthesize` | `{text, voice?, rate?}` | `{id, mime:'audio/wav', engine:'piper', durationMs, cached}`; 503 + hint when Piper is not installed |
+| GET `/api/voice/status` | | `{engine, ttsEngine, piper:{installed, binary, binaryKind, voice, installedVoices, installing, catalog:[{id, name, language, gender, quality, sizeMb, sampleText, description, installed}]}, os:{provider, hint?}, player:{available, players, hint?}, announcer}` |
+| POST `/api/voice/install` | `{voice?, force?}` | `{ok, started:true, voice}` (or `{ok, started:false, running:true, voice}` while one runs); progress as SSE `voice_install`; on success saves `voice.piperVoice` and refreshes the snapshot |
+| POST `/api/voice/use` | `{voice}` | `{ok, voice}`; 400 bad id, 409 + hint when that voice is not installed |
+| POST `/api/voice/test` | `{text?}` | `{ok, delivered:'dialog'\|'local'\|'none'\|'skipped', engine, text, error?}`: a sample through the announce path (ignores the announce toggles) |
+| POST `/api/voice/remove` | `{voice}` | `{ok, removed}` |
+| GET `/api/jira/status[?check=1]` | | `{configured, baseUrl, email, tokenSet, missing:[…], source:{baseUrl, email, apiToken: 'config'\|'env:NAME'\|null}, urlError?, deployment:'Cloud'\|'Server'\|null}`; `check=1` adds `{connected, user?, error?, hint?}`. Never returns the token |
+| POST `/api/jira/test` | `{baseUrl?, email?, apiToken?}` | 200 `{ok:true, user:{displayName, email, accountId}, deployment, baseUrl, serverTitle?}`; a Jira failure 422 `{ok:false, error, code, hint?, jiraStatus?}`; bad input 400 `{error, hint?, code:'JIRA_NOT_CONFIGURED'\|'JIRA_BAD_URL'\|'JIRA_NO_TOKEN'}`. Unsent or empty fields come from the saved settings; the saved token goes only to the saved site |
+| POST `/api/mcp/switch-project` | `{dir, task, create?, gitInit?, role?}` | from the dialog's session during its turn: `{ok, scheduled:true, dir, replaced?, created?, initialized?}` (switches when the turn ends); from the user's terminal (`role:'interactive'`) to an idle dialog: `{ok, scheduled:true, immediate:true, dir}`; already the project: `{ok, scheduled:false, same:true, dir}`. 400 bad input / relative path / missing folder without `create`; 409 `BRIDGE_MODE`, `BUSY` or `NO_TURN` (checked before any mkdir); 413 task too long; 422 git init failed. On WSL `C:\x` becomes `/mnt/c/x` |
 | GET `/api/context` | | gatherContext JSON |
 | POST `/api/show` | | `{ok, host}` |
 | POST `/api/shutdown` | | `{ok}` then exit |
@@ -452,17 +533,18 @@ Bind `127.0.0.1` only. Security on **every** request:
 | GET `/api/mcp/guard` | | `{allowed, reason?}`; bridge mode refuses the screen actions of a command the user stopped until the terminal listens again (at most 10 min) |
 | POST `/api/bridge/listen` | `{timeoutSec ≤ 590}` | `{command:{id,text,images:[path],context,source}}` or `{timeout:true}` or `{stop:true}` |
 | POST `/api/bridge/reply` | `{text, final?, speak?}` | `{ok}`; 409 (with a hint) when the dialog is in companion mode: `anywhere reply` then prints STOP and exits 3. 409 `{code:'COMMAND_STOPPED'}` after Stop cancelled the terminal's command, until its next listen: the reply is not shown, and `anywhere reply` prints STOPPED and exits 5 |
-| POST `/api/ui/visibility` | `{page, visible, focused?}` | `{ok}`: a dialog page (its own id per page load) reports whether it can be seen, after a `show` event and on `visibilitychange`; `UiHost.show()` opens a window when every page reports hidden |
+| POST `/api/ui/visibility` | `{page, visible, focused?}` | `{ok}`: a dialog page (its own id per page load) reports whether it can be seen when its event stream opens, after a `show` event and on `visibilitychange`; `UiHost.show()` opens a window when every page reports hidden, and the announcer plays announcements itself then |
 
 ### SSE events (server → UI): `event: <type>` + `data: <json>`
-- `snapshot` `{version, mode, status, statusDetail, project:{dir,name,git}, session:{id, model, costUsd, turns}, messages:[…], pending:{approvals:[…], questions:[…]}, config:<public>, voice:{serverStt, sttProvider, serverTts, ttsProvider}, bridge:{listening, queued}, platform:{platform, displayServer, driver}, screenshot:{dataUrl,width,height,ts}|null}`
+- `snapshot` `{version, mode, status, statusDetail, project:{dir,name,git}, session:{id, model, costUsd, turns}, messages:[…], pending:{approvals:[…], questions:[…]}, config:<public>, voice:{serverStt, sttProvider, serverTts, ttsProvider, engine:'piper'|'os'|'browser'|null, ttsEngine, piper:{installed, voice}, announcer, sttHint?, ttsHint?}, bridge:{listening, queued}, platform:{platform, displayServer, driver}, screenshot:{dataUrl,width,height,ts}|null}`
 - `status` `{status:'idle'|'starting'|'thinking'|'acting'|'waiting_approval'|'waiting_answer'|'stopping'|'queued'|'error'|'offline', detail?}`
   (`queued`: bridge commands wait for a terminal to run `/anywhere here`; Stop drops them)
 - `message` (transcript item; see below), `delta` `{id, text}` (append to an assistant item)
 - `tool_update` `{toolUseId, status:'ok'|'error', output?, image?}`
 - `approval_request` `{id, toolName, displayName, summary, input, risk, reason, sessionRule, ts}` · `approval_resolved` `{id, decision, by?, via?, message?}`
 - `question` `{id, question, options, ts}` · `question_resolved` `{id, answer}`
-- `notify` `{text, level, speak}` · `result` `{text, costUsd, totalCostUsd, durationMs, isError, sessionId, numTurns, commandIds, interrupted?}`
+- `notify` `{text, level, speak}` · `result` `{text, costUsd, totalCostUsd, durationMs, isError, sessionId, numTurns, commandIds, interrupted?, handoff?:{dir}}`
+  (`handoff`: switch_project moves the work on to `dir`; a `project` event and a new user item with source `handoff` follow)
   (`commandIds`: the commands this result answers, so a command queued during a turn waits for the next result;
   `interrupted` marks a turn the user stopped; `engineInitiated:true` with `commandIds: []` marks a turn Claude Code
   started by itself after a background task finished)
@@ -472,10 +554,15 @@ Bind `127.0.0.1` only. Security on **every** request:
   stopped and interrupted)
 - `screenshot` `{dataUrl, width, height, ts}` · `project` `{dir, name, git}` · `session` `{id, model}`
 - `config` `<public config>` · `mode` `{mode}` · `bridge` `{listening}` · `show` `{}` · `error` `{message}`
+- `announce` `{id:'an_<uuid>', kind:'done'|'permission'|'question'|'error'|'info', text, audio:null|{id, mime:'audio/wav', durationMs}, chime, ts}`:
+  sent only while a dialog page (`?client=ui`) is connected and visible; the page plays it (see §8). `audio.id` is for
+  `GET /api/tts/audio`; `chime` is false for spoken notifications and hand-offs, else `voice.chime !== false`
+- `voice_install` `{stage:'binary'|'voice'|'verify'|'done'|'error', percent (overall 0-100, never decreasing), stagePercent:number|null, message, voice}`;
+  the last event is `done` or `error` (its message includes the fix)
 
 Transcript items (`message` event and `snapshot.messages`):
 ```js
-{ id, role: 'user', text, source, ts, images }                                  // images = count
+{ id, role: 'user', text, source, ts, images }                                  // images = count; source text|voice|cli|skill|handoff
 { id, role: 'assistant', text, ts, streaming: bool }
 { id, role: 'tool', toolUseId, name, displayName, summary, input, status: 'running'|'ok'|'error', output, image, parentToolUseId, ts }
 { id, role: 'system', text, level: 'info'|'success'|'warning'|'error', ts }
@@ -543,8 +630,10 @@ class SessionManager extends EventEmitter {
   async submit({ text, images, attachScreenshot, source }) -> { id }
   async interrupt()
   async newSession()
-  async setProject(dir, { force })   // 409 while busy (a turn, queued follow-ups, approvals, questions, busy bridge) unless force
+  async setProject(dir, { force, fresh?, keepTranscript?, note? })   // 409 while busy (a turn, queued follow-ups, approvals, questions, busy bridge) unless force
   setMode(mode, { force })
+  handoffCheck({ dir, from }) -> { same, dir }       // throws 503 / 400 / 409 BRIDGE_MODE | BUSY | NO_TURN
+  handoff({ dir, task, from: 'engine'|'interactive' }) -> { scheduled, dir, same?, immediate?, replaced? }
   async shutdown()
 }
 ```
@@ -575,13 +664,21 @@ class SessionManager extends EventEmitter {
 - Settings: only engine settings (model, effort, Chrome, extra args… see `signature()`) restart the engine, with the
   next command (the conversation resumes); while Claude Code runs background tasks the restart waits, with a notice.
   Prompt-only settings (approval mode, spoken replies…) reach Claude as a `<settings>` block with the next message.
-- Approval and question cards are announced with their content: `createAttentionHandler()` in main.js reopens the
-  dialog when no dialog page or TUI is connected (`dialogCount()` is 0), posts an OS notification (both throttled),
-  and, with spoken replies on, says `attentionSpeech(info)` aloud: the action and its summary, or the question and
-  its options, with secret-looking values left out. A card answered before its turn to be spoken is skipped.
+- Approval and question cards: `createAttentionHandler()` in main.js reopens the dialog when no dialog page or TUI is
+  connected (`dialogCount()` is 0) and posts an OS notification (both throttled). Speaking them is the announcer's job
+  (`announcer.js`, below); the handler's own `attentionSpeech()` is used only when the announcer could not start.
 - Bridge mode, mode switch: commands that only wait for a terminal move to the companion session (same ids, their
   context and images); a terminal's command in progress is announced `interrupted`.
 - The transcript keeps at most 12 screenshots and 8 MB of image data; older images are dropped from the items.
+- Hand-off (`switch_project`, `POST /api/mcp/switch-project`): from the dialog's own session it is scheduled for the
+  end of the current turn; that turn's `result` carries `handoff:{dir}`, then `setProject(dir, {force, fresh: true,
+  keepTranscript: true, note})` starts a new conversation there (the transcript stays on screen) and `submit({text:
+  task, source:'handoff'})` sends the task. A Stop, an error result, a new session, a mode or project switch, or the
+  engine exiting cancels it (with a transcript line); commands the user sent during the turn go first, with a note to
+  Claude that the switch did not happen. From the user's terminal (`role:'interactive'`) an idle dialog switches at once.
+- `READ_ONLY_TOOLS` (`--allowedTools`): screenshot, cursor_position, screen_info, list_windows, get_desktop_context,
+  wait, notify_user, ask_user, clipboard_get, find_repos, jira_status, jira_get_issue, jira_search, jira_my_issues,
+  jira_find_user. `read_browser_tab` is not (with `includeText` it sends keystrokes), so the broker judges each call.
 - main.js: `run/daemon.lock` is the start lock. Ports are tried in this order: the one recorded in
   `run/last-port.json` for the configured port, the configured port, its 19 neighbours in an order rotated by a hash of
   the state dir, then a random free port. A busy port means ALREADY_RUNNING (exit 0; `anywhere start` keeps waiting for
@@ -624,6 +721,11 @@ PowerShell, cmd/osascript/wscript/cscript/mshta, and terminal emulators given a 
 driver for the focused window): command-shaped text keeps its full verdict in any app (focus never lowers it);
 only known non-terminal apps (chat, mail, office, notes) relax a plain sentence to medium; in a terminal, with a
 Return, or in an unknown app the text gets full scrutiny.
+Ticket tools: `read_browser_tab` is low without `includeText`, medium with it (it focuses the browser and uses the
+keyboard and clipboard); `find_repos` and the Jira reads are low; `jira_transition`, `jira_assign` and `jira_comment`
+are medium (a comment with a secret-looking value is high and gets no session rule); `switch_project` is medium, high
+for a system, credential or root folder or for creating a folder outside home, and never gets a session rule. Tools
+of a Jira/Atlassian/Confluence MCP server: reads low, writes medium, deletes and "destructive" tiers high.
 
 ### questions.js · bridge.js
 ```js
@@ -641,23 +743,85 @@ zoom with `region`); ignoring the "Claude Anywhere" window; safety (`ask_user` b
 or financial actions; never type passwords, 2FA codes, or payment data, so the user does those; no CAPTCHA solving);
 progress (`notify_user` for milestones); voice-friendly final answers (≤ 3 sentences, no markdown tables); "this repo"
 means the project dir or the active editor workspace from `<desktop_context>`; and a deployment playbook (detect the
-stack, Dockerfile or buildpacks, Cloud Run / App Engine / GKE, enable APIs, `gcloud run deploy --source`, verify the URL).
-Platform specifics: key names (`primary` = Cmd on macOS, Ctrl elsewhere), shells.
+stack, Dockerfile or buildpacks, Cloud Run / App Engine / GKE, enable APIs, `gcloud run deploy --source`, verify the URL);
+and a "Work on a ticket" playbook (find the ticket from the context's Tickets line or `read_browser_tab`, read it with
+`jira_get_issue` / an Atlassian MCP / the page, summarize with a plan, one `ask_user` for where to work from
+`find_repos`, one for the transition and assignment, `switch_project` when the repo is elsewhere, then branch
+`KEY-123-slug`, implement, test, commit, ask before pushing, comment on the ticket).
+Platform specifics: key names (`primary` = Cmd on macOS, Ctrl elsewhere), shells. At most 16,000 characters.
 
 ### voice.js
 ```js
 class VoiceService {
-  constructor({ config })
-  async capabilities() -> { serverStt: bool, sttProvider, serverTts: bool, ttsProvider }
+  constructor({ config, piper?, player?, ttsCache?, … })
+  async capabilities() -> { serverStt, sttProvider, serverTts, ttsProvider /* 'piper' when Piper speaks */,
+                            engine: 'piper'|'os'|'browser'|null, ttsEngine, piper: { installed, voice }, sttHint?, ttsHint? }
   async transcribe(buffer, { contentType = 'audio/wav', language }) -> { text, provider }
-  async speak(text, { rate, voice }) -> { ok, provider }
-  stop()
+  async speak(text, { rate, voice }) -> { ok, provider }   // Piper (synthesize + play) when the engine is piper, else the OS voice
+  stop()                                                   // stops speech and playback; tells onStop() listeners
+  piper                                                    // PiperManager
+  player() -> AudioPlayer
+  ttsEngineSetting() -> 'auto'|'piper'|'browser'|'os'      // unknown values count as auto
+  piperVoiceId() -> string
+  async engineInfo() -> { setting, engine, piper, os: { provider, hint? } }
+  invalidate()                                             // forget cached capabilities
+  async voiceStatus() -> GET /api/voice/status body (without announcer)
+  async installPiper({ voice?, force?, onProgress?, signal? })
+  async synthesize(text, { voice?, rate? }) -> { id, path, mime: 'audio/wav', engine: 'piper', durationMs, cached, voice }
+  audioFile(id) -> path | null
+  playFile(file, opts) -> Promise<{ ok, player, stopped? }>
+  onStop(fn) -> unsubscribe
 }
 ```
+`auto` uses Piper when it is installed, else the OS voice; `piper` only Piper (503 with the install command until it is
+installed); `os` the OS voice; `browser` leaves speaking to the dialog. A new utterance replaces the old one without
+notifying `onStop` listeners. Synthesized WAVs are cached in `runDir()/tts-cache` (the last 60; the same voice, speed and
+text give the same id).
 STT: OpenAI-compatible `POST {base}/audio/transcriptions` (multipart: `file`, `model`, `language`) using
 `voice.sttApiKey` | `ANYWHERE_STT_API_KEY` | `GROQ_API_KEY` (base `https://api.groq.com/openai/v1`, model
 `whisper-large-v3-turbo`) | `OPENAI_API_KEY` (base `https://api.openai.com/v1`, model `gpt-4o-mini-transcribe`).
 Then whisper.cpp (`whisper-cli` | `whisper-cpp` | `main` + model file; needs 16 kHz WAV).
+
+### piper.js · chime.js · announcer.js · src/os/audio.js
+```js
+class PiperManager {   // free, offline neural TTS (MIT), installed on request into stateDir()/voice
+  constructor({ root?, venvDir?, env?, platformInfo?, which?, runner?, releaseBase?, voicesBase?, legacyBase?, ca?, arch?, pipSpec? })
+  findBinary({ refresh }) -> { bin, kind: 'env'|'bundled'|'venv'|'path' } | null
+  async status(voice) -> { installed, binary, binaryKind, voice, installedVoices, … }
+  async install({ voice, force, onProgress, signal })      // release binary (Linux x64/arm64/armv7, Windows x64), else pip piper-tts in a private venv (macOS)
+  async synthesize(text, { voice, outFile, lengthScale, speaker, timeoutMs, signal }) -> { path, durationMs, sampleRate, voice, binaryKind, ms }
+  removeVoice(id), voiceInstalled(id), installedVoices(), voicePaths(id)
+}
+// also: TtsCache, CATALOG, DEFAULT_VOICE, parseVoiceId, validVoiceName, voiceUrls, releaseAsset, wavInfo, wavFileInfo,
+// downloadFile(url, dest, {onProgress, minBytes, maxBytes, signal, timeoutMs, ca, env, resume}), httpGet, proxyFor
+// env: ANYWHERE_PIPER_PATH, ANYWHERE_PYTHON, ANYWHERE_PIPER_RELEASE_BASE / _VOICES_BASE / _LEGACY_BASE, ANYWHERE_PIPER_PIP_SPEC
+
+chimeWav(kind) -> Buffer; chimeFile(kind, { dir? }) -> runDir()/chimes/chime-<kind>.wav; CHIME_KINDS   // two soft notes per kind
+
+class Announcer {
+  constructor({ config, hub, voice, findCard?, secretLike?, chimeFile?, now?, random?, minQuietTurnMs = 4000 })
+  start(); stop(); noteVisibility({ page, visible }); dialogVisible() -> bool
+  handle(type, data) -> queued item | null; async deliver(item); async test(text?); cancelPending()
+}
+// composers: composeDone, composeError, composePermission, composeQuestion, humanizeAction, humanizeCommand, firstSentences
+
+class AudioPlayer { constructor({ platformInfo?, which?, runner?, env?, isFile? }); async playFile(file, { device?, timeoutMs? }) -> { ok, player, stopped? }; stop() -> bool; isPlaying(); async status() -> { available, players, hint? } }
+// errors carry .code ENOENT | NO_PLAYER | PLAY_FAILED and .hint; also buildPlayCommand, soundPlayerScript, mntToWindowsPath
+```
+The **announcer** decides what is said aloud and when, in one place. It listens to the hub's `event` and `clients`
+emits: `result` → `done` ("All done." + the first sentence or two; not for a stopped turn, a `speak:false` bridge reply,
+or a quick turn under 4 s that used no tools; a result with `handoff` → info "Switching to <folder> to continue."),
+`approval_request` → `permission`, `question` → `question`, an error result, `status` error or `error` event → `error`,
+and `notify` with `speak:true` → info (no chime; only `voice.tts = off` mutes it). It honours `voice.speakResponses`,
+`voice.tts`, `voice.announce.*` and `voice.chime`, masks secrets, says each event once, plays one at a time (queue of 4;
+cards are kept over older items), and skips a card answered meanwhile. Delivery: when a dialog page is connected and
+visible (pages report through `/api/ui/visibility`; a page that has not reported counts as visible) it broadcasts
+`announce`, with a Piper WAV id when the engine is piper; otherwise it plays the chime and speaks through the OS
+(Piper WAV or OS voice). With `ttsEngine` `browser` it stays silent when no page is visible; with `os` the OS always
+speaks. `voice.stop()` (barge-in, Stop, `POST /api/tts/stop`) drops what is queued. main.js wires it: hub listeners,
+`uihost.noteVisibility` also feeds it, `server.deps.announcer` / `server.deps.refreshVoice`, the attention handler stops
+speaking cards, `session.setVoiceInfo({…caps, announcer:true})` (set before the first probe, so a dialog never speaks
+results, cards or notifications itself), and `POST /api/mcp/notify` leaves `speak:true` to it.
 
 ### uihost.js
 ```js
@@ -713,11 +877,27 @@ header on fetch and `?token=` on EventSource. Features:
   wait…", "yes, but…", "always ask me first") is not applied and the card stays. With a pending question, the
   utterance answers it: options match whole words, and hedged or ambiguous answers are sent as said. The wake word
   must open the utterance (after at most one filler such as "okay"; later only the exact phrase); while Claude
-  speaks and ~0.7 s after, only the exact wake phrase (or "stop" with no wake word set) gets through. TTS: `speechSynthesis` or `/api/tts`; speak
-  `result` text (via stripMarkdown, ≤ 600 chars) and `notify` with `speak:true`; barge-in cancels speech. With
-  several dialog windows open, only the most recently focused or shown one speaks and listens hands-free
-  (BroadcastChannel `claude-anywhere`).
-- Settings drawer: permission mode, voice options, engine model and Claude in Chrome, context options, UI theme and always-on-top.
+  speaks and ~0.7 s after, only the exact wake phrase (or "stop" with no wake word set) gets through.
+  TTS: `speechSynthesis` or `/api/tts`. While `snapshot.voice.announcer` is true (always with a current daemon)
+  the page never speaks `result` events, cards or `notify` messages by itself: it plays the daemon's `announce` events. Only without the announcer (an older daemon) does it speak `result` text
+  (via stripMarkdown, ≤ 600 chars) and `notify` with `speak:true`. With several dialog windows open, only the most
+  recently focused or shown one speaks and listens hands-free (BroadcastChannel `claude-anywhere`).
+- Announcements (`voice.announce(item)`): only the speaker window plays them. An optional WebAudio chime (two notes per
+  kind, `CHIME_NOTES`) when the event's `chime` is true and `voice.chime !== false`; then `GET /api/tts/audio?id=` with
+  the Bearer header → Blob → `URL.createObjectURL` → `new Audio()` (revoked after); without audio, or when it fails,
+  `speechSynthesis` with the chosen voice, else the most natural one (`rankVoices`/`pickNaturalVoice`; the picker
+  defaults to "Most natural available"), else `POST /api/tts`. Queue of 8; permission and question go first; entries
+  older than 120 s are dropped; an entry waits up to 20 s behind a read-aloud the user started; ids are de-duplicated;
+  `voice.tts === 'off'` ignores them. Answering a card drops its announcement (`dropAnnouncements('permission' |
+  'question')`). Barge-in (mic, typing, Esc, Stop) cancels browser speech and announcements and POSTs `/api/tts/stop`
+  (daemon playback and its queue). Read aloud uses Piper (`POST /api/tts/synthesize`, then the WAV) when
+  `snapshot.voice.engine === 'piper'`, else the browser voice.
+- Settings drawer, in tabs **General | Voice | Jira & repos | Advanced**: permission mode, mode, theme and
+  always-on-top; voice input and spoken replies (engine `voice.ttsEngine`, the Piper voice picker with Install and a
+  progress bar from `voice_install`, Test, `voice.announce.*` toggles, chime); Jira (`jira.baseUrl` normalized to
+  `https://host[/context]`, email, the token as a password field showing "•••• set" and never sent empty, Test
+  connection → `POST /api/jira/test`, status from `GET /api/jira/status`); workspace roots (`workspace.roots`, the whole
+  list, with suggestions from `GET /api/projects`); engine model, Claude in Chrome, context and privacy options.
   Save sends only the fields changed in the drawer; a config change made elsewhere while it is open refreshes the
   untouched fields. A project or mode switch the daemon refuses because a task is running (409) asks for
   confirmation, then retries with `force`.
@@ -733,6 +913,9 @@ header on fetch and `?token=` on EventSource. Features:
   once, the launch code is traded through `POST /api/launch` before the first API call, the token is kept in
   sessionStorage, and both are removed from the address bar. A failed trade (used or expired code) falls back to the
   stored token, so reloads keep working.
+- Transcript: a user item with source `handoff` (the task `switch_project` handed to the new session) is labelled
+  "Handed over by Claude" and collapsed to its first line when long; ticket tools show a ticket icon, `find_repos` and
+  `switch_project` a folder.
 - Reconnect banner; dark and light themes (`prefers-color-scheme` + manual); aria-live transcript.
 - `window.anywhereFocusInput()` is exposed for the Electron hotkey.
 
@@ -741,7 +924,8 @@ header on fetch and `?token=` on EventSource. Features:
 through the environment because command lines are readable by every local user, and browsers get single-use launch
 codes instead, see server.js; `--url <url>` still works for manual runs): one
 `BrowserWindow` titled "Claude Anywhere" (440×720, positioned right, `alwaysOnTop`, `setContentProtection(hideFromScreenshots)`),
-mic permission granted only for the daemon origin, `globalShortcut` hotkey toggles show/focus, and the window is
+mic permission granted only for the daemon origin, `autoplay-policy=no-user-gesture-required` (announcements play
+before the first click; the app windows get the same flag), `globalShortcut` hotkey toggles show/focus, and the window is
 hidden on close (tray menu with Show and Quit). `preload.js` exposes `window.anywhereShell = { isElectron: true, platform, hide(), setAlwaysOnTop(bool) }`.
 
 ## 10. CLI (`bin/anywhere.js`)
@@ -761,7 +945,10 @@ anywhere computer <op> …                     # screenshot [--display N] [--out
 anywhere doctor [--json]
 anywhere install [--electron] [--no-mcp] [--hotkey [--hotkey-key COMBO]] [--no-permissions] | uninstall
 anywhere show [--launcher]                    # --launcher (macOS applet): only show a running dialog; else open Terminal to start it
-anywhere config [path | get KEY | set KEY VALUE | reset]
+anywhere config [path | get KEY | set KEY VALUE | reset]   # voice.sttApiKey and jira.apiToken are masked unless --reveal
+anywhere voice install [ID] [--voice ID] [--force] | list | use ID [--install] | test ["text"] [--local] | status | remove ID [--json]
+anywhere jira setup [--url URL] [--email EMAIL] [--token-stdin] [--no-test] | test | status | issue KEY
+             | search "JQL" [--max N] | mine [--status S] | remove [--json]   # --token VALUE is refused
 anywhere logs [--audit] [-n N]
 anywhere tui
 anywhere mcp                                  # MCP stdio server
@@ -778,6 +965,10 @@ other process with the token URL: `show` posts `/api/show`, so the daemon's UiHo
 - Hotkeys (`install --hotkey`): Ctrl+Alt+F12 on Windows and WSL (Ctrl+Alt+<letter> is AltGr on many layouts),
   Ctrl+Alt+A on GNOME, a launcher app to bind in Shortcuts on macOS; `--hotkey-key COMBO` picks another. `install.json`
   records `envPath` (the install-time PATH) so daemons started by launchers find node and claude.
+- `voice install`, `list`, `use` and `remove` work without the daemon (`use`/`install` then tell a running one through
+  `POST /api/voice/use`); `test` plays through the dialog when it is open, else locally. `jira setup` prompts on a TTY
+  (hidden token), probes Cloud vs Server, tests, saves with `config.save` (0600) and tells a running daemon.
+- `doctor`'s Voice line also shows the natural voice: `Piper ✓ <voice>`, or `not installed (anywhere voice install)`.
 - `doctor` also warns about broad Claude Code allow rules (`Bash`, `Bash(*)`, `Write`, `Edit`, `mcp__anywhere__*` in
   ~/.claude/settings.json and the project's .claude/settings(.local).json), which apply before the dialog's approval
   broker; on macOS it shows Automation consent and the running daemon's permissions (`GET /api/permissions`), and
@@ -816,3 +1007,7 @@ is required (display tests skip unless `DISPLAY` is set and xdotool exists). `te
 the stream-json CLI. It also connects to the MCP server named in `--mcp-config` to exercise `permission_prompt`,
 `ask_user`, and `screenshot` end to end. CI (`.github/workflows/ci.yml`) runs `npm test` and `npm run lint` on
 ubuntu, macos and windows.
+The voice, Jira and ticket features are tested without network or audio: local fake HTTP servers stand in for the
+Piper release, Hugging Face and Jira, fake `piper`/player binaries for the real ones, the mock driver and
+`test/fixtures/fake-ps-host.js` for browser tabs, and `test/fixtures/ui-stub-server.js` (voice status, install,
+`/api/tts/audio`, `announce` and Jira routes) for the dialog in headless Chromium.

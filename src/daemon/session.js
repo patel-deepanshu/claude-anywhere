@@ -57,7 +57,11 @@ const STATUSES = ['idle', 'starting', 'thinking', 'acting', 'waiting_approval', 
 const NO_CONVERSATION_RE = /no conversation found|conversation .*not found|session .*not found|could not find (a )?(session|conversation)|no session found|invalid session id/i;
 const ID_IN_USE_RE = /already in use|already exists/i;
 
-/** Read-only anywhere tools: pre-approved so they never reach the permission prompt. */
+/**
+ * Read-only anywhere tools: pre-approved so they never reach the permission prompt. The ticket
+ * workflow's reads (find_repos, the Jira lookups) are here too; read_browser_tab is not, because
+ * with includeText it drives the keyboard and clipboard (the broker judges each call).
+ */
 const READ_ONLY_TOOLS = [
   'screenshot',
   'cursor_position',
@@ -68,7 +72,17 @@ const READ_ONLY_TOOLS = [
   'notify_user',
   'ask_user',
   'clipboard_get',
+  'find_repos',
+  'jira_status',
+  'jira_get_issue',
+  'jira_search',
+  'jira_my_issues',
+  'jira_find_user',
 ].map((n) => `mcp__anywhere__${n}`);
+
+// switch_project: the work moves to another folder (a fresh conversation there) when the turn that
+// asked for it ends. The transcript line shows at most this much of the task's first line.
+const HANDOFF_LINE_MAX = 140;
 
 /** Tool prefix of the Claude Anywhere plugin's own MCP server ("anywhere" in plugin "anywhere"). */
 const PLUGIN_COPY_SERVER = 'mcp__plugin_anywhere_anywhere';
@@ -125,6 +139,17 @@ const ANYWHERE_NAMES = {
   notify_user: 'Notify',
   ask_user: 'Ask you',
   permission_prompt: 'Permission check',
+  read_browser_tab: 'Read browser tab',
+  find_repos: 'Find repositories',
+  switch_project: 'Switch project',
+  jira_status: 'Jira connection',
+  jira_get_issue: 'Read Jira issue',
+  jira_search: 'Search Jira',
+  jira_my_issues: 'My Jira issues',
+  jira_transition: 'Move Jira issue',
+  jira_assign: 'Assign Jira issue',
+  jira_comment: 'Comment on Jira issue',
+  jira_find_user: 'Find Jira user',
 };
 
 function humanize(s) {
@@ -279,6 +304,36 @@ function summary(name, input) {
     case 'permission_prompt':
       s = oneLine(i.tool_name);
       break;
+    case 'read_browser_tab':
+      s = `${oneLine(i.browser) || 'browser'}${i.includeText ? ', with the page text' : ''}`;
+      break;
+    case 'find_repos':
+      s = oneLine(i.query) || 'all repositories';
+      break;
+    case 'switch_project':
+      s = `${shortPath(i.dir)}${i.create ? ' (new folder)' : ''}`;
+      break;
+    case 'jira_get_issue':
+      s = oneLine(i.key);
+      break;
+    case 'jira_search':
+      s = oneLine(i.jql);
+      break;
+    case 'jira_my_issues':
+      s = oneLine(i.status) || 'open';
+      break;
+    case 'jira_transition':
+      s = `${oneLine(i.key)} → ${oneLine(i.to)}`;
+      break;
+    case 'jira_assign':
+      s = `${oneLine(i.key)} → ${/^me$/i.test(oneLine(i.user)) ? 'you' : oneLine(i.user)}`;
+      break;
+    case 'jira_comment':
+      s = `${oneLine(i.key)}: "${truncate(oneLine(i.text), 50)}"`;
+      break;
+    case 'jira_find_user':
+      s = oneLine(i.query);
+      break;
     default: {
       for (const k of ['command', 'url', 'file_path', 'path', 'query', 'target', 'title', 'name', 'text', 'description', 'prompt']) {
         if (typeof i[k] === 'string' && i[k].trim()) {
@@ -383,6 +438,13 @@ function isDir(p) {
   } catch {
     return false;
   }
+}
+
+/** Same folder? Case-insensitive where the file system usually is (Windows, macOS). */
+function sameDir(a, b, plat = process.platform) {
+  if (!a || !b) return false;
+  const norm = (p) => path.resolve(p).replace(/[\\/]+$/, '');
+  return plat === 'win32' || plat === 'darwin' ? norm(a).toLowerCase() === norm(b).toLowerCase() : norm(a) === norm(b);
 }
 
 function writePrivate(file, data) {
@@ -538,6 +600,9 @@ class SessionManager extends EventEmitter {
     this.backgroundTasks = 0; // Claude Code's running background tasks (background_tasks_changed)
     this.engineSettingsNotes = null; // the settings notes the running engine knows (prompt file or last <settings> block)
     this.pendingFollowUps = []; // [{item, blocks}] commands waiting for the current turn to end
+    // switch_project: {dir, task, engine, at} carried out when the current turn's result arrives
+    // (the project switches, a fresh conversation starts there, and task is its first command).
+    this.pendingHandoff = null;
     this.interrupting = null; // promise while interrupt() waits for the CLI
     this.heldResult = null; // an error result that arrived before init (startup failure)
     this.resetEpoch = 0; // bumped by newSession()/setProject(): an engine start in progress gives up
@@ -636,6 +701,24 @@ class SessionManager extends EventEmitter {
     if (dir !== this.projectDir) return; // setProject() won the race
     this.project = info;
     this.broadcast('project', this.project);
+  }
+
+  /**
+   * Re-read the project's git state after a turn (a new branch, a commit) and broadcast it when
+   * it changed. Fire and forget; a project switch meanwhile wins.
+   * @private
+   */
+  refreshProjectInfo() {
+    const dir = this.projectDir;
+    if (typeof this.context.projectInfo !== 'function') return;
+    this.projectInfo(dir)
+      .then((info) => {
+        if (dir !== this.projectDir || !info || !this.project) return;
+        if (JSON.stringify(info.git || null) === JSON.stringify(this.project.git || null)) return;
+        this.project = { ...this.project, ...info };
+        this.broadcast('project', this.project);
+      })
+      .catch((err) => log.warn(`project refresh failed: ${err.message}`));
   }
 
   /** @private */
@@ -1196,6 +1279,7 @@ class SessionManager extends EventEmitter {
   /** @private ids: the commands that failed with it (they get no result) */
   engineFailed(err, ids = []) {
     log.error(`engine failed: ${err.message}`);
+    this.dropHandoff(null, 'engine_failed');
     this.turnActive = false;
     this.cancelCommands(ids, 'failed');
     this.system(`${err.message}${this.dropFollowUpsNote('failed')}`, 'error');
@@ -1251,6 +1335,8 @@ class SessionManager extends EventEmitter {
     if (this.heldResult && this.heldResult.engine === engine) this.heldResult = null;
     // A previous conversation's or project's engine: newSession()/setProject() already reset the turn state.
     if (this.detachedEngines.has(engine)) return;
+    // The turn that scheduled a hand-off never finished.
+    this.dropHandoff(info.expected ? null : 'Claude Code stopped before the step finished', 'engine_exit');
     const sent = this.engineSent;
     this.engineSent = [];
     const sentIds = this.turnCommandIds.splice(0);
@@ -1626,6 +1712,8 @@ class SessionManager extends EventEmitter {
     const engineTurn = this.engineTurn;
     this.engineTurn = false;
     this.engineTurnHint = false;
+    // switch_project asked to continue elsewhere once this turn ends (see handoff()).
+    const handoff = this.takeHandoff(engine, { interrupted, isError });
     const payload = {
       text: typeof msg.result === 'string' ? msg.result : '',
       costUsd: round6(turnCost),
@@ -1640,6 +1728,8 @@ class SessionManager extends EventEmitter {
     };
     if (interrupted) payload.interrupted = true;
     if (engineTurn) payload.engineInitiated = true;
+    // Not the end of the work: it continues in another folder (voice: no "done" yet).
+    if (handoff) payload.handoff = { dir: handoff.dir };
     this.broadcast('result', payload);
     this.emit('result', payload);
     if (isError && !interrupted) {
@@ -1651,6 +1741,12 @@ class SessionManager extends EventEmitter {
     this.turnActive = false;
     this.engineSent = [];
     this.persistSession();
+    if (handoff) {
+      this.runHandoff(handoff);
+      return;
+    }
+    // Claude may have created a branch or committed: the header shows the git state as it is now.
+    this.refreshProjectInfo();
     // A Stop in progress drops the queue and finishes the status itself.
     if (this.baseStatus !== 'stopping' && this.flushFollowUps()) return;
     if (this.baseStatus !== 'stopping' && this.mode === 'companion') this.setBase('idle');
@@ -1730,7 +1826,8 @@ class SessionManager extends EventEmitter {
     const imgs = this.normalizeImages(images);
     if (!body && !imgs.length && !attachScreenshot) throw httpError(400, 'text must be a non-empty string');
     if (body.length > MAX_TEXT) throw httpError(413, `text is longer than ${MAX_TEXT} characters`);
-    const src = ['text', 'voice', 'cli', 'skill'].includes(source) ? source : 'text';
+    // 'handoff': the task switch_project carried over from another folder's session.
+    const src = ['text', 'voice', 'cli', 'skill', 'handoff'].includes(source) ? source : 'text';
     const ctxCfg = this.config.context || {};
     const wantShot = attachScreenshot === undefined || attachScreenshot === null ? Boolean(ctxCfg.attachScreenshotByDefault) : Boolean(attachScreenshot);
     const finalText = body || (wantShot ? 'Look at my screen.' : 'See the attached image.');
@@ -2052,6 +2149,7 @@ class SessionManager extends EventEmitter {
         };
         this.broadcast('result', payload);
         this.emit('result', payload);
+        this.refreshProjectInfo();
         if (!this.bridgeBusy) this.setBase('idle');
         // More commands wait: Stop stays available until the terminal takes the next one.
         else if (!this.bridge.current) this.setBase('queued', 'Waiting for the terminal');
@@ -2143,6 +2241,7 @@ class SessionManager extends EventEmitter {
     this.pauseUntil = Date.now() + GUARD_PAUSE_MS;
     this.generation += 1;
     audit({ type: 'interrupt', mode: this.mode });
+    this.dropHandoff('you pressed Stop');
     const reason = 'Interrupted by user';
     try {
       if (this.permissions && typeof this.permissions.cancelAll === 'function') this.permissions.cancelAll(reason);
@@ -2323,9 +2422,12 @@ class SessionManager extends EventEmitter {
     this.cancelBridgeCurrent();
   }
 
-  /** @private an empty transcript for a new conversation */
-  resetTranscript() {
-    this.messages = [];
+  /**
+   * @private an empty transcript for a new conversation; keepMessages (a hand-off) keeps the items
+   * on screen and only forgets the old engine's stream state
+   */
+  resetTranscript({ keepMessages = false } = {}) {
+    if (!keepMessages) this.messages = [];
     this.toolItems.clear();
     this.streamItems.clear();
     this.streamOrder.clear();
@@ -2335,6 +2437,7 @@ class SessionManager extends EventEmitter {
 
   /** Stop the engine and start a fresh conversation. */
   async newSession() {
+    this.dropHandoff(null, 'new_session'); // the transcript starts over, so no line for it
     this.beginSwitch();
     this.sessionId = uuid();
     this.resumeNext = false;
@@ -2357,11 +2460,14 @@ class SessionManager extends EventEmitter {
   /**
    * Switch the working project (restarts the engine there). Refused with 409 while a task is
    * running (see isBusy) unless opts.force, which stops it.
+   * A hand-off (switch_project, see runHandoff) also passes fresh (a new conversation instead of
+   * resuming the folder's last one), keepTranscript (the dialog keeps showing what led here) and
+   * note (the transcript line announcing the switch).
    * @param {string} dir
-   * @param {{force?:boolean}} [opts]
+   * @param {{force?:boolean, fresh?:boolean, keepTranscript?:boolean, note?:string}} [opts]
    * @returns {Promise<{dir:string,name:string,git:object|null}>}
    */
-  async setProject(dir, { force = false } = {}) {
+  async setProject(dir, { force = false, fresh = false, keepTranscript = false, note = '' } = {}) {
     if (typeof dir !== 'string' || !dir.trim()) throw httpError(400, 'dir must be a directory path');
     const expanded = dir.trim().replace(/^~(?=$|[\\/])/, os.homedir());
     const abs = path.resolve(expanded);
@@ -2375,6 +2481,8 @@ class SessionManager extends EventEmitter {
     if (abs === this.projectDir) return this.project;
     const waitingBefore = this.bridgeWaitingOnly();
     const stopped = this.guardSwitch(force, 'project switch');
+    // A switch the user picked replaces a hand-off Claude scheduled (the transcript starts over).
+    this.dropHandoff(null, 'project_switch');
     this.beginSwitch();
     // Folder and conversation change together, before any await, so an engine start never
     // sees one without the other (and a command typed meanwhile runs in the new folder).
@@ -2382,16 +2490,22 @@ class SessionManager extends EventEmitter {
     // The old engine's --add-dir folders belonged to the old project.
     this.engineAddDirs = [];
     this.initSessionId();
+    if (fresh) {
+      // The hand-off's task carries everything the new session needs: no older conversation.
+      this.sessionId = uuid();
+      this.resumeNext = false;
+      this.lastEngineTotal = 0;
+    }
     this.project = { dir: abs, name: path.basename(abs) || abs, git: null };
     this.freshRetried = false;
     this.costUsd = 0;
     this.turns = 0;
-    this.resetTranscript();
+    this.resetTranscript({ keepMessages: keepTranscript });
     this.located = null;
-    audit({ type: 'project', project: abs });
+    audit({ type: 'project', project: abs, ...(fresh ? { fresh: true } : {}) });
     this.settleStatus();
     if (stopped) this.system(this.switchNote(stopped, waitingBefore), 'warning');
-    this.system(`Switched to ${this.project.name} (${abs}).`, 'info');
+    this.system(typeof note === 'string' && note.trim() ? note.trim() : `Switched to ${this.project.name} (${abs}).`, 'info');
     // Announced now (the approval policy judges paths against it); again below with git details.
     this.broadcast('project', this.project);
     this.broadcast('session', { id: this.sessionId, model: this.model });
@@ -2419,6 +2533,7 @@ class SessionManager extends EventEmitter {
     // Bridge commands that only wait for a terminal move to the companion session (nothing ran).
     const stopped = this.guardSwitch(force, 'mode switch', { movesWaiting: mode === 'companion' });
     if (stopped) this.system(this.switchNote(stopped), 'warning');
+    this.dropHandoff('the dialog switched to bridge mode');
     let moving = [];
     this.mode = mode;
     this.generation += 1;
@@ -2506,10 +2621,153 @@ class SessionManager extends EventEmitter {
     this.stopEngine().catch(() => {});
   }
 
+  // ---------------------------------------------------------------- hand-off (switch_project)
+
+  /**
+   * Can the work move to `dir` (POST /api/mcp/switch-project)? Throws what handoff() refuses with
+   * (bridge mode, a busy dialog, a stale request); {same:true} when dir already is the project.
+   * The route calls it before it creates the folder.
+   * @param {{dir:string, from?:'engine'|'interactive'}} req from: the MCP server's role
+   * @returns {{same:boolean, dir:string}}
+   */
+  handoffCheck({ dir, from = 'engine' } = {}) {
+    if (this.closed) throw httpError(503, 'The daemon is shutting down');
+    if (typeof dir !== 'string' || !dir.trim()) throw httpError(400, 'dir must be a directory path');
+    const abs = path.resolve(dir.trim().replace(/^~(?=$|[\\/])/, os.homedir()));
+    if (this.mode === 'bridge') {
+      throw httpError(409, 'The dialog is in bridge mode: its commands go to a Claude Code terminal, which keeps its own folder', {
+        code: 'BRIDGE_MODE',
+        hint: `Work in ${abs} from that terminal session directly (absolute paths, or cd in each Bash command).`,
+      });
+    }
+    if (sameDir(abs, this.projectDir)) return { same: true, dir: this.projectDir };
+    if (from === 'interactive') {
+      // The user's own Claude Code terminal (the plugin's tools) hands work to an idle dialog only.
+      if (this.isBusy()) {
+        throw httpError(409, `The dialog is busy with a task in ${this.project.name || this.projectDir}`, {
+          code: 'BUSY',
+          hint: 'Wait until it finishes (or the user stops it), then try again.',
+        });
+      }
+    } else if (!this.turnActive) {
+      // The dialog's own session asks from inside its turn; with none running the request is
+      // stale (the user pressed Stop meanwhile), and switching now would act on a stopped task.
+      throw httpError(409, 'No task is running in the dialog any more (it was stopped or has finished), so nothing was switched', {
+        code: 'NO_TURN',
+        hint: 'Do not retry: tell the user, and let them ask again.',
+      });
+    }
+    return { same: false, dir: abs };
+  }
+
+  /**
+   * switch_project: continue the work in another folder. When the current turn ends (Claude calls
+   * this as its last step), the project switches to dir (forced: the hand-off is intended), a fresh
+   * conversation starts there, and task is sent as its first command (source 'handoff'), so it must
+   * carry everything the new session needs. A Stop, an error result, a new session, a mode or
+   * project switch, or commands the user sends meanwhile cancel it. From the user's own terminal
+   * (from 'interactive') an idle dialog switches right away.
+   * @param {{dir:string, task:string, from?:'engine'|'interactive'}} req
+   * @returns {{scheduled:boolean, dir:string, same?:true, immediate?:true, replaced?:true}}
+   */
+  handoff({ dir, task, from = 'engine' } = {}) {
+    const check = this.handoffCheck({ dir, from });
+    if (check.same) return { scheduled: false, same: true, dir: check.dir };
+    const text = typeof task === 'string' ? task.trim() : '';
+    if (!text) throw httpError(400, 'task must be a non-empty string: everything the new session needs to continue');
+    if (text.length > MAX_TEXT) throw httpError(413, `task is longer than ${MAX_TEXT} characters`);
+    if (!isDir(check.dir)) throw httpError(400, `No such directory: ${check.dir}`);
+    const h = { dir: check.dir, task: text, engine: this.engine, at: Date.now(), from };
+    audit({ type: 'handoff_scheduled', project: this.projectDir, to: h.dir, by: from });
+    if (from === 'interactive') {
+      this.dropHandoff();
+      this.runHandoff(h);
+      return { scheduled: true, dir: h.dir, immediate: true };
+    }
+    const replaced = Boolean(this.pendingHandoff);
+    this.pendingHandoff = h;
+    this.system(`When this step finishes, Claude continues in ${h.dir} with a fresh session.`, 'info');
+    return { scheduled: true, dir: h.dir, ...(replaced ? { replaced: true } : {}) };
+  }
+
+  /**
+   * @private At a result: the scheduled hand-off to carry out now, or null. A Stop or an error result
+   * cancels it; commands the user sent during the turn go to Claude here first, with a note that
+   * the switch did not happen (Claude calls switch_project again if it still applies).
+   */
+  takeHandoff(engine, { interrupted = false, isError = false } = {}) {
+    const h = this.pendingHandoff;
+    if (!h) return null;
+    this.pendingHandoff = null;
+    if (h.engine && h.engine !== engine) return null; // a previous engine's request
+    if (interrupted || this.baseStatus === 'stopping') {
+      this.dropped(h, 'you pressed Stop');
+      return null;
+    }
+    if (isError) {
+      this.dropped(h, 'this step ended with an error (say "continue" to try again)', 'warning');
+      return null;
+    }
+    if (this.pendingFollowUps.length) {
+      this.dropped(h, 'Claude reads your new message first');
+      this.pendingFollowUps[0].blocks.unshift({
+        type: 'text',
+        text: `(Claude Anywhere: your switch_project to ${h.dir} was not carried out, because the user sent the message below while you finished. Read it first; call switch_project again if the hand-off still applies.)`,
+      });
+      return null;
+    }
+    return h;
+  }
+
+  /** @private forget a scheduled hand-off; with a reason, the transcript says why it did not happen */
+  dropHandoff(reason, auditReason) {
+    const h = this.pendingHandoff;
+    if (!h) return false;
+    this.pendingHandoff = null;
+    if (reason) this.dropped(h, reason);
+    else audit({ type: 'handoff_cancelled', to: h.dir, reason: auditReason || 'cancelled' });
+    return true;
+  }
+
+  /** @private */
+  dropped(h, reason, level = 'info') {
+    audit({ type: 'handoff_cancelled', to: h.dir, reason });
+    this.system(`Not continuing in ${h.dir}: ${reason}.`, level);
+  }
+
+  /**
+   * @private Carry out a hand-off: switch the project (fresh conversation, transcript kept), then
+   * send the task. Both happen before the first await, so a command typed meanwhile runs after it.
+   * @returns {Promise<object|null>} the new project, or null when the switch failed (reported)
+   */
+  runHandoff(h) {
+    const firstLine = h.task.split(/\r?\n/).find((l) => l.trim()) || h.task;
+    const note = `Continuing in ${h.dir}: ${truncate(oneLine(firstLine), HANDOFF_LINE_MAX)}`;
+    const failed = (err) => {
+      log.warn(`hand-off to ${h.dir} failed: ${err.message}`);
+      audit({ type: 'handoff_failed', to: h.dir, error: err.message });
+      this.system(`Could not continue in ${h.dir}: ${err.message}`, 'error');
+      if (this.mode === 'companion' && !this.turnActive && this.baseStatus !== 'stopping') this.setBase('idle');
+      return null;
+    };
+    if (this.closed) return Promise.resolve(null);
+    // The switch's own guard must not see the turn that just ended as running work.
+    if (this.mode === 'companion' && !this.turnActive && ['thinking', 'acting'].includes(this.baseStatus)) this.setBase('idle');
+    const switching = this.setProject(h.dir, { force: true, fresh: true, keepTranscript: true, note });
+    if (!sameDir(this.projectDir, h.dir)) return switching.catch(failed); // refused before switching
+    audit({ type: 'handoff', to: h.dir, by: h.from });
+    this.emit('handoff', { dir: h.dir });
+    this.submit({ text: h.task, source: 'handoff', attachScreenshot: false }).catch((err) => {
+      this.system(`Could not start the task in ${h.dir}: ${err.message}`, 'error');
+    });
+    return switching.catch(failed);
+  }
+
   /** Stop everything and remove this instance's run files. */
   async shutdown() {
     if (this.closed) return;
     this.closed = true;
+    this.pendingHandoff = null;
     await this.stopEngine();
     if (this.hub && this.onHubEvent) this.hub.removeListener('event', this.onHubEvent);
     for (const f of [this.runFiles.mcpConfig, this.runFiles.systemPrompt, this.runFiles.settings, ...this.bridgeFiles]) {

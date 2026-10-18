@@ -12,6 +12,8 @@
  *   APPROVE_TEST     calls the MCP tool permission_prompt → "DECISION: <behavior>"
  *   ASK_TEST         calls the MCP tool ask_user → "ANSWER: <text>"
  *   SCREENSHOT_TEST  calls the MCP tool screenshot → tool_result with the image
+ *   HANDOFF_TEST <dir> [CREATE]  calls the MCP tool switch_project {dir, task: HANDOFF_TASK, create?}
+ *                    → "HANDOFF: <tool text>"; the task's text starts with "HANDOFF_TASK SHOP-1:"
  *   SLOW_TEST        deltas every 300 ms for 15 s, honouring interrupts
  *   CRASH_TEST       exits 1 with a stderr message
  *   NOISE_TEST       prints a non-JSON stdout line before answering
@@ -449,6 +451,31 @@ async function runTurn(msg) {
     const text = `ANSWER: ${answer}`;
     streamText(text);
     result(text, { started });
+    return;
+  }
+  const handoff = /HANDOFF_TEST\s+(?:"([^"]+)"|(\S+))(\s+CREATE)?/.exec(last);
+  if (handoff) {
+    const dir = handoff[1] || handoff[2];
+    const input = {
+      dir,
+      task: 'HANDOFF_TASK SHOP-1: Fix the login timeout\nAcceptance: users stay signed in for 30 minutes.\nPlan: raise the session TTL, add a test.',
+    };
+    if (handoff[3]) input.create = true;
+    toolUse('toolu_fake_handoff', 'mcp__anywhere__switch_project', input);
+    let text;
+    let isError = false;
+    try {
+      const res = await startMcp().call('switch_project', input);
+      text = textOf(res);
+      isError = Boolean(res && res.isError);
+    } catch (err) {
+      text = `MCP ERROR: ${err.message}`;
+      isError = true;
+    }
+    toolResult('toolu_fake_handoff', text, isError);
+    const reply = `HANDOFF: ${text}`;
+    streamText(reply);
+    result(reply, { started });
     return;
   }
   if (/SCREENSHOT_TEST/.test(last)) {

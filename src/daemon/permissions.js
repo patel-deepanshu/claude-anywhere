@@ -5929,14 +5929,125 @@ function anywhereToolVerdict(tool, input, ctx) {
     if (args.length && t) v = maxVerdict(v, openArgsVerdict(t, args, ctx));
     return v;
   }
+  const ticket = ticketToolVerdict(tool, input, ctx);
+  if (ticket) return ticket;
   if (ANYWHERE_LOW.has(tool)) return V('low', 'Reads the screen or talks to the user');
   if (ANYWHERE_MEDIUM.has(tool)) return V('medium', 'Controls the mouse, keyboard or windows');
   return V('medium', `Runs ${tool}`);
 }
 
-function anywhereSummary(tool, input) {
+// The ticket workflow's tools (tools-browser, tools-jira, tools-project). Reads are low; Jira writes
+// and the hand-off to another folder are medium: smart mode runs them without a card (they still show
+// as tool rows in the transcript), ask mode asks.
+const JIRA_READS = new Set(['jira_status', 'jira_get_issue', 'jira_search', 'jira_my_issues', 'jira_find_user']);
+const JIRA_WRITES = {
+  jira_transition: 'Changes the status of a Jira issue',
+  jira_assign: 'Changes who a Jira issue is assigned to',
+  jira_comment: 'Posts a comment on a Jira issue (your team sees it)',
+};
+
+/** @returns {{risk:string, reason:string}|null} null: not a ticket-workflow tool */
+function ticketToolVerdict(tool, input, ctx) {
+  if (tool === 'read_browser_tab') {
+    return input.includeText === true
+      ? V('medium', 'Copies the page text of a browser tab (briefly uses the keyboard and clipboard)')
+      : V('low', 'Reads the address and title of a browser tab');
+  }
+  if (tool === 'find_repos') return V('low', 'Looks for git repositories in local folders (read-only)');
+  if (JIRA_READS.has(tool)) return V('low', 'Reads from Jira');
+  if (tool === 'jira_comment') {
+    const why = secretLike(input.text);
+    if (why) return V('high', `Posts a Jira comment that ${why}`);
+  }
+  if (JIRA_WRITES[tool]) return V('medium', JIRA_WRITES[tool]);
+  if (tool === 'switch_project') return switchProjectVerdict(input, ctx);
+  return null;
+}
+
+/** switch_project: medium for an ordinary folder; high for system, credential or out-of-home creation. */
+function switchProjectVerdict(input, ctx) {
+  const raw = str(input.dir).trim();
+  if (!raw) return V('medium', 'Continues the work in another folder');
+  const t = resolveTarget(raw, ctx, ctx.projectDir);
+  if (!t || t.glob) return V('high', 'Continues the work in a folder whose location could not be resolved');
+  const create = input.create === true;
+  const inHome = (ctx.platform === 'win32') === t.win && isUnder(t.abs, ctx.homeDir, t.win);
+  const root = rootLike(t, ctx);
+  if (root) return V('high', `Continues the work in ${root}`);
+  const sens = sensitiveKind(t, ctx) || realSensitiveKind(t, ctx);
+  // "A system location" is about writing files there; a home under /root, or an existing repository
+  // under /opt or /srv, is an ordinary place to work.
+  const generic = sens && /^a (system location|Windows system folder)$/.test(sens.what);
+  if (sens && !(generic && (inHome || (!create && isGitRepo(t))))) return V('high', `Continues the work in ${sens.what}`);
+  if (create) {
+    if (!inHome && !isTempPath(t, ctx) && !insideProject(t, ctx)) return V('high', `Creates a folder outside your home folder (${truncate(t.abs, 100)})`);
+    return V('medium', 'Creates a folder and continues the work there in a fresh session');
+  }
+  return V('medium', 'Continues the work in another folder, in a fresh session');
+}
+
+/** Does a resolved local folder hold a git repository? (false for another platform's paths) */
+function isGitRepo(t) {
+  if (t.win !== (process.platform === 'win32')) return false;
+  try {
+    return fs.existsSync(path.join(t.abs, '.git'));
+  } catch {
+    return false;
+  }
+}
+
+// Jira / Confluence MCP servers (Atlassian's own, mcp-atlassian, jira-mcp…): reads are low; writes
+// medium; deletes and the server's own "destructive" tier high.
+const TRACKER_SERVER_RE = /atlassian|jira|confluence/i;
+
+function trackerServerVerdict(tool) {
+  const t = str(tool).toLowerCase();
+  if (/destructive|delete|remove|destroy|purge|archive/.test(t)) return V('high', 'Deletes or irreversibly changes Jira or Confluence data');
+  if (/^(get|search|list|lookup|fetch|read|find|query|view|discover|describe)|userinfo|executeread|whoami/.test(t)) return V('low', 'Reads from Jira or Confluence');
+  return V('medium', 'Changes Jira or Confluence data (your team sees it)');
+}
+
+function firstLineOf(s) {
+  return (
+    str(s)
+      .split(/\r?\n/)
+      .find((l) => l.trim()) || ''
+  );
+}
+
+function anywhereSummary(tool, input, ctx) {
   const i = input;
   switch (tool) {
+    case 'read_browser_tab':
+      return `Read the ${i.browser ? `${truncate(oneLine(i.browser), 30)} ` : ''}browser tab${i.includeText === true ? ' and copy its text' : ''}`;
+    case 'find_repos':
+      return i.query ? `Find git repositories matching '${truncate(oneLine(i.query), 60)}'` : 'Find git repositories on this computer';
+    case 'switch_project': {
+      const where = ctx ? displayPath(i.dir, ctx) : truncate(str(i.dir), 100);
+      const task = truncate(oneLine(firstLineOf(i.task)), 70);
+      return `Continue in ${where}${i.create === true ? ' (new folder)' : ''}${task ? `: ${task}` : ''}`;
+    }
+    case 'jira_status':
+      return 'Check the Jira connection';
+    case 'jira_get_issue':
+      return `Read Jira issue ${truncate(oneLine(i.key), 60)}`;
+    case 'jira_search':
+      return `Search Jira: ${truncate(oneLine(i.jql), 80)}`;
+    case 'jira_my_issues':
+      return `List your Jira issues${i.status ? ` (${truncate(oneLine(i.status), 30)})` : ''}`;
+    case 'jira_transition':
+      return `Move ${truncate(oneLine(i.key), 40)} to '${truncate(oneLine(i.to), 40)}'`;
+    case 'jira_assign': {
+      const user = oneLine(i.user);
+      return `Assign ${truncate(oneLine(i.key), 40)} to ${/^me$/i.test(user) ? 'you' : `'${truncate(user, 50)}'`}`;
+    }
+    case 'jira_comment': {
+      const text = str(i.text);
+      if (secretLike(text)) return `Comment on ${truncate(oneLine(i.key), 40)} with a secret-looking value (${text.length} characters)`;
+      return `Comment on ${truncate(oneLine(i.key), 40)}: '${truncate(oneLine(text), 60)}'`;
+    }
+    case 'jira_find_user':
+      return `Find the Jira user '${truncate(oneLine(i.query), 40)}'`;
     case 'screenshot':
       return i.region ? 'Take a screenshot of a region' : 'Take a screenshot';
     case 'click': {
@@ -6095,6 +6206,17 @@ function displayName(name) {
     notify_user: 'Notify',
     ask_user: 'Ask you',
     permission_prompt: 'Permission',
+    read_browser_tab: 'Read browser tab',
+    find_repos: 'Find repositories',
+    switch_project: 'Switch project',
+    jira_status: 'Jira connection',
+    jira_get_issue: 'Read Jira issue',
+    jira_search: 'Search Jira',
+    jira_my_issues: 'My Jira issues',
+    jira_transition: 'Move Jira issue',
+    jira_assign: 'Assign Jira issue',
+    jira_comment: 'Comment on Jira issue',
+    jira_find_user: 'Find Jira user',
   };
   const m = /^mcp__(.+?)__(.+)$/.exec(n);
   if (m) {
@@ -6204,7 +6326,13 @@ function classify(toolName, input, opts = {}) {
     const [, server, tool] = m;
     if (server === 'anywhere' || /(^|_)anywhere$/.test(server)) {
       const v = anywhereToolVerdict(tool, inp, ctx);
-      return { risk: v.risk, reason: v.reason, summary: anywhereSummary(tool, inp) };
+      return { risk: v.risk, reason: v.reason, summary: anywhereSummary(tool, inp, ctx) };
+    }
+    if (TRACKER_SERVER_RE.test(server)) {
+      const v = trackerServerVerdict(tool);
+      const arg = firstString(inp);
+      const label = server.replace(/^plugin_/, '');
+      return { risk: v.risk, reason: v.reason, summary: `${label}: ${humanize(tool)}${arg ? ` ${truncate(oneLine(arg), 70)}` : ''}` };
     }
     if (BROWSER_SERVER_RE.test(server)) {
       const v = browserVerdict(tool, inp);
@@ -6419,6 +6547,12 @@ function sessionRuleFor(toolName, input, cls, opts = {}) {
     // A whole drive or home folder is too wide a scope: then only this file.
     if (dirAbs === t.abs || rootLike({ ...t, abs: dirAbs }, ctx)) return `${name}(${fwd(t.abs)})`;
     return `${name}(${fwd(dirAbs).replace(/\/+$/, '')}/**)`;
+  }
+  const mcp = /^mcp__(.+?)__(.+)$/.exec(name);
+  if (mcp && (mcp[1] === 'anywhere' || /(^|_)anywhere$/.test(mcp[1]))) {
+    // Each hand-off names its own folder; a secret in a Jira comment always gets its own card.
+    if (mcp[2] === 'switch_project') return null;
+    if (mcp[2] === 'jira_comment' && secretLike(str(isPlainObject(input) ? input.text : ''))) return null;
   }
   return name;
 }

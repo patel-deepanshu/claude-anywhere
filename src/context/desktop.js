@@ -724,6 +724,86 @@ function parseBrowserTitle(title, app = '') {
   return out;
 }
 
+// ---------------------------------------------------------------- tickets in tab titles
+
+const TICKET_KEY = '[A-Z][A-Z0-9_]{0,49}-[1-9]\\d{0,9}';
+const TICKET_KEY_ONLY_RE = new RegExp(`^\\[?#?(${TICKET_KEY})\\]?$`);
+const TICKET_BRACKET_RE = new RegExp(`^\\[#?(${TICKET_KEY})\\]\\s*(.*)$`);
+const TICKET_LEADING_RE = new RegExp(`^(${TICKET_KEY})(?::\\s*|\\s+)(.+)$`);
+const TICKET_PART_SEP = /\s[-\u2013\u2014|]\s/;
+// Jira Cloud ("- Jira"), Server/Data Center ("- Acme JIRA", "- Jira Software"), Service Management.
+const JIRA_TAIL_RE = /\bjira\b|^service (?:desk|management)$/i;
+const LINEAR_TAIL_RE = /^linear$/i;
+const AZURE_TAIL_RE = /^(?:boards|azure boards|azure devops(?: services| server)?)$/i;
+const AZURE_ITEM_RE = /^(?:Bug|Task|User Story|Feature|Epic|Issue|Product Backlog Item|Requirement|Test Case|Impediment|Change Request|Risk|Review)\s(\d{1,9}):\s*(.+)$/i;
+const MAX_TICKETS = 8;
+const TRACKER_NAMES = { jira: 'Jira', linear: 'Linear', github: 'GitHub issue', gitlab: 'GitLab issue', azure: 'Azure Boards' };
+
+/**
+ * Recognise a ticket in a browser tab title (the title without the browser's own suffix):
+ *   Jira:   "[ABC-123] Summary - Jira" (the bracket form needs no suffix), "ABC-123: Summary - Jira",
+ *           "Summary - ABC-123 - Jira", Server/Data Center "… - Acme JIRA", Service Management
+ *   Linear: "ENG-42 Summary - Linear", "Summary | ENG-42 | Linear"
+ *   GitHub: "Summary · Issue #12 · owner/repo · GitHub"           key "owner/repo#12"
+ *   GitLab: "Summary (#12) · Issues · group / project · GitLab"   key "group/project#12"
+ *   Azure Boards: "Bug 1234: Summary - Boards"                    key "AB#1234" (the mention syntax)
+ * Unbracketed keys count only next to a tracker's name, so "UTF-8" or "COVID-19" never match.
+ * @param {string} title
+ * @returns {{key:string, summary:string, tracker:'jira'|'linear'|'github'|'gitlab'|'azure'}|null}
+ */
+function parseTicketTitle(title) {
+  const t = cleanTitle(title);
+  if (!t || t.length > 1000) return null;
+  let m = /^(.*?)\s\u00b7\sIssue\s#(\d{1,9})\s\u00b7\s([\w.-]+\/[\w.-]+)(?:\s\u00b7\sGitHub)?$/.exec(t);
+  if (m) return { key: `${m[3]}#${m[2]}`, summary: m[1].trim(), tracker: 'github' };
+  m = /^(.*?)\s\(#(\d{1,9})\)\s\u00b7\sIssues?\s\u00b7\s(.+?)\s\u00b7\sGitLab$/.exec(t);
+  if (m) return { key: `${m[3].replace(/\s*\/\s*/g, '/')}#${m[2]}`, summary: m[1].trim(), tracker: 'gitlab' };
+  const parts = t
+    .split(TICKET_PART_SEP)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const tail = parts.length > 1 ? parts[parts.length - 1] : '';
+  const jira = JIRA_TAIL_RE.test(tail);
+  const linear = !jira && LINEAR_TAIL_RE.test(tail);
+  const azure = !jira && !linear && AZURE_TAIL_RE.test(tail);
+  const body = jira || linear || azure ? parts.slice(0, -1) : parts;
+  const whole = body.join(' - ');
+  if (azure) {
+    m = AZURE_ITEM_RE.exec(whole);
+    return m ? { key: `AB#${m[1]}`, summary: m[2].trim(), tracker: 'azure' } : null;
+  }
+  m = TICKET_BRACKET_RE.exec(whole);
+  if (m) return { key: m[1], summary: m[2].trim(), tracker: linear ? 'linear' : 'jira' };
+  if (!jira && !linear) return null;
+  const tracker = jira ? 'jira' : 'linear';
+  m = TICKET_LEADING_RE.exec(whole);
+  if (m) return { key: m[1], summary: m[2].trim(), tracker };
+  const at = body.findIndex((p) => TICKET_KEY_ONLY_RE.test(p));
+  if (at < 0) return null;
+  return {
+    key: TICKET_KEY_ONLY_RE.exec(body[at])[1],
+    summary: body
+      .filter((_, i) => i !== at)
+      .join(' - ')
+      .trim(),
+    tracker,
+  };
+}
+
+/** Tickets in the browser entries of a context: [{key, summary, tracker, browser, active?}], at most 8. */
+function ticketsFromBrowsers(browsers) {
+  const out = [];
+  for (const b of Array.isArray(browsers) ? browsers : []) {
+    if (!b || out.length >= MAX_TICKETS) continue;
+    const tk = parseTicketTitle(b.title);
+    if (!tk || out.some((x) => x.key === tk.key && x.browser === b.app)) continue;
+    const item = { key: tk.key, summary: tk.summary, browser: b.app || 'Browser', tracker: tk.tracker };
+    if (b.active) item.active = true;
+    out.push(item);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- editor history (storage.json, JetBrains)
 
 /**
@@ -1376,6 +1456,8 @@ async function gatherContext({ driver, projectDir, config, _sys } = {}) {
     windows: [],
     editors: [],
     browsers: [],
+    // Tickets (Jira, Linear, GitHub/GitLab issues, Azure Boards) recognised in browser tab titles.
+    tickets: [],
     project: { dir, name: baseName(dir) || dir, git: null, stack: [] },
     cloud: { gcloud: null, aws: null, az: null, kubectl: null, docker: null },
     errors,
@@ -1424,6 +1506,7 @@ async function gatherContext({ driver, projectDir, config, _sys } = {}) {
 
       const editorSeen = new Set();
       const pending = [];
+      const browserTabs = []; // every browser window (ctx.browsers keeps 12), for ticket titles
       for (const w of cw.windows) {
         const ed = parseEditorTitle(w.title, w.app, { knownNames });
         if (ed) {
@@ -1451,8 +1534,10 @@ async function gatherContext({ driver, projectDir, config, _sys } = {}) {
         if (br) {
           if (focusKey === winKey(w)) br.active = true;
           if (ctx.browsers.length < 12) ctx.browsers.push(br);
+          browserTabs.push(br);
         }
       }
+      ctx.tickets = ticketsFromBrowsers(browserTabs);
       await withTimeout(Promise.allSettled(pending), 1000, 'editor paths').catch((err) => errors.push(errorText('editors', err)));
     } else if (known && known.vscode.length) {
       // No window list (headless, some Wayland compositors): fall back to the editors' own records.
@@ -1622,6 +1707,15 @@ function render(ctx, lim) {
     lines.push(`Browsers: ${items.join('; ')}`);
   }
 
+  const tickets = (Array.isArray(ctx.tickets) ? ctx.tickets : ticketsFromBrowsers(ctx.browsers)).slice(0, lim.tickets);
+  if (tickets.length) {
+    const items = tickets.map((k) => {
+      const where = `${TRACKER_NAMES[k.tracker] || 'ticket'} in ${sanitize(k.browser || 'a browser', 30)}`;
+      return `${sanitize(k.key, 80)}${k.summary ? ` "${sanitize(k.summary, lim.ticketSummary)}"` : ''} (${where})${k.active ? ' [active]' : ''}`;
+    });
+    lines.push(`Tickets (from tab titles): ${items.join('; ')}`);
+  }
+
   if (lim.others > 0 && Array.isArray(ctx.windows)) {
     const shownKeys = new Set();
     if (ctx.activeWindow) shownKeys.add(winKey(ctx.activeWindow));
@@ -1668,11 +1762,11 @@ function render(ctx, lim) {
 function formatContext(ctx) {
   if (!ctx || typeof ctx !== 'object') return '<desktop_context>\n(unavailable)\n</desktop_context>';
   const steps = [
-    { title: 100, otherTitle: 60, others: 8, editors: 8, browsers: 8, notes: 300 },
-    { title: 80, otherTitle: 40, others: 5, editors: 6, browsers: 6, notes: 200 },
-    { title: 60, otherTitle: 30, others: 3, editors: 5, browsers: 4, notes: 150 },
-    { title: 40, otherTitle: 0, others: 0, editors: 4, browsers: 3, notes: 100 },
-    { title: 30, otherTitle: 0, others: 0, editors: 3, browsers: 2, notes: 0 },
+    { title: 100, otherTitle: 60, others: 8, editors: 8, browsers: 8, tickets: 4, ticketSummary: 100, notes: 300 },
+    { title: 80, otherTitle: 40, others: 5, editors: 6, browsers: 6, tickets: 3, ticketSummary: 80, notes: 200 },
+    { title: 60, otherTitle: 30, others: 3, editors: 5, browsers: 4, tickets: 2, ticketSummary: 60, notes: 150 },
+    { title: 40, otherTitle: 0, others: 0, editors: 4, browsers: 3, tickets: 2, ticketSummary: 40, notes: 100 },
+    { title: 30, otherTitle: 0, others: 0, editors: 3, browsers: 2, tickets: 1, ticketSummary: 30, notes: 0 },
   ];
   let out = '';
   for (const lim of steps) {
@@ -1706,6 +1800,8 @@ module.exports = {
   isOwnWindow,
   parseEditorTitle,
   parseBrowserTitle,
+  parseTicketTitle,
+  ticketsFromBrowsers,
   classifyWindows,
   decodeFileUri,
   vscodeStorageFiles,

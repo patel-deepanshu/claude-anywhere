@@ -63,7 +63,22 @@ const INPUT_SOURCE_TTL_MS = 3000;
 const AX_STALL_SKIP_MS = 30000;
 
 /** Helper commands that are safe to re-run if the helper dies mid-request. */
-const IDEMPOTENT = new Set(['ping', 'perms', 'displays', 'cursor', 'windows', 'active', 'clipGet', 'inputSource', 'automation']);
+const IDEMPOTENT = new Set(['ping', 'perms', 'displays', 'cursor', 'windows', 'active', 'clipGet', 'inputSource', 'automation', 'browserTab']);
+
+/** Browsers whose AppleScript dictionary exposes the active tab (identifyBrowser ids -> helper kind). */
+const SCRIPTABLE_BROWSERS = Object.freeze({
+  chrome: 'chromium',
+  brave: 'chromium',
+  edge: 'chromium',
+  chromium: 'chromium',
+  vivaldi: 'chromium',
+  opera: 'chromium',
+  arc: 'chromium',
+  safari: 'safari',
+});
+/** First AppleScript request to a browser: macOS may show the Automation consent prompt and wait for it. */
+const BROWSER_CONSENT_TIMEOUT_MS = 60000;
+const BROWSER_TAB_TIMEOUT_MS = 10000;
 
 const SETTINGS_URLS = Object.freeze({
   accessibility: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
@@ -170,6 +185,20 @@ function permissionHint(kind, app) {
   return (
     `Grant Accessibility to ${who}: System Settings → Privacy & Security → Accessibility, turn it on ` +
     `(use + to add it if it is missing), then ${restart}. Open the pane with: open "${SETTINGS_URLS.accessibility}". ${owner}`
+  );
+}
+
+/**
+ * How to let the app that launched Claude Code control a browser through AppleScript.
+ * @param {string} browser e.g. "Brave Browser"
+ * @param {string|null} [app] the host app, e.g. "iTerm"
+ */
+function browserAutomationHint(browser, app) {
+  const who = app ? `"${app}"` : 'the app that launched Claude Code (Terminal, iTerm, VS Code, ...)';
+  return (
+    `Allow ${who} to control "${browser}": System Settings → Privacy & Security → Automation → ` +
+    `${app || 'your terminal app'} → turn on ${browser}. Open the pane with: open "${SETTINGS_URLS.automation}". ` +
+    'Until then the address is read with the keyboard, which briefly brings the browser to the front.'
   );
 }
 
@@ -937,6 +966,8 @@ class DarwinDriver {
     this._held = new Set();
     this._hostAppPromise = null;
     this._warned = new Set();
+    /** Browsers (lowercase app names) that already answered an AppleScript request: no consent prompt pending. */
+    this._browserConsent = new Set();
   }
 
   // ----- plumbing -----
@@ -1583,6 +1614,66 @@ class DarwinDriver {
     return false;
   }
 
+  // ----- browser tabs -----
+
+  /**
+   * Read the active tab of a browser window (Driver.browserTab). Chromium browsers (Chrome, Brave,
+   * Edge, Chromium, Vivaldi, Opera, Arc) and Safari answer through AppleScript, without keystrokes,
+   * once the user allowed the Automation prompt for that browser; Firefox, a refused prompt and the
+   * page text use the keyboard reader (src/os/linux.js), with Cmd as the primary modifier.
+   * @param {{app?:string, windowId?:string, includeText?:boolean, maxChars?:number, keyboard?:boolean,
+   *   beforeInput?:Function}} [opts]
+   */
+  async browserTab(opts = {}) {
+    const tabs = require('./linux');
+    return tabs.readBrowserTab(this, opts, {
+      platform: 'darwin',
+      native: (win, browser, want) => this._browserTabScript(win, browser, want),
+    });
+  }
+
+  /** AppleScript half of browserTab: {url, title, tabTitle, text?, method:'applescript'} or null (not scriptable). */
+  async _browserTabScript(win, browser, want = {}) {
+    const kind = SCRIPTABLE_BROWSERS[browser.id];
+    if (!kind) return null;
+    const app = win.app || browser.name;
+    const ref = parseWindowId(win.id);
+    const args = { app: win.app || '', kind, title: win.title || '', wantText: Boolean(want.text) };
+    if (ref) args.pid = ref.pid;
+    const key = app.toLowerCase();
+    const firstAsk = !this._browserConsent.has(key);
+    let r;
+    try {
+      r = await this._call('browserTab', args, { timeoutMs: firstAsk ? BROWSER_CONSENT_TIMEOUT_MS : BROWSER_TAB_TIMEOUT_MS });
+    } catch (err) {
+      if (err.code === 'PERMISSION' || err.code === 'TIMEOUT') {
+        this._browserConsent.delete(key);
+        const host = await this._hostAppName();
+        const e =
+          err.code === 'TIMEOUT'
+            ? new Error(`macOS is still asking whether ${host || 'your terminal app'} may control ${app} (the Automation prompt was not answered)`)
+            : err;
+        e.code = 'PERMISSION';
+        e.permission = 'automation';
+        e.settingsUrl = SETTINGS_URLS.automation;
+        e.hint = browserAutomationHint(app, host);
+        throw e;
+      }
+      throw err;
+    }
+    this._browserConsent.add(key);
+    if (want.text && r && r.textError) log.debug(`${app} did not return the page text through AppleScript (${r.textError}); using the keyboard`);
+    if (!r) return null;
+    const title = typeof r.title === 'string' ? r.title : '';
+    return {
+      url: typeof r.url === 'string' && r.url ? r.url : null,
+      title,
+      tabTitle: title,
+      text: typeof r.text === 'string' ? r.text : undefined,
+      method: 'applescript',
+    };
+  }
+
   // ----- clipboard -----
 
   async clipboardGet() {
@@ -1646,4 +1737,6 @@ module.exports = {
   detectHostApp,
   permissionHint,
   permissionError,
+  browserAutomationHint,
+  SCRIPTABLE_BROWSERS,
 };

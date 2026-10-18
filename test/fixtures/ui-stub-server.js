@@ -16,6 +16,15 @@
  * simulates a full turn. POST /api/debug/emit {type, data} broadcasts any
  * event, which helps when poking at the UI by hand.
  *
+ * Voice and Jira: the snapshot says the daemon announces (voice.announcer);
+ * GET /api/voice/status lists a Piper catalog; POST /api/voice/install streams
+ * SSE voice_install progress and then reports Piper installed; POST
+ * /api/voice/test and POST /api/debug/announce {kind, text, audio, chime}
+ * broadcast 'announce' events whose audio is a short WAV served by
+ * GET /api/tts/audio?id= (Bearer only); POST /api/tts/synthesize makes one too.
+ * POST /api/jira/test answers as a Jira Cloud site would (an apiToken of "bad"
+ * is rejected).
+ *
  * Prints the dialog URL (with ?token=) on stdout.
  */
 
@@ -169,9 +178,54 @@ const DEFAULT_CONFIG = {
   voice: {
     stt: 'auto', tts: 'auto', language: 'en-US', autoSend: true, speakResponses: false, handsFree: false, wakeWord: 'hey claude',
     ttsRate: 1, ttsVoice: '', sttProvider: 'auto', sttBaseUrl: '', sttApiKey: '', sttModel: '', whisperCppPath: '', whisperModel: '',
+    ttsEngine: 'auto', piperVoice: 'en_US-lessac-medium', announce: { done: true, permission: true, question: true, error: true }, chime: true,
   },
+  jira: { baseUrl: '', email: '', apiToken: '' },
+  workspace: { roots: [] },
   privacy: { redactSecretsInLogs: true, auditLog: true },
 };
+
+const SECRET_KEYS = [['voice', 'sttApiKey'], ['jira', 'apiToken']];
+
+// A small Piper catalog, like the daemon's (sizes in MB of the .onnx voice file).
+const PIPER_CATALOG = [
+  { id: 'en_US-lessac-medium', name: 'Lessac', language: 'en_US', gender: 'female', quality: 'medium', sizeMb: 63, sampleText: 'Hi, I’m Lessac. I’ll tell you when your work is done.' },
+  { id: 'en_US-ryan-high', name: 'Ryan', language: 'en_US', gender: 'male', quality: 'high', sizeMb: 121, sampleText: 'Hi, I’m Ryan. I’ll tell you when your work is done.' },
+  { id: 'en_US-amy-medium', name: 'Amy', language: 'en_US', gender: 'female', quality: 'medium', sizeMb: 63, sampleText: 'Hi, I’m Amy.' },
+  { id: 'en_GB-alba-medium', name: 'Alba', language: 'en_GB', gender: 'female', quality: 'medium', sizeMb: 63, sampleText: 'Hello, I’m Alba.' },
+  { id: 'de_DE-thorsten-medium', name: 'Thorsten', language: 'de_DE', gender: 'male', quality: 'medium', sizeMb: 63, sampleText: 'Hallo, ich bin Thorsten.' },
+];
+
+/**
+ * A short, valid 16-bit mono PCM WAV: a quiet tone with a fade in and out.
+ * @param {number} [ms]
+ * @param {number} [freq]
+ * @returns {Buffer}
+ */
+function makeWav(ms = 250, freq = 440) {
+  const rate = 16000;
+  const n = Math.max(1, Math.round((rate * ms) / 1000));
+  const buf = Buffer.alloc(44 + n * 2);
+  buf.write('RIFF', 0, 'ascii');
+  buf.writeUInt32LE(36 + n * 2, 4);
+  buf.write('WAVE', 8, 'ascii');
+  buf.write('fmt ', 12, 'ascii');
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20); // PCM
+  buf.writeUInt16LE(1, 22); // mono
+  buf.writeUInt32LE(rate, 24);
+  buf.writeUInt32LE(rate * 2, 28);
+  buf.writeUInt16LE(2, 32);
+  buf.writeUInt16LE(16, 34);
+  buf.write('data', 36, 'ascii');
+  buf.writeUInt32LE(n * 2, 40);
+  const fade = Math.min(n / 2, rate * 0.02);
+  for (let i = 0; i < n; i += 1) {
+    const env = Math.min(1, i / fade, (n - 1 - i) / fade);
+    buf.writeInt16LE(Math.round(Math.sin((2 * Math.PI * freq * i) / rate) * 3000 * env), 44 + i * 2);
+  }
+  return buf;
+}
 
 function isObj(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -188,8 +242,11 @@ function deepMerge(a, b) {
 
 function publicConfig(cfg) {
   const out = JSON.parse(JSON.stringify(cfg));
-  out.voice.sttApiKeySet = Boolean(out.voice.sttApiKey);
-  out.voice.sttApiKey = '';
+  for (const [section, key] of SECRET_KEYS) {
+    if (!out[section]) continue;
+    out[section][`${key}Set`] = Boolean(out[section][key]);
+    out[section][key] = '';
+  }
   return out;
 }
 
@@ -293,8 +350,13 @@ function emptyScenario() {
 /**
  * Start the stub daemon.
  * @param {{port?:number, host?:string, token?:string, scenario?:'full'|'empty', stream?:boolean,
- *   uiDir?:string, exitOnShutdown?:boolean, log?:(msg:string)=>void}} [opts]
- * @returns {Promise<{server:http.Server, port:number, url:string, token:string, broadcast:Function, close:Function, state:object}>}
+ *   uiDir?:string, exitOnShutdown?:boolean, log?:(msg:string)=>void,
+ *   voiceInfo?:object, piperInstalled?:boolean, installStepMs?:number}} [opts]
+ *   voiceInfo: merged into the snapshot's voice info (announcer: false acts like an older daemon);
+ *   piperInstalled: start with the natural voice installed and in use;
+ *   installStepMs: time between voice_install progress events (default 120)
+ * @returns {Promise<{server:http.Server, port:number, url:string, token:string, broadcast:Function, close:Function,
+ *   state:object, snapshot:Function, announce:Function, makeClip:Function}>}
  */
 async function createStubServer(opts = {}) {
   const token = opts.token || DEFAULT_TOKEN;
@@ -331,7 +393,32 @@ async function createStubServer(opts = {}) {
     interrupts: 0,
     configPosts: [],
     visibility: [], // POST /api/ui/visibility reports {page, visible, focused}
+    // Voice: Piper's state, the WAV clips handed out, and what the dialog asked for.
+    piper: opts.piperInstalled
+      ? { installed: true, binary: '/home/dev/.claude-anywhere/piper/piper', installedVoices: ['en_US-lessac-medium'] }
+      : { installed: false, binary: null, installedVoices: [] },
+    voiceInfo: null,
+    clips: new Map(),
+    installing: false,
+    audioRequests: [], // GET /api/tts/audio {id, auth}
+    synthesized: [], // POST /api/tts/synthesize texts
+    voiceInstalls: [], // POST /api/voice/install bodies
+    voiceUses: [], // POST /api/voice/use bodies
+    voiceTests: [], // POST /api/voice/test bodies
+    announced: [], // 'announce' events broadcast
+    jiraTests: [], // POST /api/jira/test bodies
   };
+  st.voiceInfo = {
+    serverStt: true,
+    sttProvider: 'groq',
+    serverTts: true,
+    ttsProvider: 'espeak-ng',
+    announcer: true,
+    engine: opts.piperInstalled ? 'piper' : null,
+    piper: { installed: Boolean(opts.piperInstalled), voice: st.config.voice.piperVoice },
+    ...(opts.voiceInfo || {}),
+  };
+  const installStepMs = Number(opts.installStepMs) > 0 ? Number(opts.installStepMs) : 120;
 
   const later = (ms, fn) => {
     const t = setTimeout(() => {
@@ -351,7 +438,7 @@ async function createStubServer(opts = {}) {
     messages: st.messages,
     pending: { approvals: [...st.approvals.values()], questions: [...st.questions.values()] },
     config: publicConfig(st.config),
-    voice: { serverStt: true, sttProvider: 'groq', serverTts: true, ttsProvider: 'espeak-ng' },
+    voice: JSON.parse(JSON.stringify(st.voiceInfo)),
     bridge: st.bridge,
     platform: { platform: process.platform, displayServer: 'x11', driver: 'stub' },
     screenshot: st.screenshot,
@@ -377,6 +464,94 @@ async function createStubServer(opts = {}) {
     if (i >= 0) st.messages[i] = { ...st.messages[i], ...m };
     else st.messages.push(m);
     broadcast('message', i >= 0 ? st.messages[i] : m);
+  };
+
+  /** Keep a WAV for GET /api/tts/audio. @returns {{id:string, mime:string, durationMs:number}} */
+  const makeClip = (ms = 250) => {
+    const id = `aud_${crypto.randomBytes(9).toString('base64url')}`;
+    st.clips.set(id, makeWav(ms));
+    return { id, mime: 'audio/wav', durationMs: ms };
+  };
+
+  /**
+   * Broadcast an 'announce' event as the daemon's announcer would.
+   * @param {{kind?:string, text?:string, audio?:boolean, chime?:boolean, ms?:number}} [a]
+   */
+  const announce = (a = {}) => {
+    const data = {
+      id: `ann_${crypto.randomUUID()}`,
+      kind: ['done', 'permission', 'question', 'error', 'info'].includes(a.kind) ? a.kind : 'info',
+      text: typeof a.text === 'string' ? a.text : 'Done.',
+      audio: a.audio ? makeClip(a.ms || 250) : null,
+      chime: a.chime === undefined ? st.config.voice.chime !== false : Boolean(a.chime),
+      ts: new Date().toISOString(),
+    };
+    st.announced.push(data);
+    broadcast('announce', data);
+    return data;
+  };
+
+  const voiceStatus = () => ({
+    engine: st.voiceInfo.engine,
+    ttsEngine: st.config.voice.ttsEngine,
+    piper: {
+      installed: st.piper.installed,
+      binary: st.piper.binary,
+      voice: st.config.voice.piperVoice,
+      installedVoices: st.piper.installedVoices.slice(),
+      catalog: PIPER_CATALOG,
+      ...(st.installing && st.installProgress ? { installing: { ...st.installProgress } } : {}),
+    },
+    os: { provider: 'espeak-ng' },
+  });
+
+  /** What the daemon would pick: the natural voice when installed and the engine allows it. */
+  const refreshVoiceInfo = () => {
+    const e = st.config.voice.ttsEngine;
+    const usable = st.piper.installed && st.piper.installedVoices.includes(st.config.voice.piperVoice);
+    st.voiceInfo = { ...st.voiceInfo, engine: usable && (e === 'auto' || e === 'piper') ? 'piper' : e === 'os' ? 'os' : null, piper: { installed: st.piper.installed, voice: st.config.voice.piperVoice } };
+  };
+
+  /**
+   * Simulated Piper download, shaped like the daemon's events: `percent` for the whole install,
+   * `stagePercent` for the step, a sentence in `message`, and the voice. A voice id with
+   * "broken" fails while downloading.
+   */
+  const playInstall = (voiceId) => {
+    const entry = PIPER_CATALOG.find((v) => v.id === voiceId);
+    const size = entry ? entry.sizeMb : 60;
+    const steps = [{ stage: 'binary', percent: 1, stagePercent: null, message: 'Looking for Piper…' }];
+    if (!st.piper.installed) {
+      for (const p of [0, 50, 100]) steps.push({ stage: 'binary', percent: Math.round(2 + p * 0.3), stagePercent: p, message: `Downloading Piper… ${(p * 0.25).toFixed(1)} MB of 25.0 MB` });
+    }
+    steps.push({ stage: 'binary', percent: 40, stagePercent: null, message: 'Piper is ready (release binary).' });
+    for (const p of [0, 35, 70, 100]) steps.push({ stage: 'voice', percent: Math.round(40 + p * 0.5), stagePercent: p, message: `Downloading the voice… ${((size * p) / 100).toFixed(1)} MB of ${size.toFixed(1)} MB` });
+    if (/broken/.test(voiceId)) {
+      steps.splice(steps.length - 2);
+      steps.push({ stage: 'error', percent: 57, stagePercent: null, message: 'Download failed: HTTP 404 from huggingface.co' });
+    } else {
+      steps.push(
+        { stage: 'verify', percent: 92, stagePercent: null, message: 'Testing the voice…' },
+        { stage: 'done', percent: 100, stagePercent: null, message: `${entry ? entry.name : voiceId} is ready. It runs offline and costs nothing.` }
+      );
+    }
+    for (const s of steps) s.voice = voiceId;
+    steps.forEach((s, i) =>
+      later((i + 1) * installStepMs, () => {
+        st.installProgress = s;
+        if (s.stage === 'done') {
+          st.piper.installed = true;
+          st.piper.binary = '/home/dev/.claude-anywhere/piper/piper';
+          if (!st.piper.installedVoices.includes(voiceId)) st.piper.installedVoices.push(voiceId);
+          st.installing = false;
+          refreshVoiceInfo();
+        } else if (s.stage === 'error') {
+          st.installing = false;
+        }
+        broadcast('voice_install', s);
+        if (s.stage === 'done') broadcast('snapshot', snapshot());
+      })
+    );
   };
 
   /** Scripted activity right after a client connects (full scenario only). */
@@ -597,17 +772,91 @@ async function createStubServer(opts = {}) {
     'GET /api/config': () => publicConfig(st.config),
     'POST /api/config': ({ body }) => {
       const partial = isObj(body) ? JSON.parse(JSON.stringify(body)) : {};
-      if (partial.voice) {
-        delete partial.voice.sttApiKeySet;
-        if (!partial.voice.sttApiKey) delete partial.voice.sttApiKey;
+      for (const [section, key] of SECRET_KEYS) {
+        if (!isObj(partial[section])) continue;
+        delete partial[section][`${key}Set`];
+        if (!partial[section][key]) delete partial[section][key];
       }
       for (const k of Object.keys(partial)) if (!(k in DEFAULT_CONFIG)) throw fail(400, `Unknown setting "${k}"`);
+      if (partial.workspace && 'roots' in partial.workspace) {
+        const r = partial.workspace.roots;
+        if (!Array.isArray(r) || r.some((x) => typeof x !== 'string')) throw fail(400, '"workspace.roots" must be a list of strings');
+      }
       st.configPosts.push(JSON.parse(JSON.stringify(body)));
       st.config = deepMerge(st.config, partial);
+      if (partial.voice && ('ttsEngine' in partial.voice || 'piperVoice' in partial.voice)) {
+        refreshVoiceInfo();
+        broadcast('snapshot', snapshot());
+      }
       const pub = publicConfig(st.config);
       broadcast('config', pub);
       return pub;
     },
+    'GET /api/voice/status': () => voiceStatus(),
+    'POST /api/voice/install': ({ body }) => {
+      const id = typeof body.voice === 'string' && body.voice ? body.voice : st.config.voice.piperVoice;
+      st.voiceInstalls.push(JSON.parse(JSON.stringify(body)));
+      if (!PIPER_CATALOG.some((v) => v.id === id) && !/broken/.test(id)) throw fail(400, `Unknown voice "${id}". Run "anywhere voice list" to see the voices.`);
+      if (st.installing) return { ok: true, started: false, running: true, voice: st.installing };
+      st.installing = id;
+      playInstall(id);
+      return { ok: true, started: true, voice: id };
+    },
+    'POST /api/voice/use': ({ body }) => {
+      const id = typeof body.voice === 'string' ? body.voice : '';
+      st.voiceUses.push({ voice: id });
+      if (!st.piper.installedVoices.includes(id)) throw fail(400, `The voice "${id}" isn't installed. Run "anywhere voice install ${id}".`);
+      st.config = deepMerge(st.config, { voice: { piperVoice: id } });
+      refreshVoiceInfo();
+      broadcast('snapshot', snapshot());
+      broadcast('config', publicConfig(st.config));
+      return { ok: true };
+    },
+    'POST /api/voice/test': ({ body }) => {
+      st.voiceTests.push(JSON.parse(JSON.stringify(body)));
+      const text = typeof body.text === 'string' && body.text.trim() ? body.text.trim() : 'Hi! This is how I sound when your work is done.';
+      announce({ kind: 'info', text, audio: st.voiceInfo.engine === 'piper' });
+      return { ok: true };
+    },
+    'GET /api/tts/audio': ({ req, res, url }) => {
+      const id = url.searchParams.get('id') || '';
+      st.audioRequests.push({ id, auth: req.headers.authorization || null });
+      const wav = st.clips.get(id);
+      if (!wav) throw fail(404, 'That audio is gone (it expired). Ask again.');
+      res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'audio/wav', 'Content-Length': wav.length });
+      res.end(req.method === 'HEAD' ? undefined : wav);
+      return 'handled';
+    },
+    'POST /api/tts/synthesize': ({ body }) => {
+      const text = typeof body.text === 'string' ? body.text.trim() : '';
+      if (!text) throw fail(400, 'text must be a non-empty string');
+      if (st.voiceInfo.engine !== 'piper') throw fail(409, 'The natural voice is not installed.', { hint: 'Install it in Settings › Voice, or run "anywhere voice install".' });
+      st.synthesized.push(text);
+      return { ...makeClip(300), engine: 'piper' };
+    },
+    'GET /api/jira/status': () => {
+      const j = st.config.jira;
+      const configured = Boolean(j.baseUrl && j.apiToken);
+      return { configured, baseUrl: j.baseUrl, email: j.email, ...(configured ? { deployment: /\.atlassian\.net$/.test(j.baseUrl) ? 'Cloud' : 'Server' } : {}) };
+    },
+    'POST /api/jira/test': ({ body }) => {
+      st.jiraTests.push(JSON.parse(JSON.stringify(body)));
+      const j = st.config.jira;
+      const baseUrl = typeof body.baseUrl === 'string' && body.baseUrl ? body.baseUrl : j.baseUrl;
+      const email = typeof body.email === 'string' && body.email ? body.email : j.email;
+      const token = typeof body.apiToken === 'string' && body.apiToken ? body.apiToken : j.apiToken;
+      if (!baseUrl) throw fail(400, "Jira isn't set up: add your site URL (https://your-company.atlassian.net).");
+      if (!token) throw fail(400, 'Add an API token to connect to Jira.');
+      if (token === 'bad') {
+        throw fail(401, 'Jira rejected the email and API token (HTTP 401).', { hint: 'Create a new token at https://id.atlassian.com/manage-profile/security/api-tokens' });
+      }
+      return {
+        ok: true,
+        user: { displayName: 'Ankit Sharma', email: email || 'ankit@example.com', accountId: '5b10ac8d82e05b22cc7d4ef5' },
+        deployment: /\.atlassian\.net$/.test(new URL(baseUrl).hostname) ? 'Cloud' : 'Server',
+      };
+    },
+    'POST /api/debug/announce': ({ body }) => announce(body),
     'POST /api/mode': ({ body }) => {
       if (!['companion', 'bridge'].includes(body.mode)) throw fail(400, 'mode must be companion or bridge');
       st.mode = body.mode;
@@ -752,7 +1001,7 @@ async function createStubServer(opts = {}) {
       if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
     });
 
-  return { server, port, url, token, broadcast, close, state: st, snapshot };
+  return { server, port, url, token, broadcast, close, state: st, snapshot, announce, makeClip };
 }
 
 function parseArgs(argv) {
@@ -785,4 +1034,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { createStubServer, desktopPng, encodePng, crc32, SECURITY_HEADERS, CSP };
+module.exports = { createStubServer, desktopPng, encodePng, crc32, makeWav, PIPER_CATALOG, SECURITY_HEADERS, CSP };

@@ -137,6 +137,14 @@ function optionLabel(o) {
 
 function renderUserMessage(item, t = PLAIN_THEME) {
   const { c } = t;
+  // switch_project: the task Claude handed to the new session in another folder (often long).
+  if (item && item.source === 'handoff') {
+    const lines = String(item.text || '')
+      .split(/\r?\n/)
+      .filter((l) => l.trim());
+    const more = lines.length > 1 ? c.dim(` (+${lines.length - 1} more line${lines.length === 2 ? '' : 's'})`) : '';
+    return `${c.bold(c.orange('Claude'))}${c.dim(' (handed over)')}: ${lines[0] || ''}${more}`;
+  }
   const src = item && item.source && item.source !== 'text' ? c.dim(` (${item.source})`) : '';
   const n = Number(item && item.images) || 0;
   const imgs = n > 0 ? c.dim(` [+${n} image${n === 1 ? '' : 's'}]`) : '';

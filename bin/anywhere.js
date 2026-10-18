@@ -1512,7 +1512,8 @@ async function cmdStatus(p) {
     lines.push(`  Dialog    ${link.url}${link.withToken ? '' : `   (${cliQ('url')} prints the full link)`}`);
   }
   const v = snap.voice || {};
-  lines.push(`  Voice     speech-to-text: ${v.serverStt ? v.sttProvider : 'browser only'} ${s.dot} text-to-speech: ${v.serverTts ? v.ttsProvider : 'browser only'}`);
+  const tts = v.engine === 'piper' ? `Piper natural voice${v.piper && v.piper.voice ? ` (${v.piper.voice})` : ''}` : v.serverTts ? v.ttsProvider : 'browser only';
+  lines.push(`  Voice     speech-to-text: ${v.serverStt ? v.sttProvider : 'browser only'} ${s.dot} text-to-speech: ${tts}`);
   if (snap.mode === 'bridge') lines.push(`  Bridge    ${snap.bridge && snap.bridge.listening ? 'a Claude Code session is listening' : 'no Claude Code session is listening (run /anywhere here)'}`);
   const pend = snap.pending || {};
   const na = (pend.approvals || []).length;
@@ -2680,7 +2681,11 @@ async function runDoctor() {
     if (!optionalPkg('src/daemon/voice.js')) return { status: 'warn', detail: `speech-to-text: ${sttWhere} ${sym().dot} server voice module missing` };
     const vc = await voiceCaps();
     const s = sym();
-    const detail = [`speech-to-text: ${sttWhere}`, `server ${vc.serverStt ? vc.sttProvider : 'none'}`, `text-to-speech: ${vc.serverTts ? vc.ttsProvider : 'browser only'}`].join(` ${s.dot} `);
+    const piper = vc.piper || null;
+    const natural = piper ? `natural voice: ${piper.installed ? `Piper ${s.ok} ${piper.voice}` : `not installed (${cliQ('voice install')})`}` : null;
+    const detail = [`speech-to-text: ${sttWhere}`, `server ${vc.serverStt ? vc.sttProvider : 'none'}`, `text-to-speech: ${vc.serverTts ? vc.ttsProvider : 'browser only'}`, natural]
+      .filter(Boolean)
+      .join(` ${s.dot} `);
     if (vc.serverStt || browserStt) {
       const r = { detail };
       if (!vc.serverStt) r.notes = ['Optional: set GROQ_API_KEY or OPENAI_API_KEY (or install whisper.cpp) so voice also works in Electron, Firefox and the terminal dialog.'];
@@ -2992,9 +2997,10 @@ const CONFIG_ENUMS = {
   'voice.stt': ['auto', 'browser', 'server', 'off'],
   'voice.tts': ['auto', 'browser', 'server', 'off'],
   'voice.sttProvider': ['auto', 'openai', 'groq', 'custom', 'whisper.cpp'],
+  'voice.ttsEngine': ['auto', 'piper', 'browser', 'os'],
   'engine.effort': ['', 'low', 'medium', 'high', 'xhigh', 'max'],
 };
-const SECRET_PATHS = ['voice.sttApiKey'];
+const SECRET_PATHS = ['voice.sttApiKey', 'jira.apiToken'];
 // Read only when the daemon starts or launches the dialog window: saving them changes nothing now.
 const STARTUP_ONLY = ['port', 'ui', 'ui.host', 'ui.width', 'ui.height', 'ui.position', 'ui.hotkey', 'ui.hideFromScreenshots', 'ui.openOnStart'];
 
@@ -3413,6 +3419,8 @@ Setup
   doctor [--json]                    check this machine and print exact fixes
   install [--electron] [--no-mcp] [--hotkey] | uninstall [--purge]
   config [path | get KEY | set KEY VALUE | reset]
+  voice install [ID] | list | use ID | test | status | remove ID   free natural voice (Piper, offline)
+  jira setup | test | status | issue KEY | mine | search JQL | remove   connect Jira (free API token) for ticket work
   logs [--audit] [-n N] [-f]
   mcp                                MCP stdio server (Claude Code starts this)
   version | help [command]

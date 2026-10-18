@@ -105,10 +105,53 @@ task alone and say so. Add `--switch` to stop that task and switch.
 | | Works out of the box | Optional upgrades |
 |---|---|---|
 | Speech to text | Chrome, Edge and Safari (Web Speech API, live transcript) | Set `GROQ_API_KEY` or `OPENAI_API_KEY`, or any OpenAI-compatible endpoint, or install **whisper.cpp** for fully local STT. These are used automatically in Firefox, Electron and the TUI, or when browser speech fails. |
-| Text to speech | Browser voices, or the OS (`say`, Windows SAPI, `spd-say`/`espeak-ng`) | Choose the voice and rate in settings |
+| Text to speech | Piper, a free offline neural voice (`anywhere voice install`), browser voices, or the OS (`say`, Windows SAPI, `spd-say`/`espeak-ng`) | Spoken announcements when work is done or Claude needs you; see [docs/VOICE.md](docs/VOICE.md) |
 
 Hands-free mode listens continuously and acts on what you say after the wake word (*"hey claude"*).
 Details: [docs/VOICE.md](docs/VOICE.md).
+
+### Natural voice
+
+Claude tells you out loud when the work is done ("All done. I deployed shop-api; the URL is in the dialog."),
+when it needs your permission ("I need your permission to run gcloud run deploy for shop-api."), when it has a
+question, and when something failed. For a voice that sounds like a person, install **Piper**, a free and
+open-source neural text-to-speech engine that runs offline on your computer (no account, no API key, no cost):
+
+```bash
+anywhere voice install            # Piper + a natural US English voice (~63 MB, into ~/.claude-anywhere/voice)
+anywhere voice list               # more voices: US/UK English, German, French, Spanish, Italian, …
+anywhere voice use en_US-ryan-high
+anywhere voice test
+```
+
+Or press **Install** in ⚙ Settings → Voice. Without Piper, Claude Anywhere uses the most natural voice your browser
+or OS has. When the dialog is visible it plays the announcement; when it is hidden or minimized the daemon plays it
+through your speakers (with a short chime first). Speaking or typing silences it. Turn kinds of announcements off in
+Settings → Voice, or with `anywhere config set voice.announce.done false` (also `.permission`, `.question`, `.error`).
+
+---
+
+## Work on a Jira ticket
+
+> *"My Jira tab is open in Brave. Analyze the ticket and start working on it."*
+
+Claude finds the ticket key in the browser tab (it reads the tab's address, or its title), reads the ticket with
+its acceptance criteria, summarizes it with a short plan, then **asks you** which repository and folder to work in
+(it lists the git repositories it finds on your computer, plus "another folder" and "create a new folder") and whether
+to move the ticket to In Progress and assign it to you. If the repository is not the dialog's current project, the
+dialog switches to it and continues in a fresh session there. Claude then creates a branch such as
+`ABC-123-fix-login-timeout`, implements and tests the change, commits, and asks before pushing or opening a PR.
+
+Connecting Jira is optional and free (an Atlassian API token):
+
+```bash
+anywhere jira setup               # Jira Cloud or Server/Data Center; the token is typed hidden
+anywhere jira issue ABC-123       # what Claude reads
+```
+
+or ⚙ Settings → Jira & repos. Without it, Claude uses an Atlassian/Jira MCP server if you have one, or reads the
+ticket straight from the page. Add the folders where you keep code under Settings → Jira & repos → Workspace roots
+(`workspace.roots`) so the repository list is complete. Details: [docs/JIRA.md](docs/JIRA.md).
 
 ---
 
@@ -157,6 +200,11 @@ Per-OS setup and permissions: [docs/PLATFORMS.md](docs/PLATFORMS.md).
 | `voice.stt` / `voice.tts` | `auto` | `browser` · `server` · `off` |
 | `voice.language`, `voice.handsFree`, `voice.wakeWord` | `en-US`, `false`, `hey claude` | |
 | `voice.sttProvider`, `voice.sttBaseUrl`, `voice.sttApiKey`, `voice.sttModel` | `auto` | Server speech-to-text |
+| `voice.ttsEngine` | `auto` | `piper` · `browser` · `os` (auto = Piper when installed) |
+| `voice.piperVoice` | `en_US-lessac-medium` | The Piper voice (`anywhere voice use …`) |
+| `voice.announce.done` / `.permission` / `.question` / `.error`, `voice.chime` | `true` | What is said aloud, and the chime before it |
+| `jira.baseUrl`, `jira.email`, `jira.apiToken` | (empty) | Jira connection (`anywhere jira setup`); the token is never shown |
+| `workspace.roots` | `[]` | Folders searched first for repositories when Claude asks where to work |
 | `context.attachDesktopContext` | `true` | Send the active window, editors, browser tabs, git and cloud CLI state with each command |
 | `computer.maxWidth` / `maxHeight` | `1366` / `768` | Screenshot size sent to the model |
 | `computer.failsafe` | `true` | Top-left-corner emergency stop |
@@ -164,7 +212,8 @@ Per-OS setup and permissions: [docs/PLATFORMS.md](docs/PLATFORMS.md).
 
 Environment variables: `ANYWHERE_HOME`, `ANYWHERE_CLAUDE_PATH`, `ANYWHERE_BROWSER`, `ANYWHERE_ELECTRON`,
 `ANYWHERE_DRIVER`, `ANYWHERE_STT_API_KEY` / `ANYWHERE_STT_BASE_URL` / `ANYWHERE_STT_MODEL`,
-`GROQ_API_KEY`, `OPENAI_API_KEY`, `ANYWHERE_DEBUG=1`, and `ANYWHERE_UNICODE=1` / `ANYWHERE_ASCII=1`.
+`GROQ_API_KEY`, `OPENAI_API_KEY`, `ANYWHERE_PIPER_PATH`, `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN`,
+`ANYWHERE_DEBUG=1`, and `ANYWHERE_UNICODE=1` / `ANYWHERE_ASCII=1`.
 
 `anywhere tui` and the `anywhere` CLI use ASCII symbols unless the locale (`LC_ALL`, `LC_CTYPE`, then `LANG`) is
 UTF-8: on Linux an unset locale means ASCII, while macOS defaults to Unicode. `ANYWHERE_UNICODE=1` forces the symbols
@@ -179,9 +228,10 @@ and `ANYWHERE_ASCII=1` forces ASCII.
                                          ├─ dialog UI (Electron | Chrome --app | browser | TUI) ◄─ SSE
                                          ├─ claude -p --input-format stream-json …  (your Claude Code)
                                          │     └─ MCP server "anywhere": screenshot · click · type · key ·
-                                         │        windows · open · clipboard · context · ask_user · notify
+                                         │        windows · open · clipboard · context · ask_user · notify ·
+                                         │        read_browser_tab · jira_* · find_repos · switch_project
                                          ├─ approvals (--permission-prompt-tool) · questions · bridge queue
-                                         └─ voice (server STT/TTS) · desktop context · audit log
+                                         └─ voice (server STT, Piper/OS TTS, announcer) · desktop context · audit log
 ```
 
 - The plan, with every design decision and its rationale: [docs/PLAN.md](docs/PLAN.md)
@@ -196,13 +246,15 @@ and `ANYWHERE_ASCII=1` forces ASCII.
 - **Clicks land in the wrong place or nothing happens on macOS**: grant Accessibility and Screen Recording to your terminal or VS Code, then restart it.
 - **Linux**: `sudo apt install xdotool wmctrl xclip imagemagick x11-xserver-utils` (X11). On Wayland, input needs ydotool 1.0 or newer (Debian 12 and Ubuntu up to 24.04 ship 0.1.8, which doesn't work); see [docs/PLATFORMS.md](docs/PLATFORMS.md).
 - **Voice button greyed out**: use Chrome or Edge, or set `GROQ_API_KEY` or `OPENAI_API_KEY` (see [docs/VOICE.md](docs/VOICE.md)).
+- **No spoken announcements**: check `anywhere voice status` (engine, voice, audio player) and Settings → Voice → Speak answers; `anywhere voice test` plays a sample.
+- **Jira**: `anywhere jira test` explains a failed connection (wrong token, SSO, proxy); see [docs/JIRA.md](docs/JIRA.md).
 
 ---
 
 ## Development
 
 ```bash
-npm test                     # about 980 node:test tests (Node 18+); no network or display needed
+npm test                     # about 1,140 node:test tests (Node 18+); no network or display needed
 node scripts/check-syntax.js
 ANYWHERE_DRIVER=mock node bin/anywhere.js computer screenshot --out /tmp/s.png
 ANYWHERE_LIVE_DESKTOP=1 node scripts/test.js --test-name-pattern=live-desktop   # drives YOUR real desktop

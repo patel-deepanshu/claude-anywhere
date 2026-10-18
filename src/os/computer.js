@@ -649,6 +649,31 @@ class Computer {
     });
   }
 
+  /**
+   * Read a browser window's address (and, with includeText, its page text) through
+   * driver.browserTab(), in the action queue so its keystrokes never interleave with another
+   * action. Before the first keystroke (the keyboard path), opts.beforeInput (if any) and then
+   * the Computer's own guard and failsafe run; a PAUSED/FAILSAFE error aborts with no input.
+   * @param {object} [opts] driver.browserTab options ({app, window, windowId, includeText, maxChars, keyboard, beforeInput})
+   * @returns {Promise<object>} driver.browserTab's result
+   */
+  async browserTab(opts = {}) {
+    if (typeof this.driver.browserTab !== 'function') {
+      throw inputError(`This desktop driver (${this.driver.name || 'unknown'}) cannot read browser tabs`, 'UNSUPPORTED', 'Use the window titles (list_windows) or a screenshot instead.');
+    }
+    const o = opts && typeof opts === 'object' ? opts : {};
+    return this._serial(async () => {
+      const displays = await this._getDisplays();
+      return this.driver.browserTab({
+        ...o,
+        beforeInput: async () => {
+          if (typeof o.beforeInput === 'function') await o.beforeInput();
+          await this._preflight(displays);
+        },
+      });
+    });
+  }
+
   // ------------------------------------------------------------ queries
 
   /**

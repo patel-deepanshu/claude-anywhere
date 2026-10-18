@@ -1384,6 +1384,95 @@ function Get-Capture($A) {
   return @{ width = $w; height = $h; png = $b64 }
 }
 
+# ---------------------------------------------------------------- browser address bar (UI Automation)
+
+# Loaded on first use only: most sessions never read a browser tab.
+$script:UiaLoaded = $false
+
+function Use-Uia {
+  if (-not $script:UiaLoaded) {
+    try {
+      Add-Type -AssemblyName UIAutomationClient
+      Add-Type -AssemblyName UIAutomationTypes
+    } catch {
+      throw (New-HostError ('UI Automation is not available in this PowerShell: ' + $_.Exception.Message) 'UNSUPPORTED' 'The address is read with the keyboard instead.')
+    }
+    $script:UiaLoaded = $true
+  }
+}
+
+# Accessible names of the address bar in common locales ("Address and search bar", "Search with
+# Google or enter address", "Adress- und Suchleiste", ...). Without a match the first Edit outside
+# the page wins: the address bar comes first in the toolbar of Chromium browsers and Firefox.
+$script:AddressBarName = '(?i)address|adress|adresse|direcci|indirizzo|endere|search|suche|recherche|busca|cerca|url|location'
+
+# Breadth-first walk of the window's control view, skipping page content (Document subtrees), for
+# an Edit control with a ValuePattern. Bounded by time and node count: a slow browser never stalls the host.
+function Find-AddressBar($Root, [int]$BudgetMs, [int]$MaxNodes) {
+  $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+  $editId = [System.Windows.Automation.ControlType]::Edit.Id
+  $docId = [System.Windows.Automation.ControlType]::Document.Id
+  $valuePattern = [System.Windows.Automation.ValuePattern]::Pattern
+  $queue = New-Object 'System.Collections.Generic.Queue[object]'
+  $queue.Enqueue([object[]]@($Root, 0))
+  $first = $null
+  $seen = 0
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  while ($queue.Count -gt 0 -and $sw.ElapsedMilliseconds -lt $BudgetMs -and $seen -lt $MaxNodes) {
+    $item = $queue.Dequeue()
+    $depth = [int]$item[1]
+    $child = $null
+    try { $child = $walker.GetFirstChild($item[0]) } catch { $child = $null }
+    while ($null -ne $child -and $seen -lt $MaxNodes) {
+      $seen++
+      $typeId = -1
+      try { $typeId = [int]$child.Current.ControlType.Id } catch { $typeId = -1 }
+      if ($typeId -eq $editId) {
+        $pattern = $null
+        $hasValue = $false
+        try { $hasValue = $child.TryGetCurrentPattern($valuePattern, [ref]$pattern) } catch { $hasValue = $false }
+        if ($hasValue) {
+          $name = ''
+          try { $name = [string]$child.Current.Name } catch { $name = '' }
+          $found = @{ element = $child; pattern = $pattern; name = $name }
+          if ($name -match $script:AddressBarName) { return $found }
+          if ($null -eq $first) { $first = $found }
+        }
+      } elseif ($typeId -ne $docId -and $typeId -ne -1 -and $depth -lt 16) {
+        $queue.Enqueue([object[]]@($child, ($depth + 1)))
+      }
+      try { $child = $walker.GetNextSibling($child) } catch { $child = $null }
+    }
+  }
+  return $first
+}
+
+# The address bar text of a browser window: {found, url, title, name, editing}. url is the raw
+# ValuePattern value (browsers may hide the scheme; the driver adds it). editing: the address bar
+# has keyboard focus, so the text may be something the user is typing.
+function Get-BrowserTab($A) {
+  Assert-Native
+  $hwnd = Get-Hwnd $A
+  Use-Uia
+  $root = $null
+  try {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+  } catch {
+    throw (New-HostError ('UI Automation cannot read window ' + $hwnd + ': ' + $_.Exception.Message) 'NOT_FOUND' 'The window may have closed; list the windows again.')
+  }
+  $title = ''
+  try { $title = [string]$root.Current.Name } catch { $title = '' }
+  $bar = Find-AddressBar $root (Get-IntArg $A 'budgetMs' 4000) (Get-IntArg $A 'maxNodes' 4000)
+  if ($null -eq $bar) {
+    return [ordered]@{ found = $false; url = $null; title = $title; name = $null; editing = $false }
+  }
+  $value = ''
+  try { $value = [string]$bar.pattern.Current.Value } catch { $value = '' }
+  $editing = $false
+  try { $editing = [bool]$bar.element.Current.HasKeyboardFocus } catch { $editing = $false }
+  return [ordered]@{ found = $true; url = $value; title = $title; name = [string]$bar.name; editing = $editing }
+}
+
 # ---------------------------------------------------------------- dispatcher
 
 function Invoke-HostCommand([string]$Cmd, $A) {
@@ -1501,6 +1590,7 @@ function Invoke-HostCommand([string]$Cmd, $A) {
       $on = [bool](Get-Arg $A 'on' $true)
       return @{ ok = [bool][AnywhereNative]::Topmost((Get-Hwnd $A), $on) }
     }
+    'browsertab' { return (Get-BrowserTab $A) }
     'clipget' { return @{ text = (Get-ClipText) } }
     'clipset' { return (Set-ClipText ([string](Get-Arg $A 'text' ''))) }
     'notify' { return (Show-Notification ([string](Get-Arg $A 'title' '')) ([string](Get-Arg $A 'body' ''))) }

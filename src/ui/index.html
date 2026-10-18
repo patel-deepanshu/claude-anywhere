@@ -46,6 +46,11 @@
       <symbol id="i-clip" viewBox="0 0 24 24"><path d="M20.5 11.5l-8.2 8.2a5 5 0 0 1-7.1-7.1l8.6-8.6a3.4 3.4 0 0 1 4.8 4.8l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l7.9-7.9"/></symbol>
       <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6.5h11M9 12h11M9 17.5h11M4.5 6.5h.01M4.5 12h.01M4.5 17.5h.01"/></symbol>
       <symbol id="i-branch" viewBox="0 0 24 24"><circle cx="6.5" cy="5.5" r="2"/><circle cx="6.5" cy="18.5" r="2"/><circle cx="17.5" cy="7.5" r="2"/><path d="M6.5 7.5v9M17.5 9.5c0 4-5 3.5-9.5 7.5"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path class="fill" d="M8 5.8v12.4a1 1 0 0 0 1.5.86l10-6.2a1 1 0 0 0 0-1.72l-10-6.2A1 1 0 0 0 8 5.8z"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7 10.5l5 5 5-5M5 19.5h14"/></symbol>
+      <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4.5h5.5V10M19.5 4.5 11 13M18 14v4.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6H10"/></symbol>
+      <symbol id="i-wave" viewBox="0 0 24 24"><path d="M4 10v4M8 7v10M12 4v16M16 8v8M20 10.5v3"/></symbol>
+      <symbol id="i-ticket" viewBox="0 0 24 24"><path d="M3.5 8A1.5 1.5 0 0 1 5 6.5h14A1.5 1.5 0 0 1 20.5 8v2a2 2 0 0 0 0 4v2a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 16v-2a2 2 0 0 0 0-4z"/><path d="M14.5 7v1.5M14.5 11v2M14.5 15.5V17"/></symbol>
     </defs>
   </svg>
 
@@ -191,177 +196,283 @@
         <svg class="icon" aria-hidden="true"><use href="#i-x"/></svg>
       </button>
     </div>
+    <div class="set-tabs" id="set-tabs" role="tablist" aria-label="Settings sections">
+      <button type="button" class="set-tab" role="tab" id="tab-general" data-tab="general" aria-controls="panel-general" aria-selected="true">General</button>
+      <button type="button" class="set-tab" role="tab" id="tab-voice" data-tab="voice" aria-controls="panel-voice" aria-selected="false" tabindex="-1">Voice</button>
+      <button type="button" class="set-tab" role="tab" id="tab-work" data-tab="work" aria-controls="panel-work" aria-selected="false" tabindex="-1">Jira &amp; repos</button>
+      <button type="button" class="set-tab" role="tab" id="tab-advanced" data-tab="advanced" aria-controls="panel-advanced" aria-selected="false" tabindex="-1">Advanced</button>
+    </div>
     <form class="drawer-body" id="settings-form" autocomplete="off" novalidate>
-      <fieldset class="set-group">
-        <legend>Permissions</legend>
-        <div class="segmented" role="radiogroup" aria-label="Permission mode">
-          <label><input type="radio" name="permissions.mode" value="ask" data-key="permissions.mode"><span>Ask</span></label>
-          <label><input type="radio" name="permissions.mode" value="smart" data-key="permissions.mode"><span>Smart</span></label>
-          <label><input type="radio" name="permissions.mode" value="auto" data-key="permissions.mode"><span>Autopilot</span></label>
-        </div>
-        <p class="set-help" id="perm-help"></p>
-        <label class="set-row">
-          <span class="set-label">Approval timeout <small>seconds before an unanswered request is denied</small></span>
-          <input type="number" min="10" max="86400" step="1" data-key="permissions.approvalTimeoutSec" class="input input-num">
-        </label>
-      </fieldset>
-
-      <fieldset class="set-group">
-        <legend>Working style</legend>
-        <div class="segmented" role="radiogroup" aria-label="Working style">
-          <label><input type="radio" name="mode" value="companion" data-key="mode"><span>Companion</span></label>
-          <label><input type="radio" name="mode" value="bridge" data-key="mode"><span>Bridge</span></label>
-        </div>
-        <p class="set-help">Bridge sends your commands to the Claude Code terminal that ran “/anywhere here”.</p>
-      </fieldset>
-
-      <fieldset class="set-group">
-        <legend>Voice</legend>
-        <label class="set-row">
-          <span class="set-label">Speech input</span>
-          <select class="input" data-key="voice.stt">
-            <option value="auto">Automatic</option>
-            <option value="browser">Browser speech recognition</option>
-            <option value="server">Server transcription</option>
-            <option value="off">Off</option>
-          </select>
-        </label>
-        <label class="set-row">
-          <span class="set-label">Language</span>
-          <input type="text" class="input" data-key="voice.language" list="lang-list" placeholder="en-US" spellcheck="false">
-        </label>
-        <datalist id="lang-list">
-          <option value="en-US"><option value="en-GB"><option value="en-IN"><option value="hi-IN"><option value="es-ES"><option value="es-MX">
-          <option value="fr-FR"><option value="de-DE"><option value="it-IT"><option value="pt-BR"><option value="nl-NL"><option value="ja-JP">
-          <option value="ko-KR"><option value="zh-CN"><option value="ru-RU"><option value="ar-SA"><option value="tr-TR"><option value="pl-PL">
-        </datalist>
-        <label class="set-switch"><input type="checkbox" data-key="voice.autoSend"><span class="switch" aria-hidden="true"></span><span class="set-label">Send when I stop talking</span></label>
-        <label class="set-switch"><input type="checkbox" data-key="voice.speakResponses"><span class="switch" aria-hidden="true"></span><span class="set-label">Speak Claude's answers</span></label>
-        <label class="set-switch"><input type="checkbox" data-key="voice.handsFree"><span class="switch" aria-hidden="true"></span><span class="set-label">Hands-free <small>keep listening for the wake word</small></span></label>
-        <label class="set-row">
-          <span class="set-label">Wake word</span>
-          <input type="text" class="input" data-key="voice.wakeWord" placeholder="hey claude" spellcheck="false">
-        </label>
-        <label class="set-row">
-          <span class="set-label">Speech output</span>
-          <select class="input" data-key="voice.tts">
-            <option value="auto">Automatic</option>
-            <option value="browser">Browser voices</option>
-            <option value="server">System voice (daemon)</option>
-            <option value="off">Off</option>
-          </select>
-        </label>
-        <label class="set-row">
-          <span class="set-label">Voice</span>
-          <select class="input" data-key="voice.ttsVoice" id="tts-voice">
-            <option value="">System default</option>
-          </select>
-        </label>
-        <label class="set-row">
-          <span class="set-label">Speaking rate <output id="rate-out" class="set-value">1.0×</output></span>
-          <input type="range" min="0.5" max="2" step="0.1" data-key="voice.ttsRate" id="tts-rate">
-        </label>
-        <div class="set-actions">
-          <button type="button" class="btn btn-sm" id="test-voice"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-volume"/></svg>Test voice</button>
-        </div>
-        <details class="set-details">
-          <summary>Server transcription</summary>
-          <p class="set-help">Used in Electron, Firefox, or when the browser can't transcribe. Works with Groq or OpenAI keys (also read from GROQ_API_KEY / OPENAI_API_KEY), any OpenAI-compatible endpoint, or a local whisper.cpp.</p>
+      <div class="set-panel" id="panel-general" role="tabpanel" aria-labelledby="tab-general" data-panel="general">
+        <fieldset class="set-group">
+          <legend>Permissions</legend>
+          <div class="segmented" role="radiogroup" aria-label="Permission mode">
+            <label><input type="radio" name="permissions.mode" value="ask" data-key="permissions.mode"><span>Ask</span></label>
+            <label><input type="radio" name="permissions.mode" value="smart" data-key="permissions.mode"><span>Smart</span></label>
+            <label><input type="radio" name="permissions.mode" value="auto" data-key="permissions.mode"><span>Autopilot</span></label>
+          </div>
+          <p class="set-help" id="perm-help"></p>
           <label class="set-row">
-            <span class="set-label">Provider</span>
-            <select class="input" data-key="voice.sttProvider">
+            <span class="set-label">Approval timeout <small>seconds before an unanswered request is denied</small></span>
+            <input type="number" min="10" max="86400" step="1" data-key="permissions.approvalTimeoutSec" class="input input-num">
+          </label>
+        </fieldset>
+
+        <fieldset class="set-group">
+          <legend>Working style</legend>
+          <div class="segmented" role="radiogroup" aria-label="Working style">
+            <label><input type="radio" name="mode" value="companion" data-key="mode"><span>Companion</span></label>
+            <label><input type="radio" name="mode" value="bridge" data-key="mode"><span>Bridge</span></label>
+          </div>
+          <p class="set-help">Bridge sends your commands to the Claude Code terminal that ran “/anywhere here”.</p>
+        </fieldset>
+
+        <fieldset class="set-group">
+          <legend>Appearance</legend>
+          <div class="segmented" role="radiogroup" aria-label="Theme">
+            <label><input type="radio" name="ui.theme" value="system" data-key="ui.theme"><span>System</span></label>
+            <label><input type="radio" name="ui.theme" value="light" data-key="ui.theme"><span>Light</span></label>
+            <label><input type="radio" name="ui.theme" value="dark" data-key="ui.theme"><span>Dark</span></label>
+          </div>
+          <label class="set-switch"><input type="checkbox" data-key="ui.alwaysOnTop"><span class="switch" aria-hidden="true"></span><span class="set-label">Keep this window on top</span></label>
+          <label class="set-switch"><input type="checkbox" data-key="ui.hideFromScreenshots"><span class="switch" aria-hidden="true"></span><span class="set-label">Hide this window from screenshots <small>desktop app only</small></span></label>
+        </fieldset>
+      </div>
+
+      <div class="set-panel" id="panel-voice" role="tabpanel" aria-labelledby="tab-voice" data-panel="voice" hidden>
+        <fieldset class="set-group">
+          <legend>Spoken replies</legend>
+          <label class="set-switch"><input type="checkbox" data-key="voice.speakResponses"><span class="switch" aria-hidden="true"></span><span class="set-label">Speak answers and announcements <small>Claude says when work is done or needs you</small></span></label>
+          <label class="set-row">
+            <span class="set-label">Voice engine</span>
+            <select class="input input-wide" data-key="voice.ttsEngine" id="tts-engine">
+              <option value="auto">Automatic (best available)</option>
+              <option value="piper">Natural voice · free &amp; offline</option>
+              <option value="browser">Browser voice</option>
+              <option value="os">System voice</option>
+            </select>
+          </label>
+
+          <section class="voice-card" id="piper-card" aria-labelledby="piper-title">
+            <div class="voice-card-head">
+              <span class="voice-card-icon" aria-hidden="true"><svg class="icon icon-sm"><use href="#i-wave"/></svg></span>
+              <span class="voice-card-text">
+                <span class="voice-card-title" id="piper-title">Natural voice</span>
+                <span class="voice-card-sub">By Piper · free and offline</span>
+              </span>
+              <span class="tag" id="piper-state" data-state="unknown">Checking…</span>
+            </div>
+            <label class="set-row">
+              <span class="set-label">Voice</span>
+              <select class="input" data-key="voice.piperVoice" id="piper-voice"></select>
+            </label>
+            <div class="progress" id="piper-progress" hidden>
+              <div class="progress-track" id="piper-bar" role="progressbar" aria-label="Natural voice download" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span class="progress-fill" id="piper-fill"></span></div>
+              <span class="progress-text" id="piper-progress-text" aria-live="polite"></span>
+            </div>
+            <div class="set-actions">
+              <button type="button" class="btn btn-sm btn-primary" id="piper-install"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-download"/></svg><span id="piper-install-label">Install natural voice</span></button>
+              <button type="button" class="btn btn-sm" id="voice-test"><svg class="icon icon-xs" aria-hidden="true"><use href="#i-play"/></svg>Test voice</button>
+            </div>
+            <p class="set-help" id="piper-help"></p>
+          </section>
+
+          <div class="set-sub" id="announce-label">Announce</div>
+          <div class="check-grid" role="group" aria-labelledby="announce-label">
+            <label class="check"><input type="checkbox" data-key="voice.announce.done"><span class="check-box" aria-hidden="true"></span><span class="check-text">When work is done</span></label>
+            <label class="check"><input type="checkbox" data-key="voice.announce.permission"><span class="check-box" aria-hidden="true"></span><span class="check-text">When permission is needed</span></label>
+            <label class="check"><input type="checkbox" data-key="voice.announce.question"><span class="check-box" aria-hidden="true"></span><span class="check-text">When Claude asks a question</span></label>
+            <label class="check"><input type="checkbox" data-key="voice.announce.error"><span class="check-box" aria-hidden="true"></span><span class="check-text">On errors</span></label>
+          </div>
+          <label class="set-switch"><input type="checkbox" data-key="voice.chime"><span class="switch" aria-hidden="true"></span><span class="set-label">Play a soft chime first</span></label>
+
+          <details class="set-details">
+            <summary>Browser voice</summary>
+            <p class="set-help">Speaks when the natural voice isn't in use, and reads answers aloud in this window.</p>
+            <label class="set-row">
+              <span class="set-label">Speech output</span>
+              <select class="input" data-key="voice.tts">
+                <option value="auto">Automatic</option>
+                <option value="browser">Browser voices</option>
+                <option value="server">System voice (daemon)</option>
+                <option value="off">Off</option>
+              </select>
+            </label>
+            <label class="set-row">
+              <span class="set-label">Voice</span>
+              <select class="input" data-key="voice.ttsVoice" id="tts-voice">
+                <option value="">Most natural available</option>
+              </select>
+            </label>
+            <label class="set-row">
+              <span class="set-label">Speaking rate <output id="rate-out" class="set-value">1.0×</output></span>
+              <input type="range" min="0.5" max="2" step="0.1" data-key="voice.ttsRate" id="tts-rate">
+            </label>
+            <div class="set-actions">
+              <button type="button" class="btn btn-sm" id="test-voice"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-volume"/></svg>Preview</button>
+            </div>
+          </details>
+        </fieldset>
+
+        <fieldset class="set-group">
+          <legend>Voice input</legend>
+          <label class="set-row">
+            <span class="set-label">Speech input</span>
+            <select class="input" data-key="voice.stt">
               <option value="auto">Automatic</option>
-              <option value="groq">Groq</option>
-              <option value="openai">OpenAI</option>
-              <option value="custom">Custom (OpenAI-compatible)</option>
-              <option value="whisper.cpp">whisper.cpp (local)</option>
+              <option value="browser">Browser speech recognition</option>
+              <option value="server">Server transcription</option>
+              <option value="off">Off</option>
             </select>
           </label>
           <label class="set-row">
-            <span class="set-label">Base URL</span>
-            <input type="url" class="input" data-key="voice.sttBaseUrl" placeholder="https://api.groq.com/openai/v1" spellcheck="false">
+            <span class="set-label">Language</span>
+            <input type="text" class="input" data-key="voice.language" list="lang-list" placeholder="en-US" spellcheck="false">
+          </label>
+          <datalist id="lang-list">
+            <option value="en-US"><option value="en-GB"><option value="en-IN"><option value="hi-IN"><option value="es-ES"><option value="es-MX">
+            <option value="fr-FR"><option value="de-DE"><option value="it-IT"><option value="pt-BR"><option value="nl-NL"><option value="ja-JP">
+            <option value="ko-KR"><option value="zh-CN"><option value="ru-RU"><option value="ar-SA"><option value="tr-TR"><option value="pl-PL">
+          </datalist>
+          <label class="set-switch"><input type="checkbox" data-key="voice.autoSend"><span class="switch" aria-hidden="true"></span><span class="set-label">Send when I stop talking</span></label>
+          <label class="set-switch"><input type="checkbox" data-key="voice.handsFree"><span class="switch" aria-hidden="true"></span><span class="set-label">Hands-free <small>keep listening for the wake word</small></span></label>
+          <label class="set-row">
+            <span class="set-label">Wake word</span>
+            <input type="text" class="input" data-key="voice.wakeWord" placeholder="hey claude" spellcheck="false">
+          </label>
+          <details class="set-details">
+            <summary>Server transcription</summary>
+            <p class="set-help">Used in Electron, Firefox, or when the browser can't transcribe. Works with Groq or OpenAI keys (also read from GROQ_API_KEY / OPENAI_API_KEY), any OpenAI-compatible endpoint, or a local whisper.cpp.</p>
+            <label class="set-row">
+              <span class="set-label">Provider</span>
+              <select class="input" data-key="voice.sttProvider">
+                <option value="auto">Automatic</option>
+                <option value="groq">Groq</option>
+                <option value="openai">OpenAI</option>
+                <option value="custom">Custom (OpenAI-compatible)</option>
+                <option value="whisper.cpp">whisper.cpp (local)</option>
+              </select>
+            </label>
+            <label class="set-row">
+              <span class="set-label">Base URL</span>
+              <input type="url" class="input" data-key="voice.sttBaseUrl" placeholder="https://api.groq.com/openai/v1" spellcheck="false">
+            </label>
+            <label class="set-row">
+              <span class="set-label">API key</span>
+              <input type="password" class="input" data-key="voice.sttApiKey" id="stt-key" placeholder="Not set" autocomplete="new-password" spellcheck="false">
+            </label>
+            <label class="set-row">
+              <span class="set-label">Model</span>
+              <input type="text" class="input" data-key="voice.sttModel" placeholder="whisper-large-v3-turbo" spellcheck="false">
+            </label>
+            <label class="set-row">
+              <span class="set-label">whisper.cpp binary</span>
+              <input type="text" class="input" data-key="voice.whisperCppPath" placeholder="whisper-cli" spellcheck="false">
+            </label>
+            <label class="set-row">
+              <span class="set-label">whisper.cpp model file</span>
+              <input type="text" class="input" data-key="voice.whisperModel" placeholder="~/.claude-anywhere/models/ggml-base.en.bin" spellcheck="false">
+            </label>
+          </details>
+          <p class="set-help" id="voice-diag"></p>
+        </fieldset>
+      </div>
+
+      <div class="set-panel" id="panel-work" role="tabpanel" aria-labelledby="tab-work" data-panel="work" hidden>
+        <fieldset class="set-group">
+          <legend>Jira</legend>
+          <div class="set-intro">
+            <span class="set-intro-icon" aria-hidden="true"><svg class="icon icon-sm"><use href="#i-ticket"/></svg></span>
+            <p class="set-help">Lets Claude read, move and assign your tickets. Without it, Claude reads the ticket from your browser tab.</p>
+            <span class="tag" id="jira-state" hidden></span>
+          </div>
+          <label class="set-field">
+            <span class="set-label">Site URL</span>
+            <input type="url" class="input" data-key="jira.baseUrl" id="jira-url" placeholder="https://your-company.atlassian.net" spellcheck="false" inputmode="url">
+          </label>
+          <label class="set-field">
+            <span class="set-label">Email</span>
+            <input type="email" class="input" data-key="jira.email" id="jira-email" placeholder="you@company.com" spellcheck="false">
+          </label>
+          <label class="set-field">
+            <span class="set-label set-label-row">API token <span class="tag" id="jira-token-set" data-state="ok" hidden>•••• set</span></span>
+            <input type="password" class="input" data-key="jira.apiToken" id="jira-token" placeholder="Paste your API token" autocomplete="new-password" spellcheck="false">
+          </label>
+          <p class="set-help"><a id="jira-token-link" target="_blank" rel="noopener noreferrer">Create an API token<svg class="icon icon-xs" aria-hidden="true"><use href="#i-external"/></svg></a> in your Atlassian account. Jira Server or Data Center: use a personal access token (Email can stay blank).</p>
+          <div class="set-actions set-actions-result">
+            <button type="button" class="btn btn-sm" id="jira-test">Test connection</button>
+            <span class="set-result" id="jira-result" role="status" aria-live="polite"></span>
+          </div>
+        </fieldset>
+
+        <fieldset class="set-group">
+          <legend>Repo folders</legend>
+          <p class="set-help">Where your git repositories live. When you ask Claude to start on a ticket, it looks for the repo in these folders and in your open editors, then asks you where to work.</p>
+          <div class="roots" id="roots" data-key="workspace.roots">
+            <ul class="roots-list" id="roots-list" aria-label="Repo folders"></ul>
+            <div class="roots-add">
+              <label class="sr-only" for="roots-input">Folder to add</label>
+              <input type="text" class="input" id="roots-input" placeholder="~/code" spellcheck="false" autocomplete="off">
+              <button type="button" class="btn btn-sm" id="roots-add"><svg class="icon icon-xs" aria-hidden="true"><use href="#i-plus"/></svg>Add</button>
+            </div>
+            <p class="set-error" id="roots-error" role="alert" hidden></p>
+            <div class="roots-suggest" id="roots-suggest" hidden></div>
+          </div>
+        </fieldset>
+      </div>
+
+      <div class="set-panel" id="panel-advanced" role="tabpanel" aria-labelledby="tab-advanced" data-panel="advanced" hidden>
+        <fieldset class="set-group">
+          <legend>Engine</legend>
+          <label class="set-row">
+            <span class="set-label">Model <small>blank uses your Claude Code default</small></span>
+            <input type="text" class="input" data-key="engine.model" list="model-list" placeholder="Default" spellcheck="false">
+          </label>
+          <datalist id="model-list"><option value="opus"><option value="sonnet"><option value="haiku"><option value="fable"></datalist>
+          <label class="set-row">
+            <span class="set-label">Effort</span>
+            <select class="input" data-key="engine.effort">
+              <option value="">Default</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="xhigh">Extra high</option>
+              <option value="max">Max</option>
+            </select>
           </label>
           <label class="set-row">
-            <span class="set-label">API key</span>
-            <input type="password" class="input" data-key="voice.sttApiKey" id="stt-key" placeholder="Not set" autocomplete="new-password" spellcheck="false">
+            <span class="set-label">Budget per session <small>USD, 0 = no limit</small></span>
+            <input type="number" min="0" step="any" data-key="engine.maxBudgetUsd" class="input input-num">
           </label>
+          <label class="set-switch"><input type="checkbox" data-key="engine.chrome"><span class="switch" aria-hidden="true"></span><span class="set-label">Claude in Chrome <small>drive your logged-in Chrome through the extension</small></span></label>
+          <label class="set-switch"><input type="checkbox" data-key="engine.addVsCodeWorkspaces"><span class="switch" aria-hidden="true"></span><span class="set-label">Give Claude access to open VS Code workspaces</span></label>
+          <label class="set-switch"><input type="checkbox" data-key="engine.resumeLast"><span class="switch" aria-hidden="true"></span><span class="set-label">Resume the last session for a project</span></label>
+        </fieldset>
+
+        <fieldset class="set-group">
+          <legend>Context</legend>
+          <label class="set-switch"><input type="checkbox" data-key="context.attachDesktopContext"><span class="switch" aria-hidden="true"></span><span class="set-label">Attach desktop context <small>open windows, editors, browser tabs, git and cloud CLIs</small></span></label>
+          <label class="set-switch"><input type="checkbox" data-key="context.attachScreenshotByDefault"><span class="switch" aria-hidden="true"></span><span class="set-label">Attach a screenshot by default</span></label>
+          <label class="set-switch"><input type="checkbox" data-key="context.includeCloud"><span class="switch" aria-hidden="true"></span><span class="set-label">Include cloud CLI accounts (gcloud, aws, az, kubectl)</span></label>
+        </fieldset>
+
+        <fieldset class="set-group">
+          <legend>Screen control</legend>
+          <label class="set-switch"><input type="checkbox" data-key="computer.failsafe"><span class="switch" aria-hidden="true"></span><span class="set-label">Failsafe <small>move the mouse to the top-left corner to pause Claude</small></span></label>
           <label class="set-row">
-            <span class="set-label">Model</span>
-            <input type="text" class="input" data-key="voice.sttModel" placeholder="whisper-large-v3-turbo" spellcheck="false">
+            <span class="set-label">Delay after each action <small>ms</small></span>
+            <input type="number" min="0" max="5000" step="1" data-key="computer.actionDelayMs" class="input input-num">
           </label>
-          <label class="set-row">
-            <span class="set-label">whisper.cpp binary</span>
-            <input type="text" class="input" data-key="voice.whisperCppPath" placeholder="whisper-cli" spellcheck="false">
-          </label>
-          <label class="set-row">
-            <span class="set-label">whisper.cpp model file</span>
-            <input type="text" class="input" data-key="voice.whisperModel" placeholder="~/.claude-anywhere/models/ggml-base.en.bin" spellcheck="false">
-          </label>
-        </details>
-        <p class="set-help" id="voice-diag"></p>
-      </fieldset>
+        </fieldset>
 
-      <fieldset class="set-group">
-        <legend>Engine</legend>
-        <label class="set-row">
-          <span class="set-label">Model <small>blank uses your Claude Code default</small></span>
-          <input type="text" class="input" data-key="engine.model" list="model-list" placeholder="Default" spellcheck="false">
-        </label>
-        <datalist id="model-list"><option value="opus"><option value="sonnet"><option value="haiku"><option value="fable"></datalist>
-        <label class="set-row">
-          <span class="set-label">Effort</span>
-          <select class="input" data-key="engine.effort">
-            <option value="">Default</option>
-            <option value="low">Low</option>
-            <option value="medium">Medium</option>
-            <option value="high">High</option>
-            <option value="xhigh">Extra high</option>
-            <option value="max">Max</option>
-          </select>
-        </label>
-        <label class="set-row">
-          <span class="set-label">Budget per session <small>USD, 0 = no limit</small></span>
-          <input type="number" min="0" step="any" data-key="engine.maxBudgetUsd" class="input input-num">
-        </label>
-        <label class="set-switch"><input type="checkbox" data-key="engine.chrome"><span class="switch" aria-hidden="true"></span><span class="set-label">Claude in Chrome <small>drive your logged-in Chrome through the extension</small></span></label>
-        <label class="set-switch"><input type="checkbox" data-key="engine.addVsCodeWorkspaces"><span class="switch" aria-hidden="true"></span><span class="set-label">Give Claude access to open VS Code workspaces</span></label>
-        <label class="set-switch"><input type="checkbox" data-key="engine.resumeLast"><span class="switch" aria-hidden="true"></span><span class="set-label">Resume the last session for a project</span></label>
-      </fieldset>
+        <fieldset class="set-group">
+          <legend>Privacy</legend>
+          <label class="set-switch"><input type="checkbox" data-key="privacy.auditLog"><span class="switch" aria-hidden="true"></span><span class="set-label">Keep an audit log of actions</span></label>
+          <label class="set-switch"><input type="checkbox" data-key="privacy.redactSecretsInLogs"><span class="switch" aria-hidden="true"></span><span class="set-label">Redact secrets in logs</span></label>
+        </fieldset>
 
-      <fieldset class="set-group">
-        <legend>Context</legend>
-        <label class="set-switch"><input type="checkbox" data-key="context.attachDesktopContext"><span class="switch" aria-hidden="true"></span><span class="set-label">Attach desktop context <small>open windows, editors, browser tabs, git and cloud CLIs</small></span></label>
-        <label class="set-switch"><input type="checkbox" data-key="context.attachScreenshotByDefault"><span class="switch" aria-hidden="true"></span><span class="set-label">Attach a screenshot by default</span></label>
-        <label class="set-switch"><input type="checkbox" data-key="context.includeCloud"><span class="switch" aria-hidden="true"></span><span class="set-label">Include cloud CLI accounts (gcloud, aws, az, kubectl)</span></label>
-      </fieldset>
-
-      <fieldset class="set-group">
-        <legend>Screen control</legend>
-        <label class="set-switch"><input type="checkbox" data-key="computer.failsafe"><span class="switch" aria-hidden="true"></span><span class="set-label">Failsafe <small>move the mouse to the top-left corner to pause Claude</small></span></label>
-        <label class="set-row">
-          <span class="set-label">Delay after each action <small>ms</small></span>
-          <input type="number" min="0" max="5000" step="1" data-key="computer.actionDelayMs" class="input input-num">
-        </label>
-      </fieldset>
-
-      <fieldset class="set-group">
-        <legend>Appearance</legend>
-        <div class="segmented" role="radiogroup" aria-label="Theme">
-          <label><input type="radio" name="ui.theme" value="system" data-key="ui.theme"><span>System</span></label>
-          <label><input type="radio" name="ui.theme" value="light" data-key="ui.theme"><span>Light</span></label>
-          <label><input type="radio" name="ui.theme" value="dark" data-key="ui.theme"><span>Dark</span></label>
-        </div>
-        <label class="set-switch"><input type="checkbox" data-key="ui.alwaysOnTop"><span class="switch" aria-hidden="true"></span><span class="set-label">Keep this window on top</span></label>
-        <label class="set-switch"><input type="checkbox" data-key="ui.hideFromScreenshots"><span class="switch" aria-hidden="true"></span><span class="set-label">Hide this window from screenshots <small>desktop app only</small></span></label>
-      </fieldset>
-
-      <fieldset class="set-group">
-        <legend>Privacy</legend>
-        <label class="set-switch"><input type="checkbox" data-key="privacy.auditLog"><span class="switch" aria-hidden="true"></span><span class="set-label">Keep an audit log of actions</span></label>
-        <label class="set-switch"><input type="checkbox" data-key="privacy.redactSecretsInLogs"><span class="switch" aria-hidden="true"></span><span class="set-label">Redact secrets in logs</span></label>
-      </fieldset>
-
-      <div class="set-about" id="about"></div>
+        <div class="set-about" id="about"></div>
+      </div>
 
       <div class="drawer-foot">
         <button type="button" class="btn btn-ghost btn-danger-text" id="shutdown"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-power"/></svg>Quit</button>

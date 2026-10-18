@@ -661,6 +661,7 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
   const promptMod = optionalRequire('./prompt', ['buildSystemPrompt']);
   const permMod = optionalRequire('./permissions', ['PermissionBroker']);
   const voiceMod = optionalRequire('./voice', ['VoiceService']);
+  const announcerMod = optionalRequire('./announcer', ['Announcer']);
   const uihostMod = optionalRequire('./uihost', ['UiHost']);
 
   // ---- lazy driver / computer (created by the first request that needs them)
@@ -746,8 +747,40 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     }
   }
   const notifyOS = commonMod ? (title, body) => commonMod.notify(title, body) : null;
+  // The pending card of a broker (null once answered, undefined when unknown); `permissions` and
+  // `questions` are created below, and this is only called after that.
+  const findCard = (kind, id) => {
+    const broker = kind === 'question' ? questions : permissions;
+    if (!broker || typeof broker.pending !== 'function') return undefined;
+    return broker.pending().find((c) => c && c.id === id) || null;
+  };
+  const secretLike = permMod && typeof permMod.secretLike === 'function' ? permMod.secretLike : null;
 
-  // `permissions` and `questions` are created below with this handler; it looks their cards up later.
+  // The announcer says aloud when work is done, a permission card or question waits, or something
+  // failed: to the visible dialog ('announce' events), else through the speakers (chime + voice).
+  let announcer = null;
+  if (announcerMod) {
+    try {
+      announcer = new announcerMod.Announcer({ config, hub, voice, findCard, secretLike }).start();
+    } catch (err) {
+      log.error('The announcer failed to start; announcements are off:', err);
+      announcer = null;
+    }
+  }
+  // Dialog pages report whether they can be seen (POST /api/ui/visibility → uihost.noteVisibility);
+  // the announcer needs the same reports to tell a visible dialog from a minimized one.
+  if (uihost && announcer && typeof uihost.noteVisibility === 'function') {
+    const noteVisibility = uihost.noteVisibility.bind(uihost);
+    uihost.noteVisibility = (report) => {
+      noteVisibility(report);
+      try {
+        announcer.noteVisibility(report || {});
+      } catch (err) {
+        log.debug(`announcer visibility update failed: ${err.message}`);
+      }
+    };
+  }
+
   const onNeedAttention = createAttentionHandler({
     config,
     // Dialog pages and TUIs show cards; a CLI watcher (`anywhere send --wait`) does not.
@@ -755,13 +788,10 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     getUihost: () => uihost,
     getUrl: () => (server ? server.url : null),
     notifyOS,
-    getVoice: () => voice,
-    findCard: (kind, id) => {
-      const broker = kind === 'question' ? questions : permissions;
-      if (!broker || typeof broker.pending !== 'function') return undefined;
-      return broker.pending().find((c) => c && c.id === id) || null;
-    },
-    secretLike: permMod && typeof permMod.secretLike === 'function' ? permMod.secretLike : null,
+    // The announcer speaks cards now; the attention handler only reopens the dialog and notifies.
+    getVoice: () => (announcer ? null : voice),
+    findCard,
+    secretLike,
     isShuttingDown: () => Boolean(shuttingDown),
   });
 
@@ -838,7 +868,8 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
       .then((caps) => {
         if (!caps || !session) return;
         const before = JSON.stringify(session.voiceInfo);
-        session.setVoiceInfo(caps);
+        // announcer: the dialog must not speak results, cards and questions itself (no double speech).
+        session.setVoiceInfo({ ...caps, announcer: Boolean(announcer) });
         if (broadcastSnapshot && JSON.stringify(session.voiceInfo) !== before) hub.broadcast('snapshot', session.snapshot());
       })
       .catch((err) => log.warn(`voice capabilities failed: ${err.message}`));
@@ -872,6 +903,7 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
       await step('close bridge', () => bridge.close());
       if (session) await step('stop session', () => session.shutdown());
       if (uihost) await step('close dialog', () => uihost.close());
+      if (announcer) await step('stop announcer', () => announcer.stop());
       if (voice) await step('stop voice', () => voice.stop());
       await step('remove CLI screenshots', () => removeCliScreenshots());
       if (driverInstance) {
@@ -907,6 +939,10 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     notifyOS,
     onShutdown: (why) => shutdown(why),
   });
+  // Used by src/daemon/routes-voice.js: announcements for /api/voice/test, and a capability
+  // refresh (snapshot broadcast) after a voice is installed, chosen or removed.
+  server.deps.announcer = announcer;
+  server.deps.refreshVoice = () => refreshVoice(true);
   const wanted = Number.isInteger(port) ? port : Number.isInteger(config.port) ? config.port : 47120;
   let boundPort;
   try {
@@ -940,6 +976,9 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
   });
   server.session = session;
   server.deps.session = session;
+  // Before the voice probe answers: a dialog that connects now must already know that the daemon
+  // announces results and cards, or it would speak them too.
+  if (announcer) session.setVoiceInfo({ announcer: true });
   hub.setSnapshotProvider(() => session.snapshot());
   if (osMod && typeof osMod.selectBackend === 'function') {
     try {
@@ -1062,6 +1101,7 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     questions,
     bridge,
     voice,
+    announcer,
     uihost,
     shutdown,
     done,

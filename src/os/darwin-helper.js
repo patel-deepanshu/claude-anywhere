@@ -1633,6 +1633,120 @@ function cmdClose(a) {
   return { ok: true };
 }
 
+// ---------------------------------------------------------------- browser tabs
+
+/** Page text through the browser's own JavaScript bridge (works only where the user allowed it). */
+var PAGE_TEXT_JS = "(function(){var b=document.body;return b?String(b.innerText||b.textContent||''):'';})()";
+var BROWSER_WINDOW_LIMIT = 30;
+
+/**
+ * The scriptable application object of a running browser, found by process id (so the right
+ * one of several instances or channels answers) or else by name. Never launches the app.
+ */
+function browserApplication(a) {
+  var target = '';
+  var name = str(a.app);
+  if (a.pid !== undefined && a.pid !== null && isFinite(Number(a.pid))) {
+    var ra = $.NSRunningApplication.runningApplicationWithProcessIdentifier(int(a.pid, 'pid'));
+    if (isNil(ra)) throw fail('NOT_FOUND', 'process ' + a.pid + ' is not running');
+    target = str(ra.bundleIdentifier);
+    if (!name) name = str(ra.localizedName);
+  }
+  if (!target) target = name;
+  if (!target) throw fail('BAD_ARGS', 'browserTab needs the app name or its pid');
+  var app = Application(target);
+  if (typeof app.running === 'function' && !app.running()) throw fail('NOT_FOUND', name + ' is not running');
+  return { app: app, name: name || target };
+}
+
+/** The browser window whose title matches the CG window title, else its front window. */
+function pickBrowserWindow(app, title, nameOf) {
+  var wins = app.windows;
+  var count = Number(wins.length) || 0;
+  if (count === 0) throw fail('NOT_FOUND', 'the browser has no open window');
+  var want = str(title);
+  if (want) {
+    var n = Math.min(count, BROWSER_WINDOW_LIMIT);
+    for (var i = 0; i < n; i++) {
+      var name = '';
+      try {
+        name = String(nameOf(wins[i]) || '');
+      } catch (e) {
+        name = '';
+      }
+      if (name && (name === want || want.indexOf(name) === 0)) return { window: wins[i], matched: true };
+    }
+  }
+  return { window: wins[0], matched: false };
+}
+
+/**
+ * Read the active tab of a browser through its AppleScript dictionary: Chromium browsers
+ * (kind "chromium": Chrome, Brave, Edge, Chromium, Vivaldi, Opera, Arc) expose
+ * window.activeTab.url()/title(), Safari (kind "safari") window.currentTab / documents.
+ * The first call per browser shows macOS's Automation consent prompt and blocks until it is
+ * answered; a refusal is error -1743, reported as PERMISSION (perm "automation").
+ * With wantText it also tries the page text through the browser's JavaScript bridge, which
+ * only works where the user enabled "Allow JavaScript from Apple Events" (textError otherwise).
+ */
+function cmdBrowserTab(a) {
+  var kind = a.kind === 'safari' ? 'safari' : 'chromium';
+  var found = browserApplication(a);
+  var app = found.app;
+  var out = { url: null, title: '', matched: false, text: null, textError: null, app: found.name };
+  try {
+    var tab;
+    var pick;
+    if (kind === 'safari') {
+      pick = pickBrowserWindow(app, a.title, function (w) {
+        return w.name();
+      });
+      try {
+        tab = pick.window.currentTab();
+      } catch (e) {
+        tab = null;
+      }
+      if (tab) {
+        out.url = str(tab.url());
+        out.title = str(tab.name());
+      } else {
+        var doc = app.documents[0];
+        out.url = str(doc.url());
+        out.title = str(doc.name());
+      }
+      if (a.wantText && tab) {
+        try {
+          out.text = String(app.doJavaScript(PAGE_TEXT_JS, { in: tab }) || '');
+        } catch (e) {
+          out.textError = errMessage(e);
+        }
+      }
+    } else {
+      pick = pickBrowserWindow(app, a.title, function (w) {
+        return w.name();
+      });
+      tab = pick.window.activeTab();
+      out.url = str(tab.url());
+      out.title = str(tab.title());
+      if (a.wantText) {
+        try {
+          out.text = String(tab.execute({ javascript: PAGE_TEXT_JS }) || '');
+        } catch (e) {
+          out.textError = errMessage(e);
+        }
+      }
+    }
+    out.matched = pick.matched;
+  } catch (e) {
+    var c = classifyError(e);
+    if (c.code === 'PERMISSION') {
+      throw fail('PERMISSION', 'not allowed to control ' + found.name + ' (' + c.message + ')', { perm: 'automation', errorNumber: c.number });
+    }
+    throw e;
+  }
+  return out;
+}
+
 function cmdClipGet() {
   return { text: clipboardText() };
 }
@@ -1667,6 +1781,7 @@ var COMMANDS = {
   focus: cmdFocus,
   minimize: cmdMinimize,
   close: cmdClose,
+  browserTab: cmdBrowserTab,
   clipGet: cmdClipGet,
   clipSet: cmdClipSet,
   exit: function () {
