@@ -207,8 +207,12 @@ test('decode rejects bad input with clear errors', () => {
 // ------------------------------------------------------------ ImageMagick fixtures
 
 const CONVERT = (() => {
-  const r = spawnSync('convert', ['-version'], { encoding: 'utf8' });
-  return r.status === 0 && /ImageMagick/.test(r.stdout) ? 'convert' : null;
+  const exe = require('../src/shared/proc').which('convert');
+  // On Windows `convert` is normally C:\Windows\System32\convert.exe (the FAT-to-NTFS volume
+  // converter): never run it, not even with -version.
+  if (!exe || (process.platform === 'win32' && /[\\/]system32[\\/]/i.test(exe))) return null;
+  const r = spawnSync(exe, ['-version'], { encoding: 'utf8' });
+  return r.status === 0 && /ImageMagick/.test(r.stdout) ? exe : null;
 })();
 
 function im(args) {

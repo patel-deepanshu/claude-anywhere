@@ -21,6 +21,30 @@ function write(file, content) {
   fs.writeFileSync(file, content);
 }
 
+// Tests that read real files describe the machine they run on: on a Windows host the temp
+// paths are drive-letter paths, so those fixtures use the Windows layout (%APPDATA%) and
+// VS Code's Windows URI form instead of pretending to be Linux.
+const IS_WIN = process.platform === 'win32';
+
+/** A sysInfo() override for this host with `home` as the home folder. */
+function hostSys(home) {
+  return IS_WIN
+    ? { platform: 'win32', isWSL: false, env: { APPDATA: path.join(home, 'AppData', 'Roaming') }, home }
+    : { platform: 'linux', isWSL: false, env: {}, home };
+}
+
+/** Where hostSys(home) keeps per-user app config (VS Code, JetBrains). */
+function configRoot(home) {
+  return IS_WIN ? path.join(home, 'AppData', 'Roaming') : path.join(home, '.config');
+}
+
+/** A local path as VS Code stores it: file:///c%3A/Users/... on Windows, file:///home/... elsewhere. */
+function fileUri(p) {
+  const drive = /^([A-Za-z]):\\(.*)$/.exec(p);
+  if (drive) return `file:///${drive[1].toLowerCase()}%3A/${drive[2].split('\\').map(encodeURIComponent).join('/')}`;
+  return `file://${p.split('/').map(encodeURIComponent).join('/')}`;
+}
+
 test.after(() => {
   fs.rmSync(tmpHome, { recursive: true, force: true });
 });
@@ -208,9 +232,11 @@ test('vscodeStorageFiles per platform', async () => {
   const users = tmpDir();
   fs.mkdirSync(path.join(users, 'Dee'));
   fs.mkdirSync(path.join(users, 'Public'));
+  // WSL is Linux: paths under the Windows users folder are joined POSIX-style (/mnt/c/Users/...),
+  // whatever separator the host's temp folder uses.
   const wsl = await desktop.vscodeStorageFiles({ platform: 'linux', isWSL: true, env: {}, home: '/home/d' }, { winUsersDir: users });
-  assert.ok(wsl.some((f) => f.windowsSide && f.file === path.join(users, 'Dee', 'AppData', 'Roaming', 'Code', 'User', 'globalStorage', 'storage.json')));
-  assert.ok(!wsl.some((f) => f.file.includes(`${path.sep}Public${path.sep}`)));
+  assert.ok(wsl.some((f) => f.windowsSide && f.file === path.posix.join(users, 'Dee', 'AppData', 'Roaming', 'Code', 'User', 'globalStorage', 'storage.json')));
+  assert.ok(!wsl.some((f) => f.file.includes('/Public/')));
   assert.ok(wsl.some((f) => !f.windowsSide && f.file === '/home/d/.config/Code/User/globalStorage/storage.json'));
 });
 
@@ -222,7 +248,7 @@ test('readVsCodeWorkspaces reads storage.json and keeps existing paths', async (
   fs.mkdirSync(proj, { recursive: true });
   fs.mkdirSync(other, { recursive: true });
   write(wsFile, '{}');
-  const uri = (p) => `file://${p.split('/').map(encodeURIComponent).join('/')}`;
+  const uri = fileUri;
   const storage = {
     windowsState: {
       lastActiveWindow: { folder: uri(proj) },
@@ -231,12 +257,13 @@ test('readVsCodeWorkspaces reads storage.json and keeps existing paths', async (
     backupWorkspaces: { folders: [{ folderUri: uri(other) }] },
     profileAssociations: { workspaces: { [uri(proj)]: '__default__profile__', 'vscode-remote://ssh-remote+box/x': '__default__profile__' } },
   };
-  write(path.join(home, '.config', 'Code', 'User', 'globalStorage', 'storage.json'), `\ufeff${JSON.stringify(storage)}`);
-  write(path.join(home, '.config', 'Cursor', 'User', 'globalStorage', 'storage.json'), 'not json');
+  const config = configRoot(home);
+  write(path.join(config, 'Code', 'User', 'globalStorage', 'storage.json'), `\ufeff${JSON.stringify(storage)}`);
+  write(path.join(config, 'Cursor', 'User', 'globalStorage', 'storage.json'), 'not json');
   const legacy = path.join(home, 'code', 'legacy');
   fs.mkdirSync(legacy, { recursive: true });
-  write(path.join(home, '.config', 'VSCodium', 'Backups', 'workspaces.json'), JSON.stringify({ folderURIWorkspaces: [uri(legacy)], rootURIWorkspaces: [] }));
-  const sys = { platform: 'linux', isWSL: false, env: {}, home };
+  write(path.join(config, 'VSCodium', 'Backups', 'workspaces.json'), JSON.stringify({ folderURIWorkspaces: [uri(legacy)], rootURIWorkspaces: [] }));
+  const sys = hostSys(home);
   const list = await desktop.readVsCodeWorkspaces(sys);
   const names = list.map((x) => x.name);
   assert.deepEqual(names.slice(0, 3), ['shop api', 'other', 'mono']);
@@ -257,14 +284,15 @@ test('readJetBrainsRecent parses recentProjects.xml', async () => {
   const home = tmpDir('anywhere-jb-');
   const proj = path.join(home, 'IdeaProjects', 'demo');
   fs.mkdirSync(proj, { recursive: true });
+  // JetBrains writes forward slashes on every platform, Windows included.
   write(
-    path.join(home, '.config', 'JetBrains', 'IntelliJIdea2024.1', 'options', 'recentProjects.xml'),
+    path.join(configRoot(home), 'JetBrains', 'IntelliJIdea2024.1', 'options', 'recentProjects.xml'),
     `<application><component name="RecentProjectsManager"><option name="additionalInfo"><map>
       <entry key="$USER_HOME$/IdeaProjects/demo"><value><RecentProjectMetaInfo /></value></entry>
       <entry key="$USER_HOME$/IdeaProjects/missing"><value /></entry>
     </map></option></component></application>`
   );
-  const list = await desktop.readJetBrainsRecent({ platform: 'linux', isWSL: false, env: {}, home });
+  const list = await desktop.readJetBrainsRecent(hostSys(home));
   assert.equal(list.length, 1);
   assert.equal(list[0].path, proj);
   assert.equal(list[0].name, 'demo');
@@ -318,7 +346,7 @@ test('aws, azure (BOM) and kubectl configs', async () => {
     `\ufeff${JSON.stringify({ subscriptions: [{ id: '1', name: 'Dev', isDefault: false }, { id: '2', name: 'Pay-As-You-Go', isDefault: true, user: { name: 'd@x.com' } }] })}`
   );
   write(path.join(home, '.kube', 'config'), 'apiVersion: v1\nclusters: []\ncurrent-context: "gke_my-proj_us-central1_c1"\nkind: Config\n');
-  const sys = { platform: 'linux', isWSL: false, env: {}, home };
+  const sys = hostSys(home);
 
   let aws = await desktop.readAws(sys);
   assert.equal(aws.profile, 'default');
@@ -339,7 +367,8 @@ test('aws, azure (BOM) and kubectl configs', async () => {
   assert.equal(k.context, 'gke_my-proj_us-central1_c1');
   const k2 = path.join(home, 'k2');
   write(k2, 'current-context: kind-dev\n');
-  k = await desktop.readKubectl({ ...sys, env: { KUBECONFIG: [path.join(home, 'nope'), k2].join(':') } });
+  // KUBECONFIG is a PATH-style list: ';' on Windows (drive letters contain ':'), ':' elsewhere.
+  k = await desktop.readKubectl({ ...sys, env: { KUBECONFIG: [path.join(home, 'nope'), k2].join(path.delimiter) } });
   assert.equal(k.context, 'kind-dev');
   fs.rmSync(home, { recursive: true, force: true });
 });
@@ -588,11 +617,11 @@ test('detectProjects merges open editors, cwd and history', async () => {
   const cwd = path.join(home, 'code', 'gamma');
   for (const d of [a, b, cwd]) fs.mkdirSync(d, { recursive: true });
   write(
-    path.join(home, '.config', 'Code', 'User', 'globalStorage', 'storage.json'),
-    JSON.stringify({ windowsState: { lastActiveWindow: { folder: `file://${a}` } }, backupWorkspaces: { folders: [{ folderUri: `file://${b}` }] } })
+    path.join(configRoot(home), 'Code', 'User', 'globalStorage', 'storage.json'),
+    JSON.stringify({ windowsState: { lastActiveWindow: { folder: fileUri(a) } }, backupWorkspaces: { folders: [{ folderUri: fileUri(b) }] } })
   );
   const driver = fakeDriver([{ id: 1, app: 'Code', title: 'x.js - alpha - Visual Studio Code' }], null);
-  const list = await desktop.detectProjects({ driver, cwd, _sys: { platform: 'linux', isWSL: false, env: {}, home } });
+  const list = await desktop.detectProjects({ driver, cwd, _sys: hostSys(home) });
   assert.deepEqual(
     list.map((p) => [p.name, p.source]),
     [

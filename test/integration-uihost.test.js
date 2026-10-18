@@ -72,7 +72,9 @@ test('TUI drives the real daemon: streaming, tools, approvals, questions, /statu
     text += c.toString();
   });
   const get = () => text;
-  const tui = new Tui({ client, input, output, env: { NO_COLOR: '1' } });
+  // unicode: true pins the symbol set: on win32 a console without WT_SESSION/TERM gets the ASCII
+  // fallback ("ok Done" for "✓ Done"), which tui.test.js covers. This test is about the daemon flow.
+  const tui = new Tui({ client, input, output, env: { NO_COLOR: '1' }, unicode: true });
   const done = tui.run();
   try {
     await waitForText(get, /Claude Anywhere v[\d.]+/, 'the snapshot header');

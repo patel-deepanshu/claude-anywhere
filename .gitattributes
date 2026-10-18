@@ -1,0 +1,8 @@
+# Check out LF everywhere, Windows included (git for Windows defaults to core.autocrlf=true).
+# A CRLF checkout breaks the POSIX shim bin/anywhere ("#!/bin/sh\r"), which Claude Code runs
+# through Git Bash on Windows, and the SKILL.md frontmatter. PowerShell reads LF scripts fine.
+* text=auto eol=lf
+
+# cmd.exe needs CRLF: LF-only batch files can mis-parse labels and goto targets.
+*.cmd text eol=crlf
+*.bat text eol=crlf

@@ -93,6 +93,17 @@ function fake({ tools = [], responses = {}, env = { DISPLAY: ':42', LANG: 'C.UTF
   return { calls, which, run, env };
 }
 
+/**
+ * ImageMagick 6's `convert`, or null. On Windows, `convert` on PATH is normally
+ * C:\Windows\System32\convert.exe (the FAT-to-NTFS volume converter), which must never be run.
+ */
+function imageMagickConvert() {
+  const exe = proc.which('convert');
+  if (!exe) return null;
+  if (process.platform === 'win32' && /[\\/]system32[\\/]/i.test(exe)) return null;
+  return exe;
+}
+
 function x11(f, extra = {}) {
   return L.createDriver({ displayServer: 'x11', run: f.run, which: f.which, env: f.env, hostnames: ['vm'], ...extra });
 }
@@ -634,7 +645,8 @@ test('X11: capture with no tools → UNSUPPORTED; all tools failing → CAPTURE_
   await assert.rejects(x11(bad).captureDisplay(0), (e) => e.code === 'CAPTURE_FAILED' && /maim/.test(e.message));
 });
 
-test('X11: full-root capture (scrot) is cropped to the display with ImageMagick', { skip: !proc.which('convert') && 'ImageMagick convert not installed' }, async () => {
+test('X11: full-root capture (scrot) is cropped to the display with ImageMagick', { skip: !imageMagickConvert() && 'ImageMagick convert not installed' }, async () => {
+  const convertExe = imageMagickConvert();
   const root = makePng(96, 48, (x, y) => [x, y, x >= 64 ? 255 : 0]);
   const f = fake({
     tools: ['xrandr', 'scrot', 'convert'],
@@ -644,7 +656,7 @@ test('X11: full-root capture (scrot) is cropped to the display with ImageMagick'
         fs.writeFileSync(args[0], root);
         return {};
       },
-      convert: (args, opts) => proc.run('convert', args, opts),
+      convert: (args, opts) => proc.run(convertExe, args, opts),
     },
   });
   const d = x11(f, { png: null });
@@ -737,7 +749,9 @@ test('X11: listWindows falls back to xdotool search without wmctrl', async () =>
   assert.equal(wins[1].title, 'Second — ü');
   assert.equal(wins[1].focused, true);
   assert.equal(wins[1].pid, process.pid);
-  assert.ok(wins[1].app.length > 0, 'app from /proc/<pid>/comm');
+  // The app name comes from /proc/<pid>/comm, which only Linux has (the driver's real home).
+  if (process.platform === 'linux') assert.ok(wins[1].app.length > 0, 'app from /proc/<pid>/comm');
+  else assert.equal(wins[1].app, '', 'no /proc on this host: no app name, and no error');
 });
 
 test('X11: activeWindow via xprop, null when nothing is focused', async () => {
