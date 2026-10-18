@@ -148,7 +148,10 @@ function checkObject(obj, schema, prefix, errors) {
   const out = { ...obj };
   const props = isPlainObject(schema.properties) ? schema.properties : {};
   for (const k of Object.keys(out)) if (out[k] === null && props[k] && !allowsNull(props[k])) delete out[k];
-  const missing = (Array.isArray(schema.required) ? schema.required : []).filter((k) => out[k] === undefined || out[k] === '');
+  // An empty string counts as missing, unless the property allows it explicitly (minLength: 0,
+  // e.g. ui_set_value's value, where "" clears the field).
+  const emptyOk = (k) => isPlainObject(props[k]) && props[k].minLength === 0;
+  const missing = (Array.isArray(schema.required) ? schema.required : []).filter((k) => out[k] === undefined || (out[k] === '' && !emptyOk(k)));
   if (missing.length) {
     const label = prefix ? `${prefix}.` : '';
     errors.push(`missing required argument${missing.length > 1 ? 's' : ''}: ${missing.map((k) => label + k).join(', ')}`);
@@ -609,6 +612,8 @@ function buildInstructions(role) {
     'Claude Anywhere gives you eyes and hands on the user\'s desktop (macOS, Windows, WSL or Linux): screenshots, mouse, keyboard, windows, apps, URLs and the clipboard, plus ask_user / notify_user to talk to the user through the floating Anywhere dialog.',
     'Prefer CLIs and APIs (Bash with git, gh, gcloud, aws, az, kubectl, docker) when they can do the job; use the screen tools for things that only exist on screen, such as a cloud console in the browser or a desktop app.',
     'GUI loop: screenshot → decide → one action → screenshot to verify. Coordinates are pixels in your latest full screenshot of that display; zoom with screenshot.region to read small text, then convert back as the response explains.',
+    'Any app: when you know a control\'s label, ui_find it and act with ui_click / ui_set_value (faster and steadier than pixels); ui_tree outlines an unfamiliar window. Where a window exposes nothing (canvas apps, Figma, games, video editors, remote desktops) use find_text (OCR) and click its center; read_screen_text reads long text (chats, tickets, logs). On Linux, Chromium/Electron apps expose their content only when started with --force-renderer-accessibility and ACCESSIBILITY_ENABLED=1 (launch_app {accessibility: true}).',
+    '"Open X": launch_app (list_apps finds the name), not the Dock or Start menu. "The site in my Brave bookmarks bar": browser_bookmarks {browser, folder: "bar", query}, then browser_open {browser, url}; browser_tabs / browser_switch_tab find tabs; set_window arranges windows; wait_for replaces fixed waits. screenshotAfter: true and batch_actions save turns.',
     'Before type_text or key, bring the target window to the front with focus_window (or click into it) and check with a screenshot. In key combos "primary" means Cmd on macOS and Ctrl elsewhere.',
     'The window titled "Claude Anywhere" is the user\'s control dialog: never click, type into, move or close it.',
     'Use ask_user before irreversible, costly, public or financial steps. Never type passwords, 2FA codes or payment details; ask the user to do that part. Do not solve CAPTCHAs.',

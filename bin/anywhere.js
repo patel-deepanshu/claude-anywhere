@@ -1935,7 +1935,7 @@ async function cmdNotify(p) {
 
 // ------------------------------------------------------------------ commands: computer
 
-const COMPUTER_OPS = ['screenshot', 'click', 'move', 'drag', 'scroll', 'type', 'key', 'windows', 'focus', 'open', 'clipboard', 'cursor', 'screens', 'context', 'capabilities'];
+const COMPUTER_OPS = ['screenshot', 'click', 'move', 'drag', 'scroll', 'type', 'key', 'windows', 'focus', 'open', 'clipboard', 'cursor', 'screens', 'context', 'capabilities', 'ui-find', 'ocr', 'apps'];
 
 /**
  * Keep the newest `keep` CLI screenshots in run/, and none older than maxAgeMs: bridge mode
@@ -2216,6 +2216,57 @@ async function runComputerOp(op, p, env) {
       return computer.screenInfo();
     case 'capabilities':
       return Object.assign({ driver: driver.name }, await driver.capabilities());
+    case 'ui-find': {
+      if (typeof computer.uiFind !== 'function') throw new CliError('This version cannot read the controls of apps (no accessibility support in the desktop driver).');
+      const name = args.join(' ').trim();
+      const contains = f.contains != null ? String(f.contains) : '';
+      const role = f.role != null ? String(f.role) : '';
+      if (!name && !contains && !role) throw usageError('computer ui-find needs a NAME, --contains TEXT or --role ROLE, e.g. computer ui-find "For you" --role tab', 'computer');
+      const limit = f.limit != null ? toInt(f.limit, '--limit', 1, 100) : 20;
+      let windowId;
+      if (f.window != null && String(f.window).trim()) {
+        // A window id, or part of its title or app name (as computer focus takes it).
+        const desktop = optionalPkg('src/context/desktop.js');
+        const tools = optionalPkg('src/mcp/tools.js');
+        const wins = (await driver.listWindows()) || [];
+        const w = String(f.window).trim();
+        let matches = tools && typeof tools.matchWindows === 'function' ? tools.matchWindows(wins, { id: w }) : matchWindowsLocal(wins, { id: w }, desktop);
+        if (!matches.length) matches = tools && typeof tools.matchWindows === 'function' ? tools.matchWindows(wins, { title: w }) : matchWindowsLocal(wins, { title: w }, desktop);
+        if (!matches.length) {
+          const err = new CliError(`No window matches "${w}".`);
+          err.data = { open: wins.filter((x) => !ownWindow(x, desktop)).map((x) => ({ id: x.id, app: x.app, title: x.title })) };
+          throw err;
+        }
+        if (matches.length > 1) {
+          const err = new CliError(`${matches.length} windows match "${w}"; pass --window with one of their ids.`);
+          err.data = { candidates: matches.map((x) => ({ id: x.id, app: x.app, title: x.title })) };
+          throw err;
+        }
+        windowId = String(matches[0].id);
+      }
+      const list = await computer.uiFind({ windowId, name: name || undefined, text: contains || undefined, role: role || undefined, exact: Boolean(f.exact), limit });
+      const out = { count: list.length, window: list.window || null, matches: Array.from(list) };
+      if (Array.isArray(list.notes) && list.notes.length) out.notes = list.notes;
+      return out;
+    }
+    case 'ocr': {
+      const ocr = requirePkg('src/os/ocr.js', 'Text recognition');
+      const region = f.region ? parseRegion(f.region) : undefined;
+      const query = args.join(' ').trim();
+      if (query) {
+        const matches = await ocr.findText(computer, { text: query, display, region, exact: Boolean(f.exact) });
+        return { count: matches.length, matches: Array.from(matches) };
+      }
+      return ocr.readScreenText(computer, { display, region });
+    }
+    case 'apps': {
+      const desktop = requirePkg('src/context/desktop.js', 'Desktop context');
+      const q = args.join(' ').toLowerCase().trim();
+      let apps = desktop.runningApps((await driver.listWindows()) || [], 200);
+      if (q) apps = apps.filter((a) => a.app.toLowerCase().indexOf(q) >= 0);
+      const defaultBrowser = await withTimeout(desktop.readDefaultBrowser(), 3000, 'reading the default browser').catch(() => null);
+      return { count: apps.length, apps, defaultBrowser };
+    }
     case 'context': {
       const desktop = requirePkg('src/context/desktop.js', 'Desktop context');
       const projectDir = f.project ? resolveProject(f.project) : process.cwd();
@@ -2412,6 +2463,34 @@ function portFree(port) {
   });
 }
 
+/** A driver capabilities() note about app controls (UI automation / the accessibility tree). */
+function isUiNote(n) {
+  return /\bUI automation\b|force-renderer-accessibility|AXManualAccessibility|accessibility bus/i.test(String(n));
+}
+
+/**
+ * The 'appcontrols' doctor check: capabilities().ui with its notes, or uiHint as the fix.
+ * @returns {{status?:string, detail:string, notes?:string[], fix?:string}}
+ */
+function appControlsCheck(caps, pinfo) {
+  const engine = pinfo.platform === 'darwin' ? 'macOS accessibility API' : pinfo.platform === 'win32' || pinfo.isWSL ? 'UI Automation' : 'AT-SPI';
+  const notes = (caps.notes || []).filter((n) => n && isUiNote(n));
+  if (caps.ui) return { detail: `${engine}: ui_find, ui_tree, ui_click and ui_set_value work`, notes };
+  const fix =
+    caps.uiHint ||
+    (pinfo.platform === 'linux' && !pinfo.isWSL
+      ? 'sudo apt install python3-gi gir1.2-atspi-2.0 at-spi2-core (Fedora: sudo dnf install python3-gobject at-spi2-core), then log out and in.'
+      : pinfo.platform === 'darwin'
+        ? 'Grant Accessibility to the app that runs Claude Code (System Settings → Privacy & Security → Accessibility).'
+        : '');
+  return {
+    status: 'warn',
+    detail: `${engine} unavailable: Claude clicks by screenshot position and OCR instead`,
+    notes,
+    fix: fix || 'See the notes above.',
+  };
+}
+
 /**
  * Run every diagnostic check.
  * @returns {Promise<{ok:boolean, version:string, platform:object, checks:Array<{id,label,status,detail,fix,notes,critical}>}>}
@@ -2544,7 +2623,8 @@ async function runDoctor() {
     ]
       .filter(Boolean)
       .join(` ${s.dot} `);
-    const notes = (caps.notes || []).filter(Boolean);
+    // Notes about app controls (accessibility) belong to their own check below, not to this one.
+    const notes = (caps.notes || []).filter((n) => n && !isUiNote(n));
     if (shotErr) notes.unshift(`Test screenshot failed: ${shotErr.message}${shotErr.hint ? ` (${shotErr.hint})` : ''}`);
     const installNote = notes.filter((n) => /^install|grant |not granted|sudo |brew |winget /i.test(n));
     const fix = driver.hint || installNote[0] || '';
@@ -2591,6 +2671,49 @@ async function runDoctor() {
           .map((m) => `open "${m === 'Accessibility' ? urls.accessibility || 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility' : urls.screenRecording || 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'}"`)
           .join(' ; ')}`,
       };
+    });
+  }
+
+  // The desktop assistant: app controls through the accessibility API, and on-screen text (OCR).
+  // Both are optional: without them Claude works from screenshots and coordinates.
+  if (caps && (caps.screenshot || caps.mouse || caps.keyboard)) {
+    await check('appcontrols', 'App controls (accessibility)', false, () => appControlsCheck(caps, pinfo));
+  }
+  await check(
+    'ocr',
+    'Screen text (OCR)',
+    false,
+    async () => {
+      const ocr = optionalPkg('src/os/ocr.js');
+      if (!ocr) return { status: 'warn', detail: 'src/os/ocr.js is missing from this installation', fix: 'Reinstall Claude Anywhere.' };
+      const av = await ocr.available();
+      const names = { vision: 'Apple Vision', windows: 'Windows OCR', tesseract: 'tesseract' };
+      if (av && av.engine) {
+        const e = (av.engines || []).find((x) => x && x.engine === av.engine) || {};
+        const langs = Array.isArray(e.languages) && e.languages.length ? ` (${e.languages.slice(0, 6).join(', ')}${e.languages.length > 6 ? ', ...' : ''})` : '';
+        return { detail: `${names[av.engine] || av.engine}${langs}: find_text, read_screen_text and wait_for {text} work` };
+      }
+      return {
+        status: 'warn',
+        detail: 'no OCR engine: find_text and read_screen_text are unavailable (Claude reads screenshots instead)',
+        fix: (av && av.hint) || 'Install tesseract (Linux: sudo apt install tesseract-ocr).',
+      };
+    },
+    40000
+  );
+  if (pinfo.platform === 'linux' && !pinfo.isWSL) {
+    await check('desktoptools', 'Desktop assistant tools', false, () => {
+      const { which } = shared('proc');
+      const s = sym();
+      const tools = [
+        ['wmctrl', 'closes app windows gently on quit_app (sudo apt install wmctrl)'],
+        ['sqlite3', 'reads the current Firefox bookmarks; without it the daily backup is read (sudo apt install sqlite3)'],
+        ['gtk-launch', 'launches apps exactly as their menu entry does (sudo apt install libgtk-3-bin)'],
+      ];
+      const missing = tools.filter(([n]) => !which(n));
+      const detail = tools.map(([n]) => `${n} ${which(n) ? s.ok : s.fail}`).join(' ');
+      if (!missing.length) return { detail };
+      return { detail, notes: missing.map(([n, why]) => `${n}: ${why}`) };
     });
   }
 
@@ -3350,12 +3473,14 @@ const COMMANDS = {
       'type TEXT [--method auto|keys|paste] [--stdin] | key COMBO… [--repeat N]',
       'windows [--filter S] | focus QUERY | focus --id ID | open TARGET [--kind url|path|app] [-- ARGS]',
       'clipboard get | clipboard set TEXT | cursor | screens | capabilities | context [--text]',
+      'ui-find NAME [--role R] [--contains TEXT] [--window W] [--exact] [--limit N]   app controls (accessibility) with their screenshot position',
+      'ocr [TEXT] [--display N] [--region X,Y,W,H] [--exact]   find TEXT on screen, or read all text | apps [QUERY]   running apps, default browser',
       'Coordinates are pixels of the most recent screenshot of that display.',
     ],
     spec: spec({
-      string: ['display', 'out', 'region', 'button', 'clicks', 'method', 'repeat', 'filter', 'id', 'app', 'title', 'kind', 'max-width', 'max-height', 'project'],
+      string: ['display', 'out', 'region', 'button', 'clicks', 'method', 'repeat', 'filter', 'id', 'app', 'title', 'kind', 'max-width', 'max-height', 'project', 'role', 'contains', 'window', 'limit'],
       multi: ['modifiers', 'mod'],
-      boolean: ['double', 'triple', 'stdin', 'text'],
+      boolean: ['double', 'triple', 'stdin', 'text', 'exact'],
       pair: ['at'],
     }),
   },
@@ -3396,7 +3521,7 @@ const COMMANDS = {
 };
 
 // Feature command modules (src/cli/<name>.js) export commands(helpers) -> { name: {run, group, summary, usage, spec} }.
-for (const name of ['voice', 'jira', 'clone', 'calls']) {
+for (const name of ['voice', 'jira', 'clone', 'calls', 'desktop']) {
   let mod = null;
   try {
     mod = require(path.join(__dirname, '..', 'src', 'cli', `${name}.js`));
@@ -3440,6 +3565,9 @@ Desktop control (prints JSON; X Y are pixels of the latest screenshot)
   computer type TEXT | key COMBO [--repeat N]       e.g. key primary+s, key enter
   computer windows [--filter S] | focus QUERY | open TARGET
   computer clipboard get|set [TEXT] | cursor | screens | capabilities | context
+  computer ui-find NAME [--role R] | ocr [TEXT] | apps [QUERY]   app controls, screen text, running apps
+  desktop apps [Q] | launch NAME | quit NAME | bookmarks [Q] [--browser B] [--folder bar]
+  desktop open-url URL | tabs [--cycle] | switch-tab TEXT|--index N | window Q --state S | wait --window W|--text T
 
 Setup
   doctor [--json]                    check this machine and print exact fixes
@@ -3593,6 +3721,8 @@ module.exports = {
   commandHelp,
   runDoctor,
   renderDoctor,
+  isUiNote,
+  appControlsCheck,
   ensureDaemon,
   stopDaemon,
   daemonIdentity,

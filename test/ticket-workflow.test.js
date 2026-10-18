@@ -579,7 +579,7 @@ test('prompt: the ticket playbook is present, complete and within budget', () =>
       assert.ok(p.endsWith('Keep intermediate text brief.'));
     }
   }
-  assert.ok(prompt.MAX_CHARS <= 16000);
+  assert.ok(prompt.MAX_CHARS <= 18000);
 });
 
 test('skill: bridge mode describes the same ticket flow with the CLI equivalents, within its length limit', () => {

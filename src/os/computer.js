@@ -37,6 +37,22 @@ const PASTE_RESTORE_MS = 1000;
 const REPEAT_GAP_MS = 25;
 const MAX_REPEAT = 100;
 const MAX_SCROLL = 100;
+// UI elements (accessibility): ids seen in uiFind/uiTree results, for uiClick's fallback click.
+const UI_SEEN_TTL_MS = 30000;
+const UI_SEEN_MAX = 3000;
+const UI_FOCUS_SETTLE_MS = 80;
+const UI_FRONT_SETTLE_MS = 150;
+const UI_PICK_LIMIT = 20;
+/** Roles that take a value, tried first by uiSetValue when no role is given. */
+const UI_VALUE_ROLES = ['textbox', 'combobox', 'slider'];
+/**
+ * uiAction errors after which clicking the old position would be wrong: the element or window is
+ * gone (STALE on Linux and the mock, STALE_ELEMENT on Windows, NOT_FOUND on macOS), the id is bad,
+ * or the OS refuses input to that window (UIPI_BLOCKED: an elevated app on Windows).
+ */
+const UI_FATAL_CODES = new Set(['STALE', 'STALE_ELEMENT', 'NOT_FOUND', 'BAD_ARGS', 'INVALID_INPUT', 'PAUSED', 'FAILSAFE', 'PERMISSION', 'UIPI_BLOCKED', 'OWN_DIALOG']);
+/** Errors meaning the element changed since it was found: a uiClick/uiSetValue by name looks it up once more. */
+const UI_STALE_CODES = new Set(['STALE', 'STALE_ELEMENT']);
 const BUTTONS = ['left', 'right', 'middle'];
 const DIRECTIONS = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
 const TERMINAL_RE =
@@ -115,6 +131,69 @@ function displayAt(displays, x, y) {
   return displays.findIndex((d) => x >= d.x && x < d.x + d.width && y >= d.y && y < d.y + d.height);
 }
 
+/** Copy a driver result array's non-index properties (window, truncated, notes...) onto `to`, non-enumerable. */
+function copyMeta(from, to) {
+  if (!from || typeof from !== 'object') return to;
+  for (const k of Object.getOwnPropertyNames(from)) {
+    if (k === 'length' || /^\d+$/.test(k)) continue;
+    Object.defineProperty(to, k, { value: from[k], enumerable: false, configurable: true, writable: true });
+  }
+  return to;
+}
+
+/** Bounds with a positive size and finite numbers. */
+/**
+ * The window or process a UI element id names, by its format: Linux "lx:<window id | @pid.n>:...",
+ * macOS "mac:<pid>:<window number>:...", Windows "<hwnd>.<path>~<tag>", the mock driver "mock:<window id>:...".
+ * @returns {{windowId:string|null, pid:number|null}}
+ */
+function uiOwnerOfId(id) {
+  const s = String(id == null ? '' : id).trim();
+  let m = /^lx:([^:\s]+):/.exec(s);
+  if (m) {
+    const app = /^@(\d+)\./.exec(m[1]);
+    return app ? { windowId: null, pid: Number(app[1]) } : { windowId: m[1], pid: null };
+  }
+  m = /^mock:([^:\s]+):/.exec(s);
+  if (m) return { windowId: m[1], pid: null };
+  m = /^mac:(\d+):([^:]*):/.exec(s);
+  if (m) return { windowId: /^\d+$/.test(m[2]) ? `${m[1]}:${m[2]}` : null, pid: Number(m[1]) };
+  m = /^(-?\d{1,20})(?:[.~]|$)/.exec(s);
+  if (m) return { windowId: m[1], pid: null };
+  return { windowId: null, pid: null };
+}
+
+function ownDialogUiError(target) {
+  return inputError(
+    `"${(target && (target.name || target.id)) || 'That element'}" is in the Claude Anywhere dialog, which Claude may not operate`,
+    'OWN_DIALOG',
+    'Only the user answers the dialog. Name the window of the app you mean (window: its title, app or id), or ask the user.',
+  );
+}
+
+function validRect(b) {
+  return Boolean(b) && [b.x, b.y, b.width, b.height].every(Number.isFinite) && b.width > 0 && b.height > 0;
+}
+
+function hasText(v) {
+  return v != null && String(v).trim() !== '';
+}
+
+function uiNorm(s) {
+  return String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/** One line per candidate, for an ambiguous uiClick/uiSetValue query. */
+function uiCandidateLines(list) {
+  return list
+    .slice(0, 8)
+    .map((m) => {
+      const at = m.shot ? ` at (${m.shot.cx}, ${m.shot.cy}) on display ${m.shot.display}` : '';
+      return `- id ${m.id}: ${m.role} "${String(m.name || '').slice(0, 80)}"${at}${m.enabled === false ? ' [disabled]' : ''}`;
+    })
+    .join('\n');
+}
+
 function normalizeConfig(config) {
   const src = config && typeof config.computer === 'object' && config.computer ? config.computer : config || {};
   const out = { ...DEFAULT_CONFIG };
@@ -149,6 +228,8 @@ class Computer {
     this._displays = null;
     this._displaysAt = 0;
     this._queue = Promise.resolve();
+    /** UI element id -> {bounds, role, name, windowId, relative, at} from uiFind/uiTree results. */
+    this._uiSeen = new Map();
   }
 
   // ------------------------------------------------------------ geometry store
@@ -385,6 +466,58 @@ class Computer {
       if (points.some((p) => p.x >= b.x && p.y >= b.y && p.x < b.x + b.width && p.y < b.y + b.height)) {
         throw inputError('That point is inside the Claude Anywhere dialog, which Claude may not click', 'OWN_DIALOG', 'Only the user answers the dialog. Click somewhere else, or ask the user.');
       }
+    }
+  }
+
+  /**
+   * @private F3-SAFE-D1 for accessibility actions, which never pass through a pixel: refuse one on an element
+   * of a protected window (the Claude Anywhere dialog: pressing its "Allow once" or its settings through the
+   * accessibility API would approve Claude's own requests). The element's window is known from the lookup
+   * that found it, from the window or process its id names, or else from where it is on screen.
+   */
+  async _refuseProtectedUi(target) {
+    if (!this.protect || !target) return;
+    if (target.win && this.protect(target.win)) throw ownDialogUiError(target);
+    const owner = uiOwnerOfId(target.id);
+    const windowId = target.windowId || owner.windowId;
+    let wins = null;
+    if (typeof this.driver.listWindows === 'function') {
+      try {
+        wins = await this.driver.listWindows();
+      } catch {
+        wins = null;
+      }
+    }
+    if (Array.isArray(wins)) {
+      const { sameWindowId } = require('./linux');
+      const own = wins.filter((w) => w && this.protect(w));
+      if (!own.length) return;
+      if (windowId && own.some((w) => sameWindowId(w.id, windowId))) throw ownDialogUiError(target);
+      if (owner.pid && own.some((w) => Number(w.pid) === owner.pid)) throw ownDialogUiError(target);
+      if (windowId && wins.some((w) => w && sameWindowId(w.id, windowId))) return;
+      // Its window is not listed (a pop-up menu) or unknown: judged by where the element is.
+      const b = target.bounds;
+      if (!target.relative && validRect(b)) {
+        const cx = b.x + b.width / 2;
+        const cy = b.y + b.height / 2;
+        for (const w of own) {
+          if (w.minimized) continue;
+          const r = { x: Number(w.x), y: Number(w.y), width: Number(w.width), height: Number(w.height) };
+          if (validRect(r) && cx >= r.x && cy >= r.y && cx < r.x + r.width && cy < r.y + r.height) throw ownDialogUiError(target);
+        }
+      }
+      return;
+    }
+    // Windows cannot be listed here (GNOME/KDE Wayland): the drivers look in the active window by default.
+    if (typeof this.driver.activeWindow === 'function') {
+      let a = null;
+      try {
+        a = await this.driver.activeWindow();
+      } catch {
+        a = null;
+      }
+      const { sameWindowId } = require('./linux');
+      if (a && this.protect(a) && (!windowId || a.id == null || sameWindowId(a.id, windowId))) throw ownDialogUiError(target);
     }
   }
 
@@ -715,6 +848,395 @@ class Computer {
           await this._preflight(displays);
         },
       });
+    });
+  }
+
+  // ------------------------------------------------------------ UI elements (accessibility)
+
+  _requireUi(method) {
+    if (typeof this.driver[method] !== 'function') {
+      throw inputError(
+        `This desktop driver (${this.driver.name || 'unknown'}) cannot read the controls of apps`,
+        'UNSUPPORTED',
+        'Take a screenshot (or use find_text) and click by position instead.',
+      );
+    }
+  }
+
+  /**
+   * An element's logical bounds in the latest-screenshot space of the display that holds its centre:
+   * {x, y, width, height, cx, cy, display}, or null when it has no size or is on no display.
+   */
+  _shotRect(bounds, displays, store = this._readStore()) {
+    if (!validRect(bounds)) return null;
+    const lcx = bounds.x + bounds.width / 2;
+    const lcy = bounds.y + bounds.height / 2;
+    const idx = displayAt(displays, lcx, lcy);
+    if (idx < 0) return null;
+    const m = this._mapping(idx, store);
+    if (m.identity) return null;
+    const kx = m.shotW / m.rect.width;
+    const ky = m.shotH / m.rect.height;
+    return {
+      x: Math.round((bounds.x - m.rect.x) * kx),
+      y: Math.round((bounds.y - m.rect.y) * ky),
+      width: Math.max(1, Math.round(bounds.width * kx)),
+      height: Math.max(1, Math.round(bounds.height * ky)),
+      cx: Math.min(m.shotW - 1, Math.max(0, Math.round((lcx - m.rect.x) * kx))),
+      cy: Math.min(m.shotH - 1, Math.max(0, Math.round((lcy - m.rect.y) * ky))),
+      display: idx,
+    };
+  }
+
+  _uiNote(list, relative, windowId, win) {
+    const now = Date.now();
+    const w = win && typeof win === 'object' ? { id: win.id, title: win.title, app: win.app } : null;
+    for (const n of list) {
+      if (!n || typeof n.id !== 'string') continue;
+      this._uiSeen.delete(n.id);
+      this._uiSeen.set(n.id, { bounds: n.bounds || null, role: n.role, name: n.name, windowId: n.windowId || windowId || null, win: n.windowId ? null : w, relative, at: now });
+    }
+    while (this._uiSeen.size > UI_SEEN_MAX) this._uiSeen.delete(this._uiSeen.keys().next().value);
+  }
+
+  _uiKnown(id) {
+    const e = this._uiSeen.get(id);
+    if (e && Date.now() - e.at <= UI_SEEN_TTL_MS) return { id, ...e };
+    if (e) this._uiSeen.delete(id);
+    return { id, bounds: null, role: '', name: '', windowId: null, win: null, relative: false };
+  }
+
+  /**
+   * Find UI elements of a window through the driver's accessibility API (uiFind), each with `shot`:
+   * {x, y, width, height, cx, cy, display} in the latest-screenshot space of its display (null when it
+   * has no size, is off every display, or the platform cannot place it). Not an input action.
+   * @param {{windowId?:string, name?:string, role?:string|string[], text?:string, exact?:boolean, limit?:number}} [opts]
+   * @returns {Promise<object[]>} the driver's matches (plus shot), with its metadata (window, truncated, notes...)
+   */
+  async uiFind(opts = {}) {
+    this._requireUi('uiFind');
+    const list = await this.driver.uiFind(opts && typeof opts === 'object' ? opts : {});
+    const displays = await this._getDisplays();
+    const store = this._readStore();
+    const relative = Boolean(list && list.relativeBounds);
+    const out = (Array.isArray(list) ? list : []).map((m) => ({ ...m, shot: relative ? null : this._shotRect(m.bounds, displays, store) }));
+    copyMeta(list, out);
+    this._uiNote(out, relative, list && list.window ? list.window.id : null, list && list.window);
+    return out;
+  }
+
+  /**
+   * The accessibility tree of a window (driver.uiTree), each node with `shot` as in uiFind.
+   * @param {{windowId?:string, depth?:number, maxNodes?:number}} [opts]
+   * @returns {Promise<{window:object, nodes:object[], truncated:boolean, notes?:string[]}>}
+   */
+  async uiTree(opts = {}) {
+    this._requireUi('uiTree');
+    const tree = (await this.driver.uiTree(opts && typeof opts === 'object' ? opts : {})) || {};
+    const displays = await this._getDisplays();
+    const store = this._readStore();
+    const relative = Boolean(tree.relativeBounds);
+    const nodes = (Array.isArray(tree.nodes) ? tree.nodes : []).map((n) => ({ ...n, shot: relative ? null : this._shotRect(n.bounds, displays, store) }));
+    this._uiNote(nodes, relative, tree.window ? tree.window.id : null, tree.window);
+    return { ...tree, nodes };
+  }
+
+  /**
+   * The element a uiClick/uiSetValue query means: the best uiFind match; several equally good
+   * enabled, on-screen matches are AMBIGUOUS (the error lists their ids).
+   */
+  async _uiPick(q, displays, preferRoles) {
+    const query = { windowId: q.windowId, name: q.name, text: q.text, exact: q.exact === true, limit: UI_PICK_LIMIT };
+    if (hasText(q.role) || (Array.isArray(q.role) && q.role.length)) query.role = q.role;
+    const list = await this.driver.uiFind(query);
+    const relative = Boolean(list && list.relativeBounds);
+    const store = this._readStore();
+    let found = (Array.isArray(list) ? list : []).map((m) => ({ ...m, shot: relative ? null : this._shotRect(m.bounds, displays, store) }));
+    if (preferRoles && !query.role) {
+      // Without a role, a field that takes the value beats its label or a button of the same name.
+      const pref = found.filter((m) => preferRoles.includes(m.role));
+      if (pref.length) found = [...pref, ...found.filter((m) => !preferRoles.includes(m.role))];
+    }
+    const what = `${hasText(q.role) ? q.role : 'element'} ${hasText(q.name) ? `named "${q.name}"` : `with text "${q.text}"`}`;
+    const where = list && list.window && list.window.title ? ` in "${list.window.title}"` : '';
+    if (!found.length) {
+      const notes = list && Array.isArray(list.notes) && list.notes.length ? ` ${list.notes.join(' ')}` : '';
+      throw inputError(`No ${what}${where}.${notes}`, 'NOT_FOUND', 'Call ui_tree to see what the window offers, or take a screenshot.');
+    }
+    this._uiNote(found, relative, list && list.window ? list.window.id : null, list && list.window);
+    const usable = found.filter((m) => m.enabled !== false && !m.offscreen);
+    const best = usable[0] || found[0];
+    const key = (m) => {
+      const exactName = hasText(q.name) && uiNorm(m.name) === uiNorm(q.name);
+      const exactText = hasText(q.text) && [m.name, m.value].some((v) => uiNorm(v) === uiNorm(q.text));
+      return `${m.role}|${exactName || exactText ? 'exact' : 'partial'}`;
+    };
+    const ties = usable.filter((m) => key(m) === key(best));
+    if (ties.length > 1) {
+      throw inputError(
+        `${ties.length} elements match ${what}${where}; nothing was done. Call again with one of these ids:\n${uiCandidateLines(ties)}`,
+        'AMBIGUOUS',
+        'Pass id (from this list or ui_find), or narrow the query with role, exact or window.',
+      );
+    }
+    const out = { ...best, relative, candidates: found.length };
+    // The window searched (for the dialog check), unless the match says it belongs to another one.
+    if (list && list.window && typeof list.window === 'object' && (!best.windowId || String(best.windowId) === String(list.window.id))) {
+      out.win = { id: list.window.id, title: list.window.title, app: list.window.app };
+    }
+    // Driver warnings about the search (Windows: a Chromium window that exposes almost nothing).
+    if (list && Array.isArray(list.warnings) && list.warnings.length) out.findWarnings = list.warnings.slice();
+    return out;
+  }
+
+  /**
+   * The listed window `windowId` and whether it is the active one, or null when that is unknown: no window id,
+   * a driver that cannot list windows (GNOME/KDE Wayland), or a window list does not show (Windows pop-up
+   * menus and drop-downs, which focusing would close).
+   */
+  async _uiWindowState(windowId) {
+    if (!hasText(windowId) || typeof this.driver.listWindows !== 'function' || typeof this.driver.activeWindow !== 'function') return null;
+    const { sameWindowId } = require('./linux');
+    let wins;
+    let active;
+    try {
+      [wins, active] = await Promise.all([this.driver.listWindows(), this.driver.activeWindow()]);
+    } catch (err) {
+      log.debug('window state unknown:', err && err.message);
+      return null;
+    }
+    const w = (Array.isArray(wins) ? wins : []).find((x) => x && sameWindowId(x.id, windowId));
+    if (!w || !active || active.id == null) return null;
+    return { window: w, active: sameWindowId(active.id, w.id) };
+  }
+
+  /**
+   * Bring an element's window to the front before input that depends on it: a real click at its centre (on a
+   * covered window that point belongs to the window on top) and keys typed after focusing it (the accessibility
+   * focus action does not raise the window in every toolkit). Throws FOCUS_FAILED when the window is known to
+   * stay behind, so nothing lands in another app.
+   */
+  async _uiFront(target, what) {
+    const st = await this._uiWindowState(target.windowId);
+    if (!st || st.active) return;
+    try {
+      await this.driver.focusWindow(st.window.id);
+    } catch (err) {
+      log.debug('focusing the element window failed:', err && err.message);
+    }
+    await sleep(UI_FRONT_SETTLE_MS);
+    const again = await this._uiWindowState(target.windowId);
+    if (again && !again.active) {
+      throw inputError(
+        `The window of "${target.name || target.id}" could not be brought to the front, so nothing was ${what}`,
+        'FOCUS_FAILED',
+        `Call focus_window with id ${st.window.id} (or click the window), then try again.`,
+      );
+    }
+  }
+
+  /** Click the centre of an element's bounds (logical) for the uiClick/uiSetValue fallbacks. */
+  async _uiClickCentre(target, bounds, displays) {
+    if (target.relative) {
+      throw inputError(
+        `"${target.name || target.id}" cannot be pressed through accessibility, and its position on screen is unknown on this desktop`,
+        'UI_ACTION_FAILED',
+        'Take a screenshot (or use find_text) and click it by position.',
+      );
+    }
+    if (!validRect(bounds)) {
+      throw inputError(
+        `"${target.name || target.id}" cannot be pressed through accessibility and has no position to click`,
+        'UI_ACTION_FAILED',
+        'Take a screenshot (or use find_text) and click it by position.',
+      );
+    }
+    const lx = Math.round(bounds.x + bounds.width / 2);
+    const ly = Math.round(bounds.y + bounds.height / 2);
+    const idx = displayAt(displays, lx, ly);
+    if (idx < 0) {
+      throw inputError(`"${target.name || target.id}" is off screen`, 'OFFSCREEN', 'Scroll it into view (or bring its window on screen) and try again.');
+    }
+    const res = await this.driver.click(lx, ly, { button: 'left', clicks: 1, modifiers: [] });
+    this._notePointer({ x: lx, y: ly });
+    return { res, logical: { x: lx, y: ly }, display: idx };
+  }
+
+  async _uiTry(id, action, value) {
+    try {
+      const args = { id, action };
+      if (value !== undefined) args.value = value;
+      return { res: (await this.driver.uiAction(args)) || { ok: false, method: 'none' }, err: null };
+    } catch (err) {
+      if (err && UI_FATAL_CODES.has(err.code)) throw err;
+      return { res: null, err };
+    }
+  }
+
+  _uiResult(action, target, extra, displays) {
+    const bounds = (extra && extra.bounds) || target.bounds;
+    const shot = target.relative ? null : this._shotRect(bounds, displays);
+    const out = { ok: true, action, id: (extra && extra.id) || target.id, role: target.role || (extra && extra.role) || '', name: target.name || (extra && extra.name) || '' };
+    if (target.windowId) out.windowId = target.windowId;
+    if (shot) out.shot = shot;
+    if (target.candidates > 1) out.candidates = target.candidates;
+    return out;
+  }
+
+  /**
+   * Press a UI element: by id (from uiFind/uiTree), or the best match for name/text (+ role,
+   * windowId, exact). Prefers the accessibility action (press; focus for a text box), else clicks
+   * the centre of the element with the real mouse. An input action: guard, failsafe, settle delay.
+   * @param {{id?:string, name?:string, text?:string, role?:string, windowId?:string, exact?:boolean}} opts
+   * @returns {Promise<{ok:true, action:'ui_click', method:string, id:string, role:string, name:string,
+   *   shot?:object, windowId?:string, pending?:boolean, logical?:object, display?:number, warnings?:string[]}>}
+   */
+  async uiClick({ id, name, text, role, windowId, exact } = {}) {
+    this._requireUi('uiAction');
+    const byId = hasText(id);
+    if (!byId) this._requireUi('uiFind');
+    if (!byId && !hasText(name) && !hasText(text)) {
+      throw inputError('uiClick needs an element id, or a name or text to find it by (role and windowId narrow it down)');
+    }
+    const q = { name, text, role, windowId, exact };
+    return this._act(async (displays) => {
+      const target = byId ? this._uiKnown(String(id).trim()) : await this._uiPick(q, displays);
+      return () => this._uiRefinding(target, byId ? null : () => this._uiPick(q, displays), (t) => this._uiClickPerform(t, displays));
+    });
+  }
+
+  /**
+   * Run `perform(target)`; when the element changed since a by-name lookup found it (STALE /
+   * STALE_ELEMENT), look it up once more and retry. By id (`repick` null) the error stands.
+   */
+  async _uiRefinding(target, repick, perform) {
+    try {
+      return await perform(target);
+    } catch (err) {
+      if (!repick || !err || !UI_STALE_CODES.has(err.code)) throw err;
+      return perform(await repick());
+    }
+  }
+
+  /** uiClick's action on a resolved target: the accessibility press (focus for a text box), else a real click. */
+  async _uiClickPerform(target, displays) {
+    await this._refuseProtectedUi(target);
+    // A text box is "clicked" to type into it: focus does that without side effects.
+    const action = target.role === 'textbox' ? 'focus' : 'press';
+    let { res, err } = await this._uiTry(target.id, action);
+    if (action === 'focus' && !(res && res.ok)) ({ res, err } = await this._uiTry(target.id, 'press'));
+    const found = target.findWarnings ? { warnings: target.findWarnings } : null;
+    if (res && res.ok) {
+      const out = { ...this._uiResult('ui_click', target, res, displays), method: res.method || action, ...warningsOf(found, res) };
+      // pending (Windows) / confirmed:false (macOS): the app has not answered yet, most likely because
+      // the press opened a modal dialog or a menu. The press happened: never click on top of it.
+      if (res.pending || res.confirmed === false) out.pending = true;
+      return out;
+    }
+    if (res && res.disabled) {
+      throw inputError(`"${target.name || res.name || target.id}" is disabled`, 'DISABLED', 'Something must happen first (fill in a field, select an item) before it can be used.');
+    }
+    const bounds = (res && res.bounds) || target.bounds;
+    await this._uiFront(target, 'clicked');
+    const clicked = await this._uiClickCentre({ ...target, relative: target.relative || Boolean(res && res.relativeBounds) }, bounds, displays);
+    const out = {
+      ...this._uiResult('ui_click', target, { ...(res || {}), bounds }, displays),
+      method: 'click',
+      logical: clicked.logical,
+      display: clicked.display,
+      ...warningsOf(found, res, clicked.res),
+    };
+    const why = (res && res.reason) || (err && err.message);
+    if (why) out.reason = why;
+    return out;
+  }
+
+  /**
+   * Set the value of a text box, combo box or slider: by id, or the best match for name/text (+ role,
+   * windowId, exact; without a role, value-taking roles are tried first). Prefers the accessibility
+   * setValue, else focuses the element (or clicks it), selects all and types (pastes long or
+   * multi-line text). An input action: guard, failsafe, settle delay.
+   * @param {{id?:string, value:string|number, name?:string, text?:string, role?:string, windowId?:string, exact?:boolean,
+   *   query?:{name?:string, text?:string, role?:string, windowId?:string, exact?:boolean}}} opts
+   * @returns {Promise<{ok:true, action:'ui_set_value', method:string, id:string, role:string, name:string, chars:number, shot?:object}>}
+   */
+  async uiSetValue({ id, value, name, text, role, windowId, exact, query } = {}) {
+    this._requireUi('uiAction');
+    if (value == null || (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean')) {
+      throw inputError(`value must be text or a number (got ${value === undefined ? 'nothing' : typeof value})`);
+    }
+    const str = String(value);
+    const q = query && typeof query === 'object' ? { ...query } : { name, text, role, windowId, exact };
+    const byId = hasText(id);
+    if (!byId) this._requireUi('uiFind');
+    if (!byId && !hasText(q.name) && !hasText(q.text)) {
+      throw inputError('uiSetValue needs an element id, or a name or text to find it by (role and windowId narrow it down)');
+    }
+    return this._act(async (displays) => {
+      const target = byId ? this._uiKnown(String(id).trim()) : await this._uiPick(q, displays, UI_VALUE_ROLES);
+      return () => this._uiRefinding(target, byId ? null : () => this._uiPick(q, displays, UI_VALUE_ROLES), (t) => this._uiSetPerform(t, str, displays));
+    });
+  }
+
+  /** uiSetValue's action on a resolved target: accessibility setValue, else focus/click + select all + type. */
+  async _uiSetPerform(target, str, displays) {
+    await this._refuseProtectedUi(target);
+    const chars = Array.from(str).length;
+    const found = target.findWarnings ? { warnings: target.findWarnings } : null;
+    const set = await this._uiTry(target.id, 'setValue', str);
+    if (set.res && set.res.ok) {
+      return { ...this._uiResult('ui_set_value', target, set.res, displays), method: set.res.method || 'setValue', chars, ...warningsOf(found, set.res) };
+    }
+    if (set.res && set.res.disabled) {
+      throw inputError(`"${target.name || set.res.name || target.id}" is disabled`, 'DISABLED', 'Something must happen first before it takes a value.');
+    }
+    // Keyboard: the window in front, focus (or click) the field, select all, then type or paste over it.
+    await this._uiFront(target, 'typed');
+    const focus = await this._uiTry(target.id, 'focus');
+    let how = 'focus';
+    let clicked = null;
+    if (!(focus.res && focus.res.ok)) {
+      const bounds = (focus.res && focus.res.bounds) || (set.res && set.res.bounds) || target.bounds;
+      const relative = target.relative || Boolean((focus.res && focus.res.relativeBounds) || (set.res && set.res.relativeBounds));
+      clicked = await this._uiClickCentre({ ...target, relative }, bounds, displays);
+      how = 'click';
+    }
+    await sleep(UI_FOCUS_SETTLE_MS);
+    const results = [found, set.res, focus.res, clicked && clicked.res];
+    results.push(await this.driver.keyCombo(keys.normalizeCombo('primary+a', { platform: this.platform })));
+    let typed = 'type';
+    if (str === '') {
+      results.push(await this.driver.keyCombo(['delete']));
+      typed = 'delete';
+    } else if (str.length > this.config.pasteThreshold || /[\r\n]/.test(str) || /[\uD800-\uDFFF]/.test(str)) {
+      results.push(await this._paste(str, false));
+      typed = 'paste';
+    } else {
+      results.push(await this.driver.typeText(str));
+    }
+    const bounds = (focus.res && focus.res.bounds) || (set.res && set.res.bounds) || target.bounds;
+    const out = { ...this._uiResult('ui_set_value', target, { bounds }, displays), method: `${how}+select-all+${typed}`, chars, ...warningsOf(...results) };
+    if (clicked) {
+      out.logical = clicked.logical;
+      out.display = clicked.display;
+    }
+    return out;
+  }
+
+  /**
+   * Any driver.uiAction (press, focus, setValue, select, expand, collapse, scrollIntoView, showMenu)
+   * as a guarded input action. ok:false results are returned as they are (the caller may click).
+   * @param {{id:string, action:string, value?:any}} opts
+   */
+  async uiAction({ id, action, value } = {}) {
+    this._requireUi('uiAction');
+    if (!hasText(id)) throw inputError('uiAction needs an element id from uiFind or uiTree');
+    return this._act(async () => async () => {
+      await this._refuseProtectedUi(this._uiKnown(String(id).trim()));
+      const args = { id: String(id).trim(), action };
+      if (value !== undefined) args.value = value;
+      const res = (await this.driver.uiAction(args)) || { ok: false, method: 'none' };
+      return { ...res, action: `ui_${action || 'press'}`, id: res.id || args.id };
     });
   }
 
