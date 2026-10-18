@@ -3,9 +3,13 @@
 /**
  * Optional Electron shell for the Claude Anywhere dialog (Electron >= 28).
  *
- *   electron src/electron/main.js --url http://127.0.0.1:<port>/?token=<token>
+ *   ANYWHERE_UI_URL=http://127.0.0.1:<port>/?token=<token> electron src/electron/main.js
  *     [--always-on-top true|false] [--hotkey <accelerator>] [--hide-from-screenshots true|false]
  *     [--width N] [--height N] [--position right|left|center]
+ *
+ * The URL carries the daemon's access token, so the daemon passes it in the environment (readable
+ * only by the owner) rather than on the command line (readable by every local user). `--url <url>`
+ * still works for manual runs.
  *
  * One frameless-feeling, always-on-top window that only ever shows the daemon's origin. The
  * window hides instead of closing (tray: Show / Always on top / Quit), a global hotkey toggles
@@ -28,6 +32,7 @@ const IS_ELECTRON_MAIN = Boolean(
 );
 
 const WINDOW_TITLE = 'Claude Anywhere';
+const URL_ENV = 'ANYWHERE_UI_URL';
 const HEALTH_INTERVAL_MS = 5000;
 const HEALTH_TIMEOUT_MS = 3000;
 const HEALTH_MAX_FAILURES = 3;
@@ -175,9 +180,12 @@ function warn(msg) {
 function start() {
   const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, ipcMain, shell, screen, session, systemPreferences, nativeTheme, net } = electron;
   const opts = parseArgs(process.argv);
+  if (!opts.url && process.env[URL_ENV]) opts.url = process.env[URL_ENV];
+  // Keep the token out of the renderer, GPU and utility processes Chromium starts from here on.
+  delete process.env[URL_ENV];
   const startOrigin = originOf(opts.url);
   if (!opts.url || !startOrigin) {
-    warn('--url http://127.0.0.1:<port>/?token=<token> is required');
+    warn(`${URL_ENV}=http://127.0.0.1:<port>/?token=<token> (or --url <url>) is required`);
     app.exit(2);
     return;
   }
@@ -529,7 +537,7 @@ function start() {
 if (IS_ELECTRON_MAIN) {
   start();
 } else if (require.main === module) {
-  process.stderr.write('src/electron/main.js must be run with Electron: electron src/electron/main.js --url <url>\n');
+  process.stderr.write(`src/electron/main.js must be run with Electron: ${URL_ENV}=<url> electron src/electron/main.js\n`);
   process.exitCode = 1;
 }
 
@@ -541,6 +549,7 @@ module.exports = {
   windowBounds,
   ICON_DATA_URL,
   WINDOW_TITLE,
+  URL_ENV,
   HEALTH_INTERVAL_MS,
   HEALTH_MAX_FAILURES,
 };

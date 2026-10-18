@@ -23,6 +23,8 @@ const {
   buildArgs,
   buildEnv,
   launchSpec,
+  resolveCmdShim,
+  isUncPath,
   parseVersion,
   knownInstallPaths,
   LineSplitter,
@@ -95,6 +97,7 @@ test('buildArgs follows the contract order (add-dir last)', () => {
     '--session-id', 'S',
     '--mcp-config', '/run/mcp.json',
     '--permission-prompt-tool', 'mcp__anywhere__permission_prompt',
+    '--permission-mode', 'default',
     '--append-system-prompt-file', '/run/prompt.md',
     '--allowedTools', 'mcp__anywhere__screenshot,mcp__anywhere__wait',
     '--model', 'opus', '--fallback-model', 'sonnet', '--effort', 'high', '--chrome', '--max-budget-usd', '2.5',
@@ -105,6 +108,15 @@ test('buildArgs follows the contract order (add-dir last)', () => {
   assert.deepEqual(resume.slice(7, 9), ['--resume', 'R']);
   assert.ok(!buildArgs({ sessionId: 'x', maxBudgetUsd: 0 }).includes('--max-budget-usd'));
   assert.ok(!buildArgs({ sessionId: 'x' }).includes('--allowedTools'));
+  // The user's own defaultMode (acceptEdits, bypassPermissions) never applies to the engine…
+  const pinned = buildArgs({ sessionId: 'x', settingsPath: '/run/settings.json' });
+  assert.deepEqual(pinned.slice(9, 15), ['--permission-prompt-tool', 'mcp__anywhere__permission_prompt', '--permission-mode', 'default', '--settings', '/run/settings.json']);
+  assert.deepEqual(buildArgs({ sessionId: 'x', permissionMode: 'plan' }).slice(11, 13), ['--permission-mode', 'plan']);
+  // …unless engine.extraArgs sets these flags on purpose.
+  const own = buildArgs({ sessionId: 'x', settingsPath: '/s.json', extraArgs: ['--permission-mode=acceptEdits', '--settings', '/mine.json'] });
+  assert.equal(own.filter((a) => a.startsWith('--permission-mode')).length, 1);
+  assert.equal(own.filter((a) => a === '--settings').length, 1);
+  assert.ok(!own.includes('/s.json'));
 });
 
 test('buildEnv strips nested-session variables and adds MCP timeouts', () => {
@@ -116,7 +128,12 @@ test('buildEnv strips nested-session variables and adds MCP timeouts', () => {
   assert.equal(env.CLAUDE_CODE_SESSION_ID, undefined);
   assert.equal(env.claude_pid, undefined, 'case-insensitive (Windows env)');
   assert.equal(env.KEEP, undefined);
-  assert.equal(env.PATH, '/bin');
+  // WINDOWS-6: the node running the daemon is put on PATH (POSIX) so `#!/usr/bin/env node` shims resolve.
+  const nodeDir = path.dirname(process.execPath);
+  assert.equal(env.PATH, process.platform === 'win32' || nodeDir === '/bin' ? '/bin' : `${nodeDir}:/bin`);
+  assert.equal(buildEnv({ PATH: `/bin:${nodeDir}/` }, { platform: 'linux' }).PATH, `/bin:${nodeDir}/`, 'not added twice');
+  assert.equal(buildEnv({ PATH: '/bin' }, { platform: 'linux', nodeDir: '/opt/node/bin' }).PATH, '/opt/node/bin:/bin');
+  assert.equal(buildEnv({ PATH: 'C:\\bin' }, { platform: 'win32', nodeDir: 'C:\\node' }).PATH, 'C:\\bin', 'Windows PATH untouched');
   assert.equal(env.MCP_TOOL_TIMEOUT, '3600000');
   assert.equal(env.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS, '0');
   assert.equal(env.ANYWHERE_X, '1');
@@ -138,6 +155,82 @@ test('launchSpec quotes Windows .cmd shims and runs scripts with node', () => {
   assert.deepEqual(js, { command: process.execPath, args: ['C:\\x\\cli.js', '-p'], shell: false });
   const posix = launchSpec('/usr/local/bin/claude', ['-p'], 'linux');
   assert.deepEqual(posix, { command: '/usr/local/bin/claude', args: ['-p'], shell: false });
+});
+
+// The shim npm writes for `npm install -g @anthropic-ai/claude-code` (cmd-shim).
+const NPM_SHIM = [
+  '@ECHO off',
+  'GOTO start',
+  ':find_dp0',
+  'SET dp0=%~dp0',
+  'EXIT /b',
+  ':start',
+  'SETLOCAL',
+  'CALL :find_dp0',
+  '',
+  'IF EXIST "%dp0%\\node.exe" (',
+  '  SET "_prog=%dp0%\\node.exe"',
+  ') ELSE (',
+  '  SET "_prog=node"',
+  '  SET PATHEXT=%PATHEXT:;.JS;=;%',
+  ')',
+  '',
+  'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@anthropic-ai\\claude-code\\cli.js" %*',
+  '',
+].join('\r\n');
+
+function npmPrefix({ shim = NPM_SHIM, withCli = true, withNodeExe = true } = {}) {
+  const dir = fs.mkdtempSync(path.join(HOME, 'npm-'));
+  const cli = path.join(dir, 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js');
+  if (withCli) {
+    fs.mkdirSync(path.dirname(cli), { recursive: true });
+    fs.writeFileSync(cli, '// cli\n');
+  }
+  if (withNodeExe) fs.writeFileSync(path.join(dir, 'node.exe'), '');
+  const cmd = path.join(dir, 'claude.cmd');
+  fs.writeFileSync(cmd, shim);
+  return { dir, cmd, cli };
+}
+
+test('npm claude.cmd shims run their cli.js with node, without cmd.exe', () => {
+  const { cmd, cli } = npmPrefix();
+  assert.equal(resolveCmdShim(cmd), cli, 'the target, not the node.exe the shim also names');
+  assert.deepEqual(launchSpec(cmd, ['-p', 'a&b'], 'win32'), { command: process.execPath, args: [cli, '-p', 'a&b'], shell: false });
+  // Older shims: "%~dp0\node_modules\…\cli.js" %*
+  const old = npmPrefix({ shim: '@"%~dp0\\node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n', withNodeExe: false });
+  assert.equal(resolveCmdShim(old.cmd), old.cli);
+  // A shim for a native binary.
+  const exeDir = fs.mkdtempSync(path.join(HOME, 'npm-exe-'));
+  fs.mkdirSync(path.join(exeDir, 'bin'));
+  fs.writeFileSync(path.join(exeDir, 'bin', 'claude.exe'), '');
+  fs.writeFileSync(path.join(exeDir, 'claude.cmd'), '@"%~dp0\\bin\\claude.exe" %*\r\n');
+  const exe = launchSpec(path.join(exeDir, 'claude.cmd'), ['-p'], 'win32');
+  assert.deepEqual(exe, { command: path.join(exeDir, 'bin', 'claude.exe'), args: ['-p'], shell: false });
+  // A shim that names nothing usable falls back to the npm layout next to it…
+  const odd = npmPrefix({ shim: '@echo off\r\nnode "%APPDATA%\\elsewhere.js" %*\r\n' });
+  assert.equal(resolveCmdShim(odd.cmd), odd.cli);
+  // …and only then to cmd.exe.
+  const bare = npmPrefix({ shim: '@echo off\r\nclaude-real %*\r\n', withCli: false });
+  assert.equal(resolveCmdShim(bare.cmd), null);
+  const viaShell = launchSpec(bare.cmd, ['-p'], 'win32');
+  assert.equal(viaShell.shell, true);
+  assert.equal(resolveCmdShim(path.join(HOME, 'missing.cmd')), null);
+});
+
+test('a cmd.exe launch refuses a UNC project folder instead of running in C:\\Windows', async () => {
+  assert.equal(isUncPath('\\\\wsl.localhost\\Ubuntu\\home\\me\\repo'), true);
+  assert.equal(isUncPath('\\\\server\\share\\repo'), true);
+  assert.equal(isUncPath('//server/share'), true);
+  assert.equal(isUncPath('C:\\repo'), false);
+  assert.equal(isUncPath('/home/me/repo'), false);
+  const bare = npmPrefix({ shim: '@echo off\r\nclaude-real %*\r\n', withCli: false });
+  const engine = new ClaudeCliEngine({ claudePath: bare.cmd, cwd: '\\\\wsl.localhost\\Ubuntu\\home\\me\\repo', sessionId: uuid(), platform: 'win32' });
+  const exit = new Promise((r) => engine.once('exit', r));
+  engine.start();
+  const info = await exit;
+  assert.equal(info.errorCode, 'UNC_CWD');
+  assert.match(info.error, /cannot use the network or WSL folder/);
+  assert.equal(engine.running, false);
 });
 
 test('parseVersion and known install paths', () => {
@@ -164,6 +257,61 @@ test('LineSplitter handles split UTF-8, CRLF and a trailing line', () => {
   assert.deepEqual(lines, ['{"a":"héllo 👋"}', '{"b":1}', '{"c":2}']);
 });
 
+test('locate() prefers a discovered claude that answers --version over a broken one earlier on PATH (WINDOWS-6)', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('POSIX shims');
+    return;
+  }
+  const bin = fs.mkdtempSync(path.join(HOME, 'brokenbin-'));
+  const broken = path.join(bin, 'claude');
+  fs.writeFileSync(broken, '#!/bin/sh\nexit 3\n', { mode: 0o755 });
+  const savedPath = process.env.PATH;
+  const savedEnv = process.env.ANYWHERE_CLAUDE_PATH;
+  try {
+    process.env.PATH = `${bin}:${savedPath}`;
+    delete process.env.ANYWHERE_CLAUDE_PATH;
+    proc.clearWhichCache();
+    const found = await ClaudeCliEngine.locate({ engine: {} });
+    const others = [...knownInstallPaths(), path.join(path.dirname(process.execPath), 'claude')].filter((p) => fs.existsSync(p));
+    if (others.length) {
+      assert.notEqual(found.path, broken, 'a working install wins over the broken shim');
+      assert.ok(found.version);
+    } else {
+      assert.deepEqual(found, { path: broken, version: null }, 'falls back to the first usable file');
+    }
+    // An explicitly configured path is used even when --version fails.
+    const explicit = await ClaudeCliEngine.locate({ engine: { claudePath: broken } });
+    assert.deepEqual(explicit, { path: broken, version: null });
+  } finally {
+    process.env.PATH = savedPath;
+    if (savedEnv !== undefined) process.env.ANYWHERE_CLAUDE_PATH = savedEnv;
+    proc.clearWhichCache();
+  }
+});
+
+test('locate() finds claude next to the running node when PATH lacks it (WINDOWS-6)', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('POSIX shims');
+    return;
+  }
+  const nodeDir = fs.mkdtempSync(path.join(HOME, 'nodebin-'));
+  fs.symlinkSync(FAKE, path.join(nodeDir, 'claude'));
+  const savedPath = process.env.PATH;
+  const savedEnv = process.env.ANYWHERE_CLAUDE_PATH;
+  try {
+    // A launcher-started daemon: PATH has neither claude nor node (the shim's `env node` relies on buildEnv).
+    process.env.PATH = fs.mkdtempSync(path.join(HOME, 'emptybin-'));
+    delete process.env.ANYWHERE_CLAUDE_PATH;
+    proc.clearWhichCache();
+    const found = await ClaudeCliEngine.locate({ engine: {} }, { nodeDir });
+    assert.deepEqual(found, { path: path.join(nodeDir, 'claude'), version: '0.0.0-fake' });
+  } finally {
+    process.env.PATH = savedPath;
+    if (savedEnv !== undefined) process.env.ANYWHERE_CLAUDE_PATH = savedEnv;
+    proc.clearWhichCache();
+  }
+});
+
 test('locate() honours engine.claudePath and reads the version', async () => {
   const found = await ClaudeCliEngine.locate({ engine: { claudePath: FAKE } });
   assert.equal(found.path, FAKE);
@@ -182,7 +330,8 @@ test('locate() returns null when nothing is installed', async (t) => {
     process.env.PATH = fs.mkdtempSync(path.join(HOME, 'emptybin-'));
     delete process.env.ANYWHERE_CLAUDE_PATH;
     proc.clearWhichCache();
-    assert.equal(await ClaudeCliEngine.locate({ engine: { claudePath: path.join(HOME, 'nope') } }), null);
+    const emptyNodeDir = fs.mkdtempSync(path.join(HOME, 'nodedir-'));
+    assert.equal(await ClaudeCliEngine.locate({ engine: { claudePath: path.join(HOME, 'nope') } }, { nodeDir: emptyNodeDir }), null);
   } finally {
     process.env.PATH = savedPath;
     if (savedEnv !== undefined) process.env.ANYWHERE_CLAUDE_PATH = savedEnv;
@@ -269,18 +418,68 @@ test('engine: interrupt during SLOW_TEST yields a result and keeps the process a
   assert.deepEqual(await engine.interrupt(), { ok: true, killed: false });
 });
 
-test('engine: interrupt kills a CLI that never answers', async () => {
+test('engine: interrupt kills a CLI that never ends its turn', async () => {
   const stuck = path.join(HOME, 'stuck-cli.js');
   fs.writeFileSync(stuck, "process.stdin.resume(); setInterval(() => {}, 1000);\n");
   const engine = new ClaudeCliEngine({ claudePath: stuck, cwd: HOME, sessionId: uuid() });
   const exit = new Promise((r) => engine.once('exit', r));
   engine.start();
   await sleep(200);
+  engine.send('work forever');
+  assert.equal(engine.turnActive, true);
   const res = await engine.interrupt({ timeoutMs: 300 });
   assert.equal(res.killed, true);
   const info = await exit;
   assert.equal(info.expected, true);
   assert.equal(engine.running, false);
+});
+
+test('engine: interrupting an idle CLI ends on its control_response, without a kill', async () => {
+  const engine = newEngine();
+  const c = collect(engine);
+  engine.start();
+  engine.send('hello');
+  await c.until((m) => m.type === 'result');
+  assert.equal(engine.turnActive, false);
+  const t0 = Date.now();
+  const res = await engine.interrupt({ timeoutMs: 3000 });
+  assert.deepEqual(res, { ok: true, killed: false });
+  assert.ok(Date.now() - t0 < 1500, 'did not wait for the timeout');
+  assert.ok(c.msgs.some((m) => m.type === 'control_response' && m.response.response && Array.isArray(m.response.response.still_queued)));
+  assert.equal(engine.running, true);
+  engine.send('still alive?');
+  await c.until((m) => m.type === 'result' && m.result === 'Echo: still alive?');
+  await engine.stop();
+});
+
+test('engine: an idle CLI that never answers an interrupt is left alone', async () => {
+  const mute = path.join(HOME, 'mute-cli.js');
+  fs.writeFileSync(mute, "process.stdin.resume(); setInterval(() => {}, 1000);\n");
+  const engine = new ClaudeCliEngine({ claudePath: mute, cwd: HOME, sessionId: uuid() });
+  engine.start();
+  await sleep(100);
+  const res = await engine.interrupt({ timeoutMs: 200 });
+  assert.deepEqual(res, { ok: true, killed: false });
+  assert.equal(engine.running, true);
+  await engine.stop();
+});
+
+test('engine: turn state follows send, init and result', async () => {
+  const engine = newEngine();
+  const c = collect(engine);
+  engine.start();
+  await c.until((m) => m.type === 'system' && m.subtype === 'init');
+  assert.equal(engine.turnActive, false, 'the startup init is not a turn');
+  engine.send('one');
+  assert.equal(engine.turnActive, true);
+  await c.until((m) => m.type === 'result');
+  assert.equal(engine.turnActive, false);
+  // A queued message that starts its own turn announces it with a new init.
+  engine.onStdoutLine(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'x' }));
+  assert.equal(engine.turnActive, true);
+  engine.onStdoutLine(JSON.stringify({ type: 'result', subtype: 'success', is_error: false }));
+  assert.equal(engine.turnActive, false);
+  await engine.stop();
 });
 
 test('engine: crash reports code and stderr tail', async () => {

@@ -10,7 +10,7 @@
  *   5. optionally adds an OS launcher with a keyboard shortcut,
  * and reverses all of it on uninstall.
  *
- * Usage: node scripts/install.js [--electron] [--no-mcp] [--hotkey] [--quiet]
+ * Usage: node scripts/install.js [--electron] [--no-mcp] [--hotkey] [--hotkey-key=Ctrl+Alt+F12] [--quiet]
  *        node scripts/install.js uninstall [--purge]
  * (normally run through `anywhere install` / `anywhere uninstall`).
  *
@@ -31,8 +31,12 @@ const SKILL_SRC = path.join(PACKAGE_ROOT, 'skills', 'anywhere');
 const BIN_JS = path.join(PACKAGE_ROOT, 'bin', 'anywhere.js');
 const MCP_SERVER = path.join(PACKAGE_ROOT, 'src', 'mcp', 'server.js');
 const APP_NAME = 'Claude Anywhere';
+// Linux keeps AltGr apart (ISO_Level3_Shift), so Ctrl+Alt+A is safe there.
 const HOTKEY_LABEL = 'Ctrl+Alt+A';
-const WIN_HOTKEY = 'CTRL+ALT+A';
+// Windows reports AltGr as Ctrl+Alt, so a Ctrl+Alt+<letter> shortcut would swallow AltGr+<letter>
+// (ą, â, ä, € …) on European layouts. AltGr+F12 types nothing on any layout.
+const WIN_HOTKEY_LABEL = 'Ctrl+Alt+F12';
+const WIN_HOTKEY = 'CTRL+ALT+F12';
 const GNOME_SCHEMA = 'org.gnome.settings-daemon.plugins.media-keys';
 const GNOME_LIST_KEY = 'custom-keybindings';
 const GNOME_PATH = '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/claude-anywhere/';
@@ -234,9 +238,74 @@ function claudeSpawnSpec(cliPath, args, platform = process.platform) {
   return { command: cliPath, args: args.slice(), shell: false };
 }
 
-function mcpServerJson(nodePath = process.execPath, serverPath = MCP_SERVER) {
+/**
+ * A node path that survives upgrades. Homebrew (macOS and Linuxbrew) runs node from a versioned
+ * Cellar directory that `brew upgrade` deletes, and process.execPath is that resolved path. Prefer
+ * the formula's opt/ symlink (also right for keg-only node@22), then <prefix>/bin/node or `node` on
+ * PATH when they resolve into the same formula.
+ * @param {string} [execPath]
+ * @param {{which?:(name:string)=>string|null}} [opts]
+ * @returns {string}
+ */
+function stableNodePath(execPath = process.execPath, { which = proc.which } = {}) {
+  const m = /^(.*)\/Cellar\/([^/]+)\/[^/]+\/bin\/node$/.exec(String(execPath || ''));
+  if (!m) return execPath;
+  const prefix = m[1];
+  const formula = m[2];
+  const keg = `${realpathOr(`${prefix}/Cellar/${formula}`)}/`;
+  const sameFormula = (p) => Boolean(p) && exists(p) && realpathOr(p).startsWith(keg);
+  for (const candidate of [`${prefix}/opt/${formula}/bin/node`, `${prefix}/bin/node`]) {
+    if (sameFormula(candidate)) return candidate;
+  }
+  let onPath = null;
+  try {
+    onPath = which('node');
+  } catch {
+    onPath = null;
+  }
+  return onPath && path.isAbsolute(onPath) && sameFormula(onPath) ? onPath : execPath;
+}
+
+function mcpServerJson(nodePath = stableNodePath(), serverPath = MCP_SERVER) {
   return JSON.stringify({ type: 'stdio', command: nodePath, args: [serverPath] });
 }
+
+/**
+ * Parse a shortcut such as "Ctrl+Alt+F12" or "ctrl+shift+k" (for --hotkey-key).
+ * @param {string} text
+ * @returns {{label:string, win:string, gnome:string, mods:string[], key:string, altGrClash:boolean}}
+ */
+function parseHotkeyCombo(text) {
+  const bad = () => new Error(`Unsupported shortcut "${text}": use two or three of Ctrl, Alt and Shift plus one key (A-Z, 0-9 or F1-F24), e.g. Ctrl+Alt+F12.`);
+  const mods = new Set();
+  let key = null;
+  for (const part of String(text || '').split('+')) {
+    const p = part.trim().toLowerCase();
+    if (!p) throw bad();
+    if (p === 'ctrl' || p === 'control') mods.add('ctrl');
+    else if (p === 'alt') mods.add('alt');
+    else if (p === 'shift') mods.add('shift');
+    else if (key === null && /^([a-z0-9]|f([1-9]|1[0-9]|2[0-4]))$/.test(p)) key = p;
+    else throw bad();
+  }
+  if (!key || mods.size < 2) throw bad();
+  const order = ['ctrl', 'alt', 'shift'].filter((m) => mods.has(m));
+  const keyName = key.toUpperCase();
+  const names = { ctrl: 'Ctrl', alt: 'Alt', shift: 'Shift' };
+  const gnomeMods = { ctrl: '<Primary>', alt: '<Alt>', shift: '<Shift>' };
+  return {
+    label: order.map((m) => names[m]).concat([keyName]).join('+'),
+    win: order.map((m) => m.toUpperCase()).concat([keyName]).join('+'),
+    gnome: order.map((m) => gnomeMods[m]).join('') + (key.length === 1 ? key : keyName),
+    mods: order,
+    key: keyName,
+    // Windows sees AltGr as Ctrl+Alt: such a shortcut would eat AltGr+<key> characters.
+    altGrClash: mods.has('ctrl') && mods.has('alt') && key.length === 1,
+  };
+}
+
+const LINUX_DEFAULT_HOTKEY = parseHotkeyCombo(HOTKEY_LABEL);
+const WIN_DEFAULT_HOTKEY = parseHotkeyCombo(WIN_HOTKEY_LABEL);
 
 /** The command a user can paste to register the MCP server by hand. */
 function manualMcpCommand(json, platform = process.platform) {
@@ -250,8 +319,8 @@ function firstLine(s) {
 
 // ------------------------------------------------------------------ steps
 
-async function registerMcp() {
-  const json = mcpServerJson();
+async function registerMcp(nodePath = stableNodePath()) {
+  const json = mcpServerJson(nodePath);
   const manual = manualMcpCommand(json);
   const claude = await locateClaude();
   if (!claude) return { registered: false, reason: 'the claude CLI was not found', manual };
@@ -337,7 +406,7 @@ function windowsLauncherVbs(commandLine) {
  * PowerShell that writes the launcher (when `vbsContent` is given) and the Start Menu shortcut.
  * `vbsPath` null means "%LOCALAPPDATA%\ClaudeAnywhere\launch-anywhere.vbs" (used from WSL).
  */
-function windowsShortcutScript({ vbsPath, vbsContent, iconPath }) {
+function windowsShortcutScript({ vbsPath, vbsContent, iconPath, hotkey = WIN_HOTKEY }) {
   const lines = [
     "$ErrorActionPreference = 'Stop'",
     "$programs = [Environment]::GetFolderPath('Programs')",
@@ -356,7 +425,7 @@ function windowsShortcutScript({ vbsPath, vbsContent, iconPath }) {
     "$s.TargetPath = Join-Path $env:WINDIR 'System32\\wscript.exe'",
     "$s.Arguments = '\"' + $vbs + '\"'",
     '$s.WorkingDirectory = $env:USERPROFILE',
-    `$s.Hotkey = ${psQuote(WIN_HOTKEY)}`,
+    `$s.Hotkey = ${psQuote(hotkey)}`,
     `$s.Description = ${psQuote('Show the Claude Anywhere dialog')}`,
     iconPath ? `$s.IconLocation = ${psQuote(`${iconPath},0`)}` : "$s.IconLocation = (Join-Path $env:WINDIR 'System32\\shell32.dll') + ',22'",
     '$s.Save()',
@@ -391,7 +460,7 @@ async function runPs(info, script) {
   return proc.run(ps, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encodePs(script)], { timeoutMs: 30000, cwd });
 }
 
-async function installHotkeyWindows(info, nodePath, binPath) {
+async function installHotkeyWindows(info, nodePath, binPath, hk = WIN_DEFAULT_HOTKEY) {
   let commandLine;
   let vbsPath = null;
   let vbsContent;
@@ -407,18 +476,20 @@ async function installHotkeyWindows(info, nodePath, binPath) {
     fs.writeFileSync(vbsPath, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(body, 'utf16le')]));
     iconPath = nodePath;
   }
-  const r = await runPs(info, windowsShortcutScript({ vbsPath, vbsContent, iconPath }));
+  const r = await runPs(info, windowsShortcutScript({ vbsPath, vbsContent, iconPath, hotkey: hk.win }));
   if (r.error || r.code !== 0) {
     return { installed: false, reason: `creating the Start Menu shortcut failed: ${firstLine(r.stderr) || (r.error && r.error.message) || `exit ${r.code}`}` };
   }
   const out = String(r.stdout || '').trim().split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  const instructions = [`Press ${hk.label} anywhere to show the dialog (Start Menu shortcut "${APP_NAME}").`];
+  if (hk.altGrClash) instructions.push(`Note: Windows treats AltGr as Ctrl+Alt, so ${hk.label} also catches AltGr+${hk.key} on keyboard layouts that type a character with it.`);
   return {
     installed: true,
     platform: info.isWSL ? 'wsl' : 'win32',
-    label: HOTKEY_LABEL,
+    label: hk.label,
     lnk: out[0] || null,
     vbs: out[1] || vbsPath,
-    instructions: [`Press ${HOTKEY_LABEL} anywhere to show the dialog (Start Menu shortcut "${APP_NAME}").`],
+    instructions,
   };
 }
 
@@ -448,8 +519,13 @@ function macAppPath() {
   return path.join(os.homedir(), 'Applications', `${APP_NAME}.app`);
 }
 
+/**
+ * The applet only shows a running dialog. `show --launcher` never starts the daemon inside the
+ * applet: a daemon started there would run under the applet's macOS permissions and the bare
+ * `do shell script` PATH, so it opens Terminal to run `anywhere start` instead.
+ */
 function macAppleScript(nodePath, binPath) {
-  const shellCmd = `${shQuote(nodePath)} ${shQuote(binPath)} show > /dev/null 2>&1 &`;
+  const shellCmd = `${shQuote(nodePath)} ${shQuote(binPath)} show --launcher > /dev/null 2>&1 &`;
   return `do shell script "${appleScriptEscape(shellCmd)}"`;
 }
 
@@ -469,6 +545,7 @@ async function installHotkeyMac(nodePath, binPath) {
       `Created "${app}" (also launchable from Spotlight: type "${APP_NAME}").`,
       'To give it a keyboard shortcut: open the Shortcuts app → New Shortcut → add the "Open App" action →',
       `choose "${APP_NAME}" → Shortcut Details (ⓘ) → Add Keyboard Shortcut → press e.g. ⌃⌥A.`,
+      'When the dialog is not running, it opens Terminal to start it, so it keeps the permissions you gave Terminal.',
     ],
   };
 }
@@ -497,16 +574,25 @@ function desktopEntry(nodePath, binPath) {
   ].join('\n');
 }
 
+/**
+ * Desktops whose custom shortcuts live in GNOME's media-keys schema. XDG_CURRENT_DESKTOP is a
+ * ':'-separated list ("ubuntu:GNOME", "Budgie:GNOME"); COSMIC keeps its own shortcuts and ignores it.
+ */
 function isGnomeLike(desktop) {
-  return /gnome|unity|budgie|pantheon|ubuntu|cosmic/i.test(String(desktop || ''));
+  return String(desktop || '')
+    .split(':')
+    .some((t) => /^(gnome(-classic|-flashback)?|ubuntu|unity\d*|budgie(-desktop)?|pantheon)$/i.test(t.trim()));
 }
 
-function otherDesktopInstructions(cmd) {
+function otherDesktopInstructions(cmd, hk = LINUX_DEFAULT_HOTKEY) {
+  const i3 = hk.mods.map((m) => ({ ctrl: 'Ctrl', alt: 'Mod1', shift: 'Shift' })[m]).concat([hk.key.length === 1 ? hk.key.toLowerCase() : hk.key]).join('+');
+  const hypr = `${hk.mods.map((m) => m.toUpperCase()).join(' ')}, ${hk.key}`;
   return [
-    `Bind ${HOTKEY_LABEL} to: ${cmd}`,
+    `Bind ${hk.label} to: ${cmd}`,
     '  KDE Plasma: System Settings → Keyboard → Shortcuts → Add New → Command or Script.',
     '  XFCE: Settings → Keyboard → Application Shortcuts → Add.  Cinnamon/MATE: Keyboard → Shortcuts → Custom Shortcuts.',
-    `  i3/sway: bindsym Ctrl+Mod1+a exec ${cmd}   Hyprland: bind = CTRL ALT, A, exec, ${cmd}`,
+    '  COSMIC: Settings → Keyboard → Keyboard Shortcuts → Custom → Add.',
+    `  i3/sway: bindsym ${i3} exec ${cmd}   Hyprland: bind = ${hypr}, exec, ${cmd}`,
   ];
 }
 
@@ -514,23 +600,39 @@ async function gsettings(args) {
   return proc.run('gsettings', args, { timeoutMs: 10000 });
 }
 
-async function gnomeAddBinding(command) {
-  const cur = await gsettings(['get', GNOME_SCHEMA, GNOME_LIST_KEY]);
-  if (cur.error || cur.code !== 0) return { ok: false, reason: firstLine(cur.stderr) || 'gsettings is unavailable' };
+// gsettings exits 0 even when nothing is saved (no D-Bus session: the "memory" backend).
+const GSETTINGS_NOT_SAVED = /memory' GSettings backend|failed to commit|Could not connect|Cannot autolaunch D-Bus/i;
+
+function gsettingsFailed(r) {
+  return Boolean(!r || r.error || r.timedOut || r.code !== 0 || GSETTINGS_NOT_SAVED.test(String(r.stderr || '')));
+}
+
+/**
+ * Add (or update) the GNOME custom shortcut, then read it back: ok only when the change stuck.
+ * @param {string} command
+ * @param {{binding?:string, run?:(args:string[])=>Promise<object>}} [opts]
+ */
+async function gnomeAddBinding(command, { binding = GNOME_BINDING, run = gsettings } = {}) {
+  const cur = await run(['get', GNOME_SCHEMA, GNOME_LIST_KEY]);
+  if (gsettingsFailed(cur)) return { ok: false, reason: firstLine(cur && cur.stderr) || 'gsettings is unavailable' };
   const list = parseGvStringArray(cur.stdout);
   if (!list.includes(GNOME_PATH)) {
-    const set = await gsettings(['set', GNOME_SCHEMA, GNOME_LIST_KEY, formatGvStringArray(list.concat([GNOME_PATH]))]);
-    if (set.code !== 0) return { ok: false, reason: firstLine(set.stderr) || 'could not update the keybinding list' };
+    const set = await run(['set', GNOME_SCHEMA, GNOME_LIST_KEY, formatGvStringArray(list.concat([GNOME_PATH]))]);
+    if (gsettingsFailed(set)) return { ok: false, reason: firstLine(set && set.stderr) || 'could not update the keybinding list' };
   }
   const rel = `${GNOME_SCHEMA}.custom-keybinding:${GNOME_PATH}`;
   for (const [key, value] of [
     ['name', APP_NAME],
     ['command', command],
-    ['binding', GNOME_BINDING],
+    ['binding', binding],
   ]) {
-    const r = await gsettings(['set', rel, key, gvString(value)]);
-    if (r.code !== 0) return { ok: false, reason: firstLine(r.stderr) || `could not set ${key}` };
+    const r = await run(['set', rel, key, gvString(value)]);
+    if (gsettingsFailed(r)) return { ok: false, reason: firstLine(r && r.stderr) || `could not set ${key}` };
   }
+  const after = await run(['get', GNOME_SCHEMA, GNOME_LIST_KEY]);
+  const bound = await run(['get', rel, 'binding']);
+  const stuck = !gsettingsFailed(after) && parseGvStringArray(after.stdout).includes(GNOME_PATH) && !gsettingsFailed(bound) && parseGvStringArray(bound.stdout)[0] === binding;
+  if (!stuck) return { ok: false, reason: 'gsettings did not keep the change (no GNOME settings daemon or D-Bus session here)' };
   return { ok: true };
 }
 
@@ -546,7 +648,7 @@ async function gnomeRemoveBinding() {
   return { ok: true };
 }
 
-async function installHotkeyLinux(info, nodePath, binPath) {
+async function installHotkeyLinux(info, nodePath, binPath, hk = LINUX_DEFAULT_HOTKEY) {
   const file = desktopFilePath();
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, desktopEntry(nodePath, binPath), { mode: 0o755 });
@@ -555,16 +657,16 @@ async function installHotkeyLinux(info, nodePath, binPath) {
   const cmd = `${shQuote(nodePath)} ${shQuote(binPath)} show`;
   const res = { installed: true, platform: 'linux', desktopFile: file, gnome: false, label: null, instructions: [`Added "${APP_NAME}" to the applications menu (${file}).`] };
   if (proc.which('gsettings') && isGnomeLike(info.desktop)) {
-    const g = await gnomeAddBinding(cmd);
+    const g = await gnomeAddBinding(cmd, { binding: hk.gnome });
     if (g.ok) {
       res.gnome = true;
-      res.label = HOTKEY_LABEL;
-      res.instructions.push(`Press ${HOTKEY_LABEL} to show the dialog (GNOME custom shortcut "${APP_NAME}").`);
+      res.label = hk.label;
+      res.instructions.push(`Press ${hk.label} to show the dialog (GNOME custom shortcut "${APP_NAME}").`);
       return res;
     }
     res.instructions.push(`Could not add the GNOME shortcut (${g.reason}).`);
   }
-  res.instructions.push(...otherDesktopInstructions(cmd));
+  res.instructions.push(...otherDesktopInstructions(cmd, hk));
   return res;
 }
 
@@ -583,28 +685,39 @@ async function uninstallHotkeyLinux(rec) {
   return { removed };
 }
 
-async function installHotkey(info, nodePath, binPath) {
+/**
+ * @param {object} info platform info
+ * @param {string} nodePath
+ * @param {string} binPath
+ * @param {object|null} [combo] parseHotkeyCombo() result from --hotkey-key; null means the platform default
+ */
+async function installHotkey(info, nodePath, binPath, combo = null) {
   if (info.platform === 'win32' || info.isWSL) {
     if (info.isWSL && !powershellExe(info)) {
-      return { installed: false, reason: 'powershell.exe is not reachable from WSL', instructions: otherDesktopInstructions(`${shQuote(nodePath)} ${shQuote(binPath)} show`) };
+      return { installed: false, reason: 'powershell.exe is not reachable from WSL', instructions: otherDesktopInstructions(`${shQuote(nodePath)} ${shQuote(binPath)} show`, combo || LINUX_DEFAULT_HOTKEY) };
     }
-    return installHotkeyWindows(info, nodePath, binPath);
+    return installHotkeyWindows(info, nodePath, binPath, combo || WIN_DEFAULT_HOTKEY);
   }
   if (info.platform === 'darwin') return installHotkeyMac(nodePath, binPath);
-  return installHotkeyLinux(info, nodePath, binPath);
+  return installHotkeyLinux(info, nodePath, binPath, combo || LINUX_DEFAULT_HOTKEY);
 }
 
 // ------------------------------------------------------------------ install / uninstall
 
 /**
  * Install Claude Anywhere for the current user.
- * @param {{electron?:boolean, mcp?:boolean, hotkey?:boolean, skillDir?:string, quiet?:boolean, print?:(line:string)=>void}} [opts]
+ * `hotkeyKey` ("Ctrl+Alt+F12") replaces the platform's default shortcut and implies `hotkey`.
+ * @param {{electron?:boolean, mcp?:boolean, hotkey?:boolean, hotkeyKey?:string, skillDir?:string, quiet?:boolean, print?:(line:string)=>void}} [opts]
  * @returns {Promise<{ok:boolean, version:string, packageRoot:string, skillDir:string, installInfoPath:string,
  *   skill:object, mcp:object, electron:object, hotkey:object, nextSteps:string[], warnings:string[]}>}
  */
-async function install({ electron = false, mcp = true, hotkey = false, skillDir, quiet = false, print } = {}) {
+async function install({ electron = false, mcp = true, hotkey = false, hotkeyKey, skillDir, quiet = false, print } = {}) {
   const out = quiet ? () => {} : typeof print === 'function' ? print : defaultPrint;
+  const combo = hotkeyKey ? parseHotkeyCombo(hotkeyKey) : null;
+  if (combo) hotkey = true;
   const info = platformMod.info();
+  // Homebrew's versioned Cellar path disappears on `brew upgrade`; registrations use a stable one.
+  const nodePath = stableNodePath();
   const version = packageVersion();
   const warnings = [];
   const target = path.resolve(skillDir || path.join(paths.claudeHome(), 'skills', 'anywhere'));
@@ -643,9 +756,12 @@ async function install({ electron = false, mcp = true, hotkey = false, skillDir,
     packageRoot: PACKAGE_ROOT,
     version,
     installedAt: new Date().toISOString(),
-    nodePath: process.execPath,
+    nodePath,
     skillDir: target,
   };
+  // Launchers (WSL hotkey, macOS applet, .desktop entries) start without the login shell's PATH;
+  // the CLI adds these directories back when it starts the daemon (nvm, Homebrew, ~/.local/bin).
+  if (info.platform !== 'win32' && process.env.PATH) record.envPath = process.env.PATH;
 
   // 3. MCP server (a plugin install already provides it as plugin:anywhere:anywhere)
   let mcpRes = { registered: false, skipped: true };
@@ -655,7 +771,7 @@ async function install({ electron = false, mcp = true, hotkey = false, skillDir,
     mcpRes = { registered: false, skipped: true, reason: 'provided by the anywhere plugin' };
     out('  - MCP tools  provided by the anywhere plugin (not registered again)');
   } else if (mcp) {
-    mcpRes = await registerMcp();
+    mcpRes = await registerMcp(nodePath);
     if (mcpRes.registered) out('  ✓ MCP tools  "anywhere" registered at user scope (screen tools in every Claude Code session)');
     else {
       out(`  ! MCP tools  not registered: ${mcpRes.reason}`);
@@ -685,7 +801,7 @@ async function install({ electron = false, mcp = true, hotkey = false, skillDir,
   let hotkeyRes = { installed: false, skipped: true };
   if (hotkey) {
     try {
-      hotkeyRes = await installHotkey(info, process.execPath, BIN_JS);
+      hotkeyRes = await installHotkey(info, nodePath, BIN_JS, combo);
     } catch (err) {
       hotkeyRes = { installed: false, reason: err.message };
     }
@@ -829,7 +945,11 @@ function parseScriptArgs(argv) {
     else if (a === '--quiet' || a === '-q') o.quiet = true;
     else if (a === '--json') o.json = true;
     else if (a.startsWith('--skill-dir=')) o.skillDir = a.slice('--skill-dir='.length);
-    else throw new Error(`Unknown option ${a}. Usage: node scripts/install.js [install|uninstall] [--electron] [--no-mcp] [--hotkey] [--purge] [--quiet] [--json]`);
+    else if (a.startsWith('--hotkey-key=')) {
+      o.hotkeyKey = a.slice('--hotkey-key='.length);
+      parseHotkeyCombo(o.hotkeyKey);
+      o.hotkey = true;
+    } else throw new Error(`Unknown option ${a}. Usage: node scripts/install.js [install|uninstall] [--electron] [--no-mcp] [--hotkey] [--hotkey-key=COMBO] [--purge] [--quiet] [--json]`);
   }
   return o;
 }
@@ -877,6 +997,10 @@ module.exports = {
   windowsRemoveScript,
   macAppleScript,
   mcpServerJson,
+  stableNodePath,
+  parseHotkeyCombo,
+  gnomeAddBinding,
+  otherDesktopInstructions,
   manualMcpCommand,
   claudeSpawnSpec,
   isOurSkill,
@@ -884,5 +1008,8 @@ module.exports = {
   isGnomeLike,
   parseScriptArgs,
   GNOME_PATH,
+  GNOME_BINDING,
   HOTKEY_LABEL,
+  WIN_HOTKEY,
+  WIN_HOTKEY_LABEL,
 };

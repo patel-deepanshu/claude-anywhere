@@ -565,6 +565,46 @@ test('stop() kills the utterance; a new utterance replaces the old one', async (
   assert.equal((await second).stopped, true);
 });
 
+test('WSL: the SAPI script prints its Windows PID and stop() taskkills it (WINDOWS-5)', async () => {
+  // The script must announce $PID so the stopper can reach the real Windows process.
+  const sapiArgs = buildTtsCommand({ name: 'sapi', bin: 'ps' }, 'hi', {}).args;
+  const sapiScript = Buffer.from(sapiArgs[5], 'base64').toString('utf16le');
+  assert.match(sapiScript, /ANYWHERE_PID ' \+ \$PID/);
+
+  const waitForAbort = (cmd, args, opts) =>
+    new Promise((resolve) => {
+      if (opts.onStdout) opts.onStdout(Buffer.from('ANYWHERE_PID 4321\r\n'));
+      if (!opts.signal) return resolve(OK);
+      opts.signal.addEventListener('abort', () => resolve({ ...OK, code: null, signal: 'SIGTERM', aborted: true }));
+    });
+  const runner = fakeRunner(waitForAbort);
+  const svc = service({
+    runner,
+    platformInfo: { platform: 'linux', isWSL: true },
+    which: (n) => ({ 'powershell.exe': '/mnt/c/ps.exe', 'taskkill.exe': '/mnt/c/taskkill.exe' })[n] || null,
+  });
+  const p = svc.speak('a long WSL announcement that is still being read aloud');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(svc.stop(), true);
+  assert.deepEqual(await p, { ok: true, provider: 'sapi', stopped: true });
+  const kill = runner.calls.find((c) => c.cmd === '/mnt/c/taskkill.exe');
+  assert.ok(kill, 'taskkill.exe was invoked on stop');
+  assert.deepEqual(kill.args, ['/PID', '4321', '/T', '/F']);
+
+  // Native Windows: SIGTERM reaches powershell.exe directly, so no taskkill.
+  const winRunner = fakeRunner(waitForAbort);
+  const winSvc = service({
+    runner: winRunner,
+    platformInfo: { platform: 'win32', isWSL: false },
+    which: (n) => (n === 'powershell' ? 'C:\\ps.exe' : null),
+  });
+  const wp = winSvc.speak('windows announcement');
+  await new Promise((r) => setImmediate(r));
+  winSvc.stop();
+  assert.equal((await wp).stopped, true);
+  assert.ok(!winRunner.calls.some((c) => /taskkill/i.test(c.cmd)), 'native Windows does not taskkill');
+});
+
 test('speak errors are actionable', async () => {
   await assert.rejects(service({}).speak('hello'), (err) => err.status === 503 && /espeak-ng/.test(err.hint));
   const enoent = Object.assign(new Error('spawn espeak-ng ENOENT'), { code: 'ENOENT' });

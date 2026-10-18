@@ -24,6 +24,8 @@ const { createLogger, redact } = require('../shared/log');
 const log = createLogger('voice');
 
 const CAPS_TTL_MS = 30000;
+// taskkill.exe path used from WSL when interop does not put it on PATH (mirrors src/os/win32.js).
+const WSL_TASKKILL = '/mnt/c/Windows/System32/taskkill.exe';
 const STT_TIMEOUT_MS = 60000;
 const FFMPEG_TIMEOUT_MS = 60000;
 const WHISPER_TIMEOUT_MS = 180000;
@@ -53,7 +55,7 @@ function voiceError(status, message, hint) {
  * AbortSignal (the child is killed and `aborted` is set) and a timeout.
  * @returns {Promise<{code:number|null, signal:string|null, stdout:string, stderr:string, timedOut:boolean, aborted:boolean, error:Error|null}>}
  */
-function defaultRunner(cmd, args = [], { timeoutMs = 15000, input, signal, env, cwd } = {}) {
+function defaultRunner(cmd, args = [], { timeoutMs = 15000, input, signal, env, cwd, onStdout } = {}) {
   return new Promise((resolve) => {
     let child = null;
     let settled = false;
@@ -118,6 +120,13 @@ function defaultRunner(cmd, args = [], { timeoutMs = 15000, input, signal, env, 
     child.stdout.on('data', (d) => {
       outLen += d.length;
       if (outLen <= 16 * 1024 * 1024) out.push(d);
+      if (typeof onStdout === 'function') {
+        try {
+          onStdout(d);
+        } catch {
+          /* a stdout observer must never break the run */
+        }
+      }
     });
     child.stderr.on('data', (d) => {
       errLen += d.length;
@@ -256,6 +265,9 @@ function buildTtsCommand(tts, text, { rate = 1, voice = '', language = '' } = {}
       const sapiRate = clamp(Math.round((10 * Math.log(r)) / Math.log(3)), -10, 10);
       const lines = [
         "$ErrorActionPreference = 'Stop'",
+        // Announce the Windows PID first so a stop from WSL can taskkill the real speaker (the
+        // Linux-side process is only an interop relay there). Harmless on native Windows.
+        "[Console]::Out.WriteLine('ANYWHERE_PID ' + $PID); [Console]::Out.Flush()",
         'Add-Type -AssemblyName System.Speech',
         '$s = New-Object System.Speech.Synthesis.SpeechSynthesizer',
         `$s.Rate = ${sapiRate}`,
@@ -761,11 +773,21 @@ class VoiceService {
     });
     this.stop();
     const ac = new AbortController();
-    const current = { ac, tts };
+    const current = { ac, tts, winPid: null };
     this.current = current;
+    // On WSL the spawned powershell.exe is reached through an interop relay; killing the relay does
+    // not stop SAPI, so record the real Windows PID (printed by the script) to taskkill it on stop.
+    const wslSapi = tts.name === 'sapi' && Boolean(this.platformInfo && this.platformInfo.isWSL);
+    const onStdout = wslSapi
+      ? (chunk) => {
+          if (current.winPid != null) return;
+          const m = /ANYWHERE_PID (\d+)/.exec(String(chunk));
+          if (m) current.winPid = Number(m[1]);
+        }
+      : undefined;
     let r;
     try {
-      r = await this.runner(cmd.cmd, cmd.args, { input: cmd.input, timeoutMs: SPEAK_TIMEOUT_MS, signal: ac.signal });
+      r = await this.runner(cmd.cmd, cmd.args, { input: cmd.input, timeoutMs: SPEAK_TIMEOUT_MS, signal: ac.signal, onStdout });
     } finally {
       if (this.current === current) this.current = null;
     }
@@ -806,6 +828,13 @@ class VoiceService {
     if (cur.tts && cur.tts.name === 'spd-say') {
       // Killing spd-say doesn't stop speech-dispatcher's queue.
       Promise.resolve(this.runner(cur.tts.bin, ['-C'], { timeoutMs: 3000 })).catch(() => {});
+    }
+    if (cur.tts && cur.tts.name === 'sapi' && this.platformInfo && this.platformInfo.isWSL && cur.winPid != null) {
+      // Aborting the runner kills only the Linux interop relay; end the real Windows process too.
+      const taskkill = this.which('taskkill.exe') || (isFile(WSL_TASKKILL) ? WSL_TASKKILL : null);
+      if (taskkill) {
+        Promise.resolve(this.runner(taskkill, ['/PID', String(cur.winPid), '/T', '/F'], { timeoutMs: 5000 })).catch(() => {});
+      }
     }
     return true;
   }

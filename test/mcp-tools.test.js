@@ -276,6 +276,20 @@ test('click: guard, confirmation text and activity', async (t) => {
   assert.equal(d.state.unauthorized, 0);
 });
 
+test('input tools show driver warnings to the model and in the activity (win32 UIPI)', async (t) => {
+  const d = await startDaemon();
+  t.after(d.close);
+  const comp = fakeComputer();
+  const W = "The window 'Setup' belongs to another user account; Windows may drop this input (UIPI).";
+  const orig = comp.click.bind(comp);
+  comp.click = async (o) => ({ ...(await orig(o)), warnings: [W] });
+  const tools = toolMap({ computer: comp, getClient: d.getClient, config: {}, role: 'engine' });
+  const res = await tools.click.handler({ x: 5, y: 6 }, {});
+  assert.equal(textOf(res), `Clicked left at (5, 6) on display 0. Take a screenshot to verify.\n\nWarning: ${W}`);
+  const act = await waitFor(() => d.state.activities.find((a) => a.tool === 'click'));
+  assert.equal(act.warning, W);
+});
+
 test('guard: paused blocks the action; slow, failing or missing daemon allows it', async (t) => {
   const d = await startDaemon();
   t.after(d.close);

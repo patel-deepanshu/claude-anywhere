@@ -15,7 +15,9 @@
  *   SLOW_TEST        deltas every 300 ms for 15 s, honouring interrupts
  *   CRASH_TEST       exits 1 with a stderr message
  *   NOISE_TEST       prints a non-JSON stdout line before answering
- * Startup: --resume missing* → "No conversation found with session ID" and exit 1.
+ * Startup: --resume missing* → an error result before any init (like claude 2.1.x), then
+ *   "No conversation found with session ID" on stderr and exit 1.
+ * An interrupt while idle is answered with a control_response only ({still_queued: []}).
  * FAKE_CLAUDE_ARGS_FILE (env) gets one JSON line per launch: {argv, cwd, env}.
  * total_cost_usd is cumulative per process (0.001 per turn), like the real CLI.
  */
@@ -72,6 +74,7 @@ if (process.env.FAKE_CLAUDE_ARGS_FILE) {
 }
 
 if (opts.resume && opts.resume.startsWith('missing')) {
+  process.stdout.write(`${JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, duration_ms: 0, num_turns: 0, total_cost_usd: 0, session_id: opts.resume })}\n`);
   process.stderr.write(`No conversation found with session ID: ${opts.resume}\n`);
   process.exit(1);
 }
@@ -420,7 +423,7 @@ function handleLine(line) {
   if (msg.type === 'control_request') {
     if (msg.request && msg.request.subtype === 'interrupt') {
       if (busy) interruptRequested = true;
-      out({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id, response: {} } });
+      out({ type: 'control_response', response: { subtype: 'success', request_id: msg.request_id, response: busy ? {} : { still_queued: [] } } });
     } else {
       out({ type: 'control_response', response: { subtype: 'error', request_id: msg.request_id, error: 'unsupported' } });
     }

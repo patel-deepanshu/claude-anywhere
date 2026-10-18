@@ -147,6 +147,7 @@ test('Linux hotkey: .desktop entry and GNOME keybinding appended without clobber
       `const fs=require('fs');const f=${JSON.stringify(store)};const s=JSON.parse(fs.readFileSync(f,'utf8'));\n` +
       `const [cmd,schema,key,val]=process.argv.slice(2);\n` +
       `if(cmd==='get'&&key==='custom-keybindings'){process.stdout.write(s.list+'\\n');process.exit(0)}\n` +
+      `if(cmd==='get'){process.stdout.write((s.keys[schema+' '+key]||"''")+'\\n');process.exit(0)}\n` +
       `if(cmd==='set'&&key==='custom-keybindings'){s.list=val}\n` +
       `else if(cmd==='set'){s.keys[schema+' '+key]=val}\n` +
       `else if(cmd==='reset'){delete s.keys[schema+' '+key]}\n` +
@@ -230,7 +231,8 @@ test('Windows launcher, shortcut script and encoding', () => {
   assert.ok(vbs.includes('shell.Run """C:\\Program Files\\nodejs\\node.exe"" ""C:\\a\\anywhere.js"" show", 0, False'));
   assert.ok(vbs.includes('\r\n'));
   const ps = installer.windowsShortcutScript({ vbsPath: "C:\\Users\\O'Brien\\.claude-anywhere\\launch-anywhere.vbs", iconPath: 'C:\\node.exe' });
-  assert.match(ps, /\$s\.Hotkey = 'CTRL\+ALT\+A'/);
+  // Ctrl+Alt+<letter> would also fire on AltGr+<letter> (Windows reports AltGr as Ctrl+Alt).
+  assert.match(ps, /\$s\.Hotkey = 'CTRL\+ALT\+F12'/);
   assert.match(ps, /O''Brien/);
   assert.match(ps, /Claude Anywhere\.lnk/);
   assert.match(ps, /wscript\.exe/);
@@ -261,7 +263,7 @@ test('generated PowerShell scripts parse', { skip: pwsh ? false : 'PowerShell is
 
 test('macOS AppleScript launcher and MCP registration commands', () => {
   const as = installer.macAppleScript('/opt/homebrew/bin/node', "/Users/me/My Apps/it's/anywhere.js");
-  assert.equal(as, `do shell script "/opt/homebrew/bin/node '/Users/me/My Apps/it'\\\\''s/anywhere.js' show > /dev/null 2>&1 &"`);
+  assert.equal(as, `do shell script "/opt/homebrew/bin/node '/Users/me/My Apps/it'\\\\''s/anywhere.js' show --launcher > /dev/null 2>&1 &"`);
   const json = installer.mcpServerJson('/usr/bin/node', '/a b/src/mcp/server.js');
   assert.deepEqual(JSON.parse(json), { type: 'stdio', command: '/usr/bin/node', args: ['/a b/src/mcp/server.js'] });
   assert.equal(installer.manualMcpCommand(json, 'linux'), `claude mcp add-json --scope user anywhere '${json}'`);

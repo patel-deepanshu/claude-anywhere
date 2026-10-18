@@ -22,6 +22,8 @@ const log = createLogger('os-common');
 
 const WSL_POWERSHELL = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe';
 const BLOCKED_SCHEMES = new Set(['javascript', 'data', 'vbscript']);
+// An absolute Windows path: a drive path (C:\x, C:/x) or a UNC path (\\server\share, \\wsl.localhost\...).
+const WIN_ABS_PATH = /^(?:[A-Za-z]:[\\/]|\\\\[^\\/])/;
 
 /**
  * Spawn a detached process and wait briefly for an early failure.
@@ -222,14 +224,80 @@ function checkUrl(url) {
   return url.replace(/ /g, '%20');
 }
 
-function expandPath(p, cwd) {
+function expandPath(p, cwd, P = path) {
   let s = p;
-  if (s === '~' || s.startsWith('~/') || s.startsWith('~\\')) s = path.join(R.homedir(), s.slice(1));
-  return path.resolve(cwd || R.cwd(), s);
+  if (s === '~' || s.startsWith('~/') || s.startsWith('~\\')) s = P.join(R.homedir(), s.slice(1));
+  return P.resolve(cwd || R.cwd(), s);
+}
+
+/**
+ * Decode a file: URL into a path for `flavor`. On Windows and WSL a drive
+ * letter (file:///C:/x, file://localhost/C:/x) or a host (file://server/share)
+ * gives a Windows path; elsewhere only local URLs are accepted.
+ */
+function fileUrlToPath(t, flavor) {
+  const m = /^file:(?:\/\/([^/?#]*))?([^?#]*)/i.exec(t);
+  let host;
+  let p;
+  try {
+    host = decodeURIComponent(m[1] || '');
+    p = decodeURIComponent(m[2] || '');
+  } catch {
+    throw makeError(`Malformed file URL: ${t}`, 'INVALID_INPUT', 'Percent-encode special characters (a space is %20), or pass a plain path.');
+  }
+  if (/^[A-Za-z][:|]$/.test(host)) {
+    // file://C:/x: the drive letter was parsed as the host.
+    p = `/${host}${p}`;
+    host = '';
+  }
+  if (host.toLowerCase() === 'localhost') host = '';
+  const windows = flavor === 'win32' || flavor === 'wsl';
+  if (host) {
+    if (windows) return `\\\\${host}${p.replace(/\//g, '\\')}`;
+    throw makeError(`Cannot open a file URL on another host (${host})`, 'INVALID_INPUT', 'Use a local file:///... URL or a plain path.');
+  }
+  if (!p) throw makeError(`File URL has no path: ${t}`, 'INVALID_INPUT');
+  const drive = /^\/?([A-Za-z])[:|]([\\/].*)?$/.exec(p);
+  if (drive && windows) return `${drive[1].toUpperCase()}:${(drive[2] || '/').replace(/\//g, '\\')}`;
+  return flavor === 'win32' ? p.replace(/\//g, '\\') : p;
+}
+
+async function wslToLinuxPath(p) {
+  const res = await R.run('wslpath', ['-u', p], { timeoutMs: 5000 });
+  const out = String(res.stdout || '').trim();
+  return res.code === 0 && out ? out : null;
+}
+
+/**
+ * Whether a Windows path exists, checked from WSL through its Linux form. Paths
+ * that have no Linux form (\\server\share, a drive not mounted in WSL) count
+ * as existing: Windows reports the error if they do not.
+ */
+async function wslWindowsPathExists(winPath) {
+  const linux = await wslToLinuxPath(winPath);
+  if (!linux || R.exists(linux)) return true;
+  const drive = /^[A-Za-z]:\\/.exec(winPath);
+  if (!drive) return false;
+  const root = await wslToLinuxPath(drive[0]);
+  return !root || !R.exists(root);
+}
+
+/**
+ * Resolve a path against `cwd` for `flavor`: {value, exists}. On WSL a Windows
+ * path is kept in Windows form (it is opened as given) and checked through
+ * `wslpath -u`.
+ */
+async function locatePath(p, cwd, flavor) {
+  if (flavor === 'wsl' && WIN_ABS_PATH.test(p)) {
+    const value = path.win32.normalize(p);
+    return { value, exists: await wslWindowsPathExists(value) };
+  }
+  const abs = expandPath(p, cwd, flavor === 'win32' ? path.win32 : path.posix);
+  return { value: abs, exists: R.exists(abs) };
 }
 
 /** Decide what `target` is: {kind:'url'|'path'|'app', value}. */
-function classify(target, kind, cwd) {
+async function classify(target, kind, cwd, flavor) {
   const t = String(target == null ? '' : target).trim();
   if (!t) throw makeError('Nothing to open: target is empty', 'INVALID_INPUT');
   // host:port and www. forms first: "localhost:3000" would otherwise parse as scheme "localhost".
@@ -239,19 +307,24 @@ function classify(target, kind, cwd) {
     return { kind: 'url', value: checkUrl(url) };
   }
   if (kind === 'path') {
-    const p = t.startsWith('file://') ? decodeURIComponent(t.replace(/^file:\/\//, '')) : t;
-    const abs = expandPath(p, cwd);
-    if (!R.exists(abs)) throw makeError(`Path does not exist: ${abs}`, 'NOT_FOUND');
-    return { kind: 'path', value: abs };
+    const p = /^file:\//i.test(t) ? fileUrlToPath(t, flavor) : t;
+    const loc = await locatePath(p, cwd, flavor);
+    if (!loc.exists) throw makeError(`Path does not exist: ${loc.value}`, 'NOT_FOUND');
+    return { kind: 'path', value: loc.value };
   }
   if (kind === 'app') return { kind: 'app', value: t };
   // auto
   if (norm) return { kind: 'url', value: checkUrl(norm) };
+  if (flavor === 'wsl' && /^file:\//i.test(t)) {
+    // Windows would read file:///home/me/x as C:\home\me\x: open the Linux file as a path instead.
+    const p = fileUrlToPath(t, flavor);
+    if (p.startsWith('/')) return classify(p, 'path', cwd, flavor);
+  }
   if (urlScheme(t)) return { kind: 'url', value: checkUrl(t) };
-  const abs = expandPath(t, cwd);
-  if (R.exists(abs)) return { kind: 'path', value: abs };
+  const loc = await locatePath(t, cwd, flavor);
+  if (loc.exists) return { kind: 'path', value: loc.value };
   if (/[\\/]/.test(t) || t.startsWith('.') || t.startsWith('~')) {
-    throw makeError(`Path does not exist: ${abs}`, 'NOT_FOUND');
+    throw makeError(`Path does not exist: ${loc.value}`, 'NOT_FOUND');
   }
   return { kind: 'app', value: t };
 }
@@ -344,8 +417,21 @@ async function wslToWindowsPath(p) {
   return out;
 }
 
+/**
+ * Arguments for a Windows program started from WSL: existing absolute Linux
+ * paths become Windows paths (\\wsl.localhost\<distro>\..., C:\... for /mnt/c),
+ * so `code /home/me/repo` opens that folder rather than C:\home\me\repo.
+ */
+async function wslArgsToWindows(args) {
+  const out = [];
+  for (const a of args) out.push(a.startsWith('/') && R.exists(a) ? await wslToWindowsPath(a) : a);
+  return out;
+}
+
 async function openWindows(info, kind, value, args) {
-  const argLine = args.map(quoteWinArgv).join(' ');
+  // URLs are started without arguments, so only apps and paths need them translated.
+  const winArgs = info.isWSL && kind !== 'url' ? await wslArgsToWindows(args) : args;
+  const argLine = winArgs.map(quoteWinArgv).join(' ');
   if (kind === 'app') {
     const script = `$name = ${psString(value)}\n$argLine = ${psString(argLine)}\n${PS_APP_SCRIPT}`;
     const res = await runPs(info, script, { timeoutMs: 30000 });
@@ -362,7 +448,8 @@ async function openWindows(info, kind, value, args) {
     throw makeError(`Could not start "${value}": ${out.error || res.stderr.trim() || (res.timedOut ? 'timed out' : `exit ${res.code}`)}`, 'OPEN_FAILED');
   }
   let target = value;
-  if (kind === 'path' && info.isWSL) target = await wslToWindowsPath(value);
+  // A Windows path given on WSL (C:\..., \\server\share) is already in Windows form.
+  if (kind === 'path' && info.isWSL && !WIN_ABS_PATH.test(value)) target = await wslToWindowsPath(value);
   const script = `$target = ${psString(target)}\n$argLine = ${psString(kind === 'path' ? argLine : '')}\n${PS_START_SCRIPT}`;
   const res = await runPs(info, script);
   const out = lastJsonLine(res.stdout) || {};
@@ -606,7 +693,7 @@ async function openTarget(target, opts = {}) {
   const strArgs = args.map(String);
   const info = R.info();
   const flavor = osFlavor(info);
-  const { kind: k, value } = classify(target, kind, cwd);
+  const { kind: k, value } = await classify(target, kind, cwd, flavor);
   let how;
   if (flavor === 'darwin') {
     how = await openDarwin(k, value, strArgs);
@@ -734,7 +821,8 @@ async function notify(title, body = '') {
 
 // ---------------------------------------------------------------- speech
 
-let current = null; // { child, engine }
+let current = null; // { child, engine, winPid }
+const WSL_TASKKILL = '/mnt/c/Windows/System32/taskkill.exe';
 
 function speechRate(rate) {
   const r = Number(rate);
@@ -743,7 +831,10 @@ function speechRate(rate) {
 
 function sapiScript(rate, voice) {
   const sapiRate = Math.max(-10, Math.min(10, Math.round((Math.log(rate) / Math.log(3)) * 10)));
+  // The PID line lets stopSpeaking() end the Windows process from WSL, where killing the
+  // Linux-side relay does not stop powershell.exe (and so not the speech).
   return `
+[Console]::Out.WriteLine('ANYWHERE_PID ' + $PID); [Console]::Out.Flush()
 Add-Type -AssemblyName System.Speech
 $stdin = [Console]::OpenStandardInput()
 $ms = New-Object System.IO.MemoryStream
@@ -824,10 +915,12 @@ async function speak(text, { rate, voice } = {}) {
   const info = R.info();
   const plan = speechPlan(info, t, speechRate(rate), voice);
   if (!plan) throw makeError('No text-to-speech engine is available', 'UNSUPPORTED', speechHint(info));
+  // From WSL, read the Windows PID that the SAPI script prints so Stop can taskkill it.
+  const wantWinPid = plan.engine === 'sapi' && Boolean(info.isWSL);
   let child;
   try {
     child = R.spawn(plan.cmd, plan.args, {
-      stdio: [plan.input != null ? 'pipe' : 'ignore', 'ignore', 'pipe'],
+      stdio: [plan.input != null ? 'pipe' : 'ignore', wantWinPid ? 'pipe' : 'ignore', 'pipe'],
       windowsHide: true,
       cwd: plan.cwd,
     });
@@ -844,7 +937,17 @@ async function speak(text, { rate, voice } = {}) {
     child.once('error', (error) => resolve({ code: null, error }));
     child.once('exit', (code, signal) => resolve({ code, signal, stderr }));
   });
-  const entry = { child, engine: plan.engine };
+  const entry = { child, engine: plan.engine, winPid: null };
+  if (wantWinPid && child.stdout) {
+    let head = '';
+    child.stdout.on('data', (d) => {
+      if (entry.winPid != null || head.length > 4096) return;
+      head += d;
+      const m = /ANYWHERE_PID (\d+)/.exec(head);
+      if (m) entry.winPid = Number(m[1]);
+    });
+    child.stdout.on('error', () => {});
+  }
   current = entry;
   done.then(() => {
     if (current === entry) current = null;
@@ -893,6 +996,15 @@ function stopSpeaking() {
     // Killing the client does not silence speech-dispatcher; cancel explicitly.
     try {
       const c = R.spawn(R.which('spd-say') || 'spd-say', ['-C'], { stdio: 'ignore', windowsHide: true });
+      if (c && typeof c.on === 'function') c.on('error', () => {});
+    } catch {
+      /* ignore */
+    }
+  }
+  if (cur.engine === 'sapi' && cur.winPid != null && R.info().isWSL) {
+    // From WSL the Linux-side process is only a relay; end the Windows process too.
+    try {
+      const c = R.spawn(R.which('taskkill.exe') || WSL_TASKKILL, ['/PID', String(cur.winPid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
       if (c && typeof c.on === 'function') c.on('error', () => {});
     } catch {
       /* ignore */

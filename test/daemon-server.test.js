@@ -269,6 +269,62 @@ test('health needs no token and reports the instance', async () => {
   }
 });
 
+const realNow = Date.now.bind(Date);
+
+test('SECURITY-7: launch URLs carry a single-use code that expires after 60 s', async (t) => {
+  const s = await setup();
+  try {
+    const url = s.server.launchUrl();
+    const m = new RegExp(`^http://127\\.0\\.0\\.1:${s.port}/\\?launch=([A-Za-z0-9_-]{24})$`).exec(url);
+    assert.ok(m, url);
+    assert.ok(!url.includes(s.token), 'no token on the command line');
+    const code = m[1];
+    const post = (body, headers = {}) =>
+      fetch(`${s.base}/api/launch`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body) });
+    // A foreign page cannot trade a code (Origin check), and does not use it up.
+    assert.equal((await post({ code }, { Origin: 'http://evil.example' })).status, 403);
+    const first = await post({ code });
+    assert.equal(first.status, 200);
+    assert.deepEqual(await first.json(), { token: s.token });
+    const again = await post({ code });
+    assert.equal(again.status, 401, 'single use');
+    assert.equal((await again.json()).token, undefined);
+    assert.equal((await post({ code: 'nope' })).status, 401);
+    assert.equal((await post({})).status, 401);
+    assert.equal((await post({ code: 42 })).status, 401);
+    // Expired codes are refused (and removed).
+    const late = new URL(s.server.launchUrl()).searchParams.get('launch');
+    t.mock.method(Date, 'now', () => realNow() + 61000);
+    assert.equal((await post({ code: late })).status, 401);
+    t.mock.restoreAll();
+    assert.equal(s.server.launchCodes.has(late), false);
+    // Each call mints a different code.
+    assert.notEqual(s.server.launchUrl(), s.server.launchUrl());
+  } finally {
+    await s.close();
+  }
+});
+
+test('GET /api/permissions reports the driver\'s permission state (MACOS-2)', async () => {
+  const s = await setup();
+  try {
+    assert.deepEqual((await s.api('GET', '/api/permissions')).json, { platform: process.platform, permissions: null });
+    s.server.deps.getDriver = async () => ({ capabilities: async () => ({ permissions: { accessibility: true, screenRecording: false, automation: null } }) });
+    const r = await s.api('GET', '/api/permissions');
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json.permissions, { accessibility: true, screenRecording: false, automation: null });
+    s.server.deps.getDriver = async () => ({
+      capabilities: async () => {
+        throw new Error('helper died');
+      },
+    });
+    assert.equal((await s.api('GET', '/api/permissions')).json.permissions, null);
+    assert.equal((await s.api('GET', '/api/permissions', undefined, { Authorization: 'Bearer wrong' })).status, 401);
+  } finally {
+    await s.close();
+  }
+});
+
 test('token is required on /api/* and accepted from the right places', async () => {
   const s = await setup();
   try {
@@ -660,6 +716,33 @@ test('bridge listen/reply, timeout, stop, and no loss on disconnect', async () =
     await s.api('POST', '/api/mode', { mode: 'companion' });
     const stop = await s.api('POST', '/api/bridge/listen', { timeoutSec: 5 });
     assert.deepEqual(stop.json, { stop: true });
+  } finally {
+    await s.close();
+  }
+});
+
+test('bridge reply after the switch to companion mode is refused with 409; questions keep a working terminal connected', async () => {
+  const s = await setup();
+  try {
+    await s.api('POST', '/api/mode', { mode: 'bridge' });
+    await s.api('POST', '/api/command', { text: 'long deploy' });
+    await s.session.drain();
+    const got = await s.api('POST', '/api/bridge/listen', { timeoutSec: 5 });
+    assert.equal(got.json.command.text, 'long deploy');
+    // A question from the terminal counts as a sign of life.
+    s.bridge.lastPollAt = 1;
+    const ask = s.api('POST', '/api/mcp/ask', { question: 'Which region?', timeoutSec: 0.2 });
+    await sleep(50);
+    assert.ok(Date.now() - s.bridge.lastPollAt < 1000);
+    await ask;
+
+    await s.api('POST', '/api/mode', { mode: 'companion' });
+    const r = await s.api('POST', '/api/bridge/reply', { text: 'Done', final: true });
+    assert.equal(r.status, 409);
+    assert.match(r.json.error, /Bridge mode is off/);
+    assert.ok(r.json.hint);
+    const snap = (await s.api('GET', '/api/state')).json;
+    assert.ok(!snap.messages.some((m) => m.role === 'assistant' && m.text === 'Done'));
   } finally {
     await s.close();
   }

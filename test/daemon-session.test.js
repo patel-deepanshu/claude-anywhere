@@ -73,7 +73,8 @@ class ScriptEngine extends EventEmitter {
 
   async interrupt() {
     this.interrupts += 1;
-    this.feed({ type: 'result', result: '', total_cost_usd: 0, is_error: false, subtype: 'error_during_execution' });
+    // What claude 2.1.x really emits for an interrupted turn.
+    this.feed({ type: 'result', result: '', total_cost_usd: 0, is_error: true, subtype: 'error_during_execution' });
     return { ok: true, killed: false };
   }
 
@@ -288,7 +289,8 @@ test('bridge: queue, waiters, listening window, stop/resume, requeue', async () 
   const hub = new Hub();
   const events = [];
   hub.on('event', (t, d) => events.push([t, d]));
-  const b = new Bridge({ hub, listenGraceMs: 80 });
+  // The terminal holds an unanswered command at the end, so the longer busy window applies.
+  const b = new Bridge({ hub, listenGraceMs: 80, busyGraceMs: 120 });
   try {
     assert.equal(b.listening, false);
     const c1 = b.enqueue({ text: 'one', images: ['/tmp/a.png'] });
@@ -358,6 +360,8 @@ test('session normalizes the stream into transcript items and events', async () 
     assert.equal(mcp.mcpServers.anywhere.env.ANYWHERE_TOKEN, 'tok');
     assert.equal(mcp.mcpServers.anywhere.env.ANYWHERE_DAEMON_URL, 'http://127.0.0.1:1234');
     assert.equal(mcp.mcpServers.anywhere.alwaysLoad, true);
+    // CROSS-MODULE-3: a per-server timeout outlasts the longest approval deadline (86400 s).
+    assert.ok(mcp.mcpServers.anywhere.timeout > 86400 * 1000, `timeout ${mcp.mcpServers.anywhere.timeout}`);
     assert.match(path.basename(e.opts.mcpConfigPath), /^mcp-.+\.json$/);
     if (process.platform !== 'win32') assert.equal(fs.statSync(e.opts.mcpConfigPath).mode & 0o777, 0o600);
     assert.deepEqual(e.sent[0], [{ type: 'text', text: 'deploy 🚀' }]);
@@ -526,6 +530,63 @@ test('approvals and questions drive the status; interrupt cancels them and pause
     assert.equal(g.allowed, false);
     assert.match(g.reason, /resume/);
     assert.ok(s.messages.some((m) => m.role === 'system' && m.text === 'Stopped.'));
+    assert.ok(!s.messages.some((m) => m.role === 'system' && m.level === 'error'), 'a user Stop is not reported as an error');
+  } finally {
+    await s.shutdown();
+    hub.close();
+  }
+});
+
+test('stop during a tool call: status stays "stopping" and no error line is added', async () => {
+  const { s, engine, hub, of } = makeSession();
+  try {
+    await s.submit({ text: 'delete it' });
+    const e = await engine();
+    await s.drain();
+    e.feed({ type: 'system', subtype: 'init', session_id: 'sid', model: 'm', mcp_servers: [] });
+    e.feed({ type: 'assistant', message: { id: 'msg1', content: [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: { command: 'rm -rf x' } }] } });
+    e.interrupt = async () => {
+      e.interrupts += 1;
+      // The CLI rejects the pending tool, then ends the turn.
+      e.feed({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu1', is_error: true, content: 'rejected' }] } });
+      e.feed({ type: 'result', result: '', total_cost_usd: 0, is_error: true, subtype: 'error_during_execution' });
+      return { ok: true, killed: false };
+    };
+    const before = of('status').length;
+    await s.interrupt();
+    const after = of('status').slice(before).map((x) => x.status);
+    assert.equal(after[0], 'stopping');
+    assert.ok(!after.includes('thinking'), `no "thinking" while stopping: ${after.join(', ')}`);
+    assert.equal(s.status, 'idle');
+    assert.equal(of('result').pop().interrupted, true);
+    assert.ok(!s.messages.some((m) => m.role === 'system' && m.level === 'error'));
+    assert.ok(s.messages.some((m) => m.role === 'system' && m.text === 'Stopped.'));
+  } finally {
+    await s.shutdown();
+    hub.close();
+  }
+});
+
+test('answered approval cards leave a line in the transcript; cancelled ones do not', async () => {
+  const { s, hub } = makeSession();
+  try {
+    const card = (id, summary, risk = 'high') => hub.broadcast('approval_request', { id, toolName: 'Bash', displayName: 'Run command', summary, risk });
+    card('a1', 'Run: rm -rf /tmp/x');
+    hub.broadcast('approval_resolved', { id: 'a1', decision: 'allow', by: 'user' });
+    card('a2', 'Run: rm -rf /tmp/y');
+    hub.broadcast('approval_resolved', { id: 'a2', decision: 'deny', by: 'user', message: 'User denied: keep it' });
+    card('a3', 'Run: rm -rf /tmp/z');
+    hub.broadcast('approval_resolved', { id: 'a3', decision: 'cancelled', by: 'cancel', message: 'Interrupted by user' });
+    card('a4', 'Run: git push', 'medium');
+    hub.broadcast('approval_resolved', { id: 'a4', decision: 'timeout', by: 'timeout' });
+    hub.broadcast('approval_resolved', { id: 'unknown', decision: 'allow', by: 'user' });
+    const notes = s.messages.filter((m) => m.role === 'system').map((m) => [m.level, m.text]);
+    assert.deepEqual(notes, [
+      ['info', 'You allowed (high risk): Run: rm -rf /tmp/x'],
+      ['warning', 'You denied: Run: rm -rf /tmp/y (“keep it”)'],
+      ['warning', 'Denied, no answer in time: Run: git push'],
+    ]);
+    assert.equal(s.approvalCards.size, 0);
   } finally {
     await s.shutdown();
     hub.close();
@@ -601,6 +662,48 @@ test('engine crash → error status, next submit resumes; config change restarts
     assert.equal(e3.opts.model, 'opus');
     assert.equal(e3.opts.resume, true);
     assert.ok(of('status').some((x) => x.status === 'error'));
+  } finally {
+    await s.shutdown();
+    hub.close();
+  }
+});
+
+test('a command sent while a settings change restarts the engine goes to the new engine', async () => {
+  const { s, engine, hub, config } = makeSession();
+  try {
+    await s.submit({ text: 'one' });
+    const e1 = await engine();
+    await s.drain();
+    e1.feed({ type: 'system', subtype: 'init', session_id: 'sess-1', model: 'm', mcp_servers: [{ name: 'anywhere', status: 'connected' }] });
+    e1.feed({ type: 'result', result: 'ok', total_cost_usd: 0.01, is_error: false });
+    // Like the real CLI: stdin closes at once, the process exits a little later.
+    let inputClosed = false;
+    e1.stop = () =>
+      new Promise((resolve) => {
+        inputClosed = true;
+        setTimeout(() => {
+          e1.alive = false;
+          e1.emit('exit', { code: 143, signal: null, stderrTail: '', expected: true, sawInit: true, uptimeMs: 1000 });
+          resolve();
+        }, 40);
+      });
+    const send = e1.send.bind(e1);
+    e1.send = (blocks) => {
+      if (inputClosed) throw Object.assign(new Error('Claude Code is not running'), { code: 'ENGINE_NOT_RUNNING' });
+      send(blocks);
+    };
+    config.engine = { ...config.engine, model: 'opus' };
+    s.applyConfig(config);
+    await s.submit({ text: 'two' });
+    await s.drain();
+    const e2 = ScriptEngine.instances[1];
+    assert.ok(e2, 'a new engine was started');
+    assert.equal(e2.opts.model, 'opus');
+    assert.equal(e2.opts.resume, true);
+    assert.equal(e2.sent.length, 1);
+    assert.equal(e1.sent.length, 1);
+    assert.ok(!s.messages.some((m) => m.role === 'system' && m.level === 'error'), 'no "Claude Code is not running" error');
+    assert.notEqual(s.status, 'error');
   } finally {
     await s.shutdown();
     hub.close();

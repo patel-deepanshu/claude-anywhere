@@ -389,6 +389,10 @@ test('detectCompositor', () => {
   assert.equal(L.detectCompositor({ XDG_CURRENT_DESKTOP: 'KDE' }), 'kde');
   assert.equal(L.detectCompositor({ XDG_CURRENT_DESKTOP: 'river' }), 'wlroots');
   assert.equal(L.detectCompositor({}), 'unknown');
+  // Whole tokens and runtime markers, wlroots family before GNOME.
+  assert.equal(L.detectCompositor({ XDG_CURRENT_DESKTOP: 'Budgie:GNOME', LABWC_PID: '42' }), 'wlroots');
+  assert.equal(L.detectCompositor({ XDG_CURRENT_DESKTOP: 'LXQt', DESKTOP_SESSION: 'Lubuntu' }), 'unknown');
+  assert.equal(L.detectCompositor({ XDG_CURRENT_DESKTOP: 'pop:GNOME' }), 'gnome');
 });
 
 // ---------------------------------------------------------------------------
@@ -450,9 +454,11 @@ test('parseHyprMonitors, parseHyprClients, wlr-randr (json and text)', () => {
     { address: '0xc3', mapped: false, at: [0, 0], size: [1, 1], workspace: { name: '1' }, class: 'x', title: '', pid: 9 },
   ]), '0xa1');
   assert.equal(clients.length, 2);
-  assert.deepEqual(clients[0], { id: '0xa1', app: 'Google Chrome', title: 'GCP', pid: 7, x: 10, y: 20, width: 800, height: 600, focused: true, minimized: false });
+  assert.deepEqual(clients[0], { id: '0xa1', app: 'Google Chrome', title: 'GCP', pid: 7, x: 10, y: 20, width: 800, height: 600, focused: true, minimized: false, stackIndex: 1 });
   assert.equal(clients[1].minimized, true);
   assert.equal(clients[1].focused, false);
+  assert.equal(clients[1].stackIndex, 0, 'focus history is the z-order (LINUX-CONTEXT-4)');
+  assert.ok(!('stackIndex' in L.parseHyprClients([{ address: '0xd4', at: [0, 0], size: [1, 1], class: 'x' }])[0]));
 
   const wj = L.parseWlrRandrJson(JSON.stringify([
     { name: 'DP-1', enabled: true, modes: [{ width: 3840, height: 2160, current: true }], position: { x: 0, y: 0 }, transform: 'normal', scale: 1.5 },
@@ -676,6 +682,37 @@ test('X11: listWindows via wmctrl + xprop (minimized, focus, docks filtered, UTF
   const wm = f.calls.find((c) => c.cmd === 'wmctrl');
   assert.equal(wm.opts.env.LC_ALL, 'C.UTF-8');
   assert.equal(f.calls.find((c) => c.cmd === 'xprop').opts.env.LC_ALL, 'C');
+});
+
+test('X11: listWindows tags windows with stackIndex from _NET_CLIENT_LIST_STACKING (LINUX-CONTEXT-4)', async () => {
+  assert.deepEqual(L.parseClientListStacking('_NET_CLIENT_LIST_STACKING(WINDOW): window id # 0x1a00003, 0x40000c, 0x0\n'), ['0x01a00003', '0x0040000c']);
+  assert.deepEqual(L.parseClientListStacking('_NET_CLIENT_LIST_STACKING:  not found.\n'), []);
+  const f = fake({
+    env: { DISPLAY: ':42' },
+    tools: ['wmctrl', 'xprop', 'xdotool'],
+    responses: {
+      'wmctrl -lpGx': { stdout: `${WMCTRL}\n` },
+      'xdotool getactivewindow': { stdout: '4194316\n' },
+      // bottom to top: 0x0060000c is at the bottom, 0x0040000c on top
+      'xprop -root _NET_CLIENT_LIST_STACKING': { stdout: '_NET_CLIENT_LIST_STACKING(WINDOW): window id # 0x60000c, 0x3a00003, 0x40000c\n' },
+      xprop: () => ({ stdout: '_NET_WM_STATE(ATOM) = \n_NET_WM_WINDOW_TYPE:  not found.\n' }),
+    },
+  });
+  const wins = await x11(f).listWindows();
+  const byId = new Map(wins.map((w) => [w.id, w]));
+  assert.equal(byId.get('0x0040000c').stackIndex, 0, 'topmost');
+  assert.equal(byId.get('0x0060000c').stackIndex, 2);
+  const unlisted = wins.filter((w) => !['0x0040000c', '0x0060000c', '0x03a00003'].includes(w.id));
+  assert.ok(unlisted.length > 0);
+  assert.ok(unlisted.every((w) => !('stackIndex' in w)), 'windows missing from the stacking list have no stackIndex');
+  const call = f.calls.find((c) => c.line === 'xprop -root _NET_CLIENT_LIST_STACKING');
+  assert.equal(call.opts.env.LC_ALL, 'C');
+  assert.equal(f.calls.filter((c) => c.line === 'xprop -root _NET_CLIENT_LIST_STACKING').length, 1, 'queried once');
+  // desktop.js sorts by it: the topmost window is listed first even when another is focused.
+  const desktop = require('../src/context/desktop');
+  const shuffled = [...wins].reverse().map((w) => ({ ...w, focused: false }));
+  const c = desktop.classifyWindows(shuffled, null);
+  assert.equal(c.windows[0].title, byId.get('0x0040000c').title.trim());
 });
 
 test('X11: listWindows falls back to xdotool search without wmctrl', async () => {
@@ -1015,7 +1052,7 @@ test('Wayland: when wtype stops working mid-text, ydotool continues without rety
   });
   const d = wl(f);
   await d.typeText(`${'a'.repeat(200)}${'b'.repeat(50)}`);
-  const ydo = f.calls.filter((c) => c.cmd === 'ydotool');
+  const ydo = f.calls.filter((c) => c.cmd === 'ydotool' && c.args[0] !== 'help');
   assert.equal(ydo.length, 1);
   assert.deepEqual(ydo[0].args, ['type', '-d', '8', '--', 'b'.repeat(50)]);
   await d.keyCombo(['ctrl', 'a']);
@@ -1170,6 +1207,13 @@ test('live X11: Xvfb + openbox + xterm end to end', { skip: missingLive.length ?
       assert.ok(w.pid > 0);
       assert.ok(w.width > 100 && w.height > 100);
       assert.equal(w.minimized, false);
+      if (proc.which('xwininfo')) {
+        // The client's true origin, not wmctrl's (which adds the title-bar offset inside the frame).
+        const info = await proc.run('xwininfo', ['-id', w.id], { env });
+        const ax = /Absolute upper-left X:\s*(-?\d+)/.exec(info.stdout);
+        const ay = /Absolute upper-left Y:\s*(-?\d+)/.exec(info.stdout);
+        assert.deepEqual([w.x, w.y], [+ax[1], +ay[1]]);
+      }
     });
 
     await t.test('focusWindow and activeWindow', async () => {
@@ -1189,6 +1233,15 @@ test('live X11: Xvfb + openbox + xterm end to end', { skip: missingLive.length ?
       await driver.typeText(`echo anywhere-ok > ${marker}`);
       await driver.keyCombo(['enter']);
       await waitFor(() => fs.existsSync(marker) && fs.readFileSync(marker, 'utf8').trim() === 'anywhere-ok', 8000, 'marker file');
+    });
+
+    await t.test('typeText with non-ASCII text works even without a UTF-8 locale', async () => {
+      const noLocale = { ...process.env, DISPLAY: dpy };
+      for (const k of ['LANG', 'LC_ALL', 'LC_CTYPE']) delete noLocale[k];
+      const c = L.createDriver({ displayServer: 'x11', env: noLocale });
+      await driver.focusWindow(term.id);
+      await c.typeText('naïve ☕ -x');
+      await c.keyCombo(['ctrl', 'u']);
     });
 
     await t.test('clipboard roundtrip with unicode', async () => {

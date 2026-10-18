@@ -17,6 +17,10 @@
  *   FAKE_PS_DELAY_MS=<n>        delay every response
  *   FAKE_PS_START_DELAY_MS=<n>  delay before reading stdin
  * Extra commands: __requests (requests seen by this process), __crash, __stderr {text}.
+ *
+ * Like the real host, input aimed at an elevated window (the focused window for type/keys, else
+ * the window under the point; the focused window is on top) fails with UIPI_BLOCKED, and input
+ * aimed at another account's window (elevated: null) succeeds with a warning.
  */
 
 const fs = require('fs');
@@ -115,6 +119,8 @@ const desk = {
     { hwnd: '1001', app: 'Visual Studio Code', process: 'Code.exe', title: 'claude-anywhere - Visual Studio Code', pid: 4101, x: 0, y: 0, width: 60, height: 38, minimized: false, elevated: false, className: 'Chrome_WidgetWin_1' },
     { hwnd: '1002', app: 'Google Chrome', process: 'chrome.exe', title: 'Cloud Run - Google Cloud console - Google Chrome', pid: 4102, x: 64, y: 0, width: 32, height: 24, minimized: false, elevated: false, className: 'Chrome_WidgetWin_1' },
     { hwnd: '1003', app: 'Task Manager', process: 'Taskmgr.exe', title: 'Task Manager', pid: 4103, x: 5, y: 5, width: 20, height: 20, minimized: false, elevated: true, className: 'TaskManagerWindow' },
+    // Started with an administrator's credentials: another account, so its elevation is unknown.
+    { hwnd: '1004', app: '', process: '', title: 'Contoso Setup', pid: 4104, x: 30, y: 20, width: 20, height: 15, minimized: false, elevated: null, className: '#32770' },
   ],
   topmost: {},
 };
@@ -133,6 +139,25 @@ function findWindow(hwnd) {
 
 function windowOut(w) {
   return { ...w, focused: w.hwnd === desk.focused };
+}
+
+function windowAt(x, y) {
+  const order = [findWindow(desk.focused), ...desk.windows.filter((w) => w.hwnd !== desk.focused)];
+  return order.find((w) => w && !w.minimized && x >= w.x && x < w.x + w.width && y >= w.y && y < w.y + w.height) || null;
+}
+
+/** Mirror of Confirm-InputTarget in win32-host.ps1: throws or returns a warnings list. */
+function checkInput(w) {
+  if (!w || w.elevated === false) return [];
+  const name = `${w.title} (${w.process || `pid ${w.pid}`})`;
+  if (w.elevated) {
+    throw fail(`Windows blocks input to '${name}' because it runs as administrator and Claude Anywhere does not.`, 'UIPI_BLOCKED', 'Interact with that window yourself.');
+  }
+  return [`'${name}' belongs to another user account, so Claude Anywhere cannot tell whether it runs as administrator. If nothing happened, it probably does and Windows (UIPI) silently dropped the input: ask the user to do this step in that window themselves.`];
+}
+
+function withWarnings(result, warnings) {
+  return warnings.length ? { ...result, warnings } : result;
 }
 
 function num(args, name, dflt) {
@@ -161,25 +186,27 @@ const handlers = {
   },
   click: (a) => {
     if (a.x != null) desk.cursor = { x: num(a, 'x'), y: num(a, 'y') };
-    return { ...desk.cursor };
+    const warnings = checkInput(windowAt(desk.cursor.x, desk.cursor.y));
+    return withWarnings({ ...desk.cursor }, warnings);
   },
-  down: () => ({ ok: true }),
+  down: () => withWarnings({ ok: true }, checkInput(windowAt(desk.cursor.x, desk.cursor.y))),
   up: () => ({ ok: true }),
   drag: (a) => {
+    const warnings = checkInput(windowAt(num(a, 'x1'), num(a, 'y1')));
     desk.cursor = { x: num(a, 'x2'), y: num(a, 'y2') };
-    return { ok: true };
+    return withWarnings({ ok: true }, warnings);
   },
-  scroll: () => ({ ok: true }),
+  scroll: (a) => {
+    if (a.x != null) desk.cursor = { x: num(a, 'x'), y: num(a, 'y') };
+    return withWarnings({ ok: true }, checkInput(windowAt(desk.cursor.x, desk.cursor.y)));
+  },
   type: (a) => {
-    const fg = findWindow(desk.focused);
-    if (fg && fg.elevated) {
-      throw fail(`Windows blocks input to '${fg.title} (${fg.process})' because it runs as administrator and Claude Anywhere does not.`, 'UIPI_BLOCKED', 'Interact with that window yourself.');
-    }
-    return { typed: String(a.text || '').length };
+    const warnings = checkInput(findWindow(desk.focused));
+    return withWarnings({ typed: String(a.text || '').length }, warnings);
   },
   keys: (a) => {
     if (!Array.isArray(a.vks) || !a.vks.length) throw fail('No keys given.', 'BAD_ARGS');
-    return { ok: true };
+    return withWarnings({ ok: true }, checkInput(findWindow(desk.focused)));
   },
   windows: () => ({ windows: desk.windows.map(windowOut) }),
   active: () => {

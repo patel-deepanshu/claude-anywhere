@@ -12,6 +12,7 @@
  * Claude Anywhere desktop tools.
  */
 
+const fs = require('fs');
 const util = require('util');
 const { StringDecoder } = require('string_decoder');
 const { createLogger } = require('../shared/log');
@@ -500,6 +501,99 @@ function startStdioServer({ name = 'anywhere', version = '0.0.0', tools = [], lo
   };
 }
 
+// ---------------------------------------------------------------- live config
+
+/**
+ * The user's config for this long-lived process. The dialog saves changed
+ * settings (failsafe, action delay, screenshot size, desktop context) to
+ * config.json while this server keeps running, so refresh() re-reads the small
+ * file, and when its text changed, replaces the contents of `config` in place:
+ * every holder of the object sees the new values.
+ * @param {{load?:()=>object, file?:()=>string, log?:object}} [opts]
+ * @returns {{config:object, refresh:()=>boolean, version:()=>number}}
+ *   refresh() is true when the settings changed; version() counts the changes
+ */
+function createConfigSource({ load, file, log } = {}) {
+  const cfg = require('../shared/config');
+  const readConfig = load || cfg.load;
+  const filePath = file || require('../shared/paths').configPath;
+  // The file's text, not its mtime: two quick saves can share an mtime, size and inode.
+  const stampOf = () => {
+    try {
+      return fs.readFileSync(filePath(), 'utf8');
+    } catch {
+      return null;
+    }
+  };
+  const read = () => {
+    try {
+      const c = readConfig();
+      return isPlainObject(c) ? c : null;
+    } catch (err) {
+      if (log) log.warn('could not load config:', err && err.message);
+      return null;
+    }
+  };
+  let stamp = stampOf(); // taken before reading, so a write in between is picked up next time
+  const config = read() || JSON.parse(JSON.stringify(cfg.DEFAULTS));
+  let version = 0;
+  const refresh = () => {
+    const now = stampOf();
+    if (now === stamp) return false;
+    const fresh = read();
+    if (!fresh) return false; // keep the last good settings and try again on the next call
+    stamp = now;
+    if (JSON.stringify(fresh) === JSON.stringify(config)) return false;
+    for (const k of Object.keys(config)) delete config[k];
+    Object.assign(config, fresh);
+    version += 1;
+    // privacy.auditLog / redactSecretsInLogs changed in the dialog reach this process too.
+    require('../shared/log').applyPrivacyConfig(config);
+    if (log) log.debug('config changed on disk; using the new settings');
+    return true;
+  };
+  return { config, refresh, version: () => version };
+}
+
+/**
+ * Start the desktop driver and this process's one Computer on first use. Every
+ * call refreshes the config first, so a changed computer.* setting (failsafe,
+ * actionDelayMs, maxWidth...) applies to the next action without a restart.
+ * @param {{source:{config:object, refresh:()=>boolean, version:()=>number},
+ *   getDriver?:()=>Promise<object>, log?:object}} opts
+ * @returns {{getComputer:()=>Promise<object>, driver:()=>object|null}}
+ */
+function createComputerSource({ source, getDriver, log } = {}) {
+  const { Computer } = require('../os/computer');
+  const startDriver = getDriver || (() => require('../os/index').getDriver());
+  let computerPromise = null;
+  let driverRef = null;
+  let applied = -1;
+  const getComputer = async () => {
+    source.refresh();
+    if (!computerPromise) {
+      const created = (async () => {
+        const driver = await startDriver();
+        driverRef = driver;
+        return new Computer({ driver, config: source.config.computer, geometryStore: 'file' });
+      })();
+      computerPromise = created;
+      created.catch((err) => {
+        if (log) log.error('desktop driver failed to start:', err);
+        if (computerPromise === created) computerPromise = null;
+      });
+    }
+    const comp = await computerPromise;
+    if (applied !== source.version()) {
+      // Computer validates its settings in the constructor: reuse that for the live instance.
+      comp.config = new Computer({ driver: comp.driver, config: source.config.computer }).config;
+      applied = source.version();
+    }
+    return comp;
+  };
+  return { getComputer, driver: () => driverRef };
+}
+
 // ---------------------------------------------------------------- main
 
 function buildInstructions(role) {
@@ -536,33 +630,17 @@ async function main() {
   } catch {
     /* keep default */
   }
-  let config;
-  try {
-    config = require('../shared/config').load();
-  } catch (err) {
-    log.warn('could not load config, using defaults:', err.message);
-    config = JSON.parse(JSON.stringify(require('../shared/config').DEFAULTS));
-  }
+  // Re-read when config.json changes: this server lives as long as its Claude Code
+  // session, and the dialog's settings must not wait for a restart.
+  const configSource = createConfigSource({ log });
+  require('../shared/log').applyPrivacyConfig(configSource.config);
+  const config = configSource.config;
   const role = process.env.ANYWHERE_ROLE || 'interactive';
-
-  let computerPromise = null;
-  let driverRef = null;
-  const getComputer = () => {
-    if (!computerPromise) {
-      computerPromise = (async () => {
-        const { getDriver } = require('../os/index');
-        const { Computer } = require('../os/computer');
-        const driver = await getDriver();
-        driverRef = driver;
-        return new Computer({ driver, config: config.computer, geometryStore: 'file' });
-      })();
-      computerPromise.catch((err) => {
-        log.error('desktop driver failed to start:', err);
-        computerPromise = null;
-      });
-    }
-    return computerPromise;
-  };
+  // A plugin or user-scope copy of this server started under the daemon's own engine would
+  // duplicate the daemon's tools (and bypass its role). It stays up so Claude Code does not
+  // report a failed server, but serves nothing. The daemon's server (role engine) is unaffected.
+  const engineChild = process.env.ANYWHERE_ENGINE_CHILD === '1' && role !== 'engine';
+  const computers = createComputerSource({ source: configSource, log });
 
   const { DaemonClient } = require('../shared/client');
   let cached = { at: 0, client: null };
@@ -582,15 +660,17 @@ async function main() {
   };
 
   const { createTools } = require('./tools');
-  const tools = createTools({ computer: getComputer, getClient, config, role });
-  const server = startStdioServer({ name: 'anywhere', version, tools, log, instructions: buildInstructions(role) });
-  log.debug(`anywhere MCP server ${version} ready (role ${role}, ${tools.length} tools)`);
+  const tools = engineChild ? [] : createTools({ computer: computers.getComputer, getClient, config, role });
+  const instructions = engineChild ? undefined : buildInstructions(role);
+  const server = startStdioServer({ name: 'anywhere', version, tools, log, instructions });
+  log.debug(`anywhere MCP server ${version} ready (role ${role}${engineChild ? ', inside the daemon engine: no tools' : ''}, ${tools.length} tools)`);
 
   let exiting = false;
   const shutdown = async (code = 0) => {
     if (exiting) return;
     exiting = true;
     server.close();
+    const driverRef = computers.driver();
     if (driverRef && typeof driverRef.close === 'function') {
       await Promise.race([Promise.resolve(driverRef.close()).catch(() => {}), new Promise((r) => setTimeout(r, 1500))]);
     }
@@ -610,6 +690,8 @@ module.exports = {
   normalizeResult,
   errorResult,
   buildInstructions,
+  createConfigSource,
+  createComputerSource,
   LATEST_PROTOCOL_VERSION,
   ERR,
 };

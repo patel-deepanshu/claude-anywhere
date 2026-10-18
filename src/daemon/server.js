@@ -25,6 +25,8 @@ const JSON_LIMIT = 25 * 1024 * 1024;
 const AUDIO_LIMIT = 25 * 1024 * 1024;
 const LISTEN_MAX_SEC = 590;
 const LISTEN_DEFAULT_SEC = 540;
+const LAUNCH_CODE_TTL_MS = 60000;
+const MAX_LAUNCH_CODES = 64;
 const DEFAULT_UI_DIR = path.join(paths.PACKAGE_ROOT, 'src', 'ui');
 
 const CSP =
@@ -242,12 +244,29 @@ class DaemonServer {
       if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
     });
     this.claimedApprovals = new Set();
+    this.launchCodes = new Map(); // single-use launch code -> expiresAt (ms)
     this.routes = this.buildRoutes();
   }
 
   /** The daemon's URL with the token (opens the dialog). */
   get url() {
     return `http://127.0.0.1:${this.port}/?token=${encodeURIComponent(this.token)}`;
+  }
+
+  /**
+   * A dialog URL that is safe on a child-process command line (readable by every local user):
+   * it carries a single-use code, valid for 60 s, that the page trades for the token through
+   * POST /api/launch.
+   * @returns {string}
+   */
+  launchUrl() {
+    const now = Date.now();
+    for (const [c, exp] of this.launchCodes) if (exp <= now) this.launchCodes.delete(c);
+    // Bound the map: a runaway caller cannot grow it without limit.
+    while (this.launchCodes.size >= MAX_LAUNCH_CODES) this.launchCodes.delete(this.launchCodes.keys().next().value);
+    const code = crypto.randomBytes(18).toString('base64url');
+    this.launchCodes.set(code, now + LAUNCH_CODE_TTL_MS);
+    return `http://127.0.0.1:${this.port}/?launch=${code}`;
   }
 
   /**
@@ -289,6 +308,7 @@ class DaemonServer {
     const r = new Map();
     const add = (method, p, fn, opts = {}) => r.set(`${method} ${p}`, { fn: fn.bind(this), ...opts });
     add('GET', '/api/health', this.health, { noAuth: true, noBody: true });
+    add('POST', '/api/launch', this.launch, { noAuth: true });
     add('GET', '/api/events', this.events, { queryToken: true, noBody: true });
     add('GET', '/api/state', () => this.session.snapshot(), { noBody: true });
     add('POST', '/api/command', this.command);
@@ -305,6 +325,7 @@ class DaemonServer {
     add('POST', '/api/tts', this.tts);
     add('POST', '/api/tts/stop', this.ttsStop);
     add('GET', '/api/context', this.context, { noBody: true });
+    add('GET', '/api/permissions', this.osPermissions, { noBody: true });
     add('POST', '/api/show', this.show);
     add('POST', '/api/shutdown', this.shutdown);
     add('POST', '/api/mcp/permission', this.mcpPermission);
@@ -493,6 +514,16 @@ class DaemonServer {
     return { ok: true, app: 'claude-anywhere', version: this.deps.version, instanceId: this.deps.instanceId, pid: process.pid };
   }
 
+  /** @private trade a single-use launch code (from launchUrl()) for the token */
+  launch({ body }) {
+    const code = body && body.code;
+    const exp = typeof code === 'string' && code ? this.launchCodes.get(code) : undefined;
+    if (exp === undefined) throw httpError(401, 'Unauthorized');
+    this.launchCodes.delete(code);
+    if (exp <= Date.now()) throw httpError(401, 'Unauthorized');
+    return { token: this.token };
+  }
+
   /** @private */
   events({ req, res }) {
     this.hub.addClient(req, res);
@@ -559,6 +590,23 @@ class DaemonServer {
       log.warn(`desktop driver unavailable: ${err.message}`);
       return null;
     }
+  }
+
+  /**
+   * The running daemon's OS permission state (macOS TCC: accessibility, screenRecording,
+   * automation), as its driver reports it; `anywhere doctor` shows it. Never prompts.
+   * @private
+   */
+  async osPermissions() {
+    const d = await this.driver();
+    if (!d || typeof d.capabilities !== 'function') return { platform: process.platform, permissions: null };
+    let caps = null;
+    try {
+      caps = await d.capabilities();
+    } catch (err) {
+      log.warn(`could not read driver capabilities: ${err.message}`);
+    }
+    return { platform: process.platform, permissions: (caps && caps.permissions) || null };
   }
 
   /** @private */
@@ -772,6 +820,11 @@ class DaemonServer {
       if (!res.writableFinished) ac.abort();
     };
     res.on('close', onClose);
+    // A bridge terminal asking a question is alive, however long the user takes to answer.
+    const touch = () => {
+      if (this.session && typeof this.session.touchBridge === 'function') this.session.touchBridge();
+    };
+    touch();
     try {
       const out = await this.deps.questions.ask({
         question: body.question,
@@ -783,6 +836,7 @@ class DaemonServer {
       return out;
     } finally {
       res.removeListener('close', onClose);
+      touch();
     }
   }
 
@@ -856,6 +910,11 @@ class DaemonServer {
     const bridge = this.deps.bridge;
     if (!bridge) throw httpError(503, 'Bridge mode is not available');
     if (typeof body.text !== 'string') throw httpError(400, 'text must be a string');
+    if (bridge.stopped) {
+      throw httpError(409, 'Bridge mode is off: the dialog switched to companion mode, so this reply was not shown', {
+        hint: 'Stop the listen loop. Run "/anywhere here" again after switching the dialog back to bridge mode.',
+      });
+    }
     return bridge.reply({ text: body.text, final: Boolean(body.final), speak: body.speak !== false });
   }
 }

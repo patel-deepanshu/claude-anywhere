@@ -81,6 +81,29 @@ var PASTE_RESTORE = 0.3;
 var AX_TITLE_BUDGET_MS = 2500;
 var AX_TITLE_MAX_APPS = 12;
 
+// Text Input Sources (HIToolbox). The literal values of the kTIS* CFString
+// constants, used when the bridge does not expose the constants themselves.
+var TIS_PROP_ID = 'TISPropertyInputSourceID';
+var TIS_PROP_TYPE = 'TISPropertyInputSourceType';
+var TIS_PROP_ASCII = 'TISPropertyInputSourceIsASCIICapable';
+var TIS_TYPE_LAYOUT = 'TISTypeKeyboardLayout';
+var TIS_METHOD_TYPES = {
+  TISTypeKeyboardInputMode: 1,
+  TISTypeKeyboardInputMethodModeEnabled: 1,
+  TISTypeKeyboardInputMethodWithoutModes: 1,
+};
+// Keyboard layouts that type no ASCII letters. Only used when TIS cannot say
+// whether the current layout is ASCII-capable.
+var NON_ASCII_LAYOUT_RE = new RegExp(
+  '^com\\.apple\\.keylayout\\.(Russian|Ukrainian|Byelorussian|Belarusian|Bulgarian|Serbian(?!-Latin)|Macedonian|Kazakh|' +
+    'Kyrgyz|Mongolian|Tatar|Bashkir|Chuvash|Ossetian|Yakut|Tajik|Uzbek-Cyrillic|Greek|Hebrew|Arabic|Persian|Pashto|Urdu|' +
+    'Uyghur|Sindhi|Kurdish-Sorani|Dhivehi|Syriac|Thai|Lao|Khmer|Myanmar|Armenian|Georgian|Devanagari|Hindi|Marathi|Nepali|' +
+    'Sanskrit|Bangla|Bengali|Assamese|Gujarati|Gurmukhi|Punjabi|Kannada|Malayalam|Oriya|Odia|Tamil|Telugu|Sinhala|Tibetan|' +
+    'Dzongkha|Inuktitut|Cherokee|Tifinagh|NKo|Adlam|Hanifi|Amharic|Tigrinya)',
+  'i',
+);
+var CARBON_TRIED = false;
+
 importFrameworks();
 
 function importFrameworks() {
@@ -97,6 +120,17 @@ function importFrameworks() {
     if (typeof $.CGEventPost === 'undefined') ObjC.import('Quartz');
   } catch (e) {
     IMPORT_ERRORS.push('Quartz: ' + errMessage(e));
+  }
+}
+
+/** Text Input Source functions live in Carbon (HIToolbox); load it on first use only. */
+function importCarbon() {
+  if (CARBON_TRIED || !HAS_OBJC) return;
+  CARBON_TRIED = true;
+  try {
+    if (typeof $.TISCopyCurrentKeyboardInputSource === 'undefined') ObjC.import('Carbon');
+  } catch (e) {
+    IMPORT_ERRORS.push('Carbon: ' + errMessage(e));
   }
 }
 
@@ -588,6 +622,160 @@ function restoreClipboard(saved, expectedChangeCount) {
   return true;
 }
 
+// ---------------------------------------------------------------- input sources
+
+function toBool(v) {
+  if (v === true || v === 1) return true;
+  if (v === false || v === 0) return false;
+  return null;
+}
+
+/** A CF/ObjC value returned as a pointer -> JS value; null for NULL or nil. */
+function refValue(ref) {
+  if (ref === null || ref === undefined) return null;
+  var obj = ref;
+  try {
+    obj = ObjC.castRefToObject(ref);
+  } catch (e) {
+    obj = ref;
+  }
+  if (isNil(obj)) return null;
+  try {
+    var v = ObjC.unwrap(obj);
+    return v === undefined || v === null ? null : v;
+  } catch (e) {
+    return null;
+  }
+}
+
+/** One TIS property, keyed by the bridged kTIS* constant or, failing that, its literal value. */
+function tisProperty(src, constName, literal) {
+  var keys = [];
+  try {
+    var k = $[constName];
+    if (k !== undefined && k !== null) keys.push(k);
+  } catch (e) {
+    /* not bridged */
+  }
+  keys.push($(literal));
+  for (var i = 0; i < keys.length; i++) {
+    try {
+      var v = refValue($.TISGetInputSourceProperty(src, keys[i]));
+      if (v !== null) return v;
+    } catch (e) {
+      /* try the next form of the key */
+    }
+  }
+  return null;
+}
+
+function inputSourceFromTIS() {
+  importCarbon();
+  if (typeof $.TISCopyCurrentKeyboardInputSource === 'undefined' || typeof $.TISGetInputSourceProperty === 'undefined') return null;
+  // TIS hears about input source switches through notifications delivered on the run loop.
+  pump(0.01);
+  var src = $.TISCopyCurrentKeyboardInputSource();
+  if (isNil(src)) return null;
+  var id = tisProperty(src, 'kTISPropertyInputSourceID', TIS_PROP_ID);
+  var type = tisProperty(src, 'kTISPropertyInputSourceType', TIS_PROP_TYPE);
+  var ascii = toBool(tisProperty(src, 'kTISPropertyInputSourceIsASCIICapable', TIS_PROP_ASCII));
+  if (id === null && type === null && ascii === null) return null;
+  return { id: id === null ? '' : String(id), type: type === null ? '' : String(type), ascii: ascii, source: 'tis' };
+}
+
+/** Fallback: the HIToolbox preferences hold the selected keyboard layout and input method. */
+function inputSourceFromDefaults() {
+  if (typeof $.NSUserDefaults === 'undefined') return null;
+  var d = $.NSUserDefaults.alloc.initWithSuiteName('com.apple.HIToolbox');
+  if (isNil(d)) return null;
+  try {
+    d.synchronize;
+  } catch (e) {
+    /* best effort refresh */
+  }
+  var layout = str(d.stringForKey('AppleCurrentKeyboardLayoutInputSourceID'));
+  var selected = [];
+  try {
+    var arr = d.arrayForKey('AppleSelectedInputSources');
+    if (!isNil(arr)) selected = ObjC.deepUnwrap(arr) || [];
+  } catch (e) {
+    selected = [];
+  }
+  var method = '';
+  for (var i = 0; i < selected.length; i++) {
+    var s = selected[i] || {};
+    var kind = String(s.InputSourceKind || '');
+    if (kind === 'Input Mode' || kind === 'Keyboard Input Method') {
+      method = String(s['Input Mode'] || s['Bundle ID'] || 'input method');
+      break;
+    }
+  }
+  if (!layout && !method) return null;
+  return { id: method || layout, inputMethod: Boolean(method), ascii: null, source: 'defaults' };
+}
+
+/**
+ * Whether System Events keystrokes are safe for an input source. keystroke
+ * turns characters into key presses that go through the active layout and
+ * input method, so anything but an ASCII-capable keyboard layout garbles ASCII
+ * text: input methods (Japanese, Chinese, Korean...) compose it, non-Latin
+ * layouts (Russian, Greek...) type other letters. safe is null when unknown.
+ * @param {{id?:string, type?:string, ascii?:(boolean|null), inputMethod?:boolean, source?:string}} raw
+ * @returns {{id:string, kind:string, ascii:(boolean|null), safe:(boolean|null), source:string}}
+ */
+function describeInputSource(raw) {
+  var r = raw || {};
+  var id = r.id ? String(r.id) : '';
+  var kind = 'unknown';
+  if (r.inputMethod === true || TIS_METHOD_TYPES[r.type] === 1) kind = 'inputMethod';
+  else if (r.type === TIS_TYPE_LAYOUT) kind = 'layout';
+  else if (/\.inputmethod\./i.test(id)) kind = 'inputMethod';
+  else if (/^com\.apple\.keylayout\./i.test(id)) kind = 'layout';
+  var ascii = toBool(r.ascii);
+  if (ascii === null && kind === 'layout' && NON_ASCII_LAYOUT_RE.test(id)) ascii = false;
+  var safe = null;
+  if (kind === 'inputMethod' || ascii === false) safe = false;
+  else if (kind === 'layout' && ascii === true) safe = true;
+  return { id: id, kind: kind, ascii: ascii, safe: safe, source: r.source || '' };
+}
+
+/** The active keyboard input source, or null if it cannot be read. Never throws. */
+function currentInputSource() {
+  if (!HAS_OBJC) return null;
+  var raw = null;
+  try {
+    raw = inputSourceFromTIS();
+  } catch (e) {
+    raw = null;
+  }
+  if (!raw) {
+    try {
+      raw = inputSourceFromDefaults();
+    } catch (e) {
+      raw = null;
+    }
+  }
+  return raw ? describeInputSource(raw) : null;
+}
+
+/** Typing steps with every text step pasted; adjacent text is merged into one paste. */
+function pastePlan(steps) {
+  var out = [];
+  for (var i = 0; i < steps.length; i++) {
+    var s = steps[i] || {};
+    if (s.kind !== 'keys' && s.kind !== 'paste') {
+      out.push(s);
+      continue;
+    }
+    var text = s.text === undefined || s.text === null ? '' : String(s.text);
+    if (!text) continue;
+    var last = out.length ? out[out.length - 1] : null;
+    if (last && last.kind === 'paste') last.text += text;
+    else out.push({ kind: 'paste', text: text });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- errors
 
 /**
@@ -835,10 +1023,62 @@ function cmdScroll(a) {
   return { x: x, y: y, notches: n };
 }
 
+// ---------------------------------------------------------------- keyboard layout
+
+/** The character key `code` types with no modifiers on the active layout (lower case; '' if none). */
+function layoutChar(code) {
+  try {
+    var e = $.CGEventCreateKeyboardEvent(null, code, true);
+    $.CGEventSetFlags(e, 0);
+    var ns = $.NSEvent.eventWithCGEvent(e);
+    if (isNil(ns)) return '';
+    var s = ObjC.unwrap(ns.charactersIgnoringModifiers);
+    return typeof s === 'string' && s.length === 1 ? s.toLowerCase() : '';
+  } catch (err) {
+    return '';
+  }
+}
+
+/** Character -> the lowest key code that types it on the active layout. */
+function buildLayoutMap() {
+  var map = {};
+  for (var code = 0; code < 128; code++) {
+    // Keypad codes are skipped: kVK_ANSI_Keypad1 also types '1', but is not the '1' key.
+    if (code >= 0x41 && code <= 0x5c) continue;
+    var s = layoutChar(code);
+    if (s && !Object.prototype.hasOwnProperty.call(map, s)) map[s] = code;
+  }
+  return map;
+}
+
+/**
+ * The key code that types base character `ch` on the active keyboard layout. keys.js sends
+ * US ANSI positions, so Cmd+A on AZERTY would otherwise press the key labelled Q. Returns
+ * `ansiCode` when it already types `ch`, or when the layout has no key for `ch` (non-Latin
+ * layouts, where macOS matches Cmd shortcuts by their QWERTY position anyway).
+ * @param {string} ch one unshifted character ('/' for '?'; Shift is in the flags)
+ * @param {number} ansiCode
+ * @param {{map?:object}} [cache] shared within one request, so the map is built at most once
+ * @returns {number}
+ */
+function layoutKeyCode(ch, ansiCode, cache) {
+  if (typeof ch !== 'string' || ch.length !== 1 || !HAS_OBJC || typeof $.NSEvent === 'undefined') return ansiCode;
+  var want = ch.toLowerCase();
+  if (layoutChar(ansiCode) === want) return ansiCode;
+  var c = cache || {};
+  if (!c.map) c.map = buildLayoutMap();
+  return Object.prototype.hasOwnProperty.call(c.map, want) ? c.map[want] : ansiCode;
+}
+
 function cmdKey(a) {
   var codes = intList(a.keyCodes);
   if (!codes.length && a.keyCode !== undefined && a.keyCode !== null) codes = [int(a.keyCode, 'keyCode')];
   if (!codes.length) throw fail('BAD_ARGS', 'keyCode is required');
+  var chars = a.chars && typeof a.chars.length === 'number' ? a.chars : [];
+  var cache = {};
+  for (var i = 0; i < codes.length; i++) {
+    if (typeof chars[i] === 'string' && chars[i].length === 1) codes[i] = layoutKeyCode(chars[i], codes[i], cache);
+  }
   pressCombo(codes, a.flags | 0, intList(a.modifierKeyCodes));
   return { keys: codes.length };
 }
@@ -849,15 +1089,34 @@ function cmdKey(a) {
  * {kind:'paste',text} (via the pasteboard and cmd+v). The pasteboard is restored
  * 300 ms after the last paste. If System Events is not authorized (Automation),
  * keystroke steps fall back to pasting when args.fallbackPaste is true.
+ * Unless args.checkInputSource is false, keystroke steps are pasted when the
+ * active input source would garble them (an input method or a non-Latin
+ * layout); the result then says fallback 'paste', reason 'input-source'.
  */
 function cmdType(a) {
   var steps = a.steps && typeof a.steps.length === 'number' ? a.steps : [];
+  var total = steps.length;
   var se = null;
   var automationError = null;
+  var reason = null;
+  var source = null;
   var saved = null;
   var lastChange = null;
   var lastPasteAt = 0;
   var pasted = 0;
+  var keystrokes = 0;
+  var pasteKey = null;
+  if (a.checkInputSource !== false) {
+    var hasKeys = false;
+    for (var k = 0; k < steps.length && !hasKeys; k++) hasKeys = Boolean(steps[k] && steps[k].kind === 'keys');
+    if (hasKeys) {
+      source = currentInputSource();
+      if (source && source.safe === false) {
+        steps = pastePlan(steps);
+        reason = 'input-source';
+      }
+    }
+  }
   try {
     for (var i = 0; i < steps.length; i++) {
       var s = steps[i] || {};
@@ -871,6 +1130,7 @@ function cmdType(a) {
         try {
           if (!se) se = systemEvents();
           se.keystroke(text);
+          keystrokes++;
           continue;
         } catch (e) {
           var c = classifyError(e);
@@ -886,7 +1146,9 @@ function cmdType(a) {
       if (saved === null) saved = saveClipboard();
       lastChange = setClipboardText(text);
       sleep(0.03);
-      pressCombo([KEY_V], FLAG_CMD, [KEY_CMD]);
+      // Cmd+V by layout, not position: on Dvorak the US-position V key is K.
+      if (pasteKey === null) pasteKey = layoutKeyCode('v', KEY_V);
+      pressCombo([pasteKey], FLAG_CMD, [KEY_CMD]);
       lastPasteAt = Date.now();
       pasted++;
       // Let the target app read the pasteboard before it changes again.
@@ -903,7 +1165,39 @@ function cmdType(a) {
       }
     }
   }
-  return { steps: steps.length, pasted: pasted, fallback: automationError === null ? null : 'paste', automationError: automationError };
+  if (reason === null && automationError !== null) reason = 'automation';
+  return {
+    steps: total,
+    pasted: pasted,
+    keystrokes: keystrokes,
+    fallback: reason === null ? null : 'paste',
+    reason: reason,
+    automationError: automationError,
+    inputSource: source,
+  };
+}
+
+/** The active keyboard input source and whether keystrokes are safe with it (null if unreadable). */
+function cmdInputSource() {
+  return currentInputSource();
+}
+
+/**
+ * Confirm, or ask for, Automation consent to control System Events with a
+ * harmless Apple event. The first time, macOS shows a consent prompt and this
+ * blocks until the user answers it, so callers give it a long timeout.
+ * granted is true, false (refused) or null (another error).
+ */
+function cmdAutomation() {
+  try {
+    var n = systemEvents().processes.length;
+    return { granted: true, processes: Number(n) || 0 };
+  } catch (e) {
+    var c = classifyError(e);
+    var out = { granted: c.code === 'PERMISSION' && c.perm === 'automation' ? false : null, error: c.message };
+    if (c.number !== null) out.errorNumber = c.number;
+    return out;
+  }
 }
 
 function cmdWindows(a) {
@@ -932,8 +1226,9 @@ function cmdActive(a) {
       break;
     }
   }
-  if (win && !win.title && a.axTitles !== false) fillTitlesFromAX([win], 1000);
-  return { pid: front.pid, app: front.name, bundleId: front.bundleId, window: win };
+  var ax = null;
+  if (win && !win.title && a.axTitles !== false) ax = fillTitlesFromAX([win], 1000);
+  return { pid: front.pid, app: front.name, bundleId: front.bundleId, window: win, ax: ax };
 }
 
 function cmdFocus(a) {
@@ -947,10 +1242,22 @@ function cmdFocus(a) {
   }
   var bundlePath = '';
   var bundleId = '';
+  var instances = 1;
   try {
     bundleId = str(app.bundleIdentifier);
     var url = app.bundleURL;
     if (!isNil(url)) bundlePath = str(url.path);
+  } catch (e) {
+    /* informational */
+  }
+  // Several instances (the dialog's own browser next to the user's): the caller must not
+  // fall back to LaunchServices, which activates whichever instance it picks.
+  try {
+    if (bundleId && $.NSRunningApplication.runningApplicationsWithBundleIdentifier) {
+      var running = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(bundleId);
+      var n = isNil(running) ? 0 : Number(running.count);
+      if (n > 0) instances = n;
+    }
   } catch (e) {
     /* informational */
   }
@@ -1011,6 +1318,7 @@ function cmdFocus(a) {
     frontPid: front ? front.pid : null,
     bundlePath: bundlePath,
     bundleId: bundleId,
+    instances: instances,
     axError: axError,
     axPerm: axPerm,
   };
@@ -1025,6 +1333,39 @@ function cmdMinimize(a) {
   var w = findAxWindow(axProcess(systemEvents(), pid), info);
   if (!w) return { ok: false, reason: 'no matching accessibility window' };
   w.attributes.byName('AXMinimized').value = true;
+  return { ok: true };
+}
+
+/** Press the close button (AXCloseButton) of one window; the app keeps running. */
+function cmdClose(a) {
+  var pid = int(a.pid, 'pid');
+  var number = int(a.number, 'number');
+  var info = windowInfo(number);
+  if (!info) return { ok: false, reason: 'window ' + number + ' not found' };
+  if (info.pid !== pid) return { ok: false, reason: 'window ' + number + ' does not belong to process ' + pid };
+  var w = findAxWindow(axProcess(systemEvents(), pid), info);
+  if (!w) return { ok: false, reason: 'no matching accessibility window' };
+  // JXA element references are callable, so typeof is 'function' (or 'object' in tests).
+  var isRef = function (v) {
+    return v !== null && v !== undefined && (typeof v === 'object' || typeof v === 'function');
+  };
+  var button = null;
+  try {
+    button = w.attributes.byName('AXCloseButton').value();
+  } catch (e) {
+    button = null;
+  }
+  if (!isRef(button)) {
+    button = null;
+    try {
+      var list = w.buttons.whose({ subrole: 'AXCloseButton' });
+      if (list.length) button = list[0];
+    } catch (e) {
+      button = null;
+    }
+  }
+  if (!isRef(button)) return { ok: false, reason: 'the window has no close button' };
+  button.actions.byName('AXPress').perform();
   return { ok: true };
 }
 
@@ -1055,10 +1396,13 @@ var COMMANDS = {
   scroll: cmdScroll,
   key: cmdKey,
   type: cmdType,
+  inputSource: cmdInputSource,
+  automation: cmdAutomation,
   windows: cmdWindows,
   active: cmdActive,
   focus: cmdFocus,
   minimize: cmdMinimize,
+  close: cmdClose,
   clipGet: cmdClipGet,
   clipSet: cmdClipSet,
   exit: function () {

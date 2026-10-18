@@ -1401,6 +1401,19 @@ a {
   box-shadow: 0 0 0 1px var(--accent-soft), var(--shadow);
 }
 
+/* Cards are focused from code (tabindex -1), where :focus-visible may not match, and Enter on
+   a focused approval card allows it: always show the ring. The border keeps the risk color. */
+.card:focus,
+.card.approval:focus,
+.card.question:focus {
+  box-shadow: var(--focus), var(--shadow);
+}
+
+.card.approval[data-risk="critical"]:focus,
+.card.approval[data-risk="high"]:focus {
+  box-shadow: 0 0 0 1px var(--red-soft), var(--focus), var(--shadow);
+}
+
 .card.busy {
   opacity: 0.6;
   pointer-events: none;

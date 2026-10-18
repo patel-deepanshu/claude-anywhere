@@ -91,10 +91,13 @@ class RpcPeer {
 
 function spawnServer(t, extraEnv = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'anywhere-mcp-home-'));
-  const env = { ...process.env, ANYWHERE_HOME: home, ANYWHERE_DRIVER: 'mock', ...extraEnv };
+  const env = { ...process.env, ANYWHERE_HOME: home, ANYWHERE_DRIVER: 'mock' };
   delete env.ANYWHERE_DAEMON_URL;
   delete env.ANYWHERE_TOKEN;
   delete env.ANYWHERE_DEBUG;
+  delete env.ANYWHERE_ROLE;
+  delete env.ANYWHERE_ENGINE_CHILD;
+  Object.assign(env, extraEnv);
   const child = spawn(process.execPath, [SERVER], { env, stdio: ['pipe', 'pipe', 'pipe'] });
   let stderr = '';
   child.stderr.on('data', (d) => {
@@ -176,6 +179,19 @@ test('stdio server: discovery probe, initialize, list, ping, unknown tool', asyn
   child.stdin.end();
   const { code } = await exited;
   assert.equal(code, 0, 'exits cleanly when stdin ends');
+});
+
+test('stdio server: a copy started under the daemon engine serves no tools (DAEMON-PROTOCOL-8)', async (t) => {
+  const { peer } = spawnServer(t, { ANYWHERE_ENGINE_CHILD: '1' });
+  const init = await peer.request('initialize', { protocolVersion: '2025-11-25' });
+  assert.equal(init.result.serverInfo.name, 'anywhere');
+  const list = await peer.request('tools/list', {});
+  assert.deepEqual(list.result.tools, []);
+  // The daemon's own server (role engine) in the same environment keeps its tools.
+  const own = spawnServer(t, { ANYWHERE_ENGINE_CHILD: '1', ANYWHERE_ROLE: 'engine' });
+  await own.peer.request('initialize', { protocolVersion: '2025-11-25' });
+  const ownList = await own.peer.request('tools/list', {});
+  assert.ok(ownList.result.tools.some((tool) => tool.name === 'permission_prompt'));
 });
 
 test('stdio server: screenshot and actions through the mock driver', { skip: hasMockDriver ? false : 'mock driver (src/os) not available' }, async (t) => {

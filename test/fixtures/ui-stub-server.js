@@ -322,6 +322,10 @@ async function createStubServer(opts = {}) {
     questions: new Map(scenario.questions.map((q) => [q.id, q])),
     bridge: { listening: false },
     screenshot: scenario.messages.length ? { dataUrl: shotUrl, width: 480, height: 300, ts: ago(220000) } : null,
+    // What the dialog sent, for tests: command bodies (without images), approval decisions, interrupts.
+    commands: [],
+    decisions: [],
+    interrupts: 0,
   };
 
   const later = (ms, fn) => {
@@ -525,10 +529,14 @@ async function createStubServer(opts = {}) {
       if (!text) throw fail(400, 'text is required');
       const images = (Array.isArray(body.images) ? body.images.length : 0) + (body.attachScreenshot ? 1 : 0);
       const source = ['text', 'voice', 'cli', 'skill'].includes(body.source) ? body.source : 'text';
+      const sent = { ...body };
+      delete sent.images;
+      st.commands.push(sent);
       playTurn(text, images, source);
       return { ok: true, id: `cmd_${Date.now()}` };
     },
     'POST /api/interrupt': () => {
+      st.interrupts += 1;
       setStatus('stopping');
       for (const id of st.approvals.keys()) broadcast('approval_resolved', { id, decision: 'deny', by: 'interrupt', message: 'Interrupted by user' });
       for (const id of st.questions.keys()) broadcast('question_resolved', { id, answer: null, cancelled: true });
@@ -541,6 +549,7 @@ async function createStubServer(opts = {}) {
       if (!['allow', 'allow_session', 'deny'].includes(body.decision)) throw fail(400, 'decision must be allow, allow_session or deny');
       if (!st.approvals.has(body.id)) throw fail(404, 'No pending approval with that id (it may have timed out or been cancelled)');
       st.approvals.delete(body.id);
+      st.decisions.push({ id: body.id, decision: body.decision, ...(body.message ? { message: body.message } : {}) });
       broadcast('approval_resolved', { id: body.id, decision: body.decision, by: 'user', ...(body.message ? { message: body.message } : {}) });
       setStatus(st.questions.size ? 'waiting_answer' : 'acting', st.questions.size ? 'Claude asked you a question' : 'Run command');
       return { ok: true };

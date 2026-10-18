@@ -7,10 +7,13 @@
  *   claude -p --input-format stream-json --output-format stream-json --verbose
  *          --include-partial-messages (--session-id <uuid> | --resume <id>)
  *          --mcp-config <file> --permission-prompt-tool mcp__anywhere__permission_prompt
+ *          --permission-mode default [--settings <file>]
  *          --append-system-prompt-file <file> --allowedTools <list> [...] [--add-dir <dir>...]
  *
  * One process serves many turns: each send() writes a JSONL user message,
- * interrupt() sends a control_request and the process stays alive.
+ * interrupt() sends a control_request and the process stays alive. The engine
+ * tracks whether a turn is running (send/init → active, result → idle) so an
+ * interrupt of an idle CLI ends on its control_response instead of a kill.
  *
  * Events: 'spawn' ({pid}), 'message' (parsed stdout JSON), 'stderr' (line),
  *         'exit' ({code, signal, stderrTail, error, expected, sawInit, uptimeMs}).
@@ -33,6 +36,9 @@ const INTERRUPT_TIMEOUT_MS = 4000;
 const STOP_KILL_AFTER_MS = 3000;
 const MAX_LINE_BYTES = 128 * 1024 * 1024;
 const PERMISSION_TOOL = 'mcp__anywhere__permission_prompt';
+// The CLI's ask-first mode ("default"; 2.1.x also calls it "manual"), so the user's own
+// permissions.defaultMode (acceptEdits, bypassPermissions, …) cannot bypass the dialog's approvals.
+const DEFAULT_PERMISSION_MODE = 'default';
 
 const DEFAULT_STRIP_ENV = [
   'CLAUDECODE',
@@ -50,6 +56,9 @@ const DEFAULT_STRIP_ENV = [
 
 const SCRIPT_EXT = /\.(c|m)?js$/i;
 const WIN_SHELL_EXT = /\.(cmd|bat)$/i;
+// npm cmd-shims name their target relative to the shim: "%dp0%\node_modules\…\cli.js" (or %~dp0).
+const SHIM_TARGET_RE = /"%~?dp0%?[\\/]*([^"%]+?\.(?:c|m)?js|[^"%]+?\.exe)"/gi;
+const NPM_CLI_REL = ['node_modules', '@anthropic-ai', 'claude-code', 'cli.js'];
 
 /**
  * Known install locations of the claude CLI, most specific first.
@@ -104,9 +113,45 @@ function isExecutable(p) {
   }
 }
 
+function isFile(p) {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Decide how to launch a CLI path: directly, through node (scripts), or via
- * cmd.exe for Windows .cmd/.bat shims (every argument quoted).
+ * The script or executable an npm .cmd shim runs (claude.cmd → …\@anthropic-ai\claude-code\cli.js),
+ * so it can be started without cmd.exe. Returns null when the shim names no existing target.
+ * @param {string} shimPath
+ * @returns {string|null}
+ */
+function resolveCmdShim(shimPath) {
+  if (!isFile(shimPath)) return null;
+  const dir = path.dirname(shimPath);
+  const local = (rel) => path.join(dir, ...String(rel).split(/[\\/]+/).filter(Boolean));
+  let text = '';
+  try {
+    text = fs.readFileSync(shimPath, 'utf8');
+  } catch {
+    /* unreadable: try the npm layout below */
+  }
+  const targets = [];
+  for (const m of text.matchAll(SHIM_TARGET_RE)) {
+    // The shim also mentions "%dp0%\node.exe" (a node next to the shim); that is the runtime, not the target.
+    if (!/^node(\.exe)?$/i.test(path.basename(m[1].replace(/\\/g, '/')))) targets.push(local(m[1]));
+  }
+  for (const t of targets.reverse()) if (isFile(t)) return t;
+  const npmCli = path.join(dir, ...NPM_CLI_REL);
+  return isFile(npmCli) ? npmCli : null;
+}
+
+/**
+ * Decide how to launch a CLI path: directly, through node (scripts and npm
+ * .cmd shims whose cli.js is found), or as a last resort via cmd.exe for other
+ * Windows .cmd/.bat files (every argument quoted). cmd.exe cannot use a UNC
+ * working directory, so shims are resolved whenever possible.
  * @param {string} cliPath
  * @param {string[]} args
  * @returns {{command:string, args:string[], shell:boolean}}
@@ -116,9 +161,17 @@ function launchSpec(cliPath, args, platform = process.platform) {
     return { command: process.execPath, args: [cliPath, ...args], shell: false };
   }
   if (platform === 'win32' && WIN_SHELL_EXT.test(cliPath)) {
+    const target = resolveCmdShim(cliPath);
+    if (target && SCRIPT_EXT.test(target)) return { command: process.execPath, args: [target, ...args], shell: false };
+    if (target && /\.exe$/i.test(target)) return { command: target, args: args.slice(), shell: false };
     return { command: proc.quoteWinArg(cliPath), args: args.map((a) => proc.quoteWinArg(a)), shell: true };
   }
   return { command: cliPath, args: args.slice(), shell: false };
+}
+
+/** @returns {boolean} a UNC path (\\server\share, \\wsl.localhost\Distro\…), which cmd.exe cannot use as its cwd */
+function isUncPath(p) {
+  return /^(\\\\|\/\/)[^\\/]/.test(String(p || ''));
 }
 
 /**
@@ -146,6 +199,11 @@ function buildArgs(o = {}) {
   }
   if (o.mcpConfigPath) args.push('--mcp-config', o.mcpConfigPath);
   args.push('--permission-prompt-tool', o.permissionPromptTool || PERMISSION_TOOL);
+  const extra = Array.isArray(o.extraArgs) ? o.extraArgs.map((a) => String(a == null ? '' : a)) : [];
+  const hasFlag = (name) => extra.some((a) => a === name || a.startsWith(`${name}=`));
+  // engine.extraArgs may override these on purpose.
+  if (!hasFlag('--permission-mode')) args.push('--permission-mode', String(o.permissionMode || DEFAULT_PERMISSION_MODE));
+  if (o.settingsPath && !hasFlag('--settings')) args.push('--settings', String(o.settingsPath));
   if (o.systemPromptPath) args.push('--append-system-prompt-file', o.systemPromptPath);
   const allowed = Array.isArray(o.allowedTools) ? o.allowedTools.filter(Boolean) : [];
   if (allowed.length) args.push('--allowedTools', allowed.join(','));
@@ -175,11 +233,18 @@ function buildArgs(o = {}) {
  * @param {{stripEnv?:string[], extra?:object}} [opts]
  * @returns {NodeJS.ProcessEnv}
  */
-function buildEnv(base = process.env, { stripEnv = DEFAULT_STRIP_ENV, extra } = {}) {
+function buildEnv(base = process.env, { stripEnv = DEFAULT_STRIP_ENV, extra, nodeDir = path.dirname(process.execPath), platform = process.platform } = {}) {
   const env = { ...base };
   const strip = new Set((stripEnv || []).map((k) => String(k).toUpperCase()));
   for (const k of Object.keys(env)) {
     if (strip.has(k.toUpperCase())) delete env[k];
+  }
+  // npm installs claude as a `#!/usr/bin/env node` script: make sure the node running us is
+  // on PATH (a daemon started by a launcher or hotkey may have a minimal PATH).
+  if (platform !== 'win32' && nodeDir && path.posix.isAbsolute(nodeDir)) {
+    const norm = (p) => p.replace(/\/+$/, '') || '/';
+    const parts = String(env.PATH || '').split(':').filter(Boolean);
+    if (!parts.some((p) => norm(p) === norm(nodeDir))) env.PATH = [nodeDir, ...parts].join(':');
   }
   // Approvals and ask_user block inside MCP calls, so an inherited short
   // timeout (some shells set 60 s) or auto-backgrounding would break them.
@@ -267,30 +332,38 @@ class ClaudeCliEngine extends EventEmitter {
    * @param {object} [config]
    * @returns {Promise<{path:string, version:string|null}|null>}
    */
-  static async locate(config) {
+  static async locate(config, { nodeDir = path.dirname(process.execPath) } = {}) {
     const candidates = [];
     const configured = config && config.engine && config.engine.claudePath;
     if (configured) candidates.push({ p: configured, why: 'engine.claudePath' });
     if (process.env.ANYWHERE_CLAUDE_PATH) candidates.push({ p: process.env.ANYWHERE_CLAUDE_PATH, why: 'ANYWHERE_CLAUDE_PATH' });
+    const explicit = candidates.length;
     const onPath = proc.which('claude');
     // On WSL a Windows npm shim under /mnt/<drive> can shadow the Linux install; try native paths first.
     const windowsShim = Boolean(onPath) && process.platform === 'linux' && /^\/mnt\/[a-z]\//i.test(onPath);
     if (onPath && !windowsShim) candidates.push({ p: onPath, why: 'PATH' });
+    // npm's global bin next to the node running us (a daemon started by a launcher may lack it on PATH).
+    if (nodeDir) candidates.push({ p: path.join(nodeDir, process.platform === 'win32' ? 'claude.cmd' : 'claude'), why: 'node dir' });
     for (const p of knownInstallPaths()) candidates.push({ p, why: 'known path' });
     if (windowsShim) candidates.push({ p: onPath, why: 'PATH' });
     const seen = new Set();
-    for (const { p, why } of candidates) {
+    let fallback = null;
+    for (let i = 0; i < candidates.length; i += 1) {
+      const { p, why } = candidates[i];
       const abs = path.resolve(String(p).replace(/^~(?=$|[\\/])/, os.homedir()));
       if (seen.has(abs)) continue;
       seen.add(abs);
       if (!isUsableFile(abs)) {
-        if (why !== 'known path') log.warn(`claude CLI from ${why} is not usable: ${abs}`);
+        if (why !== 'known path' && why !== 'node dir') log.warn(`claude CLI from ${why} is not usable: ${abs}`);
         continue;
       }
       const version = await ClaudeCliEngine.readVersion(abs);
-      return { path: abs, version };
+      // A configured path is the user's choice; discovered ones must answer --version (a broken
+      // shim earlier on PATH must not hide a working install), else the first usable file wins.
+      if (i < explicit || version) return { path: abs, version };
+      if (!fallback) fallback = { path: abs, version };
     }
-    return null;
+    return fallback;
   }
 
   /**
@@ -313,7 +386,7 @@ class ClaudeCliEngine extends EventEmitter {
    * @param {{claudePath:string, cwd?:string, sessionId?:string, resume?:boolean, mcpConfigPath?:string,
    *   systemPromptPath?:string, allowedTools?:string[], model?:string, fallbackModel?:string, effort?:string,
    *   chrome?:boolean, addDirs?:string[], maxBudgetUsd?:number, extraArgs?:string[], env?:object,
-   *   stripEnv?:string[], baseEnv?:object}} opts
+   *   stripEnv?:string[], baseEnv?:object, permissionMode?:string, settingsPath?:string, platform?:string}} opts
    */
   constructor(opts = {}) {
     super();
@@ -333,6 +406,9 @@ class ClaudeCliEngine extends EventEmitter {
     this.startedAt = 0;
     this.stderrLines = [];
     this.resultWaiters = new Set();
+    this.platform = opts.platform || process.platform;
+    this.sendCount = 0;
+    this.turnActive = false; // a user message is being worked on (send/init → true, result → false)
   }
 
   /** @returns {boolean} the process is alive */
@@ -353,8 +429,17 @@ class ClaudeCliEngine extends EventEmitter {
   /** Spawn the CLI. Emits 'spawn', or 'exit' with .error when spawning fails. */
   start() {
     if (this.child) throw new Error('engine already started');
-    const spec = launchSpec(this.claudePath, this.args);
+    const spec = launchSpec(this.claudePath, this.args, this.platform);
     this.startedAt = Date.now();
+    if (spec.shell && isUncPath(this.cwd)) {
+      // cmd.exe would say "UNC paths are not supported" and run Claude Code in C:\Windows instead.
+      const e = new Error(`${path.basename(this.claudePath)} has to run through cmd.exe, which cannot use the network or WSL folder ${this.cwd} as its working directory. Set engine.claudePath in Settings to Claude Code's cli.js or claude.exe, or pick a project on a local drive.`);
+      e.code = 'UNC_CWD';
+      log.error(e.message);
+      this.child = { pid: null };
+      process.nextTick(() => this.finish({ code: null, signal: null, error: e }));
+      return;
+    }
     log.info(`starting claude: ${this.claudePath} ${this.args.map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(' ')} (cwd ${this.cwd})`);
     let child;
     try {
@@ -408,7 +493,12 @@ class ClaudeCliEngine extends EventEmitter {
       return;
     }
     if (!msg || typeof msg !== 'object') return;
-    if (msg.type === 'system' && msg.subtype === 'init') this.sawInit = true;
+    if (msg.type === 'system' && msg.subtype === 'init') {
+      this.sawInit = true;
+      // The CLI emits init as a turn starts (a queued message starting its own turn included).
+      if (this.sendCount > 0) this.turnActive = true;
+    }
+    if (msg.type === 'result') this.turnActive = false;
     try {
       this.emit('message', msg);
     } catch (e) {
@@ -471,17 +561,22 @@ class ClaudeCliEngine extends EventEmitter {
     const content = typeof contentBlocks === 'string' ? [{ type: 'text', text: contentBlocks }] : contentBlocks;
     if (!Array.isArray(content) || !content.length) throw new TypeError('send() needs content blocks');
     this.writeLine({ type: 'user', message: { role: 'user', content } });
+    this.sendCount += 1;
+    this.turnActive = true;
   }
 
   /**
-   * Interrupt the current turn. Resolves when the result arrives, or after
-   * killing the process if none arrives within 4 s.
+   * Interrupt the current turn. Resolves when its result arrives; when no turn
+   * is running, when the CLI acknowledges the request (an idle CLI answers only
+   * with a control_response). A running turn that produces no result within 4 s
+   * gets the process killed.
    * @param {{timeoutMs?:number}} [opts]
    * @returns {Promise<{ok:boolean, killed:boolean}>}
    */
   interrupt({ timeoutMs = INTERRUPT_TIMEOUT_MS } = {}) {
     if (!this.running) return Promise.resolve({ ok: true, killed: false });
     return new Promise((resolve) => {
+      const requestId = uuid();
       let done = false;
       let killing = false;
       const finish = () => {
@@ -490,12 +585,23 @@ class ClaudeCliEngine extends EventEmitter {
         clearTimeout(timer);
         this.resultWaiters.delete(onResult);
         this.removeListener('exit', onExit);
+        this.removeListener('message', onMessage);
         resolve({ ok: true, killed: killing });
       };
       // A result (or the process exiting, which also wakes result waiters) ends the wait.
       const onResult = () => finish();
       const onExit = () => finish();
+      const onMessage = (msg) => {
+        if (!msg || msg.type !== 'control_response') return;
+        const r = msg.response || {};
+        if (r.request_id === requestId && !this.turnActive) finish();
+      };
       const timer = setTimeout(() => {
+        if (!this.turnActive) {
+          log.warn(`no answer ${timeoutMs} ms after interrupt, but no turn is running; leaving claude alone`);
+          finish();
+          return;
+        }
         log.warn(`no result ${timeoutMs} ms after interrupt; killing claude`);
         killing = true;
         this.expectedExit = true;
@@ -505,8 +611,9 @@ class ClaudeCliEngine extends EventEmitter {
       }, timeoutMs);
       this.resultWaiters.add(onResult);
       this.once('exit', onExit);
+      this.on('message', onMessage);
       try {
-        this.writeLine({ type: 'control_request', request_id: uuid(), request: { subtype: 'interrupt' } });
+        this.writeLine({ type: 'control_request', request_id: requestId, request: { subtype: 'interrupt' } });
       } catch (e) {
         log.warn(`interrupt could not be sent: ${e.message}`);
         finish();
@@ -553,9 +660,12 @@ module.exports = {
   buildArgs,
   buildEnv,
   launchSpec,
+  resolveCmdShim,
+  isUncPath,
   parseVersion,
   knownInstallPaths,
   LineSplitter,
   PERMISSION_TOOL,
+  DEFAULT_PERMISSION_MODE,
   DEFAULT_STRIP_ENV,
 };

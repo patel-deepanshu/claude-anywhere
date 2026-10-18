@@ -249,12 +249,14 @@ function parseIni(text) {
   return out;
 }
 
-const cliCache = new Map();
+const cliCache = new Map(); // key -> { found, at }
+const CLI_MISS_TTL_MS = 10000; // re-check a missing CLI (installed mid-session) after this long
 
 /** Find a cloud CLI on PATH or in the usual install locations. */
 function findCli(name, sys) {
   const key = `${name}|${sys.platform}|${sys.home}`;
-  if (cliCache.has(key)) return cliCache.get(key);
+  const cached = cliCache.get(key);
+  if (cached && (cached.found || Date.now() - cached.at < CLI_MISS_TTL_MS)) return cached.found;
   let found = proc.which(name);
   if (!found) {
     const p = pathFor(sys);
@@ -290,7 +292,7 @@ function findCli(name, sys) {
       }
     }) || null;
   }
-  cliCache.set(key, found);
+  cliCache.set(key, { found, at: Date.now() });
   return found;
 }
 
@@ -399,8 +401,10 @@ let dockerCache = null; // { at, value }
 let dockerInflight = null;
 
 /**
- * Whether a Docker engine answers (`docker info`), cached for 60 s.
- * @returns {Promise<{running:boolean,version:string|null,cli:true,timedOut?:boolean}|null>}
+ * Whether a Docker engine answers (`docker info`), cached for 60 s. A daemon
+ * whose socket the user may not open (not in the docker group) is running but
+ * not accessible: `sudo docker` works, starting the service would not help.
+ * @returns {Promise<{running:boolean,version:string|null,cli:true,accessible?:false,timedOut?:boolean}|null>}
  */
 async function probeDocker(sys = sysInfo()) {
   if (dockerCache && Date.now() - dockerCache.at < DOCKER_CACHE_MS) return dockerCache.value;
@@ -412,6 +416,12 @@ async function probeDocker(sys = sysInfo()) {
       const r = await proc.run(bin, ['info', '--format', '{{.ServerVersion}}'], { timeoutMs: DOCKER_TIMEOUT_MS });
       const version = r.code === 0 ? String(r.stdout || '').trim() : '';
       value = { running: Boolean(version), version: version || null, cli: true };
+      const err = String(r.stderr || '');
+      if (!version && !r.timedOut && /permission denied/i.test(err) && !/no such file|connection refused/i.test(err)) {
+        // "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock"
+        value.running = true;
+        value.accessible = false;
+      }
       if (r.timedOut) value.timedOut = true;
     }
     dockerCache = { at: Date.now(), value };
@@ -960,7 +970,33 @@ async function probeWindows(driver) {
     d.listWindows(),
     typeof d.activeWindow === 'function' ? d.activeWindow().catch(() => null) : Promise.resolve(null),
   ]);
-  return { list: Array.isArray(list) ? list : [], active: active || null, driver: d.name || null };
+  const out = { list: Array.isArray(list) ? list : [], active: active || null, driver: d.name || null };
+  if (d.windowsZOrdered === true) out.zOrdered = true; // the driver lists windows front to back
+  return out;
+}
+
+/**
+ * Whether a window list is in stacking order, front first. macOS and Windows
+ * (also from WSL) list windows that way; on native Linux only a driver that
+ * says so (driver.windowsZOrdered) or tags windows with stackIndex does.
+ */
+function listIsZOrdered(sys, probe) {
+  return sys.platform === 'darwin' || sys.platform === 'win32' || Boolean(sys.isWSL) || Boolean(probe && probe.zOrdered);
+}
+
+/**
+ * Sort windows front to back by the driver's stackIndex (0 = frontmost, e.g.
+ * from X11 _NET_CLIENT_LIST_STACKING or Hyprland's focus history). Windows
+ * without one keep their relative order after the ranked ones. Returns null
+ * when no window carries a stackIndex.
+ */
+function sortByStack(list) {
+  const rank = (w) => (typeof w.stackIndex === 'number' && Number.isFinite(w.stackIndex) ? w.stackIndex : null);
+  if (!list.some((w) => rank(w) !== null)) return null;
+  return list
+    .map((w, i) => ({ w, i, r: rank(w) }))
+    .sort((a, b) => (a.r === null ? 1 : 0) - (b.r === null ? 1 : 0) || (a.r === null ? 0 : a.r - b.r) || a.i - b.i)
+    .map((x) => x.w);
 }
 
 function winKey(w) {
@@ -972,10 +1008,14 @@ function winKey(w) {
  * active window first, dedupe, and work out which window the user was in.
  * @param {object[]} rawList driver.listWindows()
  * @param {object|null} rawActive driver.activeWindow()
- * @param {{zOrdered?:boolean}} [opts] true when the driver lists windows front to back (macOS, Windows)
+ * @param {{zOrdered?:boolean}} [opts] true when the driver lists windows front to back (macOS, Windows);
+ *   a list whose windows carry stackIndex is sorted by it and counts as z-ordered too
  */
 function classifyWindows(rawList, rawActive, opts = {}) {
-  const list = (rawList || []).filter((w) => w && typeof w === 'object');
+  let list = (rawList || []).filter((w) => w && typeof w === 'object');
+  const stacked = sortByStack(list);
+  if (stacked) list = stacked;
+  const zOrdered = Boolean(opts.zOrdered) || Boolean(stacked);
   let active = rawActive && (rawActive.title || rawActive.app) ? rawActive : null;
   if (!active) active = list.find((w) => w.focused) || null;
   const dialogFocused = Boolean(active && isOwnWindow(active));
@@ -997,7 +1037,7 @@ function classifyWindows(rawList, rawActive, opts = {}) {
   let activeWindow = null;
   let frontWindow = null;
   if (active && !dialogFocused) activeWindow = { app: cleanTitle(active.app), title: cleanTitle(active.title) };
-  if (dialogFocused && opts.zOrdered) {
+  if (dialogFocused && zOrdered) {
     const f = visible.find((w) => !w.minimized);
     if (f) frontWindow = { app: cleanTitle(f.app), title: cleanTitle(f.title) };
   }
@@ -1368,8 +1408,7 @@ async function gatherContext({ driver, projectDir, config, _sys } = {}) {
     const known = r.workspaces || null;
     const knownNames = knownNameSet(known, dir);
     if (r.windows) {
-      const zOrdered = sys.platform === 'darwin' || sys.platform === 'win32' || sys.isWSL;
-      const cw = classifyWindows(r.windows.list, r.windows.active, { zOrdered });
+      const cw = classifyWindows(r.windows.list, r.windows.active, { zOrdered: listIsZOrdered(sys, r.windows) });
       ctx.activeWindow = cw.activeWindow;
       ctx.dialogFocused = cw.dialogFocused;
       ctx.frontWindow = cw.frontWindow;
@@ -1448,7 +1487,7 @@ async function detectProjects({ driver, _sys, cwd } = {}) {
   ]);
   if (win) {
     const knownNames = knownNameSet(known, here);
-    const cw = classifyWindows(win.list, win.active, { zOrdered: sys.platform !== 'linux' || sys.isWSL });
+    const cw = classifyWindows(win.list, win.active, { zOrdered: listIsZOrdered(sys, win) });
     const resolved = await Promise.all(
       cw.windows.map(async (w) => {
         const ed = parseEditorTitle(w.title, w.app, { knownNames });
@@ -1523,7 +1562,10 @@ function cloudLabel(c) {
     parts.push(s);
   }
   if (c.kubectl) parts.push(c.kubectl.context ? `kubectl ctx ${sanitize(c.kubectl.context, 100)}` : 'kubectl (no current context)');
-  if (c.docker) parts.push(c.docker.running ? 'docker running' : 'docker not running');
+  if (c.docker) {
+    if (c.docker.running && c.docker.accessible === false) parts.push('docker running (no socket permission: use sudo or join the docker group)');
+    else parts.push(c.docker.running ? 'docker running' : 'docker not running');
+  }
   return parts.length ? parts.join(' \u00b7 ') : null;
 }
 

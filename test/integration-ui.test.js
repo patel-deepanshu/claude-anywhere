@@ -165,6 +165,9 @@ async function openPage(chrome, { width, height, scheme }) {
   await send('Log.enable');
   await send('Page.enable');
   await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+  // Behave like a focused window, so focus events fire as they do for a user.
+  await send('Emulation.setFocusEmulationEnabled', { enabled: true });
+  await send('Page.bringToFront');
   await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: scheme }] });
   const evaluate = async (expression) => {
     const r = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
@@ -183,6 +186,8 @@ async function openPage(chrome, { width, height, scheme }) {
   return { send, evaluate, problems, close };
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 const waitFor = async (page, expr, ms = 5000) => {
   const end = Date.now() + ms;
   while (Date.now() < end) {
@@ -191,6 +196,49 @@ const waitFor = async (page, expr, ms = 5000) => {
   }
   return false;
 };
+
+test('headless Chromium: a ?launch= code is traded for the token before the first API call (SECURITY-7)', async (t) => {
+  const chrome = findChrome();
+  if (!chrome) {
+    t.skip('no Chromium found (set ANYWHERE_TEST_CHROME)');
+    return;
+  }
+  if (typeof globalThis.WebSocket !== 'function') {
+    t.skip('needs a global WebSocket (Node >= 22)');
+    return;
+  }
+  const { createServer } = require('../src/daemon/server');
+  const noop = () => {};
+  const authSeen = [];
+  const srv = createServer({
+    hub: { addClient: (req) => authSeen.push(new URL(req.url, 'http://x').searchParams.get('token')), broadcast: noop, clientCount: () => 0, close: noop, on: noop },
+    session: { snapshot: () => ({}), projectDir: ROOT, guard: () => ({ allowed: true }) },
+    permissions: null,
+    questions: { pending: () => [], answer: () => false },
+    bridge: null,
+    config: {},
+    token: 'launch-tok',
+    instanceId: 'test',
+    version: '0.0.0',
+    uiDir: UI,
+  });
+  await srv.listen(0);
+  t.after(() => srv.close());
+  const page = await openPage(chrome, { width: 440, height: 720, scheme: 'light' });
+  try {
+    const url = srv.launchUrl();
+    assert.ok(!url.includes('launch-tok'));
+    await page.send('Page.navigate', { url });
+    assert.ok(await waitFor(page, `sessionStorage.getItem('anywhere.token') === 'launch-tok'`), 'token stored after the exchange');
+    assert.equal(await page.evaluate('location.search'), '', 'launch code removed from the address bar');
+    assert.equal(srv.launchCodes.size, 0, 'the code was used up');
+    const end = Date.now() + 5000;
+    while (!authSeen.length && Date.now() < end) await sleep(50);
+    assert.deepEqual(authSeen.slice(0, 1), ['launch-tok'], 'the event stream connects with the traded token');
+  } finally {
+    page.close();
+  }
+});
 
 test('headless Chromium renders the dialog against the stub with no errors', async (t) => {
   const chrome = findChrome();
@@ -234,13 +282,61 @@ test('headless Chromium renders the dialog against the stub with no errors', asy
       // Answer the question by clicking an option, then approve with Enter on the focused card.
       await page.evaluate(`document.querySelector('.card.question .btn-option').click()`);
       assert.ok(await waitFor(page, `!document.querySelector('.card.question')`), 'question card resolves');
-      await page.evaluate(`(() => { const c = document.querySelector('.card.approval'); c.focus(); c.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); })()`);
+      const shadow = `getComputedStyle(document.querySelector('.card.approval')).boxShadow`;
+      const unfocused = await page.evaluate(shadow);
+      await page.evaluate(`document.querySelector('.card.approval').focus()`);
+      assert.notEqual(await page.evaluate(shadow), unfocused, 'a focused approval card shows a focus ring');
+      // Enter (or a held Enter) right after the card took focus was meant for something else.
+      const enterOnCard = (repeat) =>
+        page.evaluate(`document.querySelector('.card.approval').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', repeat: ${repeat}, bubbles: true, cancelable: true }))`);
+      await enterOnCard(false);
+      await sleep(300);
+      assert.equal(await page.evaluate(`Boolean(document.querySelector('.card.approval'))`), true, 'Enter right after the card took focus is ignored');
+      await sleep(450);
+      await enterOnCard(true);
+      await sleep(300);
+      assert.equal(await page.evaluate(`Boolean(document.querySelector('.card.approval'))`), true, 'a repeated Enter is ignored');
+      assert.deepEqual(stub.state.decisions, []);
+      await enterOnCard(false);
       assert.ok(await waitFor(page, `!document.querySelector('.card.approval')`), 'approval card resolves');
+      assert.deepEqual(stub.state.decisions, [{ id: 'ap_1', decision: 'allow' }]);
 
-      // Send a typed command; the stub plays a full turn.
-      await page.evaluate(`(() => { const i = document.getElementById('input'); i.value = 'Summarize the page in my browser'; i.dispatchEvent(new Event('input')); i.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); })()`);
+      // Send a typed command; the stub plays a full turn. A second, quick Enter on the now
+      // empty composer must not stop the command that was just sent.
+      const enterInInput = `document.getElementById('input').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))`;
+      await page.evaluate(`(() => { const i = document.getElementById('input'); i.value = 'Summarize the page in my browser'; i.dispatchEvent(new Event('input')); ${enterInInput}; })()`);
+      assert.ok(await waitFor(page, `document.getElementById('send').classList.contains('stop')`), 'composer turns into Stop while Claude works');
+      await page.evaluate(enterInInput);
       assert.ok(await waitFor(page, `[...document.querySelectorAll('.msg.user')].some(m => m.textContent.includes('Summarize the page'))`), 'user message appears');
       assert.ok(await waitFor(page, `[...document.querySelectorAll('.msg.assistant')].some(m => m.textContent.includes('UI stub'))`, 8000), 'reply streams in');
+      assert.equal(stub.state.interrupts, 0, 'the double Enter did not interrupt');
+      assert.equal(stub.state.commands.length, 1);
+      assert.equal(stub.state.commands[0].attachScreenshot, false, 'the "Include screen" chip state is always sent');
+
+      // A snapshot mid-session keeps a pending card, its typed reason and focus.
+      const card2 = { id: 'ap_2', toolName: 'Bash', displayName: 'Run command', summary: 'rm -rf build', input: { command: 'rm -rf build' }, risk: 'high', ts: new Date().toISOString(), timeoutSec: 600 };
+      stub.state.approvals.set(card2.id, card2);
+      stub.broadcast('approval_request', card2);
+      assert.ok(await waitFor(page, `Boolean(document.querySelector('.card.approval[data-id="ap_2"]'))`), 'new approval card');
+      await page.evaluate(`(() => { const r = document.querySelector('.card.approval[data-id="ap_2"] .deny-reason'); r.focus(); r.value = 'use make clean instead'; window.__card = r.closest('.card'); })()`);
+      stub.broadcast('snapshot', stub.snapshot());
+      await sleep(400);
+      assert.deepEqual(
+        await page.evaluate(`(() => { const c = document.querySelector('.card.approval[data-id="ap_2"]'); const r = c.querySelector('.deny-reason'); return { same: c === window.__card, value: r.value, focused: document.activeElement === r }; })()`),
+        { same: true, value: 'use make clean instead', focused: true }
+      );
+      await page.evaluate(`document.querySelector('.card.approval[data-id="ap_2"] .deny-reason').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))`);
+      assert.ok(await waitFor(page, `!document.querySelector('.card.approval')`), 'denied from the reason box');
+      assert.deepEqual(stub.state.decisions[1], { id: 'ap_2', decision: 'deny', message: 'use make clean instead' });
+
+      // Only the newest 12 screenshots stay in the transcript.
+      const shot = stub.snapshot().messages.find((m) => m.image).image;
+      for (let i = 0; i < 14; i += 1) {
+        stub.broadcast('message', { id: `shot_${i}`, role: 'tool', toolUseId: `tu_shot_${i}`, name: 'mcp__anywhere__screenshot', displayName: 'Screenshot', status: 'ok', image: shot, ts: new Date().toISOString() });
+      }
+      assert.ok(await waitFor(page, `document.querySelector('[data-id="shot_13"] .tool-thumb') !== null`), 'screenshot rows render');
+      assert.equal(await page.evaluate(`document.querySelectorAll('#items .tool-thumb img').length`), 12);
+      assert.equal(await page.evaluate(`document.querySelector('[data-id="shot_1"] .tool-thumb')`), null, 'older rows lose their thumbnail');
 
       // Settings drawer opens, shows the permission mode, and Escape closes it.
       await page.evaluate(`document.getElementById('open-settings').click()`);
@@ -263,5 +359,56 @@ test('headless Chromium renders the dialog against the stub with no errors', asy
     // The stub's scripted state was consumed; restart it for the next viewport.
     await stub.close();
     Object.assign(stub, await createStubServer({ token: 'tok' }));
+  }
+});
+
+test('headless Chromium: in hands-free mode Esc stops Claude before it turns listening off', async (t) => {
+  const chrome = findChrome();
+  if (!chrome) {
+    t.skip('no Chromium found (set ANYWHERE_TEST_CHROME)');
+    return;
+  }
+  if (typeof globalThis.WebSocket !== 'function') {
+    t.skip('needs a global WebSocket (Node >= 22)');
+    return;
+  }
+  const { createStubServer } = require('./fixtures/ui-stub-server');
+  const stub = await createStubServer({ token: 'tok' });
+  t.after(() => stub.close());
+  stub.state.config.voice.handsFree = true;
+  const page = await openPage(chrome, { width: 440, height: 720, scheme: 'light' });
+  try {
+    // A stand-in for the Web Speech API: hands-free starts and waits for its wake word.
+    await page.send('Page.addScriptToEvaluateOnNewDocument', {
+      source: `(() => {
+        class FakeSR {
+          start() { setTimeout(() => this.onstart && this.onstart(), 0); }
+          stop() { setTimeout(() => this.onend && this.onend(), 0); }
+          abort() {}
+        }
+        window.SpeechRecognition = FakeSR;
+        window.webkitSpeechRecognition = FakeSR;
+      })()`,
+    });
+    await page.send('Page.navigate', { url: stub.url });
+    const phase = `document.getElementById('mic')?.dataset.phase`;
+    assert.ok(await waitFor(page, `${phase} === 'wake'`), 'hands-free listens for the wake word');
+    // Let the stub's scripted intro finish; Claude is then waiting for an approval (busy).
+    assert.ok(await waitFor(page, `[...document.querySelectorAll('.msg.assistant')].some(m => m.textContent.includes('which project to use'))`), 'intro plays');
+    assert.ok(await waitFor(page, `document.getElementById('status').dataset.state === 'waiting'`), 'busy');
+    await sleep(300);
+    const esc = `document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))`;
+    await page.evaluate(esc);
+    // Idle again; with hands-free waiting the pill reads "Hands-free".
+    assert.ok(await waitFor(page, `document.getElementById('status').dataset.state === 'handsfree'`), 'Esc stopped Claude');
+    assert.equal(stub.state.interrupts, 1);
+    assert.equal(await page.evaluate(phase), 'wake', 'hands-free is still listening');
+    // With nothing else running, Esc turns hands-free off.
+    await page.evaluate(esc);
+    assert.ok(await waitFor(page, `${phase} === 'idle'`), 'second Esc turns listening off');
+    assert.equal(stub.state.interrupts, 1);
+    assert.deepEqual(page.problems, [], page.problems.join('\n'));
+  } finally {
+    page.close();
   }
 });

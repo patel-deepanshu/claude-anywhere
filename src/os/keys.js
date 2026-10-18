@@ -235,7 +235,6 @@ const MAC_KEYCODES = {
   8: 0x1c, 0: 0x1d, ']': 0x1e, o: 0x1f, u: 0x20, '[': 0x21, i: 0x22, p: 0x23, l: 0x25, j: 0x26,
   "'": 0x27, k: 0x28, ';': 0x29, '\\': 0x2a, ',': 0x2b, '/': 0x2c, n: 0x2d, m: 0x2e, '.': 0x2f, '`': 0x32,
   enter: 0x24, tab: 0x30, space: 0x31, backspace: 0x33, escape: 0x35, capslock: 0x39,
-  volumeup: 0x48, volumedown: 0x49, volumemute: 0x4a,
   insert: 0x72, home: 0x73, pageup: 0x74, delete: 0x75, end: 0x77, pagedown: 0x79,
   left: 0x7b, right: 0x7c, down: 0x7d, up: 0x7e,
   f1: 0x7a, f2: 0x78, f3: 0x63, f4: 0x76, f5: 0x60, f6: 0x61, f7: 0x62, f8: 0x64, f9: 0x65, f10: 0x6d,
@@ -252,19 +251,39 @@ const MAC_UNSUPPORTED_HINTS = {
   playpause: 'Media keys cannot be sent as key codes on macOS; control the player app directly.',
   nexttrack: 'Media keys cannot be sent as key codes on macOS; control the player app directly.',
   prevtrack: 'Media keys cannot be sent as key codes on macOS; control the player app directly.',
+  // Hardware volume keys arrive as NX_SYSDEFINED aux-control events, so a kVK_VolumeUp key event does nothing.
+  volumeup:
+    "Volume keys cannot be sent as key codes on macOS. Use: osascript -e 'set volume output volume (output volume of (get volume settings) + 10)'",
+  volumedown:
+    "Volume keys cannot be sent as key codes on macOS. Use: osascript -e 'set volume output volume (output volume of (get volume settings) - 10)'",
+  volumemute:
+    "Volume keys cannot be sent as key codes on macOS. Use: osascript -e 'set volume with output muted' (or 'set volume without output muted' to unmute)",
 };
+// Keys whose meaning depends on the keyboard layout. The kVK_ANSI_* codes above
+// name physical US-QWERTY positions, so on AZERTY, QWERTZ or Dvorak the same code
+// types a different character (kVK_ANSI_A is "q" on AZERTY: cmd+a would quit).
+const MAC_LAYOUT_CHARS = new Set([...LOWER, ...DIGITS, ...UNSHIFTED_PUNCT]);
 
 /**
  * macOS virtual key codes (kVK_*) and CGEventFlags for a combo.
  * Shifted punctuation ('?', '!') adds Shift. A modifier-only combo uses the
  * last modifier as the key.
+ *
+ * `chars` is aligned with `keyCodes`: for a layout-dependent key (letter, digit,
+ * punctuation) it is the character the key must produce without modifiers
+ * ('/' for '?'), and null for position-independent keys (Return, Tab, arrows,
+ * F-keys, modifiers...). The helper should post the key code that types that
+ * character in the current input source, and fall back to `keyCodes` (US ANSI
+ * positions) when the layout has no such key, as with non-Latin layouts where
+ * macOS already matches cmd shortcuts by QWERTY position.
  * @param {string[]|string} keys
- * @returns {{keyCode:number,keyCodes:number[],flags:number,modifierKeyCodes:number[]}}
+ * @returns {{keyCode:number,keyCodes:number[],chars:(string|null)[],flags:number,modifierKeyCodes:number[]}}
  */
 function toMacKeyCodes(keys) {
   const list = ensureKeys(keys, 'darwin');
   const mods = new Set(list.filter(isModifier));
   const keyCodes = [];
+  const chars = [];
   for (const k of list) {
     if (isModifier(k)) continue;
     const base = SHIFTED[k] || k;
@@ -277,6 +296,7 @@ function toMacKeyCodes(keys) {
       throw err;
     }
     keyCodes.push(code);
+    chars.push(MAC_LAYOUT_CHARS.has(base) ? base : null);
   }
   const ordered = MODIFIERS.filter((m) => mods.has(m));
   let flags = 0;
@@ -286,6 +306,7 @@ function toMacKeyCodes(keys) {
     return {
       keyCode: MAC_MOD_KEYCODES[last],
       keyCodes: [MAC_MOD_KEYCODES[last]],
+      chars: [null],
       flags,
       modifierKeyCodes: ordered.slice(0, -1).map((m) => MAC_MOD_KEYCODES[m]),
     };
@@ -293,6 +314,7 @@ function toMacKeyCodes(keys) {
   return {
     keyCode: keyCodes[keyCodes.length - 1],
     keyCodes,
+    chars,
     flags,
     modifierKeyCodes: ordered.map((m) => MAC_MOD_KEYCODES[m]),
   };

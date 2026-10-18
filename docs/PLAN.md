@@ -7,7 +7,7 @@
 > some capability isn't available.
 
 This document is the product and engineering plan. `ARCHITECTURE.md` is the module-level contract
-that the code follows. `PLATFORMS.md`, `VOICE.md` and `SECURITY.md` go deeper on their topics.
+that the code follows, including the per-platform drivers, the voice pipeline and the security model.
 
 ---
 
@@ -163,7 +163,7 @@ Claude Code ──/anywhere──► skills/anywhere/run.js ──► anywhere d
 
 ---
 
-## 7. Safety model (summary; see SECURITY.md)
+## 7. Safety model (summary; details in ARCHITECTURE.md)
 
 1. **Local API hardening**: loopback only, unguessable token, Host/Origin checks, CSP, no CORS.
 2. **Permission policy**: Ask (only read-only actions run without asking), Smart (default; also lets file edits, screen actions and ordinary commands run, but asks for deploys, deletes, force-pushes, sudo, installs, remote shells and secrets), and Autopilot (asks only for catastrophic commands). Self-escalation, meaning edits to Anywhere's or Claude's own config or settings, is always *critical*.
