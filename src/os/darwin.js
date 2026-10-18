@@ -42,9 +42,10 @@ const PERM_TTL_MS = 60000;
 const FRESH_PERM_RECHECK_MS = 3000;
 const DISPLAY_CACHE_MS = 1500;
 const TYPE_CHUNK = 50;
-// Per paste and once per typing request: match PASTE_SETTLE and PASTE_RESTORE in darwin-helper.js.
-const PASTE_STEP_MS = 800;
-const PASTE_RESTORE_MS = 1500;
+// Typing time budgets per paste and once per request, above the helper's PASTE_SETTLE (0.4 s)
+// and PASTE_RESTORE (1 s) in darwin-helper.js.
+const PASTE_STEP_BUDGET_MS = 800;
+const PASTE_RESTORE_BUDGET_MS = 1500;
 const KEY_RETURN = 36;
 const KEY_TAB = 48;
 const MAX_NOTCHES = 200;
@@ -416,12 +417,12 @@ function typingTimeoutMs(steps) {
   let ms = REQUEST_TIMEOUT_MS;
   let text = false;
   for (const s of steps) {
-    if (s.kind === 'keys') ms += Math.max(40 * s.text.length + 100, PASTE_STEP_MS);
-    else if (s.kind === 'paste') ms += PASTE_STEP_MS;
+    if (s.kind === 'keys') ms += Math.max(40 * s.text.length + 100, PASTE_STEP_BUDGET_MS);
+    else if (s.kind === 'paste') ms += PASTE_STEP_BUDGET_MS;
     else ms += 60;
     if (s.kind === 'keys' || s.kind === 'paste') text = true;
   }
-  if (text) ms += PASTE_RESTORE_MS;
+  if (text) ms += PASTE_RESTORE_BUDGET_MS;
   return Math.min(ms, 10 * 60 * 1000);
 }
 

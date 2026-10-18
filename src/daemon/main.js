@@ -568,6 +568,7 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
 
   let lastAttention = 0;
   const onNeedAttention = (info = {}) => {
+    if (shuttingDown) return; // a window opened now would outlive the daemon
     const now = Date.now();
     if (now - lastAttention < ATTENTION_THROTTLE_MS) return;
     lastAttention = now;

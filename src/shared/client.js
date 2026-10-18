@@ -15,11 +15,23 @@ function abortError(signal) {
   return err;
 }
 
+/** A refused connection never reached the daemon, so the request is safe to send again. */
+function connectionRefused(err) {
+  const code = err && (err.code || (err.cause && err.cause.code));
+  return code === 'ECONNREFUSED';
+}
+
 class DaemonClient {
-  /** @param {{baseUrl:string, token:string}} opts */
-  constructor({ baseUrl, token }) {
+  /**
+   * @param {{baseUrl:string, token:string, fromState?:boolean}} opts fromState: the coordinates
+   *   came from daemon.json, so a restarted daemon (new token, maybe a new port) is looked up
+   *   there again instead of retrying the old URL forever.
+   */
+  constructor({ baseUrl, token, fromState = false }) {
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.token = token;
+    this.fromState = Boolean(fromState);
+    this.refreshing = null;
   }
 
   /** Connect via env (ANYWHERE_DAEMON_URL + ANYWHERE_TOKEN) or daemon.json. */
@@ -29,7 +41,32 @@ class DaemonClient {
     }
     const st = await findRunningDaemon();
     if (!st) return null;
-    return new DaemonClient({ baseUrl: `http://127.0.0.1:${st.port}`, token: st.token });
+    return new DaemonClient({ baseUrl: `http://127.0.0.1:${st.port}`, token: st.token, fromState: true });
+  }
+
+  /**
+   * For a client built from daemon.json: find the running daemon again and switch to it when it
+   * is a different one (restarted, crashed and started again, or on a fallback port).
+   * Env-provided clients (the engine's MCP server) never move.
+   * @returns {Promise<{pid:number|null, port:number, instanceId:string|null}|null>} the new
+   *   daemon, or null when nothing changed or none is running
+   */
+  refresh() {
+    if (!this.fromState) return Promise.resolve(null);
+    if (!this.refreshing) {
+      this.refreshing = findRunningDaemon()
+        .catch(() => null)
+        .then((st) => {
+          this.refreshing = null;
+          if (!st || !st.port || !st.token) return null;
+          const baseUrl = `http://127.0.0.1:${st.port}`;
+          if (baseUrl === this.baseUrl && st.token === this.token) return null;
+          this.baseUrl = baseUrl;
+          this.token = st.token;
+          return { pid: st.pid || null, port: st.port, instanceId: st.instanceId || null };
+        });
+    }
+    return this.refreshing;
   }
 
   headers(extra = {}) {
@@ -47,8 +84,8 @@ class DaemonClient {
    */
   async request(method, path, body, { timeoutMs = 30000, signal } = {}) {
     const payload = body !== undefined ? Buffer.from(JSON.stringify(body)) : null;
-    const headers = this.headers(payload ? { 'Content-Type': 'application/json' } : {});
-    const { status, text } = await this.raw(method, path, payload, headers, { timeoutMs, signal });
+    const extra = payload ? { 'Content-Type': 'application/json' } : {};
+    const { status, text } = await this.send(method, path, payload, extra, { timeoutMs, signal });
     let data;
     try {
       data = text ? JSON.parse(text) : {};
@@ -65,10 +102,7 @@ class DaemonClient {
   }
 
   async postBinary(path, buffer, contentType, { timeoutMs = 120000, signal } = {}) {
-    const { status, text } = await this.raw('POST', path, buffer, this.headers({ 'Content-Type': contentType }), {
-      timeoutMs,
-      signal,
-    });
+    const { status, text } = await this.send('POST', path, buffer, { 'Content-Type': contentType }, { timeoutMs, signal });
     let data;
     try {
       data = text ? JSON.parse(text) : {};
@@ -82,6 +116,27 @@ class DaemonClient {
       throw err;
     }
     return data;
+  }
+
+  /**
+   * raw() with the current token. A daemon.json client whose daemon was replaced (401 for the
+   * old token, or the old port refuses connections) switches to the new one and sends once more;
+   * neither failure means the old daemon acted on the request.
+   * @private
+   * @returns {Promise<{status:number, text:string}>}
+   */
+  async send(method, path, payload, extraHeaders, opts) {
+    let res;
+    try {
+      res = await this.raw(method, path, payload, this.headers(extraHeaders), opts);
+    } catch (err) {
+      if (!this.fromState || !connectionRefused(err) || !(await this.refresh())) throw err;
+      return this.raw(method, path, payload, this.headers(extraHeaders), opts);
+    }
+    if (res.status === 401 && this.fromState && (await this.refresh())) {
+      return this.raw(method, path, payload, this.headers(extraHeaders), opts);
+    }
+    return res;
   }
 
   /** @returns {Promise<{status:number, text:string}>} */
@@ -136,7 +191,9 @@ class DaemonClient {
   }
 
   /**
-   * Subscribe to the SSE stream. Reconnects with backoff until closed.
+   * Subscribe to the SSE stream. Reconnects with backoff until closed. A daemon.json client
+   * whose daemon was replaced emits '_daemon_replaced' ({pid, port, instanceId}) and reconnects
+   * to the new daemon at once.
    * @param {(type:string, data:any)=>void} onEvent
    * @returns {{close:()=>void}}
    */
@@ -190,6 +247,17 @@ class DaemonClient {
           onEvent('_disconnected', {});
         } catch {
           /* ignore */
+        }
+        const moved = await this.refresh();
+        if (closed) return;
+        if (moved) {
+          try {
+            onEvent('_daemon_replaced', moved);
+          } catch {
+            /* ignore */
+          }
+          delay = 1000;
+          continue;
         }
         await new Promise((r) => setTimeout(r, delay));
         delay = Math.min(delay * 2, 10000);

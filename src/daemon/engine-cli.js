@@ -369,8 +369,24 @@ function commandTree(rootPid, table) {
   return { pids: [...seen], groups: [...groups] };
 }
 
+function signalTree(tree, signal) {
+  for (const target of [...tree.groups.map((g) => -g), ...tree.pids]) {
+    try {
+      process.kill(target, signal);
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+/**
+ * Signal the CLI and (POSIX) the commands it runs, see commandTree().
+ * @returns {{pids:number[], groups:number[]}} what was signalled besides the CLI, so a later SIGKILL
+ *   can reach commands that outlived a SIGTERM the CLI itself obeyed
+ */
 function killTree(child, signal) {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const none = { pids: [], groups: [] };
+  if (!child || child.exitCode !== null || child.signalCode !== null) return none;
   if (process.platform === 'win32') {
     // cmd.exe shims: killing the shell would orphan node; taskkill /T takes the tree.
     try {
@@ -389,23 +405,18 @@ function killTree(child, signal) {
         /* ignore */
       }
     }
-    return;
+    return none;
   }
   // Collected before the CLI dies: afterwards its commands are orphans nobody stops.
   const table = child.pid ? processTable() : null;
-  const tree = table ? commandTree(child.pid, table) : { pids: [], groups: [] };
+  const tree = table ? commandTree(child.pid, table) : none;
   try {
     child.kill(signal);
   } catch {
     /* already gone */
   }
-  for (const target of [...tree.groups.map((g) => -g), ...tree.pids]) {
-    try {
-      process.kill(target, signal);
-    } catch {
-      /* already gone */
-    }
-  }
+  signalTree(tree, signal);
+  return tree;
 }
 
 class ClaudeCliEngine extends EventEmitter {
@@ -662,12 +673,10 @@ class ClaudeCliEngine extends EventEmitter {
       const requestId = uuid();
       let done = false;
       let killing = false;
-      let hardKill = null;
       const finish = () => {
         if (done) return;
         done = true;
         clearTimeout(timer);
-        clearTimeout(hardKill);
         this.resultWaiters.delete(onResult);
         this.removeListener('exit', onExit);
         this.removeListener('message', onMessage);
@@ -690,9 +699,13 @@ class ClaudeCliEngine extends EventEmitter {
         log.warn(`no result ${timeoutMs} ms after interrupt; killing claude`);
         killing = true;
         this.expectedExit = true;
-        // SIGTERM lets the CLI end the commands it runs; whatever is left then gets SIGKILL.
-        killTree(this.child, 'SIGTERM');
-        hardKill = setTimeout(() => killTree(this.child, 'SIGKILL'), INTERRUPT_KILL_AFTER_MS);
+        // SIGTERM lets the CLI end the commands it runs; whatever is left then gets SIGKILL
+        // (also commands that ignored a SIGTERM the CLI itself obeyed).
+        const tree = killTree(this.child, 'SIGTERM');
+        setTimeout(() => {
+          killTree(this.child, 'SIGKILL');
+          signalTree(tree, 'SIGKILL');
+        }, INTERRUPT_KILL_AFTER_MS).unref();
         // Safety net when the OS never reports the exit.
         setTimeout(finish, INTERRUPT_KILL_AFTER_MS + 2000).unref();
       }, timeoutMs);
@@ -730,7 +743,10 @@ class ClaudeCliEngine extends EventEmitter {
         // taskkill is forceful, so give the CLI a moment to exit on stdin EOF first.
         this.termTimer = setTimeout(() => killTree(this.child, 'SIGTERM'), 1500);
       } else {
-        killTree(this.child, 'SIGTERM');
+        // The CLI's commands get SIGTERM with it, and SIGKILL later if they outlive it (this
+        // timer is not cleared when the CLI exits).
+        const tree = killTree(this.child, 'SIGTERM');
+        if (tree.pids.length) setTimeout(() => signalTree(tree, 'SIGKILL'), STOP_KILL_AFTER_MS).unref();
       }
       this.killTimer = setTimeout(() => killTree(this.child, 'SIGKILL'), STOP_KILL_AFTER_MS);
       const hard = setTimeout(() => {
