@@ -82,6 +82,25 @@ const DEFAULTS = Object.freeze({
     sttModel: '',
     whisperCppPath: '',
     whisperModel: '',
+    // Spoken voice. 'auto' prefers a free local neural voice (Piper) when installed, then the
+    // best natural browser voice, then the OS voice. 'piper' | 'browser' | 'os' force one.
+    ttsEngine: 'auto',
+    piperVoice: 'en_US-lessac-medium',
+    // What is announced aloud (when speakResponses is on): finished work, a permission card,
+    // a question from Claude, and failures. chime plays a short tone first.
+    announce: { done: true, permission: true, question: true, error: true },
+    chime: true,
+  },
+  // Jira Cloud/Data Center REST access for ticket work (optional: Claude falls back to a Jira MCP
+  // server, then to reading the browser tab). apiToken is stored locally (0600) and never shown.
+  jira: {
+    baseUrl: '',
+    email: '',
+    apiToken: '',
+  },
+  // Folders searched for git repositories when Claude asks where to work (besides open editors).
+  workspace: {
+    roots: [],
   },
   privacy: {
     redactSecretsInLogs: true,
@@ -89,7 +108,7 @@ const DEFAULTS = Object.freeze({
   },
 });
 
-const SECRET_KEYS = [['voice', 'sttApiKey']];
+const SECRET_KEYS = [['voice', 'sttApiKey'], ['jira', 'apiToken']];
 
 function clone(v) {
   return JSON.parse(JSON.stringify(v));
