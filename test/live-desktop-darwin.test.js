@@ -171,38 +171,39 @@ function textEditRunning() {
   return sh('pgrep', ['-x', 'TextEdit']).code === 0;
 }
 
-// TextEdit's automatic text changes (capitalizing the first word, spelling correction, smart
-// dashes and quotes, completions) would change what the tests type. They are turned off for
-// TextEdit only, and the user's TextEdit preferences are put back afterwards.
-const TEXTEDIT_OFF = [
+// macOS text checking (capitalizing the first word of a sentence, spelling correction, smart
+// dashes and quotes, completions) changes what the tests type, and its asynchronous result can
+// replace the text, collapsing a selection, just after a shortcut. TextEdit is sandboxed and reads
+// these from the global domain (System Settings > Keyboard > Text Input), so they are turned off
+// there for the run and put back afterwards.
+const TEXT_CHECKING = [
   'NSAutomaticCapitalizationEnabled',
   'NSAutomaticSpellingCorrectionEnabled',
   'NSAutomaticPeriodSubstitutionEnabled',
   'NSAutomaticDashSubstitutionEnabled',
   'NSAutomaticQuoteSubstitutionEnabled',
-  'NSAutomaticTextReplacementEnabled',
   'NSAutomaticTextCompletionEnabled',
   'NSAutomaticInlinePredictionEnabled',
-  'CorrectSpellingAutomatically',
-  'CheckSpellingWhileTyping',
-  'SmartDashes',
-  'SmartQuotes',
-  'TextReplacement',
 ];
-let textEditPrefs = null;
+let savedTextChecking = null;
 
 function quietTextEdit() {
-  if (textEditPrefs) return;
-  const file = path.join(HOME, 'textedit-prefs.plist');
-  textEditPrefs = { file, saved: sh('defaults', ['export', 'com.apple.TextEdit', file]).code === 0 };
-  for (const key of TEXTEDIT_OFF) sh('defaults', ['write', 'com.apple.TextEdit', key, '-bool', 'false']);
+  if (savedTextChecking) return;
+  savedTextChecking = {};
+  for (const key of TEXT_CHECKING) {
+    const r = sh('defaults', ['read', '-g', key]);
+    savedTextChecking[key] = r.code === 0 ? r.stdout.trim() : null;
+    sh('defaults', ['write', '-g', key, '-bool', 'false']);
+  }
 }
 
 function restoreTextEdit() {
-  if (!textEditPrefs) return;
-  if (textEditPrefs.saved) sh('defaults', ['import', 'com.apple.TextEdit', textEditPrefs.file]);
-  else sh('defaults', ['delete', 'com.apple.TextEdit']);
-  textEditPrefs = null;
+  if (!savedTextChecking) return;
+  for (const [key, value] of Object.entries(savedTextChecking)) {
+    if (value === null) sh('defaults', ['delete', '-g', key]);
+    else sh('defaults', ['write', '-g', key, '-bool', value === '1' || value === 'true' ? 'true' : 'false']);
+  }
+  savedTextChecking = null;
 }
 
 after(async () => {
@@ -225,7 +226,6 @@ async function focusDiag(d, label) {
   } catch (err) {
     act = { error: err.message };
   }
-  const se = sh('osascript', ['-e', 'tell application "System Events" to get {name, unix id} of first application process whose frontmost is true'], { timeoutMs: 10000 });
   const te = sh(
     'osascript',
     ['-e', 'tell application "System Events" to tell process "TextEdit" to get {value, value of attribute "AXSelectedText"} of text area 1 of scroll area 1 of window 1'],
@@ -234,7 +234,6 @@ async function focusDiag(d, label) {
   note(`DIAG ${label}:`, {
     helperPid: d._transport.pid,
     front: act && (act.error || `${act.app} pid ${act.pid}`),
-    systemEventsFront: (se.stdout || se.stderr).trim(),
     textEdit: (te.stdout || te.stderr).trim(),
   });
 }
@@ -520,6 +519,37 @@ test('live-desktop darwin h: typeText, then Cmd+A / Cmd+C put the typed text on 
   assert.equal(copied2, UNICODE);
 });
 
+// ---------------------------------------------------------------- h2. Return, Tab and arrow keys
+
+test('live-desktop darwin h2: typed newlines and tabs, and Shift+Left selection', { skip: SKIP, timeout: 120000 }, async () => {
+  const d = await drv();
+  assert.ok(state.textEdit, 'TextEdit is open (test f)');
+  if (state.perms.accessibility === false) {
+    await expectPermission(d.keyCombo(['shift', 'left']), 'accessibility');
+    return;
+  }
+  assert.equal(await d.focusWindow(state.textEdit.id), true);
+  await sleep(200);
+  await d.keyCombo(['meta', 'a']);
+  await sleep(150);
+  const text = 'one\n\ttwo three';
+  await d.typeText(text);
+  await sleep(300);
+  const all = await selectAllAndCopy(d, 'sentinel-5');
+  note('after typing a newline and a tab:', JSON.stringify(all));
+  assert.equal(all, text, 'Return and Tab were typed as a newline and a tab, replacing the selection');
+  // Cmd+Down to the end of the document, then Shift+Left five times selects "three".
+  await d.keyCombo(['meta', 'down']);
+  await sleep(100);
+  for (let i = 0; i < 5; i++) await d.keyCombo(['shift', 'left']);
+  await sleep(150);
+  await d.clipboardSet('sentinel-6');
+  await d.keyCombo(['meta', 'c']);
+  const word = await clipboardAfterCopy(d, 'sentinel-6');
+  note('after Cmd+Down and 5x Shift+Left:', JSON.stringify(word));
+  assert.equal(word, 'three', 'Shift+Left extends the selection one character at a time');
+});
+
 // ---------------------------------------------------------------- j. Computer: screenshot mapping and click
 
 test('live-desktop darwin j: Computer screenshot coordinates click into TextEdit (scale mapping) and type', { skip: SKIP, timeout: 180000 }, async () => {
@@ -647,6 +677,30 @@ test('live-desktop darwin k: scroll and drag do not throw', { skip: SKIP, timeou
     await comp.drag({ fromX: s.x, fromY: s.y, toX: s.x + 20, toY: s.y + 5 });
   }
   note('scroll, drag and mouseDown/mouseUp completed');
+});
+
+// ---------------------------------------------------------------- k2. minimize and restore
+
+test('live-desktop darwin k2: minimizeWindow hides the TextEdit window and focusWindow restores it', { skip: SKIP, timeout: 120000 }, async () => {
+  const d = await drv();
+  assert.ok(state.textEdit, 'TextEdit is open (test f)');
+  const id = state.textEdit.id;
+  if (state.perms.accessibility === false) {
+    await expectPermission(d.minimizeWindow(id), 'accessibility');
+    return;
+  }
+  const minimized = await d.minimizeWindow(id);
+  note('minimizeWindow:', minimized);
+  assert.equal(minimized, true);
+  const hidden = await waitFor(async () => !(await d.listWindows({ axTitles: false })).some((w) => w.id === id), 8000);
+  assert.ok(hidden, 'the minimized window is no longer listed as on screen');
+  const focused = await d.focusWindow(id);
+  note('focusWindow after minimizing:', focused);
+  assert.equal(focused, true);
+  const back = await waitFor(async () => (await d.listWindows({ axTitles: false })).find((w) => w.id === id), 8000);
+  assert.ok(back, 'the window is on screen again');
+  const active = await d.activeWindow();
+  assert.equal(active && active.app, 'TextEdit');
 });
 
 // ---------------------------------------------------------------- l. quit TextEdit
