@@ -38,6 +38,13 @@ app. Only known chat, mail, office and notes apps relax a plain sentence ("Reboo
 is red.") to medium. In a terminal, with a Return in it, or in an app the classifier does not know, the
 text gets full scrutiny.
 
+The desktop assistant's tools ([DESKTOP.md](DESKTOP.md)) follow the same scale. Reading app controls, on-screen
+text (OCR), the app list, bookmarks and tab titles is low; pressing controls, setting fields, launching apps,
+opening web pages, switching tabs and arranging windows is medium. High: a secret-looking value typed into a field,
+`quit_app` with `force` or on a system process or Claude itself, `launch_app` with a shell or interpreter command,
+`browser_open` with a non-web link or an executable. `batch_actions` is as risky as its riskiest step, its card lists
+every step, and it never gets an "Always (session)" rule; neither does any high desktop-tool call.
+
 | Mode | Asks you for |
 |---|---|
 | `ask` | everything except low |

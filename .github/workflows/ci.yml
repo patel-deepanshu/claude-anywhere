@@ -66,11 +66,13 @@ jobs:
         with:
           node-version: 22
       - name: Install X11 tools
-        run: sudo apt-get update && sudo apt-get install -y xvfb openbox xterm xdotool wmctrl xclip x11-utils x11-xserver-utils imagemagick
+        run: sudo apt-get update && sudo apt-get install -y xvfb openbox xterm xdotool wmctrl xclip x11-utils x11-xserver-utils imagemagick tesseract-ocr python3-gi gir1.2-atspi-2.0 at-spi2-core
       - name: Live driver tests
         run: |
           node --test test/os-linux.test.js test/integration-os-linux.test.js
           xvfb-run -a node --test test/integration-os-core.test.js
+      - name: Desktop assistant (AT-SPI helper, real tesseract)
+        run: node --test test/desktop-linux.test.js test/desktop-ocr.test.js
 
   live-desktop:
     name: Live desktop (${{ matrix.os }})
