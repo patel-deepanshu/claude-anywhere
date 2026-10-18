@@ -137,6 +137,14 @@ const MOCK_WINDOWS = [
   { id: '0x1003', app: 'Terminal', title: 'bash - ~/claude-anywhere', pid: 4103, x: 200, y: 200, width: 900, height: 600, focused: false, minimized: false },
 ];
 
+/** The active tab of each mock browser window, by window id: {url, text, method?}. */
+const MOCK_TABS = {
+  '0x1002': {
+    url: 'https://console.cloud.google.com/run?project=my-project',
+    text: 'Cloud Run\nServices\nshop-api    us-central1    Ready\nshop-web    us-central1    Ready',
+  },
+};
+
 function finite(v, name) {
   const n = Number(v);
   if (!Number.isFinite(n)) throw new TypeError(`mock driver: ${name} must be a finite number (got ${v})`);
@@ -178,7 +186,9 @@ function testPattern(w, h, index, mx, my, markSize) {
  * In-memory driver for tests and demos (ANYWHERE_DRIVER=mock). Records every
  * call in `driver.actions` and tracks cursor, windows, focus and clipboard in
  * `driver.state`. Pressing primary+v "pastes" the clipboard into state.typed.
- * @param {{displays?:object[],windows?:object[],cursor?:{x:number,y:number},clipboard?:string}} [opts]
+ * browserTab() reads state.tabs (window id -> {url, text, method?}); method 'keyboard' (the default)
+ * behaves like the Linux reader: it calls beforeInput and needs keyboard !== false.
+ * @param {{displays?:object[],windows?:object[],cursor?:{x:number,y:number},clipboard?:string,tabs?:object}} [opts]
  */
 function createMockDriver(opts = {}) {
   const displays = (opts.displays || MOCK_DISPLAYS).map((d, i) => ({
@@ -195,6 +205,7 @@ function createMockDriver(opts = {}) {
     cursor: opts.cursor ? { x: opts.cursor.x, y: opts.cursor.y } : { x: 960, y: 540 },
     clipboard: opts.clipboard != null ? String(opts.clipboard) : '',
     windows: (opts.windows || MOCK_WINDOWS).map((w) => ({ ...w })),
+    tabs: Object.fromEntries(Object.entries(opts.tabs || (opts.windows ? {} : MOCK_TABS)).map(([id, t]) => [id, { ...t }])),
     pressed: new Set(),
     typed: '',
     topmost: {},
@@ -312,6 +323,41 @@ function createMockDriver(opts = {}) {
     async clipboardSet(text) {
       state.clipboard = String(text);
       record('clipboardSet', { text: String(text) });
+    },
+    /**
+     * Driver.browserTab: the most recently active browser window (or windowId / app), read from
+     * state.tabs. Same result shape as the real backends (src/os/linux.js readBrowserTab).
+     */
+    async browserTab({ app, windowId, window, includeText = false, maxChars, keyboard = true, beforeInput } = {}) {
+      const tabs = require('./linux');
+      const { window: w, browser } = await tabs.resolveBrowserWindow(driver, { app, windowId, window });
+      const tab = state.tabs[w.id] || {};
+      const method = tab.method || 'keyboard';
+      const usesKeys = method === 'keyboard' || includeText;
+      const result = { browser: browser.name, app: w.app || browser.name, title: w.title || '', url: null, method: 'title', windowId: String(w.id), tookFocus: false };
+      if (usesKeys && keyboard && typeof beforeInput === 'function') await beforeInput();
+      if (tab.url && (method !== 'keyboard' || keyboard)) {
+        result.url = tab.url;
+        result.method = method;
+      }
+      if (usesKeys && keyboard) {
+        result.tookFocus = !w.focused;
+        result.clipboard = 'restored';
+      }
+      if (includeText) {
+        if (keyboard && typeof tab.text === 'string') {
+          const n = maxChars == null ? tabs.DEFAULT_TAB_CHARS : Math.max(1, Math.round(Number(maxChars)) || tabs.DEFAULT_TAB_CHARS);
+          const clipped = tabs.clipTabText(tabs.cleanPageText(tab.text), n);
+          result.text = clipped.text;
+          result.truncated = clipped.truncated;
+          if (clipped.truncated) result.textChars = clipped.total;
+          result.textMethod = 'keyboard';
+        } else {
+          result.text = null;
+        }
+      }
+      record('browserTab', { windowId: String(w.id), includeText: Boolean(includeText), keyboard: keyboard !== false });
+      return result;
     },
     async close() {
       state.closed = true;

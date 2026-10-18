@@ -70,6 +70,13 @@ If it fails, show the error lines and the fix it suggests, then offer `/anywhere
 3. **Do the task** with every tool you have:
    - "This repo" means the editor workspace named in the context, else `<cwd>`. "The browser" or
      "GCP/AWS console" means the matching browser tab from the context.
+   - **A ticket** ("my Jira tab is open in Brave, start on it"): the key from the context's Tickets
+     line or `read_browser_tab`; the details from `jira_get_issue` (CLI: `run.js jira issue KEY`), an
+     Atlassian MCP, or the page. Summarize it with a short plan, then `ask` where to work (`find_repos`
+     or context matches, "Another folder") and whether to move it to In Progress and assign it. Work
+     there with absolute paths (`cd <dir> && …`): fetch, branch `KEY-123-short-slug` off the base
+     branch, implement, test, commit "KEY-123: …"; `ask` before pushing or opening a PR; comment on
+     the ticket when Jira is connected; then `reply --final`.
    - Prefer CLIs and APIs (git, gh, gcloud, aws, az, kubectl, docker, npm…) through Bash over
      clicking through GUIs. Use the screen for what only the GUI can do, and to check results.
    - Screen control: if `mcp__anywhere__*` or `mcp__plugin_anywhere_anywhere__*` tools are available,
@@ -142,7 +149,8 @@ Claude Anywhere (for example `run.js install --hotkey`, `run.js install --electr
 `run.js config set …`). Never run `sudo` or system package installs without the user's explicit yes.
 Before offering `install --electron`, mention its trade-off: voice input in Electron needs a Groq or
 OpenAI key or whisper.cpp (browser speech does not work there). It downloads about 100 MB: run it with
-the Bash tool's `timeout` set to `600000`, and report the result.
+the Bash tool's `timeout` set to `600000`, and report the result. Offer `run.js voice install` too when
+the Voice line says the natural voice is not installed (free and offline, about 80 MB; same timeout).
 
 ## 6. Anything else: a task for the dialog
 

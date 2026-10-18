@@ -5,14 +5,23 @@
  */
 
 import { renderMarkdown } from './markdown.js';
-import { createVoice, parseVoiceIntent, getBrowserVoices } from './voice.js';
+import { createVoice, parseVoiceIntent, getBrowserVoices, rankVoices } from './voice.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const XLINK_NS = 'http://www.w3.org/1999/xlink';
 const EVENT_TYPES = [
   'snapshot', 'status', 'message', 'delta', 'tool_update', 'approval_request', 'approval_resolved', 'question',
   'question_resolved', 'notify', 'result', 'screenshot', 'project', 'session', 'config', 'mode', 'bridge', 'show',
+  'announce', 'voice_install',
 ];
+// Settings never sent back empty: the daemon keeps a saved secret unless a new one is typed.
+const SECRET_FIELDS = new Set(['voice.sttApiKey', 'jira.apiToken']);
+const SETTINGS_TABS = ['general', 'voice', 'work', 'advanced'];
+const JIRA_TOKEN_URL = 'https://id.atlassian.com/manage-profile/security/api-tokens';
+const MAX_ROOTS = 24;
+// voice_install stages → share of the progress bar (the engine is small; most time is the voice).
+const INSTALL_STAGES = { binary: [0, 30], voice: [30, 94], verify: [94, 100], done: [100, 100] };
+const INSTALL_LABEL = { binary: 'Downloading the Piper engine', voice: 'Downloading the voice', verify: 'Checking the voice', done: 'Installed', error: 'Install failed' };
 // 'queued': bridge commands wait for a terminal; Stop and Esc drop them (POST /api/interrupt).
 const BUSY = new Set(['starting', 'thinking', 'acting', 'waiting_approval', 'waiting_answer', 'stopping', 'queued']);
 const MAX_ITEMS = 600;
@@ -237,6 +246,15 @@ const state = {
   handsFreeStarted: false,
   lastHandsFree: undefined,
   lastAlwaysOnTop: undefined,
+  // Settings: the open tab; GET /api/voice/status (null until loaded) or why it failed; the
+  // natural-voice install in progress (SSE voice_install); GET /api/jira/status; the repo
+  // folders list as edited in the drawer.
+  settingsTab: 'general',
+  voiceStatus: null,
+  voiceStatusError: '',
+  voiceInstall: null,
+  jiraStatus: null,
+  roots: [],
 };
 
 const el = {};
@@ -387,6 +405,44 @@ async function api(method, path, body, { timeoutMs = 30000, contentType } = {}) 
   return data;
 }
 
+/**
+ * GET binary data (announcement audio) with the Bearer token.
+ * @param {string} path
+ * @param {{timeoutMs?:number}} [opts]
+ * @returns {Promise<Blob>}
+ */
+async function apiBlob(path, { timeoutMs = 20000 } = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    let res;
+    try {
+      res = await fetch(path, { method: 'GET', headers: { Authorization: `Bearer ${state.token}` }, signal: ctrl.signal, cache: 'no-store', credentials: 'same-origin' });
+    } catch (err) {
+      const e = new Error(err && err.name === 'AbortError' ? 'The request timed out.' : "Can't reach Claude Anywhere. Is it still running?");
+      e.status = 0;
+      throw e;
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      let message = `Request failed (HTTP ${res.status})`;
+      try {
+        const data = JSON.parse(text);
+        if (data && data.error) message = data.error;
+      } catch {
+        /* not JSON */
+      }
+      const e = new Error(message);
+      e.status = res.status;
+      if (res.status === 401) onUnauthorized();
+      throw e;
+    }
+    return await res.blob();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ------------------------------------------------------------------ visibility
 
 /** This page load's id for POST /api/ui/visibility (several dialog pages can be connected). */
@@ -399,7 +455,7 @@ const PAGE_ID = (() => {
   return `page-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 })();
 
-/** Tell the daemon whether this page can be seen (after a 'show' event, and when that changes). */
+/** Tell the daemon whether this page can be seen (when the event stream opens, after a 'show' event, and when that changes). */
 function reportVisibility() {
   if (!state.token) return;
   let focused = false;
@@ -460,6 +516,9 @@ function connect() {
     state.everConnected = true;
     state.offlineDiagnosed = false;
     hideBanner();
+    // The announcer counts a page that has not reported as visible: say at once whether this one
+    // is (a page opened in a background tab must not take the announcements).
+    reportVisibility();
   };
   source.onerror = (ev) => {
     if (es !== source) return;
@@ -612,6 +671,12 @@ const handlers = {
     removeCard(d.id, 'question');
     if (d.timeout) toast('A question from Claude timed out.', 'warning');
   },
+  announce(d) {
+    // The daemon decides what to say and when; only the most recently focused dialog says it.
+    if (!speaker.active) return;
+    voice.announce(d);
+  },
+  voice_install: onVoiceInstall,
   notify: onNotify,
   result: onResult,
   screenshot(d) {
@@ -892,18 +957,35 @@ function buildItem(item) {
   }
 }
 
+/** Hand-off tasks (switch_project) longer than this show their first line, expandable. */
+const HANDOFF_COLLAPSE_CHARS = 240;
+
 function buildUser(item) {
   const meta = [];
+  const handoff = item.source === 'handoff';
   if (item.source === 'voice') meta.push(h('span', null, icon('mic'), 'Voice'));
   else if (item.source === 'cli' || item.source === 'skill') meta.push(h('span', null, icon('terminal'), 'Terminal'));
+  // switch_project: the task Claude handed to the new session in another folder.
+  else if (handoff) meta.push(h('span', null, icon('branch'), 'Handed over by Claude'));
   const imgs = Number(item.images) || 0;
   if (imgs > 0) meta.push(h('span', null, icon('image'), `${imgs} image${imgs === 1 ? '' : 's'}`));
   const time = fmtTime(item.ts);
   if (time) meta.push(h('span', null, time));
+  const text = item.text || '';
+  let body = text;
+  if (handoff && text.length > HANDOFF_COLLAPSE_CHARS) {
+    const first = (text.split(/\r?\n/).find((l) => l.trim()) || text).trim();
+    body = h(
+      'details',
+      { class: 'handoff-task' },
+      h('summary', null, first.length > 200 ? `${first.slice(0, 199)}…` : first),
+      h('div', { class: 'handoff-full' }, text)
+    );
+  }
   return h(
     'div',
-    { class: 'msg user', 'data-id': item.id },
-    h('div', { class: 'bubble' }, item.text || ''),
+    { class: `msg user${handoff ? ' handoff' : ''}`, 'data-id': item.id },
+    h('div', { class: 'bubble' }, body),
     meta.length ? h('div', { class: 'msg-meta' }, meta) : null
   );
 }
@@ -920,6 +1002,8 @@ function buildAssistant(item) {
   const speakBtn = h('button', { type: 'button', class: 'icon-btn icon-btn-sm', 'aria-label': 'Read aloud', title: 'Read aloud' }, icon('volume'));
   speakBtn.addEventListener('click', () => {
     if (voice.isSpeaking()) voice.cancelSpeech();
+    // The daemon's natural voice when it uses one, else the browser's.
+    else if (state.voiceInfo && state.voiceInfo.engine === 'piper') voice.speakNatural(item.text || '');
     else voice.speak(item.text || '');
   });
   return h(
@@ -981,6 +1065,7 @@ function toolBase(name) {
 function toolKind(name) {
   const { server, tool } = toolBase(name);
   if (/chrome|browser|playwright|puppeteer/i.test(server)) return 'web';
+  if (tool === 'read_browser_tab') return 'web';
   if (['screenshot', 'screen_info', 'cursor_position', 'zoom', 'get_desktop_context', 'list_windows', 'focus_window'].includes(tool)) return 'screen';
   if (['click', 'mouse_move', 'drag', 'scroll', 'left_click', 'right_click', 'double_click', 'mouse_down', 'mouse_up'].includes(tool)) return 'mouse';
   if (['type_text', 'key', 'type', 'clipboard_get', 'clipboard_set', 'hotkey'].includes(tool)) return 'keyboard';
@@ -996,6 +1081,9 @@ function toolIcon(name, kind) {
   if (tool === 'todowrite') return 'list';
   if (tool === 'ask_user' || tool === 'askuserquestion') return 'question';
   if (tool === 'notify_user') return 'info';
+  // The ticket workflow: Jira tools (ours or a Jira/Atlassian MCP server's), repositories, hand-off.
+  if (/^jira_/.test(tool) || /atlassian|jira/i.test(toolBase(name).server)) return 'ticket';
+  if (tool === 'find_repos' || tool === 'switch_project') return 'folder';
   return { screen: 'screen', mouse: 'mouse', keyboard: 'keyboard', terminal: 'terminal', file: 'file', web: 'web' }[kind] || 'tool';
 }
 
@@ -1195,6 +1283,9 @@ function focusCard(node) {
 function removeCard(id, kind) {
   if (kind === 'approval') state.approvals.delete(id);
   else state.questions.delete(id);
+  // Answered: an announcement of it still waiting (or being said) is no longer news.
+  if (kind === 'approval' && !state.approvals.size) voice.dropAnnouncements('permission');
+  if (kind === 'question' && !state.questions.size) voice.dropAnnouncements('question');
   renderComposerButtons();
   const n = cardNodes.get(id);
   if (!n) return;
@@ -1536,10 +1627,13 @@ function renderFooter() {
   } catch {
     /* voice not ready */
   }
-  el.sbStt.textContent = providerLabel(p.sttName);
-  el.sbTts.textContent = providerLabel(p.ttsName);
   const vi = state.voiceInfo || {};
-  el.sbVoice.title = `Speech input: ${providerLabel(p.sttName)}${vi.sttHint && p.stt !== 'browser' ? ` (${vi.sttHint})` : ''}\nSpeech output: ${providerLabel(p.ttsName)}`;
+  // The daemon's natural voice speaks announcements (and read-alouds) when it is in use.
+  const natural = Boolean(vi.announcer && vi.engine === 'piper' && p.tts !== 'off');
+  const ttsLabel = natural ? 'Natural' : providerLabel(p.ttsName);
+  el.sbStt.textContent = providerLabel(p.sttName);
+  el.sbTts.textContent = ttsLabel;
+  el.sbVoice.title = `Speech input: ${providerLabel(p.sttName)}${vi.sttHint && p.stt !== 'browser' ? ` (${vi.sttHint})` : ''}\nSpeech output: ${natural ? `Natural voice (Piper${vi.piper && vi.piper.voice ? `, ${vi.piper.voice}` : ''})` : ttsLabel}`;
 }
 
 // ------------------------------------------------------------------ Claude's view and lightbox
@@ -1745,17 +1839,25 @@ function settingsFields() {
   return [...el.settingsForm.querySelectorAll('[data-key]')];
 }
 
+/** "Microsoft Aria Online (Natural) - English (United States)" → "Aria (Natural)". */
+function shortVoiceName(name) {
+  return String(name || '')
+    .replace(/^Microsoft\s+/i, '')
+    .replace(/\s+-\s+.*$/, '')
+    .replace(/\s+Online\s+\(Natural\)/i, ' (Natural)')
+    .trim();
+}
+
 function populateVoices(selected) {
   const voices = getBrowserVoices();
   const lang = String((state.config && state.config.voice && state.config.voice.language) || navigator.language || 'en').toLowerCase();
-  const prefix = lang.split('-')[0];
-  const sorted = [...voices].sort((a, b) => {
-    const ra = a.lang && a.lang.toLowerCase().startsWith(prefix) ? 0 : 1;
-    const rb = b.lang && b.lang.toLowerCase().startsWith(prefix) ? 0 : 1;
-    return ra - rb || String(a.name).localeCompare(String(b.name));
-  });
-  const opts = [h('option', { value: '' }, voices.length ? 'System default' : 'System default (no browser voices found)')];
-  for (const v of sorted) opts.push(h('option', { value: v.name }, `${v.name} (${v.lang || '?'})${v.localService === false ? ' · online' : ''}`));
+  // The language's voices, most natural first, then every other voice by name.
+  const ranked = rankVoices(voices, lang);
+  const rest = voices.filter((v) => !ranked.includes(v)).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  const best = ranked[0];
+  const first = !voices.length ? 'Most natural available (no browser voices found)' : best ? `Most natural available: ${shortVoiceName(best.name)}` : 'System default';
+  const opts = [h('option', { value: '' }, first)];
+  for (const v of [...ranked, ...rest]) opts.push(h('option', { value: v.name }, `${v.name} (${v.lang || '?'})${v.localService === false ? ' · online' : ''}`));
   if (selected && !voices.some((v) => v.name === selected)) opts.push(h('option', { value: selected }, `${selected} (not in this browser)`));
   el.ttsVoice.replaceChildren(...opts);
   el.ttsVoice.value = selected || '';
@@ -1774,14 +1876,31 @@ function populateSettings({ keepEdits = false } = {}) {
     const key = input.dataset.key;
     if (keepEdits && state.formDirty.has(key)) continue;
     const val = key === 'mode' ? state.mode : getPath(cfg, key);
-    if (input.type === 'checkbox') input.checked = Boolean(val);
+    if (input === el.roots) {
+      state.roots = Array.isArray(val) ? val.filter((x) => typeof x === 'string' && x.trim()) : [];
+      renderRoots();
+    } else if (input.type === 'checkbox') input.checked = Boolean(val);
     else if (input.type === 'radio') input.checked = String(val) === input.value;
-    else if (input === el.sttKey) {
+    else if (SECRET_FIELDS.has(key)) {
+      // Secrets never come back from the daemon: an empty field keeps the saved one.
+      const [section, name] = key.split('.');
+      const isSet = Boolean(cfg[section] && cfg[section][`${name}Set`]);
       input.value = '';
-      input.placeholder = cfg.voice && cfg.voice.sttApiKeySet ? '•••• set (type to replace)' : 'Not set';
+      if (input === el.jiraToken) {
+        input.placeholder = isSet ? 'Saved. Paste a new token to replace it' : 'Paste your API token';
+        el.jiraTokenSet.hidden = !isSet;
+      } else {
+        input.placeholder = isSet ? '•••• set (type to replace)' : 'Not set';
+      }
     } else if (input === el.ttsVoice) populateVoices(val || '');
+    else if (input === el.piperVoice) populatePiperVoices(val || '');
     else if (input.type === 'range') input.value = String(val == null ? 1 : val);
-    else input.value = val == null ? '' : String(val);
+    else if (input.tagName === 'SELECT') {
+      // A value this form has no option for (a newer daemon's) stays selected, so Save can't change it unasked.
+      const v = val == null ? '' : String(val);
+      if (v && ![...input.options].some((o) => o.value === v)) input.append(h('option', { value: v }, v));
+      input.value = v;
+    } else input.value = val == null ? '' : String(val);
   }
   let base;
   try {
@@ -1792,6 +1911,8 @@ function populateSettings({ keepEdits = false } = {}) {
   state.formBase = { config: base, mode: state.mode };
   updateSettingsHelp();
   renderAbout();
+  renderPiper();
+  renderJiraState();
 }
 
 /** The config changed (here or elsewhere) while the drawer is open: keep the user's edits. */
@@ -1820,22 +1941,55 @@ function renderAbout() {
     ['Server speech-to-text', vi.serverStt ? providerLabel(vi.sttProvider) : vi.sttHint || 'not configured'],
     ['Server text-to-speech', vi.serverTts ? providerLabel(vi.ttsProvider) : vi.ttsHint || 'not available'],
   ];
+  if (vi.announcer !== undefined) {
+    const piper = vi.piper || {};
+    rows.push(['Natural voice', vi.engine === 'piper' ? `in use${piper.voice ? ` (${piper.voice})` : ''}` : piper.installed ? 'installed' : 'not installed']);
+    rows.push(['Announcements', vi.announcer ? 'spoken by Claude Anywhere' : 'this window only']);
+  }
   el.about.replaceChildren(h('dl', null, rows.map(([k, v]) => [h('dt', null, k), h('dd', null, v)])));
   const diag = [];
   if (!SR && !vi.serverStt) diag.push('Voice input needs Chrome, Edge or Safari, or a server transcription provider (a Groq or OpenAI key, or whisper.cpp).');
   el.voiceDiag.textContent = diag.join(' ');
 }
 
+function activePanel() {
+  return el.settingsForm.querySelector(`.set-panel[data-panel="${state.settingsTab}"]`) || el.settingsForm;
+}
+
+/**
+ * Show one settings tab. Fields of the other tabs stay in the form, so Save still sends them.
+ * @param {string} name general | voice | work | advanced
+ * @param {{focusTab?:boolean}} [opts]
+ */
+function selectTab(name, { focusTab = false } = {}) {
+  const tab = SETTINGS_TABS.includes(name) ? name : 'general';
+  state.settingsTab = tab;
+  for (const b of el.setTabs.querySelectorAll('[role="tab"]')) {
+    const on = b.dataset.tab === tab;
+    b.setAttribute('aria-selected', String(on));
+    b.tabIndex = on ? 0 : -1;
+    if (on && focusTab) b.focus();
+  }
+  for (const p of el.settingsForm.querySelectorAll('.set-panel')) p.hidden = p.dataset.panel !== tab;
+  el.settingsForm.scrollTop = 0;
+  if (tab === 'work') suggestRoots();
+}
+
 function openSettings() {
   closePopover(false);
   drawerReturn = document.activeElement;
   populateSettings();
+  selectTab(state.settingsTab);
   el.drawerBackdrop.hidden = false;
   el.drawer.hidden = false;
   el.openSettings.setAttribute('aria-expanded', 'true');
   // A selector list matches in document order (the close button comes first): ask in order of preference.
-  const first = el.settingsForm.querySelector('input:checked') || el.settingsForm.querySelector('input, select, button') || el.closeSettings;
+  const panel = activePanel();
+  const first = panel.querySelector('input:checked') || panel.querySelector('input, select, button') || el.closeSettings;
   first.focus();
+  // What the daemon can do beyond the config: natural voices and the Jira connection.
+  loadVoiceStatus();
+  loadJiraStatus();
 }
 
 function closeSettings(returnFocus) {
@@ -1846,6 +2000,31 @@ function closeSettings(returnFocus) {
   applyTheme();
   if (returnFocus && drawerReturn && drawerReturn.focus) drawerReturn.focus();
   drawerReturn = null;
+}
+
+/**
+ * A Jira site address as the daemon wants it: https://host[/context], without a page path
+ * someone pasted from the browser (/browse/KEY-1, /jira/software/…), a query or a slash at the end.
+ * @param {string} raw
+ * @returns {string} '' when empty
+ */
+function normalizeJiraUrl(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return '';
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = `https://${s}`;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    throw new Error('The Jira site URL isn’t a web address. It looks like https://your-company.atlassian.net');
+  }
+  if ((u.protocol !== 'https:' && u.protocol !== 'http:') || !u.hostname || u.username || u.password) {
+    throw new Error('The Jira site URL must be an https:// address without a user name, like https://your-company.atlassian.net');
+  }
+  let p = u.pathname.replace(/\/+$/, '');
+  if (/\.atlassian\.net$/i.test(u.hostname) || /\.jira\.com$/i.test(u.hostname)) p = '';
+  else p = p.replace(/\/(?:browse|secure|projects|issues|software|plugins|rest|login\.jsp|jira\/software)(?:[/?#.].*)?$/i, '');
+  return `${u.protocol}//${u.host.toLowerCase()}${p}`;
 }
 
 /**
@@ -1860,6 +2039,13 @@ function collectSettings() {
   let mode = null;
   for (const input of settingsFields()) {
     const key = input.dataset.key;
+    if (input === el.roots) {
+      const cur = getPath(cfg, key);
+      const next = state.roots.slice();
+      if (cur === undefined && !state.formDirty.has(key)) continue;
+      if (JSON.stringify(Array.isArray(cur) ? cur : []) !== JSON.stringify(next)) setPath(partial, key, next);
+      continue;
+    }
     let val;
     if (input.type === 'checkbox') val = input.checked;
     else if (input.type === 'radio') {
@@ -1870,7 +2056,8 @@ function collectSettings() {
       val = Number(input.value);
       if (!Number.isFinite(val) || val < 0) throw new Error(`${fieldName(input)} must be a number of zero or more.`);
     } else val = input.value.trim();
-    if (key === 'voice.sttApiKey') {
+    if (SECRET_FIELDS.has(key)) {
+      // Never sent empty: that would read as "no change" at best and wipe the saved secret at worst.
       if (val) setPath(partial, key, val);
       continue;
     }
@@ -1879,6 +2066,9 @@ function collectSettings() {
       continue;
     }
     const cur = getPath(cfg, key);
+    // A setting this daemon doesn't know (an older version) is sent only when it was edited.
+    if (cur === undefined && !state.formDirty.has(key)) continue;
+    if (key === 'jira.baseUrl') val = normalizeJiraUrl(val);
     if (cur === val || (cur == null && val === '')) continue;
     // The form has novalidate (a stored value off the input's step or range must not block
     // saving other fields), so check the range here, and only for what was changed.
@@ -1933,7 +2123,7 @@ async function saveSettings() {
 
 function trapFocus(e) {
   if (e.key !== 'Tab' || el.drawer.hidden) return;
-  const focusables = [...el.drawer.querySelectorAll('button, input, select, textarea, summary, [tabindex]:not([tabindex="-1"])')].filter(
+  const focusables = [...el.drawer.querySelectorAll('button, input, select, textarea, summary, a[href], [tabindex]:not([tabindex="-1"])')].filter(
     (n) => !n.disabled && n.offsetParent !== null
   );
   if (!focusables.length) return;
@@ -1946,6 +2136,459 @@ function trapFocus(e) {
     e.preventDefault();
     first.focus();
   }
+}
+
+// natural voice (Piper)
+
+function catalogEntry(id) {
+  const piper = (state.voiceStatus && state.voiceStatus.piper) || {};
+  const list = Array.isArray(piper.catalog) ? piper.catalog : [];
+  return list.find((v) => v && v.id === id) || null;
+}
+
+function languageName(code) {
+  const c = String(code || '').replace(/_/g, '-');
+  if (!/^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(c)) return String(code || '');
+  try {
+    return new Intl.DisplayNames(['en'], { type: 'language' }).of(c) || c;
+  } catch {
+    return c;
+  }
+}
+
+/** "en_US-lessac-medium" → "Lessac". */
+function voiceIdName(id) {
+  const m = /^[a-z]{2,3}[_-][A-Za-z]{2,3}-(.+?)(?:-(?:x_low|low|medium|high))?$/.exec(String(id || ''));
+  const name = (m ? m[1] : String(id || '')).replace(/[_-]+/g, ' ');
+  return name.replace(/\b\p{L}/gu, (c) => c.toUpperCase());
+}
+
+function fmtSize(mb) {
+  const n = Number(mb);
+  if (!(n > 0)) return '';
+  return n >= 1000 ? `${(n / 1000).toFixed(1)} GB` : `${Math.round(n)} MB`;
+}
+
+/** "Lessac · American English, female", plus the quality when not the usual medium, and the size to download. */
+function piperLabel(v, installed) {
+  const parts = [v.name || voiceIdName(v.id)];
+  const lang = v.language ? languageName(v.language) : '';
+  const who = [lang, v.gender ? String(v.gender).toLowerCase() : ''].filter(Boolean).join(', ');
+  if (who) parts.push(who);
+  const q = v.quality ? String(v.quality).replace(/_/g, ' ').toLowerCase() : '';
+  if (q && q !== 'medium') parts.push(`${q} quality`);
+  if (!installed && fmtSize(v.sizeMb)) parts.push(fmtSize(v.sizeMb));
+  return parts.join(' · ');
+}
+
+/** The Piper voice picker: installed voices first, then the free downloads with their sizes. */
+function populatePiperVoices(selected) {
+  const piper = (state.voiceStatus && state.voiceStatus.piper) || {};
+  const catalog = Array.isArray(piper.catalog) ? piper.catalog.filter((v) => v && typeof v.id === 'string' && v.id) : [];
+  const installed = new Set(Array.isArray(piper.installedVoices) ? piper.installedVoices.filter((x) => typeof x === 'string') : []);
+  const have = catalog.filter((v) => installed.has(v.id));
+  for (const id of installed) if (!catalog.some((v) => v.id === id)) have.push({ id });
+  const get = catalog.filter((v) => !installed.has(v.id));
+  const nodes = [];
+  if (have.length) nodes.push(h('optgroup', { label: 'On this computer' }, have.map((v) => h('option', { value: v.id }, piperLabel(v, true)))));
+  if (get.length) nodes.push(h('optgroup', { label: 'Free to download' }, get.map((v) => h('option', { value: v.id }, piperLabel(v, false)))));
+  const known = [...have, ...get];
+  // The saved voice always has an option, so an untouched picker never changes it.
+  if (selected && !known.some((v) => v.id === selected)) nodes.unshift(h('option', { value: selected }, voiceIdName(selected)));
+  if (!nodes.length) nodes.push(h('option', { value: '' }, 'No voices listed'));
+  el.piperVoice.replaceChildren(...nodes);
+  el.piperVoice.value = selected || (known[0] ? known[0].id : '');
+}
+
+/** GET /api/voice/status: what is installed and what can be downloaded. */
+async function loadVoiceStatus() {
+  try {
+    const st = await api('GET', '/api/voice/status', undefined, { timeoutMs: 10000 });
+    state.voiceStatus = st && typeof st === 'object' ? st : null;
+    state.voiceStatusError = '';
+    if (state.voiceStatus) {
+      // Keep the snapshot's summary in step until the daemon sends a new one.
+      const vi = state.voiceInfo || {};
+      const piper = state.voiceStatus.piper || {};
+      // An install already running (this page was reloaded, or the CLI started it): show it.
+      const running = piper.installing;
+      if (running && typeof running === 'object' && typeof running.stage === 'string' && !(state.voiceInstall && state.voiceInstall.active)) {
+        state.voiceInstall = { active: true, stage: running.stage, percent: Number(running.percent) || 0, overall: 'stagePercent' in running, message: running.message || '', voice: running.voice || null, startedHere: false, reached: 0 };
+      }
+      state.voiceInfo = {
+        ...vi,
+        engine: state.voiceStatus.engine !== undefined ? state.voiceStatus.engine : vi.engine,
+        piper: { ...(vi.piper || {}), installed: Boolean(piper.installed), voice: piper.voice || (vi.piper && vi.piper.voice) || null },
+      };
+    }
+  } catch (err) {
+    state.voiceStatus = null;
+    // 404: a daemon without the route; 503: one without neural voice support.
+    state.voiceStatusError = err.status === 404 || err.status === 503 ? 'unsupported' : err.message || 'unknown error';
+  }
+  if (!el.drawer.hidden) {
+    const selected = state.formDirty.has('voice.piperVoice') ? el.piperVoice.value : getPath(state.config || {}, 'voice.piperVoice') || el.piperVoice.value;
+    populatePiperVoices(selected || '');
+    renderPiper();
+    renderAbout();
+  }
+  renderFooter();
+}
+
+function renderPiper() {
+  const st = state.voiceStatus;
+  const piper = (st && st.piper) || {};
+  const inst = state.voiceInstall;
+  const installing = Boolean(inst && inst.active);
+  const failed = Boolean(inst && inst.stage === 'error');
+  const selected = el.piperVoice.value;
+  const installedVoices = new Set(Array.isArray(piper.installedVoices) ? piper.installedVoices : []);
+  const engineReady = Boolean(piper.installed);
+  const voiceReady = engineReady && (!selected || installedVoices.has(selected));
+  const unsupported = state.voiceStatusError === 'unsupported';
+  const entry = catalogEntry(selected);
+  const size = entry ? fmtSize(entry.sizeMb) : '';
+  const vi = state.voiceInfo || {};
+
+  let tag = ['unknown', 'Checking…'];
+  if (installing) tag = ['busy', 'Installing'];
+  else if (failed) tag = ['error', 'Failed'];
+  else if (unsupported) tag = ['off', 'Unavailable'];
+  else if (state.voiceStatusError) tag = ['error', 'Unknown'];
+  else if (st) tag = engineReady ? (vi.engine === 'piper' ? ['ok', 'In use'] : ['ok', 'Installed']) : ['off', 'Not installed'];
+  el.piperState.dataset.state = tag[0];
+  el.piperState.textContent = tag[1];
+
+  el.piperVoice.disabled = !st || installing;
+  el.piperProgress.hidden = !(installing || failed || (inst && inst.stage === 'done'));
+  if (inst) {
+    const pct = installPercent(inst);
+    el.piperFill.style.width = `${pct}%`;
+    el.piperBar.setAttribute('aria-valuenow', String(pct));
+    el.piperProgress.dataset.state = inst.stage === 'error' ? 'error' : inst.stage === 'done' ? 'done' : 'busy';
+    const label = INSTALL_LABEL[inst.stage] || 'Installing';
+    // The daemon's own words when it sends them ("Downloading Piper… 12 MB of 25 MB").
+    el.piperProgressText.textContent =
+      inst.stage === 'error' ? inst.message || label : inst.stage === 'done' ? inst.message || label : `${pct}% · ${inst.message || `${label}…`}`;
+  }
+
+  el.piperInstall.hidden = !st || (voiceReady && !installing);
+  el.piperInstall.disabled = installing;
+  el.piperInstallLabel.textContent = installing ? 'Installing…' : failed ? 'Try again' : engineReady ? `Download this voice${size ? ` (${size})` : ''}` : 'Install natural voice';
+  el.voiceTest.disabled = installing;
+
+  const engine = el.ttsEngine.value;
+  let help = '';
+  if (unsupported) help = 'Natural voices need a newer Claude Anywhere. Update it, then restart (anywhere restart).';
+  else if (state.voiceStatusError) help = `Couldn’t check the natural voice: ${state.voiceStatusError}`;
+  else if (!st) help = '';
+  else if (!engineReady) help = `A free, one-time download${size ? ` (about ${size} with this voice)` : ''}. After that it speaks without the internet, and nothing you hear leaves this computer.`;
+  else if (!voiceReady) help = `This voice isn’t downloaded yet${size ? ` (${size})` : ''}.`;
+  else if (engine === 'browser' || engine === 'os') help = `Installed. The voice engine is set to ${engine === 'os' ? 'the system voice' : 'the browser voice'}; choose Automatic or Natural to hear it.`;
+  else help = 'Speaks offline on this computer. Test it to hear a sample.';
+  el.piperHelp.textContent = help;
+  el.piperCard.classList.toggle('dim', engine === 'browser' || engine === 'os');
+}
+
+/**
+ * The bar's position. A daemon that also sends stagePercent reports `percent` for the whole
+ * install; with only {stage, percent}, `percent` is the stage's own and is placed in its share
+ * of the bar. Never moves back (an error keeps where it got to).
+ */
+function installPercent(inst) {
+  const raw = Math.max(0, Math.min(100, Number(inst.percent) || 0));
+  let pct;
+  if (inst.stage === 'error') pct = Math.max(raw, Number(inst.reached) || 0);
+  else if (inst.stage === 'done') pct = 100;
+  else if (inst.overall) pct = Math.round(raw);
+  else {
+    const [from, to] = INSTALL_STAGES[inst.stage] || [0, 100];
+    pct = Math.round(from + ((to - from) * raw) / 100);
+  }
+  pct = Math.max(pct, inst.stage === 'error' ? 0 : Number(inst.reached) || 0);
+  inst.reached = pct;
+  return pct;
+}
+
+/** SSE voice_install {stage, percent, message}: from this window's Install or the CLI's. */
+function onVoiceInstall(d) {
+  const stage = typeof d.stage === 'string' ? d.stage : '';
+  if (!stage) return;
+  const prev = state.voiceInstall || {};
+  const active = stage !== 'done' && stage !== 'error';
+  // A new install (another voice, or after a finished one) starts its bar from zero.
+  const fresh = !prev.active || (typeof d.voice === 'string' && prev.voice && d.voice !== prev.voice);
+  state.voiceInstall = {
+    ...(fresh ? { voice: typeof d.voice === 'string' ? d.voice : prev.voice || null, startedHere: Boolean(prev.startedHere && prev.active) } : prev),
+    active,
+    stage,
+    percent: Number(d.percent) || 0,
+    overall: Object.prototype.hasOwnProperty.call(d, 'stagePercent'),
+    message: typeof d.message === 'string' ? d.message : '',
+  };
+  if (fresh) state.voiceInstall.reached = 0;
+  if (stage === 'done') {
+    toast('Natural voice installed. Claude speaks with it from now on.', 'success');
+    (async () => {
+      if (prev.voice && prev.startedHere) await useInstalledVoice(prev.voice);
+      await loadVoiceStatus();
+    })();
+    setTimeout(() => {
+      if (state.voiceInstall && state.voiceInstall.stage === 'done') {
+        state.voiceInstall = null;
+        renderPiper();
+      }
+    }, 3000);
+  } else if (stage === 'error') {
+    toast(`Couldn’t install the natural voice: ${state.voiceInstall.message || 'unknown error'}`, 'error');
+    loadVoiceStatus();
+  }
+  renderPiper();
+}
+
+/** The voice the user installed from the picker becomes the one in use. */
+async function useInstalledVoice(id) {
+  if (getPath(state.config || {}, 'voice.piperVoice') === id) return;
+  try {
+    await api('POST', '/api/voice/use', { voice: id }, { timeoutMs: 15000 });
+    // Saved now: Save must not send it again, and a config refresh may update the picker.
+    if (state.formBase && state.formBase.config) setPath(state.formBase.config, 'voice.piperVoice', id);
+    state.formDirty.delete('voice.piperVoice');
+  } catch {
+    // Left as an edit in the form: Save stores it.
+    state.formDirty.add('voice.piperVoice');
+  }
+}
+
+async function installNaturalVoice() {
+  if (state.voiceInstall && state.voiceInstall.active) return;
+  const id = el.piperVoice.value || '';
+  state.voiceInstall = { active: true, stage: 'binary', percent: 0, reached: 0, message: '', voice: id || null, startedHere: true };
+  renderPiper();
+  try {
+    const res = (await api('POST', '/api/voice/install', id ? { voice: id } : {}, { timeoutMs: 30000 })) || {};
+    if (res.started === false && state.voiceInstall && state.voiceInstall.active) {
+      // Another install (the CLI's) is already running: follow that one.
+      const other = typeof res.voice === 'string' ? res.voice : null;
+      state.voiceInstall = { ...state.voiceInstall, voice: other, startedHere: false };
+      toast(`Already installing ${other ? voiceIdName(other) : 'a voice'}. Try again when it's done.`, 'info');
+    }
+  } catch (err) {
+    const message = err.status === 404 ? 'This version of Claude Anywhere can’t install voices. Update it, then try again.' : `${err.message}${err.hint ? ` ${err.hint}` : ''}`;
+    state.voiceInstall = { active: false, stage: 'error', percent: 0, message, voice: id || null };
+    renderPiper();
+    toast(`Couldn’t install the natural voice: ${message}`, 'error');
+  }
+}
+
+async function testVoice() {
+  const sel = el.piperVoice.value;
+  const entry = catalogEntry(sel);
+  const text = (entry && typeof entry.sampleText === 'string' && entry.sampleText.trim()) || "Hi! This is how I'll sound when I tell you the work is done.";
+  const savedVoice = getPath(state.config || {}, 'voice.piperVoice');
+  const savedEngine = getPath(state.config || {}, 'voice.ttsEngine');
+  // The sample comes back as an announcement: this window should be the one that plays it.
+  speaker.claim();
+  el.voiceTest.disabled = true;
+  try {
+    await api('POST', '/api/voice/test', { text }, { timeoutMs: 30000 });
+    if ((sel && savedVoice !== undefined && sel !== savedVoice) || (savedEngine !== undefined && el.ttsEngine.value !== savedEngine)) {
+      toast('Playing your saved voice. Save to switch to the one you picked.', 'info', { timeout: 5000 });
+    }
+  } catch (err) {
+    if (err.status === 404) voice.speak(text);
+    else toast(`Couldn’t play the test: ${err.message}${err.hint ? ` ${err.hint}` : ''}`, 'error');
+  } finally {
+    setTimeout(() => {
+      el.voiceTest.disabled = Boolean(state.voiceInstall && state.voiceInstall.active);
+    }, 800);
+  }
+}
+
+// Jira
+
+async function loadJiraStatus() {
+  try {
+    const st = await api('GET', '/api/jira/status', undefined, { timeoutMs: 8000 });
+    state.jiraStatus = st && typeof st === 'object' ? st : null;
+  } catch {
+    state.jiraStatus = null;
+  }
+  renderJiraState();
+}
+
+function renderJiraState() {
+  const st = state.jiraStatus;
+  const cfg = (state.config && state.config.jira) || {};
+  if (!st) {
+    el.jiraState.hidden = true;
+  } else {
+    el.jiraState.hidden = false;
+    el.jiraState.dataset.state = st.configured ? 'ok' : 'off';
+    el.jiraState.textContent = st.configured ? (st.deployment ? `Jira ${st.deployment}` : 'Set up') : 'Not set up';
+  }
+  // Set up through the environment (JIRA_BASE_URL…): say so where the fields are empty.
+  const fromEnv = Boolean(st && st.configured && !cfg.baseUrl && st.baseUrl);
+  el.jiraUrl.placeholder = fromEnv ? `${st.baseUrl} (from the environment)` : 'https://your-company.atlassian.net';
+  el.jiraEmail.placeholder = fromEnv && st.email ? `${st.email} (from the environment)` : 'you@company.com';
+  // A token from JIRA_API_TOKEN (or the like) is in use although none is saved here.
+  const tokenFromEnv = Boolean(st && st.tokenSet && !cfg.apiTokenSet && st.source && /^env:/.test(String(st.source.apiToken || '')));
+  if (tokenFromEnv && !el.jiraToken.value) el.jiraToken.placeholder = 'From the environment (paste one to save it here)';
+}
+
+function showJiraResult(kind, text) {
+  el.jiraResult.dataset.state = kind;
+  if (!text) {
+    el.jiraResult.replaceChildren();
+    return;
+  }
+  const ic = kind === 'ok' ? icon('check', 'icon-sm') : kind === 'error' ? icon('alert', 'icon-sm') : icon('spinner', 'icon-sm spin');
+  el.jiraResult.replaceChildren(ic, h('span', null, text));
+}
+
+/** POST /api/jira/test with what is in the form now (fields left empty come from the saved config). */
+async function testJira() {
+  let baseUrl;
+  try {
+    baseUrl = normalizeJiraUrl(el.jiraUrl.value);
+  } catch (err) {
+    showJiraResult('error', err.message);
+    return;
+  }
+  const saved = (state.config && state.config.jira) || {};
+  if (!baseUrl && !saved.baseUrl && !(state.jiraStatus && state.jiraStatus.configured)) {
+    showJiraResult('error', 'Enter your Jira site URL first.');
+    el.jiraUrl.focus();
+    return;
+  }
+  const body = {};
+  if (baseUrl) body.baseUrl = baseUrl;
+  const email = el.jiraEmail.value.trim();
+  if (email) body.email = email;
+  const token = el.jiraToken.value.trim();
+  if (token) body.apiToken = token;
+  el.jiraTest.disabled = true;
+  showJiraResult('busy', 'Connecting…');
+  try {
+    const res = (await api('POST', '/api/jira/test', body, { timeoutMs: 30000 })) || {};
+    const u = res.user || {};
+    const who = u.displayName || u.email || 'your account';
+    showJiraResult('ok', `Connected as ${who}${u.displayName && u.email ? ` (${u.email})` : ''}${res.deployment ? ` · Jira ${res.deployment}` : ''}`);
+  } catch (err) {
+    const missing = err.status === 404 && /^not found$/i.test(String(err.message || ''));
+    showJiraResult('error', missing ? 'This version of Claude Anywhere can’t connect to Jira. Update it, then try again.' : `${err.message}${err.hint ? ` ${err.hint}` : ''}`);
+  } finally {
+    el.jiraTest.disabled = false;
+  }
+}
+
+// repo folders (workspace.roots)
+
+function rootKey(p) {
+  const s = String(p || '').replace(/[\\/]+$/, '');
+  // Windows paths compare without case.
+  return /^[A-Za-z]:|\\/.test(p) ? s.toLowerCase() : s;
+}
+
+/**
+ * Tidy a typed folder: no surrounding quotes (Windows "Copy as path"), no trailing separator.
+ * @returns {string} the folder, or throws when it isn't a full path
+ */
+function cleanRoot(raw) {
+  let s = String(raw || '').trim();
+  s = s.replace(/^(["'])(.*)\1$/, '$2').trim();
+  if (!s) return '';
+  if (!/^(?:~(?:[\\/]|$)|\/|[A-Za-z]:[\\/]|\\\\[^\\]+\\)/.test(s)) {
+    throw new Error('Use a full folder path, like ~/code, /home/you/repos or C:\\Users\\you\\repos.');
+  }
+  if (s.length > 1024) throw new Error('That folder path is too long.');
+  if (!/^(?:\/|[A-Za-z]:[\\/]|~[\\/]?)$/.test(s)) s = s.replace(/[\\/]+$/, '');
+  return s;
+}
+
+function renderRoots() {
+  const list = state.roots;
+  const items = list.map((p, i) => {
+    const rm = h('button', { type: 'button', class: 'icon-btn icon-btn-sm root-remove', 'aria-label': `Remove ${p}`, title: 'Remove' }, icon('x'));
+    rm.addEventListener('click', () => {
+      state.roots = state.roots.filter((_, j) => j !== i);
+      state.formDirty.add('workspace.roots');
+      renderRoots();
+      const next = el.rootsList.querySelectorAll('.root-remove')[Math.min(i, state.roots.length - 1)];
+      if (next) next.focus();
+      else el.rootsInput.focus();
+    });
+    return h('li', { class: 'root-item' }, icon('folder', 'icon-sm'), h('span', { class: 'root-path', title: p }, h('bdi', null, p)), rm);
+  });
+  el.rootsList.replaceChildren(...(items.length ? items : [h('li', { class: 'roots-empty' }, 'No folders yet. Add the one that holds your repos, like ~/code.')]));
+  el.rootsAdd.disabled = list.length >= MAX_ROOTS;
+  el.rootsInput.disabled = list.length >= MAX_ROOTS;
+  renderRootSuggestions();
+}
+
+function addRoot(raw) {
+  let p;
+  try {
+    p = cleanRoot(raw == null ? el.rootsInput.value : raw);
+  } catch (err) {
+    el.rootsError.textContent = err.message;
+    el.rootsError.hidden = false;
+    el.rootsInput.focus();
+    return;
+  }
+  el.rootsError.hidden = true;
+  if (!p) {
+    el.rootsInput.focus();
+    return;
+  }
+  if (state.roots.some((r) => rootKey(r) === rootKey(p))) {
+    el.rootsError.textContent = 'That folder is already in the list.';
+    el.rootsError.hidden = false;
+    return;
+  }
+  if (state.roots.length >= MAX_ROOTS) return;
+  state.roots = [...state.roots, p];
+  state.formDirty.add('workspace.roots');
+  if (raw == null) el.rootsInput.value = '';
+  renderRoots();
+  el.rootsInput.focus();
+}
+
+// Parent folders of the projects the daemon found (open editors, recent sessions).
+let rootSuggestions = [];
+
+async function suggestRoots() {
+  try {
+    const res = await api('GET', '/api/projects', undefined, { timeoutMs: 15000 });
+    const counts = new Map();
+    for (const p of Array.isArray(res.projects) ? res.projects : []) {
+      const dir = String((p && p.dir) || '');
+      const m = /^(.*?)[\\/][^\\/]+[\\/]?$/.exec(dir);
+      if (!m || !m[1]) continue;
+      const parent = m[1];
+      // Not a drive or file-system root, nor a home folder itself (/home/you, /Users/you, C:\Users\you).
+      if (/^(?:[A-Za-z]:)?$/.test(parent) || /^(?:\/home|\/Users|[A-Za-z]:\\Users)[\\/][^\\/]+$/i.test(parent) || parent === '/root') continue;
+      counts.set(parent, (counts.get(parent) || 0) + 1);
+    }
+    rootSuggestions = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([dir]) => dir);
+  } catch {
+    rootSuggestions = [];
+  }
+  renderRootSuggestions();
+}
+
+function renderRootSuggestions() {
+  const have = new Set(state.roots.map(rootKey));
+  const list = rootSuggestions.filter((d) => !have.has(rootKey(d))).slice(0, 3);
+  el.rootsSuggest.hidden = !list.length || state.roots.length >= MAX_ROOTS;
+  el.rootsSuggest.replaceChildren(
+    h('span', { class: 'roots-suggest-label' }, 'Suggested'),
+    ...list.map((d) => {
+      const b = h('button', { type: 'button', class: 'chip-suggest', title: `Add ${d}` }, icon('plus', 'icon-xs'), h('bdi', null, d));
+      b.addEventListener('click', () => addRoot(d));
+      return b;
+    })
+  );
 }
 
 // ------------------------------------------------------------------ config
@@ -2312,6 +2955,7 @@ const voice = createVoice({
   getConfig: () => state.config || {},
   getServerVoice: () => state.voiceInfo || {},
   api,
+  fetchBlob: apiBlob,
   onInterim(text) {
     state.interim = text || '';
     renderVoiceLine();
@@ -2457,18 +3101,29 @@ function showCriticalCard(approval) {
   if (speaker.active && v.speakResponses !== false && v.tts !== 'off') voice.speak('Critical actions need a click. Press Allow once on the card.');
 }
 
+/** The daemon announces finished work, approvals and questions itself (SSE 'announce'). */
+function daemonAnnounces() {
+  return Boolean(state.voiceInfo && state.voiceInfo.announcer);
+}
+
 function onResult(d) {
   if (typeof d.totalCostUsd === 'number') state.session.costUsd = d.totalCostUsd;
   if (d.sessionId) state.session.id = d.sessionId;
   state.session.turns = (Number(state.session.turns) || 0) + 1;
   renderFooter();
+  // With the daemon's announcer, the answer arrives as an 'announce' event: speaking it here too
+  // would say it twice.
+  if (daemonAnnounces()) return;
   const v = (state.config && state.config.voice) || {};
   if (speaker.active && v.speakResponses !== false && v.tts !== 'off' && d.speak !== false && !d.isError && d.text) voice.speak(d.text);
 }
 
 function onNotify(d) {
   const v = (state.config && state.config.voice) || {};
-  if (speaker.active && d.speak && v.tts !== 'off' && d.text) voice.speak(d.text);
+  // With the daemon's announcer, a spoken notification arrives as an 'announce' event (in the
+  // natural voice, or through the speakers when no dialog is visible): speaking it here too would
+  // say it twice.
+  if (speaker.active && d.speak && v.tts !== 'off' && d.text && !daemonAnnounces()) voice.speak(d.text);
   if (d.text && (d.level === 'warning' || d.level === 'error' || !isNearBottom() || document.hidden)) {
     toast(d.text, ['info', 'success', 'warning', 'error'].includes(d.level) ? d.level : 'info');
   }
@@ -2707,6 +3362,57 @@ function bindUi() {
     updateSettingsHelp();
   });
   el.ttsRate.addEventListener('input', updateSettingsHelp);
+
+  // Settings tabs (arrow keys move between them, as in a tab list).
+  for (const b of el.setTabs.querySelectorAll('[role="tab"]')) b.addEventListener('click', () => selectTab(b.dataset.tab));
+  el.setTabs.addEventListener('keydown', (e) => {
+    const i = SETTINGS_TABS.indexOf(state.settingsTab);
+    let next = null;
+    if (e.key === 'ArrowRight') next = SETTINGS_TABS[(i + 1) % SETTINGS_TABS.length];
+    else if (e.key === 'ArrowLeft') next = SETTINGS_TABS[(i - 1 + SETTINGS_TABS.length) % SETTINGS_TABS.length];
+    else if (e.key === 'Home') next = SETTINGS_TABS[0];
+    else if (e.key === 'End') next = SETTINGS_TABS[SETTINGS_TABS.length - 1];
+    if (!next) return;
+    e.preventDefault();
+    selectTab(next, { focusTab: true });
+  });
+  // Natural voice, Jira and repo folders.
+  el.ttsEngine.addEventListener('change', renderPiper);
+  el.piperVoice.addEventListener('change', renderPiper);
+  el.piperInstall.addEventListener('click', installNaturalVoice);
+  el.voiceTest.addEventListener('click', testVoice);
+  el.jiraTest.addEventListener('click', testJira);
+  el.jiraUrl.addEventListener('change', () => {
+    try {
+      const v = normalizeJiraUrl(el.jiraUrl.value);
+      if (v && v !== el.jiraUrl.value) el.jiraUrl.value = v;
+    } catch {
+      /* reported on Save or Test */
+    }
+  });
+  for (const f of [el.jiraUrl, el.jiraEmail, el.jiraToken]) f.addEventListener('input', () => showJiraResult('', ''));
+  // Set here: the page itself only references its own files.
+  el.jiraTokenLink.href = JIRA_TOKEN_URL;
+  el.rootsAdd.addEventListener('click', () => addRoot());
+  el.rootsInput.addEventListener('keydown', (e) => {
+    // Enter adds the folder instead of submitting the whole form.
+    if (e.key === 'Enter' && !e.isComposing) {
+      e.preventDefault();
+      addRoot();
+    }
+  });
+  el.rootsInput.addEventListener('input', () => {
+    el.rootsError.hidden = true;
+  });
+  // Chrome keeps audio locked until the page has had a click or a key: unlock it on the first one,
+  // so a chime can play before an announcement later.
+  const unlock = () => {
+    document.removeEventListener('pointerdown', unlock, true);
+    document.removeEventListener('keydown', unlock, true);
+    voice.unlockAudio();
+  };
+  document.addEventListener('pointerdown', unlock, true);
+  document.addEventListener('keydown', unlock, true);
   el.testVoice.addEventListener('click', () => {
     // Speak with the values currently in the form, not the saved ones.
     try {
@@ -2865,6 +3571,12 @@ function grabElements() {
     voiceDiag: 'voice-diag', about: 'about', shutdown: 'shutdown', cancelSettings: 'cancel-settings',
     saveSettings: 'save-settings', lightbox: 'lightbox', lightboxImg: 'lightbox-img', lightboxCaption: 'lightbox-caption',
     lightboxClose: 'lightbox-close',
+    setTabs: 'set-tabs', ttsEngine: 'tts-engine', piperCard: 'piper-card', piperState: 'piper-state', piperVoice: 'piper-voice',
+    piperProgress: 'piper-progress', piperBar: 'piper-bar', piperFill: 'piper-fill', piperProgressText: 'piper-progress-text',
+    piperInstall: 'piper-install', piperInstallLabel: 'piper-install-label', voiceTest: 'voice-test', piperHelp: 'piper-help',
+    jiraState: 'jira-state', jiraUrl: 'jira-url', jiraEmail: 'jira-email', jiraToken: 'jira-token', jiraTokenSet: 'jira-token-set',
+    jiraTest: 'jira-test', jiraResult: 'jira-result', roots: 'roots', rootsList: 'roots-list', rootsInput: 'roots-input',
+    rootsAdd: 'roots-add', rootsError: 'roots-error', rootsSuggest: 'roots-suggest', jiraTokenLink: 'jira-token-link',
   };
   for (const [k, id] of Object.entries(ids)) {
     el[k] = $(id);

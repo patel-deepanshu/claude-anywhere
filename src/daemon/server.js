@@ -79,6 +79,7 @@ const ENUMS = {
   'voice.stt': ['auto', 'browser', 'server', 'off'],
   'voice.tts': ['auto', 'browser', 'server', 'off'],
   'voice.sttProvider': ['auto', 'openai', 'groq', 'custom', 'whisper.cpp'],
+  'voice.ttsEngine': ['auto', 'piper', 'browser', 'os'],
 };
 
 const FALLBACK_HTML = `<!doctype html>
@@ -935,6 +936,8 @@ class DaemonServer {
     }
     const voice = this.deps.voice;
     const v = this.deps.config.voice || {};
+    // The announcer already says notify {speak:true} (through the dialog or the speakers).
+    if (body.speak && this.deps.announcer && v.tts !== 'off') return { ok: true, delivered: true };
     if (body.speak && voice && typeof voice.speak === 'function' && v.tts !== 'off') {
       voice.speak(stripMarkdownForSpeech(String(body.message)).slice(0, 600), { rate: v.ttsRate, voice: v.ttsVoice || undefined }).then(
         () => {},

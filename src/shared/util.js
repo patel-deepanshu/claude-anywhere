@@ -76,7 +76,8 @@ function stripMarkdownForSpeech(text) {
   s = s.replace(/^\s*[-*+]\s+/gm, '');
   s = s.replace(/^\s*\d+\.\s+/gm, '');
   s = s.replace(/(\*\*|__)(.*?)\1/g, '$2');
-  s = s.replace(/(\*|_)(.*?)\1/g, '$2');
+  // Single * or _ emphasis only at word edges: LOGIN_TIMEOUT_MINUTES and a*b keep their characters.
+  s = s.replace(/(^|[^\w*])[*_]([^*_\n]+)[*_](?=[^\w*]|$)/g, '$1$2');
   s = s.replace(/<[^>]+>/g, '');
   s = s.replace(/https?:\/\/\S+/g, 'the link');
   s = s.replace(/[ \t]+/g, ' ');

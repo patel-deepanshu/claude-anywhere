@@ -1182,6 +1182,512 @@ function utf8LocaleOverride(env) {
 }
 
 // ---------------------------------------------------------------------------
+// Browser tabs (shared by every backend)
+// ---------------------------------------------------------------------------
+//
+// driver.browserTab({app, windowId, includeText, maxChars, keyboard, beforeInput}) reads the address
+// and, on request, the text of the active tab of a browser window. macOS (AppleScript) and Windows
+// (UI Automation) read the address bar without input; Linux, browsers those cannot script (Firefox
+// on macOS), and the page text everywhere use the keyboard: focus the window, primary+L and copy for
+// the address, Escape twice, then select-all and copy in the page, with the clipboard saved before
+// and restored after. That reader only needs the Driver primitives (focusWindow, keyCombo,
+// clipboardGet/Set, activeWindow), so darwin.js and win32.js reuse it from here.
+
+const SEP_RE = '\\s[-\\u2013\\u2014]\\s';
+/** Known browsers. engine decides the keyboard details; app matches the window's app name, title its title suffix. */
+const BROWSERS = [
+  { id: 'brave', name: 'Brave', engine: 'chromium', app: /\bbrave\b/i, title: new RegExp(`${SEP_RE}Brave(?:\\s(?:Browser|Beta|Nightly|Dev))*$`) },
+  { id: 'edge', name: 'Microsoft Edge', engine: 'chromium', app: /\b(?:microsoft[\s-]*edge|msedge)\b/i, title: new RegExp(`${SEP_RE}Microsoft[\\u200b-\\u200d\\ufeff]*\\s?Edge(?:\\s(?:Beta|Dev|Canary))?$`) },
+  { id: 'vivaldi', name: 'Vivaldi', engine: 'chromium', app: /\bvivaldi\b/i, title: new RegExp(`${SEP_RE}Vivaldi$`) },
+  { id: 'opera', name: 'Opera', engine: 'chromium', app: /\bopera\b/i, title: new RegExp(`${SEP_RE}Opera(?:\\sGX)?$`) },
+  { id: 'arc', name: 'Arc', engine: 'chromium', app: /^arc(?:\.exe)?$/i, title: null },
+  { id: 'chromium', name: 'Chromium', engine: 'chromium', app: /\bchromium\b/i, title: new RegExp(`${SEP_RE}Chromium$`) },
+  { id: 'chrome', name: 'Google Chrome', engine: 'chromium', app: /\b(?:google[\s-]*chrome|chrome(?:\.exe)?)\b/i, title: new RegExp(`${SEP_RE}Google Chrome(?:\\s(?:Beta|Dev|Canary|for Testing))?$`) },
+  { id: 'firefox', name: 'Firefox', engine: 'gecko', app: /\bfirefox\b|^navigator$/i, title: new RegExp(`${SEP_RE}(?:Mozilla Firefox(?: Private Browsing)?|Firefox(?: Developer Edition| Nightly)?)$`) },
+  { id: 'librewolf', name: 'LibreWolf', engine: 'gecko', app: /\blibrewolf\b/i, title: new RegExp(`${SEP_RE}LibreWolf$`) },
+  { id: 'waterfox', name: 'Waterfox', engine: 'gecko', app: /\bwaterfox\b/i, title: new RegExp(`${SEP_RE}Waterfox$`) },
+  { id: 'zen', name: 'Zen Browser', engine: 'gecko', app: /^zen(?:\s?browser)?(?:\.exe)?$/i, title: new RegExp(`${SEP_RE}Zen Browser$`) },
+  { id: 'floorp', name: 'Floorp', engine: 'gecko', app: /\bfloorp\b/i, title: new RegExp(`${SEP_RE}Floorp$`) },
+  { id: 'safari', name: 'Safari', engine: 'webkit', app: /^safari(?:\stechnology\spreview)?$/i, title: null },
+  { id: 'orion', name: 'Orion', engine: 'webkit', app: /^orion$/i, title: null },
+];
+const BROWSER_ALIASES = {
+  ff: 'firefox', mozilla: 'firefox', 'mozilla firefox': 'firefox', msedge: 'edge', 'ms edge': 'edge', 'microsoft edge': 'edge', 'google chrome': 'chrome',
+  google: 'chrome', 'chrome browser': 'chrome', 'brave browser': 'brave', zen: 'zen',
+};
+const OWN_WINDOW_RE = /^Claude Anywhere\b/;
+const DEFAULT_TAB_CHARS = 20000;
+const MAX_TAB_CHARS = 2000000;
+const MAX_TEXT_ATTEMPTS = 4;
+/** Keyboard reader timings (ms); browserTab({timing}) overrides them in tests. */
+const TAB_TIMING = Object.freeze({ settleMs: 150, keyGapMs: 80, pageFocusMs: 200, pollMs: 50, clipboardMs: 1500 });
+
+/**
+ * Recognize a browser from a window's app name, else from its title suffix (" - Brave").
+ * @param {string} [app]
+ * @param {string} [title]
+ * @returns {{id:string,name:string,engine:'chromium'|'gecko'|'webkit'}|null}
+ */
+function identifyBrowser(app, title) {
+  const a = String(app == null ? '' : app).trim();
+  const t = String(title == null ? '' : title).trim();
+  const hit = (a && BROWSERS.find((b) => b.app.test(a))) || (t && BROWSERS.find((b) => b.title && b.title.test(t))) || null;
+  return hit ? { id: hit.id, name: hit.name, engine: hit.engine } : null;
+}
+
+/** "Brave browser" -> "brave", "Google Chrome" -> "chrome", "ff" -> "firefox". */
+function normalizeBrowserQuery(query) {
+  let q = String(query == null ? '' : query).toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!q || q === 'any' || q === 'browser' || q === 'default') return '';
+  if (BROWSER_ALIASES[q]) return BROWSER_ALIASES[q];
+  q = q.replace(/^(?:the|my)\s+/, '').replace(/\s+(?:browser|web browser|window|tab)$/, '').trim();
+  return BROWSER_ALIASES[q] || q;
+}
+
+function browserMatches(browser, w, q) {
+  if (!q) return true;
+  const name = browser.name.toLowerCase();
+  return browser.id === q || name === q || name.includes(q) || String(w.app || '').toLowerCase().includes(q);
+}
+
+/**
+ * Normalized window id equality: decimal and 0x hex X11 ids, and macOS "pid:number" ids
+ * (an id that is just "pid" matches any window of that process).
+ */
+function sameWindowId(a, b) {
+  if (a == null || b == null) return false;
+  const x = String(a).trim().toLowerCase();
+  const y = String(b).trim().toLowerCase();
+  if (!x || !y) return false;
+  if (x === y) return true;
+  const num = (s) => (/^0x[0-9a-f]+$/.test(s) ? parseInt(s, 16) : /^\d+$/.test(s) ? Number(s) : NaN);
+  if (!Number.isNaN(num(x)) && num(x) === num(y)) return true;
+  const mx = /^(\d+):(\d+)$/.exec(x);
+  const my = /^(\d+):(\d+)$/.exec(y);
+  if (mx && !my && /^\d+$/.test(y)) return mx[1] === y;
+  if (my && !mx && /^\d+$/.test(x)) return my[1] === x;
+  return false;
+}
+
+/**
+ * Browser windows, most recently active first: the focused one, then front to back (stackIndex,
+ * or list order on drivers that list front to back), minimized windows last.
+ * @param {object[]} windows driver.listWindows()
+ * @param {string} [query] e.g. "brave"; empty for any browser
+ * @param {{zOrdered?:boolean, exclude?:(w:object)=>boolean}} [opts]
+ * @returns {Array<{window:object, browser:{id:string,name:string,engine:string}}>}
+ */
+function browserWindows(windows, query, { zOrdered = false, exclude } = {}) {
+  const q = normalizeBrowserQuery(query);
+  const skip = typeof exclude === 'function' ? exclude : (w) => OWN_WINDOW_RE.test(String(w.title || '')) || String(w.app || '') === 'Claude Anywhere';
+  const list = [];
+  (Array.isArray(windows) ? windows : []).forEach((w, i) => {
+    if (!w || w.id == null || skip(w)) return;
+    const browser = identifyBrowser(w.app, w.title);
+    if (!browser || !browserMatches(browser, w, q)) return;
+    list.push({ window: w, browser, i });
+  });
+  const ranked = list.some((c) => Number.isInteger(c.window.stackIndex));
+  const order = (c) => (ranked ? (Number.isInteger(c.window.stackIndex) ? c.window.stackIndex : 1e6 + c.i) : zOrdered ? c.i : -c.i);
+  list.sort((a, b) => Number(!a.window.focused) - Number(!b.window.focused) || Number(Boolean(a.window.minimized)) - Number(Boolean(b.window.minimized)) || order(a) - order(b));
+  return list.map(({ window, browser }) => ({ window, browser }));
+}
+
+const LOCAL_HOST_RE = /^(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|\[[0-9a-f:]+\]|[a-z0-9-]+\.(?:local|localhost|internal|lan))(?::\d+)?$/i;
+
+/**
+ * Turn an address bar's text into a URL. Browsers often hide the scheme ("example.com/a"): add
+ * https:// (http:// for localhost and private addresses). Text that is not an address (a search
+ * the user is typing) gives null.
+ * @param {string} raw
+ * @returns {string|null}
+ */
+function normalizeTabUrl(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s || s.length > 8192 || /\s/.test(s)) return null;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(s) && !/^[a-z0-9-]+(?:\.[a-z0-9-]+)*:\d+(?:[/?#]|$)/i.test(s)) return s;
+  const m = /^([^/?#]+)(.*)$/.exec(s);
+  if (!m) return null;
+  const host = m[1];
+  if (LOCAL_HOST_RE.test(host)) return `http://${s}`;
+  if (/^(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]*\.?(?::\d+)?$/i.test(host) || /^\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?$/.test(host)) return `https://${s}`;
+  return null;
+}
+
+/** Whether copied text is the address bar's content rather than page text. */
+function looksLikeAddress(text, knownUrl) {
+  const s = String(text == null ? '' : text).trim();
+  if (!s || /\s/.test(s)) return false;
+  if (knownUrl && (s === knownUrl || normalizeTabUrl(s) === knownUrl)) return true;
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(s) || normalizeTabUrl(s) !== null;
+}
+
+/** Page text as copied: one line-ending style, no trailing spaces, at most one blank line in a row. */
+function cleanPageText(text) {
+  return String(text == null ? '' : text)
+    .replace(/\r\n?/g, '\n')
+    .replace(/ /g, ' ')
+    .replace(/[ \t]+$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/**
+ * At most maxChars UTF-16 units, never splitting a surrogate pair.
+ * @returns {{text:string, truncated:boolean, total:number}}
+ */
+function clipTabText(text, maxChars) {
+  const s = String(text == null ? '' : text);
+  if (s.length <= maxChars) return { text: s, truncated: false, total: s.length };
+  let end = maxChars;
+  const c = s.charCodeAt(end - 1);
+  if (c >= 0xd800 && c <= 0xdbff) end -= 1;
+  return { text: s.slice(0, end), truncated: true, total: s.length };
+}
+
+function sameClip(a, b) {
+  return typeof a === 'string' && typeof b === 'string' && (a === b || a.replace(/\r\n?/g, '\n') === b.replace(/\r\n?/g, '\n'));
+}
+
+function tabError(message, code, hint) {
+  const err = new Error(message);
+  err.code = code;
+  if (hint) err.hint = hint;
+  return err;
+}
+
+/** True for errors that must stop the keyboard reader at once (the user paused Claude). */
+function isStopError(err) {
+  return Boolean(err && (err.code === 'PAUSED' || err.code === 'FAILSAFE'));
+}
+
+/** Poll the clipboard until it differs from `sentinel`; the new text, or null (nothing copied). */
+async function waitForClipboard(driver, sentinel, t) {
+  const polls = Math.max(1, Math.ceil(t.clipboardMs / Math.max(1, t.pollMs)));
+  for (let i = 0; i < polls; i++) {
+    await sleep(t.pollMs);
+    let v;
+    try {
+      v = await driver.clipboardGet();
+    } catch {
+      v = null;
+    }
+    if (typeof v === 'string' && !sameClip(v, sentinel)) return v.trim() ? v : null;
+  }
+  return null;
+}
+
+/**
+ * Put the user's clipboard back unless someone else changed it meanwhile.
+ * @returns {Promise<'restored'|'changed'|'unknown'|'lost'>}
+ */
+async function restoreClipboard(driver, saved, ours) {
+  let current;
+  try {
+    current = await driver.clipboardGet();
+  } catch {
+    current = undefined;
+  }
+  const isOurs = current === undefined || [...ours].some((v) => sameClip(v, current));
+  if (!isOurs) return 'changed';
+  if (typeof saved !== 'string') {
+    // The original could not be read: at least do not leave a sentinel behind.
+    if (typeof current === 'string' && /^anywhere-clip-[0-9a-f]+$/.test(current)) await driver.clipboardSet('').catch(() => {});
+    return 'unknown';
+  }
+  if (sameClip(current, saved)) return 'restored';
+  try {
+    await driver.clipboardSet(saved);
+    return 'restored';
+  } catch (err) {
+    log.warn('could not restore the clipboard after reading a browser tab:', err.message);
+    return 'lost';
+  }
+}
+
+/**
+ * Read a browser window's address and/or page text with the keyboard. Saves the clipboard, focuses
+ * the window, copies, restores the clipboard and gives focus back to the window that had it.
+ * beforeInput (the caller's pause guard and failsafe) runs before the first keystroke and again
+ * before the page text is selected; a PAUSED or FAILSAFE error from it stops at once.
+ * @param {object} driver any Driver
+ * @param {{window:object, engine?:string, platform?:string, wantUrl?:boolean, wantText?:boolean,
+ *   knownUrl?:string|null, beforeInput?:Function, timing?:object}} opts
+ * @returns {Promise<{url:string|null, text:string|null, tookFocus:boolean, clipboard:string, notes:string[]}>}
+ */
+async function keyboardReadTab(driver, opts) {
+  const win = opts.window;
+  const engine = opts.engine || 'chromium';
+  const platform = opts.platform || process.platform;
+  const wantUrl = opts.wantUrl !== false;
+  const wantText = Boolean(opts.wantText);
+  const t = { ...TAB_TIMING, ...(opts.timing || {}) };
+  const mod = platform === 'darwin' ? 'meta' : 'ctrl';
+  const label = win.app || win.title || 'the browser';
+  let knownUrl = opts.knownUrl || null;
+  const out = { url: null, text: null, tookFocus: false, clipboard: 'unchanged', notes: [] };
+  const press = (keys) => driver.keyCombo(keys);
+
+  let prev = null;
+  try {
+    prev = await driver.activeWindow();
+  } catch {
+    prev = null;
+  }
+  let saved = null;
+  try {
+    const s = await driver.clipboardGet();
+    saved = typeof s === 'string' ? s : null;
+  } catch (err) {
+    out.notes.push(`The clipboard could not be read beforehand (${err.message}), so it was not restored.`);
+  }
+  if (opts.beforeInput) await opts.beforeInput();
+
+  const ours = new Set();
+  const sentinel = async () => {
+    const s = `anywhere-clip-${crypto.randomBytes(6).toString('hex')}`;
+    ours.add(s);
+    await driver.clipboardSet(s);
+    return s;
+  };
+  let touched = false;
+  let stopped = false;
+  try {
+    const focused = await driver.focusWindow(win.id);
+    touched = true;
+    out.tookFocus = !(prev && sameWindowId(prev.id, win.id));
+    if (focused === false) {
+      throw tabError(`Could not bring ${label} to the front to read it.`, 'FOCUS_FAILED', 'Bring the browser window to the front yourself and ask again.');
+    }
+    await sleep(t.settleMs);
+    let now = null;
+    try {
+      now = await driver.activeWindow();
+    } catch {
+      now = null;
+    }
+    if (now && now.id != null && !sameWindowId(now.id, win.id)) {
+      throw tabError(
+        `${label} did not come to the front (the active window is ${now.app || now.title || now.id}), so no keys were sent.`,
+        'FOCUS_FAILED',
+        'Bring the browser window to the front yourself and ask again.',
+      );
+    }
+
+    let inAddressBar = false;
+    if (wantUrl || (wantText && engine !== 'webkit')) {
+      const s = await sentinel();
+      await press([mod, 'l']);
+      await sleep(t.keyGapMs);
+      await press([mod, 'c']);
+      const got = await waitForClipboard(driver, s, t);
+      const url = got != null ? normalizeTabUrl(got) : null;
+      if (got != null) ours.add(got);
+      if (url) {
+        inAddressBar = true;
+        if (!knownUrl) knownUrl = url;
+        if (wantUrl) out.url = url;
+      } else if (wantUrl) {
+        out.notes.push('Copying the address bar gave no URL.');
+      }
+      // Only while the address bar surely has focus: in the page, Escape can close a dialog (a Jira issue).
+      // The first Escape closes the suggestion list, the second returns focus to the page (Chromium).
+      if (inAddressBar) {
+        await press(['escape']);
+        await sleep(t.keyGapMs);
+        await press(['escape']);
+        await sleep(t.pageFocusMs);
+      }
+    }
+
+    if (wantText) {
+      if (opts.beforeInput) await opts.beforeInput();
+      // F6 moves focus from the address bar (or a toolbar) towards the page in Chromium and Firefox.
+      const focusPage = engine === 'webkit' ? null : ['f6'];
+      for (let attempt = 0; attempt < MAX_TEXT_ATTEMPTS && out.text == null; attempt++) {
+        if (attempt > 0) {
+          if (!focusPage) break;
+          await press(focusPage);
+          await sleep(t.pageFocusMs);
+        }
+        const s = await sentinel();
+        await press([mod, 'a']);
+        await sleep(t.keyGapMs);
+        await press([mod, 'c']);
+        const got = await waitForClipboard(driver, s, t);
+        if (got == null) continue; // nothing selectable has focus (a toolbar)
+        ours.add(got);
+        if (looksLikeAddress(got, knownUrl)) continue; // still in the address bar
+        out.text = got;
+        // Collapse the select-all: extend the selection back to the start of the page (no click).
+        await press(platform === 'darwin' ? ['meta', 'shift', 'up'] : ['ctrl', 'shift', 'home']);
+      }
+      if (out.text == null) {
+        out.notes.push(`Select-all and copy in ${label} gave no page text (the page may block copying, or keyboard focus is in a field).`);
+      }
+    }
+  } catch (err) {
+    stopped = isStopError(err);
+    throw err;
+  } finally {
+    out.clipboard = await restoreClipboard(driver, saved, ours);
+    if (touched && !stopped) {
+      if (out.tookFocus && prev && prev.id != null) {
+        try {
+          await driver.focusWindow(prev.id);
+        } catch (err) {
+          log.debug('could not give focus back after reading a browser tab:', err.message);
+        }
+      }
+      if (win.minimized && typeof driver.minimizeWindow === 'function') {
+        try {
+          await driver.minimizeWindow(win.id);
+        } catch (err) {
+          log.debug('could not minimize the browser again:', err.message);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * The browser window to read: opts.window (a listWindows() entry the caller picked), opts.windowId,
+ * else the most recently active window of opts.app (any browser when unset).
+ * @returns {Promise<{window:object, browser:object}>}
+ */
+async function resolveBrowserWindow(driver, opts = {}) {
+  if (opts.window && typeof opts.window === 'object' && opts.window.id != null) {
+    // The caller already listed the windows and picked this one.
+    const w = opts.window;
+    const browser = identifyBrowser(w.app, w.title) || identifyBrowser(opts.app, '') || { id: 'browser', name: w.app || 'Browser', engine: 'chromium' };
+    return { window: w, browser };
+  }
+  const wins = (await driver.listWindows()) || [];
+  if (opts.windowId != null && String(opts.windowId).trim() !== '') {
+    const w = wins.find((x) => sameWindowId(x.id, opts.windowId));
+    if (!w) throw tabError(`Window ${opts.windowId} is not open any more.`, 'NOT_FOUND', 'List the windows again and pick a browser window.');
+    // An explicit window may be a browser this table does not know: treat it like Chromium.
+    const browser = identifyBrowser(w.app, w.title) || identifyBrowser(opts.app, '') || { id: 'browser', name: w.app || 'Browser', engine: 'chromium' };
+    return { window: w, browser };
+  }
+  const zOrdered = driver.windowsZOrdered === true || /^(?:darwin|win32|wsl)$/.test(String(driver.name || ''));
+  const found = browserWindows(wins, opts.app, { zOrdered });
+  if (found.length) return found[0];
+  const open = [...new Set(browserWindows(wins, '', { zOrdered }).map((c) => c.browser.name))];
+  if (opts.app && normalizeBrowserQuery(opts.app)) {
+    throw tabError(
+      `No ${opts.app} window is open.${open.length ? ` Open browsers: ${open.join(', ')}.` : ''}`,
+      'NOT_FOUND',
+      open.length ? 'Ask for one of the open browsers, or open the page in the browser you named.' : 'Open the page in a browser first.',
+    );
+  }
+  throw tabError('No browser window is open.', 'NOT_FOUND', 'Open the page in a browser (Brave, Chrome, Edge, Firefox, Safari...) first.');
+}
+
+/**
+ * driver.browserTab() for any backend: native(window, browser, {text}) reads without input
+ * (AppleScript, UI Automation) and returns {url, title?, text?, method} or null; the keyboard
+ * reader fills in what is still missing unless opts.keyboard is false.
+ * @param {object} driver
+ * @param {{app?:string, windowId?:string, window?:object, includeText?:boolean, maxChars?:number, keyboard?:boolean,
+ *   beforeInput?:Function, timing?:object}} opts
+ * @param {{platform:string, native?:Function}} how
+ * @returns {Promise<{browser:string, app:string, title:string, url:string|null, text?:string|null, truncated?:boolean,
+ *   method:'applescript'|'uia'|'keyboard'|'title', windowId:string, tookFocus:boolean, clipboard?:string,
+ *   textMethod?:string, hint?:string, permission?:string, settingsUrl?:string, notes?:string[]}>}
+ */
+async function readBrowserTab(driver, opts = {}, how = {}) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const includeText = Boolean(o.includeText);
+  const maxChars = o.maxChars == null || o.maxChars === '' ? DEFAULT_TAB_CHARS : clampInt(o.maxChars, 1, MAX_TAB_CHARS, DEFAULT_TAB_CHARS);
+  const keyboard = o.keyboard !== false;
+  const { window: w, browser } = await resolveBrowserWindow(driver, o);
+  const result = { browser: browser.name, app: w.app || browser.name, title: String(w.title || ''), url: null, method: 'title', windowId: String(w.id), tookFocus: false };
+  const notes = [];
+  let text = null;
+
+  if (typeof how.native === 'function') {
+    try {
+      const r = await how.native(w, browser, { text: includeText });
+      if (r) {
+        const url = r.url ? normalizeTabUrl(r.url) : null;
+        if (url) {
+          result.url = url;
+          result.method = r.method;
+        }
+        if (!result.title && r.title) result.title = String(r.title);
+        if (r.tabTitle) result.tabTitle = String(r.tabTitle);
+        if (includeText && typeof r.text === 'string' && r.text.trim()) {
+          text = r.text;
+          result.textMethod = r.method;
+        }
+        if (r.note) notes.push(r.note);
+      }
+    } catch (err) {
+      if (isStopError(err) || !keyboard) throw err;
+      if (err.code === 'PERMISSION') {
+        result.permission = err.permission || 'automation';
+        if (err.hint) result.hint = err.hint;
+        if (err.settingsUrl) result.settingsUrl = err.settingsUrl;
+      }
+      notes.push(`Reading the address bar directly failed (${err.message}); used the keyboard instead.`);
+      log.debug(`browserTab: native read failed (${err.code || 'error'}): ${err.message}`);
+    }
+  }
+
+  const wantUrl = !result.url;
+  const wantText = includeText && text == null;
+  if (keyboard && (wantUrl || wantText)) {
+    try {
+      const kb = await keyboardReadTab(driver, {
+        window: w,
+        engine: browser.engine,
+        platform: how.platform,
+        wantUrl,
+        wantText,
+        knownUrl: result.url,
+        beforeInput: o.beforeInput,
+        timing: o.timing,
+      });
+      result.tookFocus = kb.tookFocus;
+      result.clipboard = kb.clipboard;
+      if (kb.url) {
+        result.url = kb.url;
+        result.method = 'keyboard';
+      }
+      if (kb.text != null) {
+        text = kb.text;
+        result.textMethod = 'keyboard';
+      }
+      notes.push(...kb.notes);
+    } catch (err) {
+      if (isStopError(err)) throw err;
+      notes.push(`The keyboard fallback failed: ${err.message}`);
+      // Both paths may need a permission (macOS: Automation for AppleScript, Accessibility for keys): keep both hints.
+      if (err.hint && !(result.hint || '').includes(err.hint)) result.hint = result.hint ? `${result.hint} ${err.hint}` : err.hint;
+      if (err.code === 'PERMISSION' && !result.permission) result.permission = err.permission || 'accessibility';
+      log.debug(`browserTab: keyboard read failed (${err.code || 'error'}): ${err.message}`);
+    }
+  } else if (!keyboard && wantUrl) {
+    notes.push('The address could not be read without the keyboard.');
+  }
+
+  if (includeText) {
+    if (text != null) {
+      const clipped = clipTabText(cleanPageText(text), maxChars);
+      result.text = clipped.text;
+      result.truncated = clipped.truncated;
+      if (clipped.truncated) result.textChars = clipped.total;
+    } else {
+      result.text = null;
+    }
+  }
+  if (notes.length) result.notes = notes;
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Base driver
 // ---------------------------------------------------------------------------
 
@@ -1325,6 +1831,16 @@ class LinuxDriverBase {
 
   _speakAvailable() {
     return this._has('spd-say') || this._has('espeak-ng') || this._has('espeak');
+  }
+
+  /**
+   * Read the active tab of a browser window with the keyboard (see readBrowserTab): Linux has no
+   * scripting interface that every browser offers, so the address comes from primary+L and copy.
+   * @param {{app?:string, windowId?:string, includeText?:boolean, maxChars?:number, keyboard?:boolean,
+   *   beforeInput?:Function}} [opts]
+   */
+  async browserTab(opts = {}) {
+    return readBrowserTab(this, opts, { platform: 'linux' });
   }
 
   /** Stop persistent helpers (none on Linux). */
@@ -2734,4 +3250,19 @@ module.exports = {
   detectCompositor,
   detectPackageManager,
   installHint,
+  // browser tabs (shared with darwin.js and win32.js)
+  readBrowserTab,
+  keyboardReadTab,
+  resolveBrowserWindow,
+  browserWindows,
+  identifyBrowser,
+  normalizeBrowserQuery,
+  normalizeTabUrl,
+  looksLikeAddress,
+  cleanPageText,
+  clipTabText,
+  sameWindowId,
+  BROWSERS,
+  TAB_TIMING,
+  DEFAULT_TAB_CHARS,
 };

@@ -16,6 +16,8 @@
  *   FAKE_PS_NOISE=1             emit non-protocol lines and stale ids before each response
  *   FAKE_PS_DELAY_MS=<n>        delay every response
  *   FAKE_PS_START_DELAY_MS=<n>  delay before reading stdin
+ *   FAKE_PS_BROWSER_TABS=<json> browsertab results by hwnd ({"1002": {found, url, title, name, editing}});
+ *                               the default reads Chrome's (1002) address bar without the scheme
  * Extra commands: __requests (requests seen by this process), __crash, __stderr {text}.
  *
  * Like the real host, input aimed at an elevated window (the focused window for type/keys, else
@@ -232,6 +234,22 @@ const handlers = {
     if (!w) return { ok: false };
     desk.topmost[w.hwnd] = Boolean(a.on);
     return { ok: true };
+  },
+  // UI Automation read of a browser's address bar (Get-BrowserTab in win32-host.ps1).
+  browsertab: (a) => {
+    const w = findWindow(a.hwnd);
+    if (!w) throw fail(`UI Automation cannot read window ${a.hwnd}: element not available`, 'NOT_FOUND', 'The window may have closed; list the windows again.');
+    let custom = {};
+    try {
+      custom = env.FAKE_PS_BROWSER_TABS ? JSON.parse(env.FAKE_PS_BROWSER_TABS) : {};
+    } catch {
+      custom = {};
+    }
+    if (custom[w.hwnd]) return { title: w.title, name: null, editing: false, ...custom[w.hwnd] };
+    if (w.hwnd === '1002') {
+      return { found: true, url: 'console.cloud.google.com/run?project=my-project', title: w.title, name: 'Address and search bar', editing: false };
+    }
+    return { found: false, url: null, title: w.title, name: null, editing: false };
   },
   clipget: () => ({ text: desk.clipboard }),
   clipset: (a) => {

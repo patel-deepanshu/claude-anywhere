@@ -1118,6 +1118,8 @@ async function install({ electron = false, mcp = true, hotkey = false, hotkeyKey
     `Check this machine any time: ${binHint} doctor   (or /anywhere doctor)`,
   ];
   if (!electron) nextSteps.push(`Optional: ${binHint} install --electron for an always-on-top window with a global hotkey.`);
+  nextSteps.push(`Optional: ${binHint} voice install for a natural, human-sounding voice (Piper: free, offline, about 80 MB).`);
+  nextSteps.push(`Optional: ${binHint} jira setup so Claude can read and update your Jira tickets (free API token).`);
   out('');
   out(`✓ Claude Anywhere ${version} is installed. Next:`);
   nextSteps.forEach((s, i) => out(`  ${i + 1}. ${s}`));

@@ -176,8 +176,11 @@ test('compactInput truncates long strings deeply', () => {
 
 test('read-only tool list and fallback prompt', () => {
   assert.deepEqual(READ_ONLY_TOOLS.map((t) => t.replace('mcp__anywhere__', '')).sort(), [
-    'ask_user', 'clipboard_get', 'cursor_position', 'get_desktop_context', 'list_windows', 'notify_user', 'screen_info', 'screenshot', 'wait',
+    'ask_user', 'clipboard_get', 'cursor_position', 'find_repos', 'get_desktop_context', 'jira_find_user', 'jira_get_issue', 'jira_my_issues',
+    'jira_search', 'jira_status', 'list_windows', 'notify_user', 'screen_info', 'screenshot', 'wait',
   ]);
+  // read_browser_tab with includeText sends keystrokes: the broker judges each call.
+  assert.ok(!READ_ONLY_TOOLS.includes('mcp__anywhere__read_browser_tab'));
   const p = fallbackSystemPrompt({ platformInfo: { platform: 'darwin', osName: 'macOS', displayServer: 'quartz' } });
   assert.match(p, /Claude Anywhere/);
   assert.match(p, /Cmd/);

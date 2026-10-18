@@ -44,7 +44,10 @@ const MAX_NOTCHES = 200;
 const KILL_GRACE_MS = 3000;
 
 /** Read-only commands that are safe to resend once after a host crash. */
-const RETRYABLE = new Set(['ping', 'displays', 'capture', 'cursor', 'windows', 'active', 'clipget']);
+const RETRYABLE = new Set(['ping', 'displays', 'capture', 'cursor', 'windows', 'active', 'clipget', 'browsertab']);
+/** UI Automation walk of a browser window: the host stops looking after BROWSER_TAB_BUDGET_MS. */
+const BROWSER_TAB_BUDGET_MS = 4000;
+const BROWSER_TAB_TIMEOUT_MS = 15000;
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const BUTTONS = new Set(['left', 'right', 'middle', 'x1', 'x2']);
@@ -973,6 +976,34 @@ class Win32Driver {
     // Windows clipboard text uses CRLF line endings.
     const s = String(text == null ? '' : text).replace(/\r?\n/g, '\r\n');
     await this.host.request('clipset', { text: s });
+  }
+
+  /**
+   * Read the active tab of a browser window (Driver.browserTab). The address comes from the
+   * address bar through UI Automation (no input; the value may lack the scheme, which is added
+   * back); the page text, and the address when UI Automation finds no address bar, come from the
+   * keyboard reader in linux.js (focus, Ctrl+L / Ctrl+A and copy, clipboard restored).
+   * @param {{app?:string, windowId?:string, includeText?:boolean, maxChars?:number, keyboard?:boolean,
+   *   beforeInput?:Function}} [opts]
+   */
+  async browserTab(opts = {}) {
+    const tabs = require('./linux');
+    return tabs.readBrowserTab(this, opts, {
+      platform: 'win32',
+      native: (win) => this._browserTabUia(win),
+    });
+  }
+
+  /** UI Automation half of browserTab: {url, title, method:'uia'} or null when no address bar was found. */
+  async _browserTabUia(win) {
+    const hwnd = normalizeWindowId(win.id);
+    if (!hwnd) return null;
+    const r = await this.host.request('browsertab', { hwnd, budgetMs: BROWSER_TAB_BUDGET_MS }, { timeoutMs: BROWSER_TAB_TIMEOUT_MS });
+    if (!r || !r.found) return null;
+    const raw = typeof r.url === 'string' ? r.url.trim() : '';
+    // With focus in the address bar the value may be text the user is typing, not the page's address.
+    if (!raw || (r.editing && !/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) && !/[./]/.test(raw))) return null;
+    return { url: raw, title: typeof r.title === 'string' ? r.title : '', method: 'uia' };
   }
 
   /** Show a tray balloon / toast (not part of the Driver contract). */

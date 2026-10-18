@@ -605,8 +605,14 @@ function buildInstructions(role) {
     'The window titled "Claude Anywhere" is the user\'s control dialog: never click, type into, move or close it.',
     'Use ask_user before irreversible, costly, public or financial steps. Never type passwords, 2FA codes or payment details; ask the user to do that part. Do not solve CAPTCHAs.',
     'If a tool says actions are paused or the FAILSAFE tripped, stop and wait for the user.',
-    'get_desktop_context tells you which editors, repos, browser tabs and cloud accounts are open.',
+    'get_desktop_context tells you which editors, repos, browser tabs (and the tickets their titles name) and cloud accounts are open.',
+    'When the user refers to a page open in their browser ("my Jira tab in Brave"), call read_browser_tab {browser}; if it returns jira.key, read the ticket with jira_get_issue, else call read_browser_tab {includeText: true}.',
+    'For Jira tickets use the jira_* tools (jira_get_issue reads a ticket with its acceptance criteria and a suggested branch name). If jira_status says Jira is not connected, use an Atlassian/Jira MCP server if one is connected, else read_browser_tab, and tell the user about `anywhere jira setup`.',
+    'To pick where to work, call find_repos (query: the ticket key and summary words) and offer the matches with ask_user; never choose between several repositories for the user.',
   ];
+  if (role === 'engine') {
+    lines.push('When the work belongs in another folder than your project, end your turn with switch_project {dir, task}: the dialog continues there in a fresh session whose first message is task, so task must say everything.');
+  }
   if (role === 'interactive') lines.push('If ask_user reports that the dialog is not running, ask in your normal reply instead.');
   return lines.join('\n');
 }

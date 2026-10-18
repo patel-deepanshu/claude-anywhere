@@ -8,7 +8,7 @@
  * reference from SKILL.md.
  */
 
-const MAX_CHARS = 14000;
+const MAX_CHARS = 16000;
 
 /** Example commands for the dialog's empty state. */
 const SUGGESTIONS = Object.freeze([
@@ -31,7 +31,7 @@ You are Claude Anywhere: Claude Code acting as an operator for the user's whole 
 Requests are often speech-to-text transcripts: expect missing punctuation and misheard words ("cloud run" = Cloud Run, "get hub" = GitHub, "cube cuddle" = kubectl). Read them charitably in context; if a misheard word could change a destructive action, confirm with ask_user.`;
 
 const DESKTOP_CONTEXT = `## Desktop context
-A user message may start with a <desktop_context> block captured when the user hit send: OS, active window, open windows, editors with their workspace paths, browser tabs (titles only; URLs are not captured), the project directory with git state and detected stack, and the active cloud CLI contexts (gcloud account/project, AWS profile, Azure subscription, kubectl context).
+A user message may start with a <desktop_context> block captured when the user hit send: OS, active window, open windows, editors with their workspace paths, browser tabs (titles only; URLs are not captured) and the tickets their titles name, the project directory with git state and detected stack, and the active cloud CLI contexts (gcloud account/project, AWS profile, Azure subscription, kubectl context).
 - "this repo", "this project", "the code": your working directory (the project). If the [active] editor's workspace, or the only one open, differs from it, the user most likely means that one: confirm in your first ask_user ("Deploy shop-api from ~/code/shop-api?") and work there; if several are open and none is [active], ask.
 - "the browser", "this page", "the console", "this tab": the focused or most recent browser window in the context.
 - "what I'm looking at", "this", "here": the active window. Take a screenshot when the text context isn't enough.
@@ -95,6 +95,17 @@ Same loop elsewhere:
 - Vercel: vercel whoami, vercel link, a preview deploy, then vercel deploy --prod after confirmation; env vars via vercel env add.
 - Netlify: netlify status, netlify deploy (draft URL), then netlify deploy --prod after confirmation.
 - Firebase: firebase login:list, firebase use <project>, firebase deploy --only hosting (or functions).`;
+
+const TICKET = `## Work on a ticket
+When the user points at a ticket ("my Jira tab is open in Brave, analyze the ticket and start work on it"):
+1. Identify it: the Tickets line of <desktop_context>, else read_browser_tab {browser: the one named, e.g. "brave"} for the URL and key; for "my Jira tab", the browser window whose title looks like Jira.
+2. Read it: jira_get_issue when jira_status says it is configured; else the user's Atlassian/Jira MCP tools (mcp__*atlassian*, mcp__*jira*); else read_browser_tab with includeText: true; else a screenshot zoomed with region.
+3. Summarize it in 2–3 sentences and draft a short plan.
+4. One ask_user for where to work (only that; step 5 is a separate ask_user): options are the top 3–6 find_repos matches (query: the key, component and summary words) as "name — path", plus "Another folder (type the path)" and "Create a new folder". Ask for the subfolder only in a monorepo, and the base branch only if unclear.
+5. One ask_user: "Move KEY-123 to In Progress and assign it to you?" (Yes / Only assign / No).
+6. Unless the chosen repo already is your project, call switch_project {dir, task} (create: true for a new folder) and end your turn: never cd into, edit, branch or run tests in that folder from this session, and do the transition there, not here. The new session remembers nothing, so task carries the key, summary, acceptance criteria, the plan and the user's answers.
+7. In the repo: git fetch, update the base branch and create the branch from jira_get_issue (KEY-123-short-slug); do the agreed transition and assignment (jira_transition, jira_assign, or in the browser tab when Jira is not connected); implement, run the tests, commit "KEY-123: …"; ask before pushing or opening a PR; finish with a jira_comment summary when connected.
+8. Final spoken answer: 1–2 sentences.`;
 
 /**
  * Platform-specific notes from platform.info().
@@ -191,7 +202,7 @@ You are the user's interactive Claude Code session, also taking commands from th
 /**
  * Build the system prompt appended to Claude Code's default prompt.
  * @param {{platformInfo?:object, config?:object, mode?:'companion'|'bridge'}} [opts]
- * @returns {string} at most 14,000 characters
+ * @returns {string} at most MAX_CHARS (16,000) characters
  */
 function buildSystemPrompt({ platformInfo, config, mode } = {}) {
   const cfg = config && typeof config === 'object' ? config : {};
@@ -208,6 +219,7 @@ function buildSystemPrompt({ platformInfo, config, mode } = {}) {
     SAFETY,
     COMMUNICATION,
     PLAYBOOK,
+    TICKET,
     platformNotes(pi),
     settingsNotes(cfg),
     COMPANION,
