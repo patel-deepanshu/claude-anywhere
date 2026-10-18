@@ -833,6 +833,8 @@ class VoiceService {
     } finally {
       if (this.current === current) this.current = null;
     }
+    // Windows PowerShell reports -EncodedCommand errors as CLIXML; keep the message (e.g. "Audio device error").
+    if (r && tts.name === 'sapi' && typeof r.stderr === 'string') r = { ...r, stderr: proc.psErrorText(r.stderr) };
     if (ac.signal.aborted || (r && r.aborted)) return { ok: true, provider: tts.name, stopped: true };
     if (r.error) {
       const hint = r.error.code === 'ENOENT' ? this.resolveTtsHintFor(tts.name) : undefined;

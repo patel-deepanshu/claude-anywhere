@@ -121,12 +121,37 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     await driver.keyCombo(['ctrl', 'a']);
     await sleep(150);
     await driver.keyCombo(['ctrl', 'c']);
-    const text = await waitFor(async () => {
+    const got = await waitFor(async () => {
       const s = await driver.clipboardGet();
-      return s !== sentinel ? s : null;
+      return s !== sentinel ? { s } : null;
     }, 4000, 150);
-    note(t, 'Notepad text via ctrl+a, ctrl+c:', text == null ? null : text.length > 300 ? `${text.slice(0, 300)}... (${text.length} chars)` : text);
+    const text = got ? got.s : null;
+    note(t, 'Notepad text via ctrl+a, ctrl+c:', text == null ? '(clipboard unchanged: nothing was copied)' : text.length > 300 ? `${text.slice(0, 300)}... (${text.length} chars)` : text);
     return text == null ? null : text.replace(/\r\n/g, '\n');
+  }
+
+  /** Where two strings first differ, with code points around it (for typing diagnostics). */
+  function firstDiff(actual, expected) {
+    const a = String(actual == null ? '' : actual);
+    let i = 0;
+    while (i < a.length && i < expected.length && a[i] === expected[i]) i++;
+    if (i === a.length && i === expected.length) return 'identical';
+    const codes = (s) => Array.from(s.slice(Math.max(0, i - 3), i + 6)).map((c) => c.codePointAt(0).toString(16)).join(' ');
+    return `lengths ${a.length}/${expected.length}, first difference at ${i}: actual [${codes(a)}] expected [${codes(expected)}]`;
+  }
+
+  /** Type into a cleared Notepad, copy it back and compare. */
+  async function typeAndCompare(t, text, label) {
+    await clearNotepad(t);
+    const started = Date.now();
+    const r = await driver.typeText(text);
+    note(t, `${label}: typed ${text.length} UTF-16 units in ${Date.now() - started} ms; result ${show(r === undefined ? null : r)}`);
+    await sleep(500);
+    note(t, `${label}: active window after typing:`, await driver.activeWindow());
+    await snap(t, `${label}.png`);
+    const got = await copyNotepadText(t);
+    if (got !== text) note(t, `${label}: ${firstDiff(got, text)}`);
+    return got;
   }
 
   async function newNotepadWindows() {
@@ -405,18 +430,27 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     assert.equal(text, 'Xabc?b\nt1\tt2\nli');
   });
 
-  it('live-desktop: long typed text is chunked without losing characters or splitting surrogates', { timeout: 120000 }, async (t) => {
-    await clearNotepad(t);
+  it('live-desktop: typeText of astral characters (surrogate pairs) through SendInput', { timeout: 60000 }, async (t) => {
+    const text = 'astral 🎉 ok 𝄞 end';
+    const got = await typeAndCompare(t, text, '06b-astral');
+    assert.equal(got, text);
+  });
+
+  it('live-desktop: long typed ASCII text is chunked without losing characters', { timeout: 120000 }, async (t) => {
+    // Longer than the driver's 1000-unit chunk and the host's 64-character SendInput batches.
+    const text = `${'abcdefghij'.repeat(130)} end`;
+    const got = await typeAndCompare(t, text, '06c-long-ascii');
+    assert.ok(got != null, 'copied something');
+    assert.equal(got.length, text.length, 'same length');
+    assert.equal(got, text);
+  });
+
+  it('live-desktop: a surrogate pair on the chunk boundary of long typed text stays whole', { timeout: 120000 }, async (t) => {
     // 'x' * 999 puts the emoji's surrogate pair across the driver's 1000-unit chunk boundary.
-    const long = `${'x'.repeat(999)}🎉${'y'.repeat(300)} ü€ 日本 end`;
-    const started = Date.now();
-    await driver.typeText(long);
-    note(t, `typed ${long.length} UTF-16 units in ${Date.now() - started} ms`);
-    await sleep(500);
-    const text = await copyNotepadText(t);
-    assert.ok(text != null, 'copied something');
-    assert.equal(text.length, long.length, 'same length');
-    assert.equal(text, long);
+    const text = `${'x'.repeat(999)}🎉${'y'.repeat(300)} ü€ 日本 end`;
+    const got = await typeAndCompare(t, text, '06d-long-astral');
+    assert.ok(got != null, 'copied something');
+    assert.equal(got, text);
   });
 
   it('live-desktop: scroll, drag, mouseDown/mouseUp and a region zoom', { timeout: 60000 }, async (t) => {
@@ -626,7 +660,7 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     }
   });
 
-  it('live-desktop: openTarget (file and app), notify and speak', { timeout: 180000 }, async (t) => {
+  it('live-desktop: openTarget (file and app) and notify', { timeout: 180000 }, async (t) => {
     const common = require('../src/os/common');
     const beforeIds = new Set((await newNotepadWindows()).map((w) => w.id));
     const file = path.join(HOME, 'live ü test.txt');
@@ -657,13 +691,39 @@ describe('live-desktop: Windows (real driver, Computer, CLI, MCP)', { skip }, ()
     note(t, 'notify:', n);
     assert.equal(n.ok, true);
     await driver.notify('Claude Anywhere host notify', 'ü€');
+  });
 
+  it('live-desktop: speak (SAPI through Windows PowerShell)', { timeout: 120000 }, async (t) => {
+    // The daemon's voice service (dialog read-aloud) has its own SAPI command.
+    const { VoiceService } = require('../src/daemon/voice');
+    const svc = new VoiceService({ config: { voice: { language: 'en-US' } } });
+    let voiceError = null;
+    try {
+      const r = await svc.speak('Claude Anywhere voice service test');
+      note(t, 'VoiceService.speak:', r);
+      assert.equal(r.provider, 'sapi');
+    } catch (err) {
+      voiceError = err;
+      note(t, `VoiceService.speak failed: ${err.message}${err.hint ? ` (${err.hint})` : ''}`);
+      assert.doesNotMatch(err.message, /CLIXML|<\/S>|_x000D_/, 'the voice error is plain text');
+      if (!/Audio device error|AudioException/i.test(err.message)) throw err;
+    }
+
+    const common = require('../src/os/common');
     const s = await common.speak('Claude Anywhere live desktop test');
     note(t, 'speak:', s);
     assert.equal(s.engine, 'sapi');
     const done = await Promise.race([s.done, sleep(60000).then(() => ({ timedOut: true }))]);
     note(t, 'speak done:', { code: done.code, signal: done.signal, timedOut: done.timedOut, stderr: done.stderr, error: done.error && done.error.message });
     assert.ok(!done.timedOut, 'speech finished');
+    // Errors must read as text, not as Windows PowerShell's CLIXML serialization.
+    assert.doesNotMatch(String(done.stderr || ''), /CLIXML|<Objs|_x000D_/, 'SAPI errors are plain text');
+    if (done.code !== 0 && /Audio device error|AudioException/i.test(String(done.stderr))) {
+      assert.ok(voiceError, 'both SAPI paths agree that there is no audio device');
+      // The hosted runner has no sound device, so SAPI cannot open an audio output there.
+      t.skip(`no audio output device on this machine: ${String(done.stderr).split('\n')[0]}`);
+      return;
+    }
     assert.equal(done.code, 0, `SAPI speech failed: ${done.stderr || (done.error && done.error.message) || ''}`);
   });
 

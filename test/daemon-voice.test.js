@@ -631,6 +631,26 @@ test('defaultRunner: output, input, abort and missing commands', async () => {
   assert.equal(aborted.aborted, true);
   const slow = await defaultRunner(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'], { timeoutMs: 100 });
   assert.equal(slow.timedOut, true);
+});
+
+test('a SAPI failure reports the PowerShell error text, not CLIXML', async () => {
+  // Windows PowerShell 5.1 writes -EncodedCommand errors as CLIXML; this one came from the
+  // windows-latest runner, which has no audio device. The tail used to keep only closing tags.
+  const clixml =
+    '#< CLIXML\r\n<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">' +
+    '<S S="Error">Exception calling "Speak" with "1" argument(s): "Audio device error encountered. - Error Code: 0x2"_x000D__x000A_</S>' +
+    '<S S="Error">    + FullyQualifiedErrorId : AudioException_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>';
+  const runner = fakeRunner(() => ({ ...OK, code: 1, stderr: clixml }));
+  const svc = service({
+    runner,
+    platformInfo: { platform: 'win32' },
+    which: (n) => (n === 'powershell' ? 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' : null),
+  });
+  await assert.rejects(svc.speak('hello'), (err) => {
+    assert.match(err.message, /^sapi failed \(exit 1\): Exception calling "Speak".*Audio device error.*AudioException$/);
+    assert.doesNotMatch(err.message, /CLIXML|<\/S>|_x000D_/);
+    return true;
+  });
   const missing = await defaultRunner('definitely-not-a-command-xyz', []);
   assert.ok(missing.error);
   assert.equal(missing.error.code, 'ENOENT');

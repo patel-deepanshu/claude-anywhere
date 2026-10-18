@@ -649,3 +649,48 @@ test('PowerShell scripts parse cleanly and psString round-trips unicode (live pw
   const lines = check.stdout.trim().split(/\r?\n/);
   assert.deepEqual(lines.filter((l) => /^s\d\.ps1:/.test(l)).map((l) => l.split(':')[1]), ['0', '0', '0', '0', '0'], check.stdout);
 });
+
+// Captured from SAPI speech on the windows-latest runner (no audio device): Windows PowerShell 5.1
+// writes the error stream of an -EncodedCommand as CLIXML.
+const SAPI_CLIXML =
+  '#< CLIXML\r\n<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">' +
+  '<S S="Error">Exception calling "Speak" with "1" argument(s): "Audio device error encountered. - Error Code: 0x2"_x000D__x000A_</S>' +
+  '<S S="Error">At line:21 char:3_x000D__x000A_</S><S S="Error">+   $s.Speak($text)_x000D__x000A_</S>' +
+  '<S S="Error">+   ~~~~~~~~~~~~~~~_x000D__x000A_</S>' +
+  '<S S="Error">    + CategoryInfo          : NotSpecified: (:) [], ParentContainsErrorRecordException_x000D__x000A_</S>' +
+  '<S S="Error">    + FullyQualifiedErrorId : AudioException_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>';
+
+test('psErrorText turns Windows PowerShell CLIXML stderr into the error text', () => {
+  const { psErrorText } = require('../src/shared/proc');
+  const text = psErrorText(SAPI_CLIXML);
+  assert.equal(text.split('\n')[0], 'Exception calling "Speak" with "1" argument(s): "Audio device error encountered. - Error Code: 0x2"');
+  assert.match(text, /FullyQualifiedErrorId : AudioException$/);
+  assert.doesNotMatch(text, /CLIXML|<Objs|_x000D_/);
+  const plain = '<S S="Error">a &amp; b_x000A_</S>';
+  assert.equal(psErrorText(plain), plain, 'text that is not CLIXML is left alone');
+  assert.equal(psErrorText('#< CLIXML\n<Objs><S S="Error">a &amp; b &lt;c&gt; _x005F_x_x000D__x000A_</S><Obj S="progress" RefId="0"><TN/></Obj></Objs>'), 'a & b <c> _x');
+  assert.equal(psErrorText(''), '');
+  assert.equal(psErrorText(undefined), '');
+});
+
+test('open and speak on Windows report PowerShell errors as text, not CLIXML', async (t) => {
+  const calls = fake(t, {
+    platform: 'win32',
+    which: { 'powershell.exe': PS },
+    run: () => ({ code: 1, stderr: '#< CLIXML\r\n<Objs Version="1.1.0.1"><S S="Error">Start-Process : boom_x000D__x000A_</S></Objs>' }),
+  });
+  await assert.rejects(common.openTarget('someapp', { kind: 'app' }), (e) => {
+    assert.equal(e.message, 'Could not start "someapp": Start-Process : boom');
+    return true;
+  });
+  assert.equal(calls.run.length, 1);
+
+  const r = await common.speak('hello');
+  const child = calls.spawn[0].child;
+  child.stderr.emit('data', Buffer.from(SAPI_CLIXML));
+  child.emit('exit', 1, null);
+  const done = await r.done;
+  assert.equal(done.code, 1);
+  assert.match(done.stderr, /^Exception calling "Speak".*Audio device error/);
+  assert.doesNotMatch(done.stderr, /CLIXML|<Objs/);
+});
