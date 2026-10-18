@@ -3370,7 +3370,7 @@ const COMMANDS = {
 };
 
 // Feature command modules (src/cli/<name>.js) export commands(helpers) -> { name: {run, group, summary, usage, spec} }.
-for (const name of ['voice', 'jira', 'calls']) {
+for (const name of ['voice', 'jira', 'clone', 'calls']) {
   let mod = null;
   try {
     mod = require(path.join(__dirname, '..', 'src', 'cli', `${name}.js`));

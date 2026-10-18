@@ -90,6 +90,40 @@ const DEFAULTS = Object.freeze({
     // a question from Claude, and failures. chime plays a short tone first.
     announce: { done: true, permission: true, question: true, error: true },
     chime: true,
+    // Your own cloned voice (feature 3, docs/CALLS.md). Set by a consented enrollment
+    // (/anywhere:clone-voice); everything runs locally and free.
+    clone: {
+      enabled: false,
+      engine: 'pocket', // 'pocket' | 'zipvoice'
+      threads: 2,
+      steps: 0, // 0 = engine default
+      provider: 'cpu', // 'cpu' | 'cuda' | 'coreml'
+      python: '',
+    },
+  },
+  // AI-answered calls (feature 3, docs/CALLS.md). Off until armed by a click; the greeting always
+  // discloses that an AI assistant is answering and taking notes.
+  calls: {
+    ownerName: '',
+    ownerPronoun: 'their', // 'his' | 'her' | 'their'
+    apps: ['zoho-cliq', 'google-meet', 'teams', 'slack', 'zoom'],
+    defaultArmMinutes: 120,
+    maxArmMinutes: 720,
+    answerAfterSec: 8,
+    answerOnlyWhenIdleSec: 0,
+    quietHours: { enabled: true, start: '22:00', end: '08:00' },
+    greeting: '',
+    maxCallMinutes: 15,
+    model: 'haiku',
+    stt: { model: 'moonshine' }, // 'moonshine' | 'whisper-tiny' | 'parakeet'
+    audio: { mode: 'auto', virtualMic: '', capture: '', switchDefaultInput: true }, // auto | virtual | speakers
+    detect: { titles: true, notifications: true, screenDiff: true, vision: true },
+    limits: { assign: 1, comment: 2, chat: 2, writes: 3 },
+    jira: { projects: [] },
+    notesDir: '',
+    saveTranscript: true,
+    keepCallDataDays: 30,
+    cliq: { mode: 'gui', dc: 'com', clientId: '', clientSecret: '', refreshToken: '' },
   },
   // Jira Cloud/Data Center REST access for ticket work (optional: Claude falls back to a Jira MCP
   // server, then to reading the browser tab). apiToken is stored locally (0600) and never shown.
@@ -108,7 +142,23 @@ const DEFAULTS = Object.freeze({
   },
 });
 
-const SECRET_KEYS = [['voice', 'sttApiKey'], ['jira', 'apiToken']];
+// Paths of secret values: blanked (with a <key>Set flag) in publicConfig, ignored when sent empty.
+const SECRET_KEYS = [
+  ['voice', 'sttApiKey'],
+  ['jira', 'apiToken'],
+  ['calls', 'cliq', 'clientSecret'],
+  ['calls', 'cliq', 'refreshToken'],
+];
+
+/** The object holding the last segment of a secret path, or null. */
+function secretParent(obj, keyPath) {
+  let cur = obj;
+  for (const k of keyPath.slice(0, -1)) {
+    if (!cur || !isPlainObject(cur[k])) return null;
+    cur = cur[k];
+  }
+  return cur;
+}
 
 function clone(v) {
   return JSON.parse(JSON.stringify(v));
@@ -201,10 +251,12 @@ function coerce(str) {
 /** Config safe to send to the UI: secrets blanked, with *Set flags. */
 function publicConfig(cfg) {
   const out = clone(cfg);
-  for (const [section, key] of SECRET_KEYS) {
-    if (out[section]) {
-      out[section][`${key}Set`] = Boolean(out[section][key]);
-      out[section][key] = '';
+  for (const keyPath of SECRET_KEYS) {
+    const parent = secretParent(out, keyPath);
+    const key = keyPath[keyPath.length - 1];
+    if (parent) {
+      parent[`${key}Set`] = Boolean(parent[key]);
+      parent[key] = '';
     }
   }
   return out;
@@ -222,10 +274,12 @@ function sanitizeUpdate(partial) {
     if (!(k in DEFAULTS)) continue;
     out[k] = clone(v);
   }
-  for (const [section, key] of SECRET_KEYS) {
-    if (out[section] && isPlainObject(out[section])) {
-      delete out[section][`${key}Set`];
-      if (out[section][key] === '' || out[section][key] == null) delete out[section][key];
+  for (const keyPath of SECRET_KEYS) {
+    const parent = secretParent(out, keyPath);
+    const key = keyPath[keyPath.length - 1];
+    if (parent) {
+      delete parent[`${key}Set`];
+      if (parent[key] === '' || parent[key] == null) delete parent[key];
     }
   }
   return out;
