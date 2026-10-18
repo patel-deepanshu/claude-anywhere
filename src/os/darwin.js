@@ -157,7 +157,7 @@ function permissionHint(kind, app) {
   if (kind === 'screenRecording') {
     return (
       `Grant Screen Recording to ${who}: System Settings → Privacy & Security → Screen Recording ` +
-      `(named "Screen & System Audio Recording" on macOS 15), turn it on, then ${restart}. ` +
+      `(named "Screen & System Audio Recording" on macOS 15 and later), turn it on, then ${restart}. ` +
       `Open the pane with: open "${SETTINGS_URLS.screenRecording}". ${owner}`
     );
   }
