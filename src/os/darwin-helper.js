@@ -1117,6 +1117,8 @@ function hasOwn(o, k) {
  * Caps Lock does not matter. Other layers are read from `characters`, which follows the
  * layout's Command keymap: Apple's non-Latin layouts and "Dvorak - QWERTY ⌘" switch to a
  * QWERTY keymap while Command is held, which is what apps match Cmd shortcuts against.
+ * When `characters` gives nothing for Command alone, the plain layer answers instead, so
+ * Command lookups never fall back to US positions (Cmd+A would be Cmd+Q on AZERTY).
  */
 function layoutChar(code, flags) {
   var f = flags | 0;
@@ -1126,6 +1128,7 @@ function layoutChar(code, flags) {
     var ns = $.NSEvent.eventWithCGEvent(e);
     if (isNil(ns)) return '';
     var s = ObjC.unwrap(f ? ns.characters : ns.charactersIgnoringModifiers);
+    if ((typeof s !== 'string' || s.length !== 1) && f === FLAG_CMD) s = ObjC.unwrap(ns.charactersIgnoringModifiers);
     if (typeof s !== 'string' || s.length !== 1) return '';
     return (f & FLAG_SHIFT) !== 0 ? s : s.toLowerCase();
   } catch (err) {

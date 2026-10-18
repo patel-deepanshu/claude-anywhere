@@ -334,13 +334,13 @@ test('engine: no inheritable marker in its environment; the plugin copy of the s
 
 /**
  * A CLI that, like Claude Code, runs a "Bash command" in a session of its own (which starts a
- * grandchild in yet another process group, as `timeout` does), and an MCP server in its own
- * process group that opened an "app" on purpose. With ignoreTerm, the CLI and the command
- * ignore SIGTERM.
+ * grandchild in yet another process group, as `timeout` does), and an MCP server in the CLI's
+ * process group that opened an "app" on purpose. cliIgnoresTerm / commandIgnoresTerm: SIGTERM
+ * does nothing to the CLI / to the command and its grandchild.
  */
-function treeCli(ignoreTerm) {
-  const file = path.join(HOME, `tree-cli-${ignoreTerm ? 'stubborn' : 'plain'}.js`);
-  const hold = `${ignoreTerm ? "process.on('SIGTERM', () => {});" : ''} setInterval(() => {}, 1000);`;
+function treeCli(cliIgnoresTerm, commandIgnoresTerm = cliIgnoresTerm) {
+  const file = path.join(HOME, `tree-cli-${uuid()}.js`);
+  const hold = `${commandIgnoresTerm ? "process.on('SIGTERM', () => {});" : ''} setInterval(() => {}, 1000);`;
   fs.writeFileSync(
     file,
     `
@@ -357,7 +357,7 @@ const mcp = spawn(process.execPath, ['-e', ${JSON.stringify(
        process.stdin.resume(); process.stdin.on('end', () => process.exit(0));`
     )}, out + '.app'], { stdio: ['pipe', 'ignore', 'ignore'] });
 fs.writeFileSync(out, JSON.stringify({ command: command.pid, mcp: mcp.pid }));
-${ignoreTerm ? "process.on('SIGTERM', () => {});" : ''}
+${cliIgnoresTerm ? "process.on('SIGTERM', () => {});" : ''}
 process.stdin.resume();
 setInterval(() => {}, 1000);
 `
@@ -365,9 +365,9 @@ setInterval(() => {}, 1000);
   return file;
 }
 
-async function startTree(ignoreTerm) {
+async function startTree(cliIgnoresTerm, commandIgnoresTerm) {
   const pidsFile = path.join(HOME, `pids-${uuid()}.json`);
-  const engine = new ClaudeCliEngine({ claudePath: treeCli(ignoreTerm), cwd: HOME, sessionId: uuid(), env: { TREE_PIDS_FILE: pidsFile } });
+  const engine = new ClaudeCliEngine({ claudePath: treeCli(cliIgnoresTerm, commandIgnoresTerm), cwd: HOME, sessionId: uuid(), env: { TREE_PIDS_FILE: pidsFile } });
   engine.start();
   assert.ok(await waitUntil(() => fs.existsSync(pidsFile) && fs.existsSync(`${pidsFile}.grand`) && fs.existsSync(`${pidsFile}.app`), 5000), 'the fake CLI started its tree');
   await sleep(50);
@@ -387,6 +387,24 @@ test("engine stop ends the CLI's commands, but not an app an MCP server opened o
     assert.ok(await waitUntil(() => !alive(pids.command) && !alive(pids.grand)), 'the command and its grandchild are gone');
     assert.ok(await waitUntil(() => !alive(pids.mcp)), 'the MCP server exits on stdin EOF');
     assert.equal(alive(pids.app), true, 'the opened app outlives the engine');
+  } finally {
+    for (const pid of Object.values(pids)) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        /* gone */
+      }
+    }
+  }
+});
+
+test('engine stop: a command that ignores SIGTERM gets SIGKILL even though the CLI itself exited', { skip: posixOnly }, async () => {
+  const { engine, pids } = await startTree(false, true);
+  try {
+    await engine.stop();
+    assert.equal(engine.running, false);
+    assert.ok(alive(pids.command), 'SIGTERM did not end it');
+    assert.ok(await waitUntil(() => !alive(pids.command) && !alive(pids.grand), 5000), 'SIGKILL 3 s later did');
   } finally {
     for (const pid of Object.values(pids)) {
       try {
