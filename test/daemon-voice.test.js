@@ -639,6 +639,8 @@ test('a SAPI failure reports the PowerShell error text, not CLIXML', async () =>
   const clixml =
     '#< CLIXML\r\n<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">' +
     '<S S="Error">Exception calling "Speak" with "1" argument(s): "Audio device error encountered. - Error Code: 0x2"_x000D__x000A_</S>' +
+    '<S S="Error">At line:1 char:391_x000D__x000A_</S><S S="Error">+ ... :UTF8.GetString($ms.ToArray()); if ($t.Trim()) { $s.Speak($t) }; $s.D ..._x000D__x000A_</S>' +
+    '<S S="Error">    + CategoryInfo          : NotSpecified: (:) [], ParentContainsErrorRecordException_x000D__x000A_</S>' +
     '<S S="Error">    + FullyQualifiedErrorId : AudioException_x000D__x000A_</S><S S="Error"> _x000D__x000A_</S></Objs>';
   const runner = fakeRunner(() => ({ ...OK, code: 1, stderr: clixml }));
   const svc = service({
@@ -647,8 +649,8 @@ test('a SAPI failure reports the PowerShell error text, not CLIXML', async () =>
     which: (n) => (n === 'powershell' ? 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' : null),
   });
   await assert.rejects(svc.speak('hello'), (err) => {
-    assert.match(err.message, /^sapi failed \(exit 1\): Exception calling "Speak".*Audio device error.*AudioException$/);
-    assert.doesNotMatch(err.message, /CLIXML|<\/S>|_x000D_/);
+    assert.equal(err.message, 'sapi failed (exit 1): Exception calling "Speak" with "1" argument(s): "Audio device error encountered. - Error Code: 0x2"');
+    assert.match(err.hint, /no working audio output device/);
     return true;
   });
   const missing = await defaultRunner('definitely-not-a-command-xyz', []);
