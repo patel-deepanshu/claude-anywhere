@@ -4,3 +4,4 @@ node_modules/
 /tmp/
 coverage/
 .anywhere-test-*/
+.claude/worktrees/
