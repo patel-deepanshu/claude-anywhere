@@ -60,7 +60,10 @@ const ID_IN_USE_RE = /already in use|already exists/i;
 /**
  * Read-only anywhere tools: pre-approved so they never reach the permission prompt. The ticket
  * workflow's reads (find_repos, the Jira lookups) are here too; read_browser_tab is not, because
- * with includeText it drives the keyboard and clipboard (the broker judges each call).
+ * with includeText it drives the keyboard and clipboard (the broker judges each call). So are the
+ * desktop assistant's reads: the accessibility tree, OCR, the app list, bookmarks and waiting for
+ * the screen (permissions.js classifies them low; none sends input). browser_tabs is not: with
+ * cycle: true it steps through the tabs with the keyboard (the broker allows the plain read at once).
  */
 const READ_ONLY_TOOLS = [
   'screenshot',
@@ -78,6 +81,13 @@ const READ_ONLY_TOOLS = [
   'jira_search',
   'jira_my_issues',
   'jira_find_user',
+  'ui_find',
+  'ui_tree',
+  'find_text',
+  'read_screen_text',
+  'list_apps',
+  'browser_bookmarks',
+  'wait_for',
 ].map((n) => `mcp__anywhere__${n}`);
 
 // switch_project: the work moves to another folder (a fresh conversation there) when the turn that
@@ -150,6 +160,23 @@ const ANYWHERE_NAMES = {
   jira_assign: 'Assign Jira issue',
   jira_comment: 'Comment on Jira issue',
   jira_find_user: 'Find Jira user',
+  // the desktop assistant (tools-ui, tools-ocr, tools-desktop, batch_actions): as permissions.displayName
+  ui_find: 'Find UI elements',
+  ui_tree: 'Read window controls',
+  ui_click: 'Click UI element',
+  ui_set_value: 'Set field value',
+  find_text: 'Find text on screen',
+  read_screen_text: 'Read screen text',
+  list_apps: 'List apps',
+  launch_app: 'Launch app',
+  quit_app: 'Quit app',
+  set_window: 'Arrange window',
+  wait_for: 'Wait for screen',
+  browser_bookmarks: 'Read bookmarks',
+  browser_open: 'Open in browser',
+  browser_tabs: 'List browser tabs',
+  browser_switch_tab: 'Switch browser tab',
+  batch_actions: 'Run several actions',
 };
 
 function humanize(s) {
@@ -334,6 +361,60 @@ function summary(name, input) {
     case 'jira_find_user':
       s = oneLine(i.query);
       break;
+    case 'ui_find':
+    case 'ui_click': {
+      const what = oneLine(i.name || i.text) ? `"${truncate(oneLine(i.name || i.text), 50)}"` : oneLine(i.id);
+      s = `${what}${oneLine(i.role) ? ` (${oneLine(i.role)})` : ''}${oneLine(i.window) ? ` in ${oneLine(i.window)}` : ''}`;
+      break;
+    }
+    case 'ui_tree':
+      s = oneLine(i.window) || 'active window';
+      break;
+    case 'ui_set_value': {
+      const field = oneLine(i.name || i.text) ? `"${truncate(oneLine(i.name || i.text), 30)}"` : oneLine(i.id) || 'field';
+      const value = i.value == null ? '' : String(i.value);
+      // Shown like type_text's text, except a secret-looking value (as on the approval card).
+      const secret = value && require('./permissions').secretLike(value);
+      s = secret ? `${field} = a secret-looking value (${value.length} characters)` : `${field} = "${truncate(oneLine(value), 40)}"`;
+      break;
+    }
+    case 'find_text':
+      s = `"${truncate(oneLine(i.text), 60)}"`;
+      break;
+    case 'read_screen_text':
+      s = isPlainObject(i.region) ? `region ${point(i.region.x, i.region.y)} ${i.region.width}×${i.region.height}` : i.display != null ? `display ${i.display}` : 'screen';
+      break;
+    case 'list_apps':
+      s = oneLine(i.query) || 'all apps';
+      break;
+    case 'launch_app':
+    case 'quit_app':
+      s = `${oneLine(i.name)}${i.force === true ? ' (force)' : ''}`;
+      break;
+    case 'set_window':
+      s = `${oneLine(i.window)}${oneLine(i.state) ? ` → ${oneLine(i.state)}` : isPlainObject(i.bounds) ? ` → ${point(i.bounds.x, i.bounds.y)} ${i.bounds.width}×${i.bounds.height}` : ''}`;
+      break;
+    case 'wait_for':
+      s = `${oneLine(i.text) ? `"${truncate(oneLine(i.text), 40)}"` : oneLine(i.window)}${i.gone === true ? ' gone' : ''}${i.timeoutSec ? `, ${i.timeoutSec}s` : ''}`;
+      break;
+    case 'browser_bookmarks':
+      s = [oneLine(i.browser), oneLine(i.folder) && `folder ${oneLine(i.folder)}`, oneLine(i.query) && `"${oneLine(i.query)}"`].filter(Boolean).join(', ') || 'all browsers';
+      break;
+    case 'browser_open':
+      s = `${oneLine(i.url)}${oneLine(i.browser) ? ` in ${oneLine(i.browser)}` : ''}`;
+      break;
+    case 'browser_tabs':
+      s = `${oneLine(i.browser) || 'browser'}${i.cycle === true ? ', with the keyboard' : ''}`;
+      break;
+    case 'browser_switch_tab':
+      s = `${oneLine(i.match) ? `"${truncate(oneLine(i.match), 50)}"` : i.index != null ? `tab ${i.index}` : ''}${oneLine(i.browser) ? ` in ${oneLine(i.browser)}` : ''}`;
+      break;
+    case 'batch_actions': {
+      const steps = Array.isArray(i.actions) ? i.actions : [];
+      const types = steps.map((a) => (isPlainObject(a) ? oneLine(a.type) : '?') || '?');
+      s = `${steps.length} step${steps.length === 1 ? '' : 's'}${types.length ? `: ${types.join(', ')}` : ''}`;
+      break;
+    }
     default: {
       for (const k of ['command', 'url', 'file_path', 'path', 'query', 'target', 'title', 'name', 'text', 'description', 'prompt']) {
         if (typeof i[k] === 'string' && i[k].trim()) {

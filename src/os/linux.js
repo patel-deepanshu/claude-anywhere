@@ -72,6 +72,11 @@ const PACKAGES = {
   'gnome-screenshot': 'gnome-screenshot',
   spectacle: { apt: 'kde-spectacle', dnf: 'spectacle', pacman: 'spectacle', zypper: 'spectacle', apk: 'spectacle' },
   'wlr-randr': 'wlr-randr',
+  // UI automation (atspi-helper.py): PyGObject, the Atspi typelib and the accessibility bus.
+  python3: { apt: 'python3', dnf: 'python3', pacman: 'python', zypper: 'python3', apk: 'python3' },
+  'python3-gi': { apt: 'python3-gi', dnf: 'python3-gobject', pacman: 'python-gobject', zypper: 'python3-gobject', apk: 'py3-gobject3' },
+  'gir1.2-atspi-2.0': { apt: 'gir1.2-atspi-2.0', dnf: 'at-spi2-core', pacman: 'at-spi2-core', zypper: 'typelib-1_0-Atspi-2_0', apk: 'at-spi2-core' },
+  'at-spi2-core': 'at-spi2-core',
 };
 
 /**
@@ -1688,6 +1693,234 @@ async function readBrowserTab(driver, opts = {}, how = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// UI automation (AT-SPI through src/os/atspi-helper.py) and window bounds
+// ---------------------------------------------------------------------------
+
+const ATSPI_HELPER = path.join(__dirname, 'atspi-helper.py');
+/** The shared role vocabulary (docs/ARCHITECTURE.md §4); the helper maps AT-SPI roles onto it. */
+const UI_ROLES = Object.freeze([
+  'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox', 'listitem', 'menuitem', 'menu', 'tab', 'tablist',
+  'treeitem', 'image', 'text', 'heading', 'window', 'toolbar', 'group', 'table', 'row', 'cell', 'slider', 'other',
+]);
+const UI_ROLE_SET = new Set(UI_ROLES);
+/** Other names callers use for the same roles (AT-SPI, UI Automation, ARIA and plain English). */
+const UI_ROLE_ALIASES = Object.freeze({
+  edit: 'textbox', entry: 'textbox', input: 'textbox', field: 'textbox', textfield: 'textbox', searchbox: 'textbox',
+  textarea: 'textbox', passwordtext: 'textbox', hyperlink: 'link', anchor: 'link', option: 'listitem',
+  menubar: 'menu', popupmenu: 'menu', tabitem: 'tab', pagetab: 'tab', pagetablist: 'tablist', dropdown: 'combobox',
+  select: 'combobox', radiobutton: 'radio', pushbutton: 'button', togglebutton: 'button', splitbutton: 'button',
+  switch: 'checkbox', checkbox: 'checkbox', statictext: 'text', label: 'text', static: 'text', paragraph: 'text',
+  img: 'image', picture: 'image', icon: 'image', dialog: 'window', frame: 'window', pane: 'group', panel: 'group',
+  section: 'group', list: 'group', listbox: 'group', tree: 'group', grid: 'table', datagrid: 'table',
+  dataitem: 'row', tablerow: 'row', gridcell: 'cell', tablecell: 'cell', columnheader: 'cell', rowheader: 'cell',
+  spinner: 'slider', spinbutton: 'slider', toolbar: 'toolbar', treeitem: 'treeitem', listitem: 'listitem',
+  menuitem: 'menuitem', combobox: 'combobox',
+});
+const UI_ACTIONS = Object.freeze(['press', 'focus', 'setValue', 'select', 'expand', 'collapse', 'scrollIntoView', 'showMenu']);
+const UI_ACTION_MAP = new Map(UI_ACTIONS.map((a) => [a.toLowerCase(), a]));
+/** Time the helper may spend walking one window; it stops there and reports truncated. */
+const UI_BUDGET_MS = 6000;
+const UI_MAX_BUDGET_MS = 30000;
+/** Python start-up, the PyGObject imports and one slow accessibility call on top of the walk budget. */
+const UI_HELPER_MARGIN_MS = 6000;
+const UI_ACTION_TIMEOUT_MS = 15000;
+const UI_PROBE_TIMEOUT_MS = 8000;
+/** Element ids remember their window and bounds this long (and are re-resolved by path after). */
+const UI_CACHE_TTL_MS = 30000;
+const UI_CACHE_MAX = 4000;
+/** How long an interpreter without the bindings is skipped, and a capabilities probe is reused. */
+const UI_PYTHON_RETRY_MS = 60000;
+const UI_PROBE_TTL_MS = 30000;
+/** "lx:<window key>:<root>:<child path>:<hash>"; the key is a listWindows() id or "@<pid>.<app child index>". */
+const UI_ID_RE = /^lx:([^:\s]{1,100}):(w|p\d{1,4}):((?:\d{1,5}(?:\.\d{1,5}){0,99})?):([0-9a-f]{6})$/;
+const UI_APP_KEY_RE = /^@(\d{1,10})\.(\d{1,5})$/;
+/** What a Chromium-based browser or Electron app needs at start-up to show its pages to AT-SPI (for launch_app). */
+const CHROMIUM_A11Y_ARGS = Object.freeze(['--force-renderer-accessibility']);
+const CHROMIUM_A11Y_ENV = Object.freeze({ ACCESSIBILITY_ENABLED: '1' });
+const CHROMIUM_A11Y_HINT =
+  'Chromium-based browsers (Chrome, Brave, Edge, Chromium) and Electron apps (VS Code, Slack, Discord, WhatsApp ' +
+  'desktop) join the accessibility bus only with ACCESSIBILITY_ENABLED=1 in their environment (or the desktop\'s ' +
+  'accessibility setting on), and show their page content only when started with --force-renderer-accessibility: ' +
+  'quit the app and start it as, e.g., ACCESSIBILITY_ENABLED=1 brave-browser --force-renderer-accessibility';
+const APP_A11Y_HINT =
+  `${CHROMIUM_A11Y_HINT}; Qt apps need QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 and Java apps the java-atk-wrapper ` +
+  'package. Otherwise use find_text (OCR) or a screenshot and click by position.';
+const RELATIVE_BOUNDS_NOTE =
+  'Element positions are relative to their window on this Wayland desktop (the compositor does not tell apps where ' +
+  'their windows are), so elements cannot be clicked by position: ui_click and ui_set_value use accessibility ' +
+  'actions only.';
+const WINDOW_STATES = Object.freeze(['maximize', 'minimize', 'restore', 'fullscreen']);
+const WINDOW_STATE_ALIASES = Object.freeze({
+  maximized: 'maximize', max: 'maximize', zoom: 'maximize', minimized: 'minimize', min: 'minimize', iconify: 'minimize',
+  restored: 'restore', normal: 'restore', unmaximize: 'restore', 'full screen': 'fullscreen', 'full-screen': 'fullscreen',
+  fullscreened: 'fullscreen',
+});
+const MIN_WINDOW_SIZE = 20;
+const BOUNDS_SETTLE_MS = 150;
+const STATE_WAIT_MS = 800;
+
+function uiError(message, code, hint) {
+  const err = new Error(message);
+  err.code = code;
+  if (hint) err.hint = hint;
+  return err;
+}
+
+/**
+ * Normalize a role name to the shared vocabulary (case, spaces and common aliases).
+ * @param {string} role
+ * @returns {string} a UI_ROLES entry
+ */
+function normalizeUiRole(role) {
+  const key = String(role == null ? '' : role).trim().toLowerCase().replace(/[\s_-]+/g, '');
+  if (UI_ROLE_SET.has(key)) return key;
+  if (Object.prototype.hasOwnProperty.call(UI_ROLE_ALIASES, key)) return UI_ROLE_ALIASES[key];
+  throw uiError(`Unknown UI role "${role}"`, 'BAD_ARGS', `Use one of: ${UI_ROLES.join(', ')}.`);
+}
+
+/** A role filter (string, "a|b", "a,b" or a list) as a de-duplicated list, or undefined for none. */
+function uiRoleFilter(role) {
+  if (role == null || role === '') return undefined;
+  const list = (Array.isArray(role) ? role : String(role).split(/[|,]/)).map((r) => String(r).trim()).filter(Boolean);
+  if (!list.length) return undefined;
+  return [...new Set(list.map(normalizeUiRole))];
+}
+
+function uiNorm(s) {
+  return String(s == null ? '' : s).replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * How well a text matches a query, case-insensitively with whitespace collapsed (atspi-helper.py
+ * match_score): 3 whole text, 2 prefix, 1 substring, 0 none; exact allows only 3.
+ */
+function uiMatchScore(haystack, query, exact = false) {
+  const h = uiNorm(haystack);
+  const q = uiNorm(query);
+  if (!q || !h) return 0;
+  if (h === q) return 3;
+  if (exact) return 0;
+  if (h.startsWith(q)) return 2;
+  return h.includes(q) ? 1 : 0;
+}
+
+/**
+ * Parse a Linux UI element id ("lx:<window key>:<root>:<path>:<hash>").
+ * @returns {{windowKey:string, root:string, path:number[], pathText:string, hash:string}|null}
+ */
+function parseUiId(id) {
+  const m = UI_ID_RE.exec(typeof id === 'string' ? id.trim() : '');
+  if (!m) return null;
+  return { windowKey: m[1], root: m[2], path: m[3] ? m[3].split('.').map(Number) : [], pathText: m[3], hash: m[4] };
+}
+
+function formatUiId(windowKey, ref) {
+  return `lx:${windowKey}:${ref}`;
+}
+
+/** {x, y, width, height} with whole finite numbers (all zero when unknown). */
+function uiBounds(b) {
+  const o = b && typeof b === 'object' ? b : {};
+  const n = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : 0);
+  return { x: n(o.x), y: n(o.y), width: Math.max(0, n(o.width)), height: Math.max(0, n(o.height)) };
+}
+
+/** State fields shared by tree nodes and search results, from a helper record. */
+function uiState(out, n) {
+  if (typeof n.value === 'string' && n.value) out.value = n.value;
+  if (typeof n.description === 'string' && n.description) out.description = n.description;
+  out.bounds = uiBounds(n.bounds);
+  out.enabled = n.enabled !== false;
+  out.focused = n.focused === true;
+  if (typeof n.selected === 'boolean') out.selected = n.selected;
+  if (n.checked === true || n.checked === false || n.checked === 'mixed') out.checked = n.checked;
+  if (typeof n.expanded === 'boolean') out.expanded = n.expanded;
+  if (n.editable === true) out.editable = true;
+  if (n.offscreen === true) out.offscreen = true;
+  return out;
+}
+
+function uiRoleOf(role) {
+  return UI_ROLE_SET.has(role) ? role : 'other';
+}
+
+/** Attach non-enumerable metadata (window, truncated, notes...) to a result array. */
+function withMeta(list, meta) {
+  for (const [k, v] of Object.entries(meta)) {
+    if (v !== undefined) Object.defineProperty(list, k, { value: v, enumerable: false, configurable: true, writable: true });
+  }
+  return list;
+}
+
+/** The helper's answer: the last line of stdout that is a JSON object (or null). */
+function parseHelperOutput(stdout) {
+  const lines = String(stdout == null ? '' : stdout).split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const s = lines[i].trim();
+    if (!s.startsWith('{')) continue;
+    try {
+      const j = JSON.parse(s);
+      if (j && typeof j === 'object' && typeof j.ok === 'boolean') return j;
+    } catch {
+      /* keep looking */
+    }
+  }
+  return null;
+}
+
+/**
+ * Validate a setWindowBounds spec: {state} (maximize, minimize, restore, fullscreen, or an alias) or
+ * any of {x, y, width, height}.
+ * @returns {{state:string}|{x?:number,y?:number,width?:number,height?:number}}
+ */
+function parseBoundsSpec(spec) {
+  const s = spec && typeof spec === 'object' ? spec : null;
+  if (!s) throw uiError('setWindowBounds needs {x, y, width, height} or {state}', 'BAD_ARGS');
+  const keys = ['x', 'y', 'width', 'height'].filter((k) => s[k] != null && s[k] !== '');
+  if (s.state != null && s.state !== '') {
+    const raw = String(s.state).trim().toLowerCase();
+    const state = WINDOW_STATE_ALIASES[raw] || raw;
+    if (!WINDOW_STATES.includes(state)) {
+      throw uiError(`Unknown window state "${s.state}"`, 'BAD_ARGS', 'Use maximize, minimize, restore or fullscreen.');
+    }
+    if (keys.length) throw uiError(`Give either bounds or the state "${s.state}", not both`, 'BAD_ARGS');
+    return { state };
+  }
+  if (!keys.length) throw uiError('setWindowBounds needs {x, y, width, height} (any of them) or {state}', 'BAD_ARGS');
+  const out = {};
+  for (const k of keys) {
+    const n = Number(s[k]);
+    if (!Number.isFinite(n) || Math.abs(n) > 1e6) throw uiError(`${k} must be a number (got ${JSON.stringify(s[k])})`, 'BAD_ARGS');
+    if ((k === 'width' || k === 'height') && n < MIN_WINDOW_SIZE) {
+      throw uiError(`${k} must be at least ${MIN_WINDOW_SIZE} (got ${s[k]})`, 'BAD_ARGS');
+    }
+    out[k] = Math.round(n);
+  }
+  return out;
+}
+
+/** Parse `xwininfo -id <id>`: the window's absolute position and size. */
+function parseXwininfoWindow(text) {
+  const s = String(text || '');
+  const ax = /Absolute upper-left X:\s*(-?\d+)/.exec(s);
+  const ay = /Absolute upper-left Y:\s*(-?\d+)/.exec(s);
+  const w = /^\s*Width:\s*(\d+)/m.exec(s);
+  const h = /^\s*Height:\s*(\d+)/m.exec(s);
+  if (!ax || !ay || !w || !h) return null;
+  return { x: +ax[1], y: +ay[1], width: +w[1], height: +h[1] };
+}
+
+function nearRect(a, b, posTol, sizeTol) {
+  if (!a || !b) return false;
+  return (
+    (b.x == null || Math.abs(a.x - b.x) <= posTol) &&
+    (b.y == null || Math.abs(a.y - b.y) <= posTol) &&
+    (b.width == null || Math.abs(a.width - b.width) <= sizeTol) &&
+    (b.height == null || Math.abs(a.height - b.height) <= sizeTol)
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Base driver
 // ---------------------------------------------------------------------------
 
@@ -1841,6 +2074,425 @@ class LinuxDriverBase {
    */
   async browserTab(opts = {}) {
     return readBrowserTab(this, opts, { platform: 'linux' });
+  }
+
+  // ----- UI automation (AT-SPI) -----
+
+  _uiState() {
+    if (!this._uiData) this._uiData = { python: null, bad: new Map(), ids: new Map(), probe: null };
+    return this._uiData;
+  }
+
+  _uiInstallHint() {
+    return this._hint(['python3-gi', 'gir1.2-atspi-2.0', 'at-spi2-core']);
+  }
+
+  /**
+   * Python interpreters to run the helper with, best first: $ANYWHERE_PYTHON, python3, then the
+   * distribution's own versioned interpreters (python3-gi is built for those, which matters when
+   * python3 on PATH is a newer or self-built one).
+   * The list is kept for a minute, so an interpreter installed meanwhile is found without a restart.
+   * @returns {string[]} resolved paths, without duplicates
+   */
+  _pythonCandidates() {
+    const st = this._uiState();
+    if (st.candidates && Date.now() - st.candidates.at < UI_PYTHON_RETRY_MS) return st.candidates.list;
+    const list = this._findPythons();
+    st.candidates = { at: Date.now(), list };
+    return list;
+  }
+
+  _findPythons() {
+    const env = this._env();
+    const names = [];
+    if (env.ANYWHERE_PYTHON) names.push(String(env.ANYWHERE_PYTHON));
+    names.push('python3', '/usr/bin/python3');
+    for (let v = 20; v >= 6; v--) names.push(`/usr/bin/python3.${v}`);
+    for (let v = 20; v >= 6; v--) names.push(`python3.${v}`);
+    const out = [];
+    const seen = new Set();
+    for (const n of names) {
+      const p = this._whichImpl(n);
+      if (!p) continue;
+      let real = p;
+      try {
+        real = fs.realpathSync(p);
+      } catch {
+        /* keep the path as found */
+      }
+      if (seen.has(real)) continue;
+      seen.add(real);
+      out.push(p);
+    }
+    return out;
+  }
+
+  /**
+   * Run one atspi-helper.py request with the first interpreter that has the AT-SPI bindings (and
+   * remember it). Helper errors become Errors with a code (UNSUPPORTED, NOT_FOUND, STALE, BAD_ARGS,
+   * TIMEOUT, UI_ERROR) and a hint; an answer with ok:false and no code (an action the element does
+   * not support) is returned as it is.
+   * @param {object} req
+   * @param {{timeoutMs?:number}} [opts]
+   */
+  async _atspi(req, { timeoutMs = UI_BUDGET_MS + UI_HELPER_MARGIN_MS } = {}) {
+    const st = this._uiState();
+    const all = this._pythonCandidates();
+    if (!all.length) {
+      throw uiError('UI automation needs python3, which is not installed', 'UNSUPPORTED', `Install it: ${this._hint(['python3', 'python3-gi', 'gir1.2-atspi-2.0', 'at-spi2-core'])}.`);
+    }
+    const now = Date.now();
+    const order = st.python && all.includes(st.python) ? [st.python, ...all.filter((p) => p !== st.python)] : all;
+    const usable = order.filter((p) => !(st.bad.has(p) && now - st.bad.get(p) < UI_PYTHON_RETRY_MS));
+    let missing = null;
+    for (const py of usable) {
+      const r = await this._run(py, ['-I', ATSPI_HELPER], { input: JSON.stringify(req), timeoutMs, env: this._env() });
+      const res = parseHelperOutput(r.stdout);
+      if (!res) {
+        if (r.error && r.error.code === 'ENOENT') {
+          st.bad.set(py, Date.now());
+          continue;
+        }
+        if (r.timedOut) {
+          throw uiError(
+            `The accessibility helper did not answer within ${Math.round(timeoutMs / 1000)} s`,
+            'TIMEOUT',
+            'The app may be busy or not answering accessibility requests: take a screenshot (or use find_text) instead, or try again.',
+          );
+        }
+        const why = firstLine(r.stderr) || (r.error && r.error.message) || `exit code ${r.code}`;
+        throw uiError(`The accessibility helper failed: ${why}`, 'UI_ERROR', 'Take a screenshot (or use find_text) and click by position instead.');
+      }
+      if (res.ok === false && res.code === 'NO_BINDINGS') {
+        st.bad.set(py, Date.now());
+        if (st.python === py) st.python = null;
+        missing = res;
+        continue;
+      }
+      st.python = py;
+      st.bad.delete(py);
+      if (res.ok === false && res.code) throw this._uiHelperError(res);
+      return res;
+    }
+    const which = missing && missing.python ? ` for Python ${missing.python}` : '';
+    throw uiError(
+      `UI automation needs the AT-SPI Python bindings (python3-gi and the Atspi typelib${which})`,
+      'UNSUPPORTED',
+      `Install them: ${this._uiInstallHint()}. Meanwhile use screenshots (or find_text) and click by position.`,
+    );
+  }
+
+  _uiHelperError(res) {
+    const msg = String(res.error || 'the accessibility request failed');
+    switch (res.code) {
+      case 'NO_BUS':
+        return uiError(
+          `UI automation is unavailable: ${msg}`,
+          'UNSUPPORTED',
+          `Run Claude Anywhere inside your desktop session, with the accessibility bus installed (${this._hint(['at-spi2-core'])}); ` +
+            'on GNOME also run: gsettings set org.gnome.desktop.interface toolkit-accessibility true. Meanwhile use screenshots and click by position.',
+        );
+      case 'NO_WINDOW':
+        return uiError(
+          res.apps === 0 ? 'No application has registered with the accessibility bus (AT-SPI)' : 'This window is not in the accessibility tree (AT-SPI)',
+          'NOT_FOUND',
+          APP_A11Y_HINT,
+        );
+      case 'STALE':
+        return uiError(msg, 'STALE', 'Call ui_find (or ui_tree) again for a fresh id.');
+      case 'BAD_REQUEST':
+        return uiError(msg, 'BAD_ARGS');
+      default:
+        return uiError(`Accessibility request failed: ${msg}`, 'UI_ERROR', 'Take a screenshot (or use find_text) and click by position instead.');
+    }
+  }
+
+  _uiRemember(id, entry) {
+    const ids = this._uiState().ids;
+    ids.delete(id);
+    ids.set(id, { ...entry, at: Date.now() });
+    while (ids.size > UI_CACHE_MAX) ids.delete(ids.keys().next().value);
+  }
+
+  _uiCached(id) {
+    const ids = this._uiState().ids;
+    const e = ids.get(id);
+    if (!e) return null;
+    if (Date.now() - e.at > UI_CACHE_TTL_MS) {
+      ids.delete(id);
+      return null;
+    }
+    return e;
+  }
+
+  /** Window origin for window-relative element extents (Wayland), or null for screen coordinates. */
+  _uiOrigin() {
+    return null;
+  }
+
+  /** True when element bounds cannot be placed on the screen (Wayland without window positions). */
+  _uiRelative() {
+    return false;
+  }
+
+  /**
+   * The window a UI request is about: listWindows() entry (by id, else the focused window) and the
+   * reference the helper matches it by (process id, title, bounds). Without a window list
+   * (GNOME/KDE Wayland) the helper takes the active accessible window.
+   * @returns {Promise<{key:string|null, window:object|null, ref:object}>}
+   */
+  async _uiWindowRef(windowId) {
+    const raw = windowId && typeof windowId === 'object' && windowId.id != null ? windowId.id : windowId;
+    const key = raw != null && String(raw).trim() !== '' ? String(raw).trim() : null;
+    const app = key ? UI_APP_KEY_RE.exec(key) : null;
+    if (app) return { key, window: null, ref: { pid: Number(app[1]), index: Number(app[2]) } };
+    let wins = null;
+    try {
+      wins = await this.listWindows();
+    } catch (err) {
+      if (!err || err.code !== 'UNSUPPORTED') throw err;
+    }
+    if (!wins) {
+      if (key) throw uiError(`Window ${key} cannot be looked up on this desktop`, 'NOT_FOUND', 'Leave the window out to use the active window.');
+      return { key: null, window: null, ref: { active: true } };
+    }
+    let w = null;
+    if (key) {
+      w = wins.find((x) => sameWindowId(x.id, key)) || null;
+      if (!w) throw uiError(`Window ${key} is not open`, 'NOT_FOUND', 'Call list_windows for the current window ids.');
+    } else {
+      w = wins.find((x) => x.focused) || null;
+      if (!w) {
+        const a = await this.activeWindow().catch(() => null);
+        if (a) w = wins.find((x) => sameWindowId(x.id, a.id)) || null;
+      }
+      if (!w) return { key: null, window: null, ref: { active: true } };
+    }
+    const ref = { pid: Number(w.pid) || 0, title: String(w.title || ''), app: String(w.app || '') };
+    if ([w.x, w.y, w.width, w.height].every(Number.isFinite) && w.width > 0 && w.height > 0) {
+      ref.bounds = { x: w.x, y: w.y, width: w.width, height: w.height };
+    }
+    if (ref.pid === 0 && !ref.title) ref.active = Boolean(w.focused);
+    return { key: String(w.id), window: w, ref };
+  }
+
+  /** Request fields shared by tree/find/action: the window reference and, on Wayland, the origin. */
+  _uiRequest(cmd, w, extra = {}) {
+    const req = { cmd, window: w.ref, ...extra };
+    const origin = this._uiOrigin(w.window);
+    if (origin) req.origin = origin;
+    return req;
+  }
+
+  /** The window key ids are built on, and the reference cached with them (with the helper's index). */
+  _uiKeyAndRef(w, res) {
+    const hw = (res && res.window) || {};
+    const key = w.key || `@${Number(hw.pid) || 0}.${Number(hw.index) || 0}`;
+    const ref = { ...w.ref };
+    if (Number.isInteger(hw.index)) ref.index = hw.index;
+    if (!ref.pid && Number(hw.pid) > 0) ref.pid = Number(hw.pid);
+    if (!ref.title && hw.title) ref.title = String(hw.title);
+    return { key, ref };
+  }
+
+  _uiNotes(res, w) {
+    const notes = Array.isArray(res.notes) ? res.notes.filter((n) => typeof n === 'string' && n) : [];
+    if (this._uiRelative(w.window)) notes.push(RELATIVE_BOUNDS_NOTE);
+    if (res.truncated) notes.push('The walk stopped at its node, depth or time limit; narrow it down with ui_find, or ask for more nodes.');
+    return notes;
+  }
+
+  /**
+   * The accessibility tree of a window (Driver.uiTree), breadth first: up to `depth` listed levels
+   * below the window and `maxNodes` nodes. Unnamed containers, decorative images and labels that
+   * repeat their parent's name are walked through but not listed; showing pop-up menus of the app
+   * are extra roots. Nodes come in document order.
+   * @param {{windowId?:string, depth?:number, maxNodes?:number, budgetMs?:number}} [opts]
+   * @returns {Promise<{window:{id,app,title}, nodes:object[], truncated:boolean, scanned?:number, notes?:string[], relativeBounds?:boolean}>}
+   */
+  async uiTree({ windowId, depth = 6, maxNodes = 400, budgetMs = UI_BUDGET_MS } = {}) {
+    const w = await this._uiWindowRef(windowId);
+    const req = this._uiRequest('tree', w, {
+      depth: clampInt(depth == null ? 6 : depth, 0, 50, 6),
+      maxNodes: clampInt(maxNodes == null ? 400 : maxNodes, 1, 5000, 400),
+      budgetMs: clampInt(budgetMs == null ? UI_BUDGET_MS : budgetMs, 200, UI_MAX_BUDGET_MS, UI_BUDGET_MS),
+    });
+    const res = await this._atspi(req, { timeoutMs: req.budgetMs + UI_HELPER_MARGIN_MS });
+    const { key, ref } = this._uiKeyAndRef(w, res);
+    const toId = (r) => (typeof r === 'string' && r ? formatUiId(key, r) : null);
+    const nodes = [];
+    for (const n of Array.isArray(res.nodes) ? res.nodes : []) {
+      if (!n || typeof n.ref !== 'string') continue;
+      const out = uiState({ id: toId(n.ref), role: uiRoleOf(n.role), name: typeof n.name === 'string' ? n.name : '' }, n);
+      out.parent = toId(n.parent);
+      out.children = Array.isArray(n.children) ? n.children.map(toId).filter(Boolean) : [];
+      if (Number.isInteger(n.depth)) out.depth = n.depth;
+      if (n.more === true) out.more = true;
+      nodes.push(out);
+      this._uiRemember(out.id, { key, window: ref, bounds: out.bounds, role: out.role, name: out.name });
+    }
+    const hw = res.window || {};
+    const result = {
+      window: { id: key, app: String((w.window && w.window.app) || hw.app || ''), title: String(hw.title || (w.window && w.window.title) || '') },
+      nodes,
+      truncated: res.truncated === true,
+    };
+    if (Number.isFinite(res.scanned)) result.scanned = res.scanned;
+    const notes = this._uiNotes(res, w);
+    if (notes.length) result.notes = notes;
+    if (this._uiRelative(w.window)) result.relativeBounds = true;
+    return result;
+  }
+
+  /**
+   * Find elements of a window (Driver.uiFind) by name (the accessible name), text (name, value or
+   * description) and/or role; case-insensitive substring, or the whole text with exact. Open menus
+   * and drop-downs of the app are searched first. Best matches first: whole text, then prefix, then
+   * substring; controls before labels, on-screen and enabled first. The array also carries
+   * non-enumerable window, truncated, scanned, total, notes and relativeBounds.
+   * @param {{windowId?:string, name?:string, role?:string|string[], text?:string, exact?:boolean, limit?:number,
+   *   depth?:number, maxNodes?:number, budgetMs?:number}} [opts]
+   * @returns {Promise<Array<{id,role,name,value,bounds,windowId,path,enabled,focused}>>}
+   */
+  async uiFind({ windowId, name, role, text, exact = false, limit = 20, depth, maxNodes, budgetMs = UI_BUDGET_MS } = {}) {
+    const n = name == null ? '' : String(name).trim();
+    const t = text == null ? '' : String(text).trim();
+    const roles = uiRoleFilter(role);
+    if (!n && !t && !roles) throw uiError('uiFind needs a name, text or role to look for', 'BAD_ARGS', 'Example: { name: "Save", role: "button" }');
+    const w = await this._uiWindowRef(windowId);
+    const extra = {
+      exact: exact === true,
+      limit: clampInt(limit == null ? 20 : limit, 1, 200, 20),
+      budgetMs: clampInt(budgetMs == null ? UI_BUDGET_MS : budgetMs, 200, UI_MAX_BUDGET_MS, UI_BUDGET_MS),
+    };
+    if (n) extra.name = n;
+    if (t) extra.text = t;
+    if (roles) extra.roles = roles;
+    if (depth != null) extra.depth = clampInt(depth, 1, 80, 60);
+    if (maxNodes != null) extra.maxNodes = clampInt(maxNodes, 1, 50000, 8000);
+    const req = this._uiRequest('find', w, extra);
+    const res = await this._atspi(req, { timeoutMs: req.budgetMs + UI_HELPER_MARGIN_MS });
+    const { key, ref } = this._uiKeyAndRef(w, res);
+    const list = [];
+    for (const m of Array.isArray(res.matches) ? res.matches : []) {
+      if (!m || typeof m.ref !== 'string') continue;
+      const out = uiState({ id: formatUiId(key, m.ref), role: uiRoleOf(m.role), name: typeof m.name === 'string' ? m.name : '' }, m);
+      out.value = typeof m.value === 'string' ? m.value : '';
+      out.windowId = key;
+      out.path = typeof m.path === 'string' ? m.path : '';
+      list.push(out);
+      this._uiRemember(out.id, { key, window: ref, bounds: out.bounds, role: out.role, name: out.name });
+    }
+    const hw = res.window || {};
+    const notes = this._uiNotes(res, w);
+    return withMeta(list, {
+      window: { id: key, app: String((w.window && w.window.app) || hw.app || ''), title: String(hw.title || (w.window && w.window.title) || '') },
+      truncated: res.truncated === true,
+      scanned: Number.isFinite(res.scanned) ? res.scanned : undefined,
+      total: Number.isFinite(res.total) ? res.total : undefined,
+      notes: notes.length ? notes : undefined,
+      relativeBounds: this._uiRelative(w.window) || undefined,
+    });
+  }
+
+  /**
+   * Act on an element from uiFind/uiTree without the mouse (Driver.uiAction): press = the default
+   * action (click, press, activate, jump...) or selecting it in its parent; focus = grab_focus;
+   * setValue = EditableText (or Value for sliders, or the named option of a combo box); select =
+   * selection in the parent, or with a value the named option inside; expand / collapse; scrollIntoView
+   * = scroll_to; showMenu = a menu action, else focus + Shift+F10.
+   * ok false (method 'none', with a reason) means the element does not support it: click it instead.
+   * pending: the app had not answered (an action that opened a modal dialog, usually).
+   * @param {{id:string, action?:string, value?:string|number}} opts
+   * @returns {Promise<{ok:boolean, method:string, reason?:string, pending?:boolean, disabled?:boolean,
+   *   confirmed?:boolean, item?:string, role?:string, name?:string, bounds?:object, value?:string, id?:string, resolved?:string}>}
+   */
+  async uiAction({ id, action = 'press', value } = {}) {
+    const p = parseUiId(id);
+    if (!p) throw uiError(`Invalid UI element id ${JSON.stringify(id)}`, 'BAD_ARGS', 'Use an id returned by uiFind or uiTree.');
+    const act = UI_ACTION_MAP.get(String(action == null ? 'press' : action).trim().toLowerCase());
+    if (!act) throw uiError(`Unknown UI action "${action}"`, 'BAD_ARGS', `Use one of: ${UI_ACTIONS.join(', ')}.`);
+    if (act === 'setValue' && value == null) throw uiError('setValue needs a value', 'BAD_ARGS');
+    const cached = this._uiCached(String(id).trim());
+    let w;
+    if (UI_APP_KEY_RE.test(p.windowKey)) {
+      w = { key: p.windowKey, window: null, ref: cached ? cached.window : (await this._uiWindowRef(p.windowKey)).ref };
+    } else {
+      try {
+        w = await this._uiWindowRef(p.windowKey);
+      } catch (err) {
+        if (err && err.code === 'NOT_FOUND') throw uiError(`The window of element ${id} is closed`, 'STALE', 'Call ui_find again.');
+        throw err;
+      }
+      if (cached && cached.window && Number.isInteger(cached.window.index)) w = { ...w, ref: { ...w.ref, index: cached.window.index } };
+    }
+    const extra = { root: p.root, path: p.pathText, hash: p.hash, action: act };
+    if (value != null) extra.value = typeof value === 'number' || typeof value === 'boolean' ? value : String(value);
+    const req = this._uiRequest('action', w, extra);
+    let res = await this._atspi(req, { timeoutMs: UI_ACTION_TIMEOUT_MS });
+    if (res.ok !== true && act === 'showMenu' && !res.disabled) res = await this._uiMenuByKeyboard(req, res);
+    const out = { ok: res.ok === true, method: typeof res.method === 'string' && res.method ? res.method : 'none' };
+    for (const k of ['reason', 'item', 'resolved']) if (typeof res[k] === 'string' && res[k]) out[k] = res[k];
+    if (res.pending === true) out.pending = true;
+    if (res.disabled === true) out.disabled = true;
+    if (res.confirmed === false) out.confirmed = false;
+    if (typeof res.value === 'string' || typeof res.value === 'number') out.value = String(res.value);
+    if (typeof res.role === 'string') out.role = uiRoleOf(res.role);
+    if (typeof res.name === 'string') out.name = res.name;
+    if (res.bounds) out.bounds = uiBounds(res.bounds);
+    if (this._uiRelative(w.window)) out.relativeBounds = true;
+    const newId = typeof res.ref === 'string' && res.ref ? formatUiId(p.windowKey, res.ref) : null;
+    if (newId && newId !== String(id).trim()) out.id = newId;
+    this._uiRemember(newId || String(id).trim(), {
+      key: p.windowKey,
+      window: cached ? cached.window : w.ref,
+      bounds: out.bounds || (cached && cached.bounds) || null,
+      role: out.role || (cached && cached.role) || '',
+      name: out.name != null ? out.name : (cached && cached.name) || '',
+    });
+    return out;
+  }
+
+  /** showMenu without a menu action: give the element focus and press Shift+F10 (the context-menu key). */
+  async _uiMenuByKeyboard(req, failed) {
+    let focus;
+    try {
+      focus = await this._atspi({ ...req, action: 'focus' }, { timeoutMs: UI_ACTION_TIMEOUT_MS });
+    } catch {
+      return failed;
+    }
+    if (!focus || focus.ok !== true) return failed;
+    try {
+      await this.keyCombo(['shift', 'f10']);
+    } catch (err) {
+      log.debug('Shift+F10 for showMenu failed:', err && err.message);
+      return failed;
+    }
+    return { ...focus, ok: true, method: 'focus+shift+F10' };
+  }
+
+  /** capabilities().ui: whether the helper runs and reaches the accessibility bus (cached a while). */
+  async _uiCapabilities() {
+    const st = this._uiState();
+    if (st.probe && Date.now() - st.probe.at < UI_PROBE_TTL_MS) return st.probe.value;
+    let value;
+    try {
+      const res = await this._atspi({ cmd: 'probe' }, { timeoutMs: UI_PROBE_TIMEOUT_MS });
+      const n = Number(res.appCount) || 0;
+      value = {
+        ui: true,
+        notes: [
+          `UI automation (ui_find, ui_click) via AT-SPI with Python ${res.python || '3'}: ${n} application${n === 1 ? '' : 's'} on the accessibility bus.`,
+          `${CHROMIUM_A11Y_HINT}.`,
+        ],
+        hint: '',
+      };
+    } catch (err) {
+      const hint = (err && err.hint) || '';
+      value = { ui: false, notes: [`UI automation (ui_find, ui_click) is unavailable: ${err && err.message}.${hint ? ` ${hint}` : ''}`], hint };
+    }
+    st.probe = { at: Date.now(), value };
+    return value;
   }
 
   /** Stop persistent helpers (none on Linux). */
@@ -2354,6 +3006,144 @@ class X11Driver extends LinuxDriverBase {
     return false;
   }
 
+  // ----- window bounds -----
+
+  /** _NET_WM_STATE atoms without the prefix (MAXIMIZED_VERT, FULLSCREEN, HIDDEN...), or null when unknown. */
+  async _netWmState(hex) {
+    if (!this._has('xprop')) return null;
+    const p = await this._xprop(hex, ['_NET_WM_STATE']);
+    if (!p) return null;
+    const vals = (p._NET_WM_STATE && p._NET_WM_STATE.values) || [];
+    return vals.map((v) => String(v).replace(/^_NET_WM_STATE_/, ''));
+  }
+
+  /** Add or remove EWMH states (wmctrl takes two at a time; xdotool windowstate one). */
+  async _setWmStates(hex, op, props) {
+    if (this._has('wmctrl')) {
+      const names = props.map((x) => x.toLowerCase());
+      for (let i = 0; i < names.length; i += 2) {
+        const r = await this._run('wmctrl', ['-i', '-r', hex, '-b', `${op},${names.slice(i, i + 2).join(',')}`], { timeoutMs: 3000 });
+        if (!ok(r)) return false;
+      }
+      return true;
+    }
+    if (this._has('xdotool')) {
+      for (const prop of props) {
+        const r = await this._run('xdotool', ['windowstate', op === 'add' ? '--add' : '--remove', prop.toUpperCase(), x11IdToDecimal(hex)], { timeoutMs: 3000 });
+        if (!ok(r)) return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /** Poll _NET_WM_STATE until test(states) holds; true without xprop (it cannot be checked). */
+  async _waitWmState(hex, test, ms = STATE_WAIT_MS) {
+    const until = Date.now() + ms;
+    for (;;) {
+      const st = await this._netWmState(hex);
+      if (st == null) return true;
+      if (test(st)) return true;
+      if (Date.now() >= until) return false;
+      await sleep(60);
+    }
+  }
+
+  /** The window's client area in absolute screen pixels (what listWindows() reports). */
+  async _clientGeometry(hex) {
+    if (this._has('xwininfo')) {
+      const r = await this._run('xwininfo', ['-id', hex], { timeoutMs: 2000, env: this._env({ LC_ALL: 'C' }) });
+      const g = ok(r) ? parseXwininfoWindow(r.stdout) : null;
+      if (g) return g;
+    }
+    if (this._has('xdotool')) {
+      const r = await this._run('xdotool', ['getwindowgeometry', '--shell', x11IdToDecimal(hex)], { timeoutMs: 2000 });
+      if (ok(r)) return parseWindowGeometry(r.stdout);
+    }
+    return null;
+  }
+
+  async _moveResize(hex, t) {
+    if (this._has('wmctrl')) {
+      // Gravity 0: the window's own gravity.
+      const r = await this._run('wmctrl', ['-i', '-r', hex, '-e', `0,${t.x},${t.y},${t.width},${t.height}`], { timeoutMs: 3000 });
+      if (ok(r)) return true;
+    }
+    if (this._has('xdotool')) {
+      const dec = x11IdToDecimal(hex);
+      const a = await this._run('xdotool', ['windowsize', dec, t.width, t.height], { timeoutMs: 3000 });
+      const b = await this._run('xdotool', ['windowmove', dec, t.x, t.y], { timeoutMs: 3000 });
+      return ok(a) && ok(b);
+    }
+    return false;
+  }
+
+  /**
+   * Move/resize a window, or change its state (Driver.setWindowBounds). Bounds are the client area in
+   * X11 pixels, as listWindows() reports it (the frame's offset is corrected after a first move);
+   * any of x, y, width, height may be left out. maximize / fullscreen / restore use EWMH states
+   * (_NET_WM_STATE), minimize iconifies, restore also un-minimizes.
+   * @param {string} windowId
+   * @param {{x?:number,y?:number,width?:number,height?:number}|{state:'maximize'|'minimize'|'restore'|'fullscreen'}} spec
+   * @returns {Promise<boolean>} false when the window is gone or the window manager refused
+   */
+  async setWindowBounds(windowId, spec) {
+    this._requireDisplay();
+    const s = parseBoundsSpec(spec);
+    const raw = windowId && typeof windowId === 'object' && windowId.id != null ? windowId.id : windowId;
+    const hex = normalizeX11Id(raw);
+    if (!this._has('wmctrl') && !this._has('xdotool')) {
+      throw unsupportedError('Cannot move or resize windows: install wmctrl (or xdotool)', this._hint(['wmctrl', 'xdotool']));
+    }
+    if (!(await this._windowExists(hex))) return false;
+    const MAX = ['MAXIMIZED_VERT', 'MAXIMIZED_HORZ'];
+    const minimized = async () => this._has('xprop') && (await this._isMinimized(hex));
+    if (s.state === 'minimize') return this.minimizeWindow(hex);
+    if (s.state === 'maximize' || s.state === 'fullscreen') {
+      if (await minimized()) await this.focusWindow(hex);
+      const props = s.state === 'maximize' ? MAX : ['FULLSCREEN'];
+      if (s.state === 'maximize') await this._setWmStates(hex, 'remove', ['FULLSCREEN']);
+      if (!(await this._setWmStates(hex, 'add', props))) return false;
+      return this._waitWmState(hex, (st) => props.every((x) => st.includes(x)));
+    }
+    if (s.state === 'restore') {
+      await this._setWmStates(hex, 'remove', ['FULLSCREEN']);
+      await this._setWmStates(hex, 'remove', MAX);
+      if (await minimized()) await this.focusWindow(hex);
+      const normal = await this._waitWmState(hex, (st) => !st.includes('FULLSCREEN') && !MAX.some((x) => st.includes(x)) && !st.includes('HIDDEN'));
+      return normal && !(await minimized());
+    }
+    // Bounds: leave full screen / maximized first (window managers ignore moves otherwise).
+    const st = await this._netWmState(hex);
+    if (!st || st.includes('FULLSCREEN')) await this._setWmStates(hex, 'remove', ['FULLSCREEN']);
+    if (!st || MAX.some((x) => st.includes(x))) await this._setWmStates(hex, 'remove', MAX);
+    if (st && st.includes('HIDDEN')) await this.focusWindow(hex);
+    const cur = await this._clientGeometry(hex);
+    if (!cur && Object.keys(s).length < 4) {
+      throw uiError('Cannot read the window geometry to keep the values left out', 'UNSUPPORTED', this._hint(['xwininfo']));
+    }
+    const target = {
+      x: s.x != null ? s.x : cur.x,
+      y: s.y != null ? s.y : cur.y,
+      width: s.width != null ? s.width : cur.width,
+      height: s.height != null ? s.height : cur.height,
+    };
+    if (!(await this._moveResize(hex, target))) return false;
+    await sleep(BOUNDS_SETTLE_MS);
+    let now = await this._clientGeometry(hex);
+    if (!now) return true;
+    // The window manager may place the frame where the client was asked to go: shift by that offset once.
+    const dx = now.x - target.x;
+    const dy = now.y - target.y;
+    if ((dx || dy) && Math.abs(dx) <= 200 && Math.abs(dy) <= 200) {
+      await this._moveResize(hex, { ...target, x: target.x - dx, y: target.y - dy });
+      await sleep(BOUNDS_SETTLE_MS);
+      now = (await this._clientGeometry(hex)) || now;
+    }
+    // Size hints (a terminal's character cells) may round the size a little.
+    return nearRect(now, target, 8, 64);
+  }
+
   // ----- clipboard -----
 
   async clipboardGet() {
@@ -2421,6 +3211,8 @@ class X11Driver extends LinuxDriverBase {
     if (!speak) missing.push('espeak-ng');
     const install = missing.length ? this._hint(missing) : '';
     if (install) notes.push(`Install missing tools: ${install}`);
+    const ui = await this._uiCapabilities();
+    notes.push(...ui.notes);
     return {
       screenshot: reachable && shotTools.length > 0,
       mouse: reachable && xdotool,
@@ -2429,8 +3221,10 @@ class X11Driver extends LinuxDriverBase {
       clipboard: reachable && clip,
       notify,
       speak,
+      ui: ui.ui,
       notes,
       install,
+      ...(ui.hint ? { uiHint: ui.hint } : {}),
     };
   }
 }
@@ -3103,6 +3897,125 @@ class WaylandDriver extends LinuxDriverBase {
     return false;
   }
 
+  // ----- window bounds -----
+
+  async _swayCmd(cmd) {
+    const r = await this._run('swaymsg', [cmd], { timeoutMs: 3000 });
+    if (!ok(r)) return false;
+    try {
+      const j = JSON.parse(r.stdout);
+      if (Array.isArray(j)) return j.every((x) => !x || x.success !== false);
+    } catch {
+      /* older swaymsg prints nothing parseable on success */
+    }
+    return true;
+  }
+
+  async _swayBounds(id, s) {
+    const sel = `[con_id=${id}]`;
+    const w = (await this.listWindows()).find((x) => x.id === id);
+    if (!w) return false;
+    if (s.state === 'minimize') return this.minimizeWindow(id);
+    if (w.minimized && !(await this._swayCmd(`${sel} scratchpad show, floating disable`))) return false;
+    // sway has no maximize: full screen on the window's output is the closest it offers.
+    if (s.state === 'maximize' || s.state === 'fullscreen') return this._swayCmd(`${sel} fullscreen enable`);
+    if (s.state === 'restore') return this._swayCmd(`${sel} fullscreen disable`);
+    const t = {
+      x: s.x != null ? s.x : w.x,
+      y: s.y != null ? s.y : w.y,
+      width: s.width != null ? s.width : w.width,
+      height: s.height != null ? s.height : w.height,
+    };
+    return this._swayCmd(
+      `${sel} fullscreen disable, floating enable, resize set width ${t.width} px height ${t.height} px, move absolute position ${t.x} px ${t.y} px`,
+    );
+  }
+
+  async _hyprClient(addr) {
+    const r = await this._run('hyprctl', ['clients', '-j'], { timeoutMs: 3000 });
+    if (!ok(r)) return null;
+    try {
+      const list = JSON.parse(r.stdout);
+      return (Array.isArray(list) && list.find((c) => c && c.address === addr)) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 'maximize' | 'fullscreen' | null (Hyprland >= 0.42 numbers the mode; older ones have a flag and fullscreenMode). */
+  _hyprFullscreen(c) {
+    if (typeof c.fullscreen === 'number') return c.fullscreen === 1 ? 'maximize' : c.fullscreen >= 2 ? 'fullscreen' : null;
+    if (c.fullscreen === true) return c.fullscreenMode === 1 ? 'maximize' : 'fullscreen';
+    return null;
+  }
+
+  async _hyprBounds(addr, s) {
+    const c = await this._hyprClient(addr);
+    if (!c) return false;
+    if (s.state === 'minimize') return this.minimizeWindow(addr);
+    const wsName = (c.workspace && c.workspace.name) || '';
+    if (wsName.startsWith('special')) {
+      // Back from the "minimized" special workspace to the one on screen.
+      const r = await this._run('hyprctl', ['activeworkspace', '-j'], { timeoutMs: 2000 });
+      let wsId = null;
+      try {
+        wsId = ok(r) ? JSON.parse(r.stdout).id : null;
+      } catch {
+        wsId = null;
+      }
+      if (!Number.isInteger(wsId) || !(await this._hyprDispatch('movetoworkspacesilent', `${wsId},address:${addr}`))) return false;
+    }
+    const mode = this._hyprFullscreen(c);
+    // The fullscreen dispatcher toggles the focused window: 1 = maximize, 0 = full screen.
+    const toggle = async (m) => (await this._hyprDispatch('focuswindow', `address:${addr}`)) && this._hyprDispatch('fullscreen', m === 'maximize' ? '1' : '0');
+    if (s.state === 'maximize' || s.state === 'fullscreen') {
+      if (mode === s.state) return true;
+      if (mode && !(await toggle(mode))) return false;
+      return toggle(s.state);
+    }
+    if (mode && !(await toggle(mode))) return false;
+    if (s.state === 'restore') return true;
+    const at = Array.isArray(c.at) ? c.at : [0, 0];
+    const size = Array.isArray(c.size) ? c.size : [0, 0];
+    const t = {
+      x: s.x != null ? s.x : at[0],
+      y: s.y != null ? s.y : at[1],
+      width: s.width != null ? s.width : size[0],
+      height: s.height != null ? s.height : size[1],
+    };
+    if (!c.floating && !(await this._hyprDispatch('setfloating', `address:${addr}`))) return false;
+    const resized = await this._hyprDispatch('resizewindowpixel', `exact ${t.width} ${t.height},address:${addr}`);
+    const moved = await this._hyprDispatch('movewindowpixel', `exact ${t.x} ${t.y},address:${addr}`);
+    return resized && moved;
+  }
+
+  /**
+   * Move/resize a window or change its state (Driver.setWindowBounds) on sway (floating, fullscreen,
+   * scratchpad) and Hyprland (floating, fullscreen modes, the special "minimized" workspace).
+   * GNOME and KDE on Wayland do not let other programs move windows: UNSUPPORTED with a hint.
+   * @returns {Promise<boolean>}
+   */
+  async setWindowBounds(windowId, spec) {
+    const s = parseBoundsSpec(spec);
+    const raw = windowId && typeof windowId === 'object' && windowId.id != null ? windowId.id : windowId;
+    if (this._swayOk()) return this._swayBounds(this._swayId(raw), s);
+    if (this._hyprOk()) return this._hyprBounds(this._hyprAddress(raw), s);
+    const why = this._windowsUnsupported();
+    throw unsupportedError(`Moving and resizing windows is not available on ${this.compositor} (Wayland)`, why.hint);
+  }
+
+  // ----- UI automation -----
+
+  /** Apps on Wayland do not know where their windows are: element extents are window-relative plus this origin. */
+  _uiOrigin(win) {
+    if (win && Number.isFinite(win.x) && Number.isFinite(win.y) && (this._swayOk() || this._hyprOk())) return { x: win.x, y: win.y };
+    return null;
+  }
+
+  _uiRelative(win) {
+    return !this._uiOrigin(win);
+  }
+
   // ----- clipboard -----
 
   async clipboardGet() {
@@ -3177,7 +4090,22 @@ class WaylandDriver extends LinuxDriverBase {
     if (!speak) missing.push('espeak-ng');
     const install = missing.length ? this._hint(missing) : '';
     if (install) notes.push(`Install missing tools: ${install}`);
-    return { screenshot: shotTools.length > 0, mouse, keyboard, windows, clipboard, notify, speak, notes, install };
+    const ui = await this._uiCapabilities();
+    notes.push(...ui.notes);
+    if (ui.ui && !windows) notes.push(RELATIVE_BOUNDS_NOTE);
+    return {
+      screenshot: shotTools.length > 0,
+      mouse,
+      keyboard,
+      windows,
+      clipboard,
+      notify,
+      speak,
+      ui: ui.ui,
+      notes,
+      install,
+      ...(ui.hint ? { uiHint: ui.hint } : {}),
+    };
   }
 }
 
@@ -3265,4 +4193,20 @@ module.exports = {
   BROWSERS,
   TAB_TIMING,
   DEFAULT_TAB_CHARS,
+  // UI automation (shared with the mock driver in index.js) and window bounds
+  UI_ROLES,
+  UI_ACTIONS,
+  normalizeUiRole,
+  uiRoleFilter,
+  uiMatchScore,
+  parseUiId,
+  formatUiId,
+  parseHelperOutput,
+  parseBoundsSpec,
+  parseXwininfoWindow,
+  withMeta,
+  ATSPI_HELPER,
+  CHROMIUM_A11Y_HINT,
+  CHROMIUM_A11Y_ARGS,
+  CHROMIUM_A11Y_ENV,
 };

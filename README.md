@@ -155,6 +155,35 @@ ticket straight from the page. Add the folders where you keep code under Setting
 
 ---
 
+## Desktop assistant: any app, the real mouse and keyboard
+
+> *"Open the Jira site saved in my Brave bookmarks bar, check my work in the For you tab, pick the ticket and start
+> it in the shop-api repo."* · *"Open Figma and design an e-commerce dashboard."* · *"Check my WhatsApp messages and
+> reply."* · *"Trim the first 10 seconds of this video in Shotcut."*
+
+Claude opens and quits apps, arranges windows, finds bookmarks in any browser profile and opens them where you are
+signed in, switches tabs, and presses buttons, tabs, links and menu items **by name** through your OS's accessibility
+API (macOS AX, Windows UI Automation, Linux AT-SPI). Where an app draws its own interface (Figma's canvas, games, video
+editors) it finds text with on-device OCR (Apple Vision, Windows OCR, tesseract) and clicks it with the real pointer.
+It checks each step on screen and can run short sequences in one go, pausing whenever you press Stop.
+
+| Tools | |
+|---|---|
+| Apps and windows | `list_apps`, `launch_app`, `quit_app`, `set_window` (maximize, halves, bounds), `wait_for` |
+| Browsers | `browser_bookmarks`, `browser_open`, `browser_tabs`, `browser_switch_tab` |
+| App controls | `ui_find`, `ui_tree`, `ui_click`, `ui_set_value` |
+| Screen text | `find_text`, `read_screen_text` |
+| Faster loops | `screenshotAfter` on every action, `batch_actions` |
+
+The same from a terminal: `anywhere desktop apps|launch|quit|bookmarks|open-url|tabs|switch-tab|window|wait` and
+`anywhere computer ui-find|ocr|apps`. It costs nothing extra: built-in OS features, plus optional free packages on
+Linux (`python3-gi gir1.2-atspi-2.0 at-spi2-core` for app controls, `tesseract-ocr` for screen text, and `wmctrl`,
+`sqlite3`, `gtk-launch` for gentler quits, current Firefox bookmarks and exact app launches). Safari bookmarks need
+Full Disk Access, and listing tabs on macOS needs the Automation permission. `anywhere doctor` shows what works on
+your machine. Guide, examples and per-OS setup: [docs/DESKTOP.md](docs/DESKTOP.md).
+
+---
+
 ## Safety
 
 - The dialog's API listens on **127.0.0.1 only**. It requires a per-run random token and checks Host/Origin headers, so web pages and other local software can't drive your computer.
@@ -229,7 +258,8 @@ and `ANYWHERE_ASCII=1` forces ASCII.
                                          ├─ claude -p --input-format stream-json …  (your Claude Code)
                                          │     └─ MCP server "anywhere": screenshot · click · type · key ·
                                          │        windows · open · clipboard · context · ask_user · notify ·
-                                         │        read_browser_tab · jira_* · find_repos · switch_project
+                                         │        read_browser_tab · jira_* · find_repos · switch_project ·
+                                         │        ui_* · find_text · apps · browsers · batch_actions
                                          ├─ approvals (--permission-prompt-tool) · questions · bridge queue
                                          └─ voice (server STT, Piper/OS TTS, announcer) · desktop context · audit log
 ```
@@ -254,7 +284,7 @@ and `ANYWHERE_ASCII=1` forces ASCII.
 ## Development
 
 ```bash
-npm test                     # about 1,140 node:test tests (Node 18+); no network or display needed
+npm test                     # about 1,420 node:test tests (Node 18+); no network or display needed
 node scripts/check-syntax.js
 ANYWHERE_DRIVER=mock node bin/anywhere.js computer screenshot --out /tmp/s.png
 ANYWHERE_LIVE_DESKTOP=1 node scripts/test.js --test-name-pattern=live-desktop   # drives YOUR real desktop

@@ -163,8 +163,8 @@ test('settings notes follow the config', () => {
   assert.match(settingsNotes(cfg({ context: { attachDesktopContext: false } })), /get_desktop_context/);
 });
 
-test('length stays within 16k characters for every platform, mode and setting', () => {
-  assert.equal(MAX_CHARS, 16000);
+test('length stays within 18k characters for every platform, mode and setting', () => {
+  assert.equal(MAX_CHARS, 18000);
   const configs = [
     cfg(),
     cfg({ permissions: { mode: 'auto' }, engine: { chrome: true }, context: { attachDesktopContext: false } }),
@@ -175,7 +175,7 @@ test('length stays within 16k characters for every platform, mode and setting', 
       for (const mode of ['companion', 'bridge']) {
         const s = buildSystemPrompt({ platformInfo: pi, config: c, mode });
         assert.ok(s.length > 500, 'not empty');
-        assert.ok(s.length <= 16000, `${pi.platform}/${pi.displayServer}/${mode}: ${s.length} chars`);
+        assert.ok(s.length <= 18000, `${pi.platform}/${pi.displayServer}/${mode}: ${s.length} chars`);
       }
     }
   }
@@ -202,7 +202,7 @@ test('bridge variant is short and explains the listen/reply loop', () => {
 test('works with missing arguments', () => {
   const s = buildSystemPrompt();
   assert.ok(s.includes('# Claude Anywhere'));
-  assert.ok(s.length <= 16000);
+  assert.ok(s.length <= 18000);
   assert.ok(buildSystemPrompt({ config: null, platformInfo: null }).includes('## Safety rules'));
 });
 
