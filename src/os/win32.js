@@ -110,7 +110,8 @@ async function toWslPath(winPath, runner, whichFn) {
   if (wslpath) {
     const r = await runner(wslpath, ['-u', winPath], { timeoutMs: 5000 });
     const out = String(r.stdout || '').trim();
-    if (r.code === 0 && out.startsWith('/')) return out;
+    // An absolute path of this machine (inside WSL, always /...).
+    if (r.code === 0 && path.isAbsolute(out)) return out;
   }
   return winToWslPath(winPath);
 }

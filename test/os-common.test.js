@@ -375,7 +375,13 @@ function writeDesktop(dir, name, content) {
 function desktopFixture() {
   const root = fs.mkdtempSync(path.join(HOME, 'xdg-'));
   const user = path.join(root, 'home', 'applications');
-  const sys = path.join(root, 'sys', 'applications');
+  // XDG_DATA_DIRS is a colon-separated list (XDG Base Directory spec), so it cannot carry a
+  // Windows drive-letter path. On a Windows host the "system" entries go in the per-user
+  // flatpak exports folder instead, which desktopDirs() derives from HOME when XDG_DATA_DIRS
+  // is unset (the default /usr/share dirs resolve to nothing there). It is searched after
+  // XDG_DATA_HOME, so shadowing works the same way.
+  const sysData = process.platform === 'win32' ? path.join(root, 'home', '.local', 'share', 'flatpak', 'exports', 'share') : path.join(root, 'sys');
+  const sys = path.join(sysData, 'applications');
   writeDesktop(sys, 'code.desktop', [
     '[Desktop Entry]', 'Name=Visual Studio Code', 'Exec=/usr/share/code/code --unity-launch %F', 'Type=Application',
     '', '[Desktop Action new-empty-window]', 'Name=New Empty Window', 'Exec=/usr/share/code/code --new-window %F',
@@ -387,7 +393,9 @@ function desktopFixture() {
   writeDesktop(sys, 'shadowed.desktop', '[Desktop Entry]\nName=Shadow\nExec=/usr/bin/system-version\n');
   writeDesktop(user, 'shadowed.desktop', '[Desktop Entry]\nName=Shadow\nExec="/opt/my app/run" --flag "quoted arg" %%u\n');
   writeDesktop(path.join(sys, 'kde4'), 'kate.desktop', '[Desktop Entry]\nName=Kate\nName[de]=Kate Editor\nExec=kate -b %U\n');
-  return { XDG_DATA_HOME: path.join(root, 'home'), XDG_DATA_DIRS: path.join(root, 'sys'), HOME: path.join(root, 'home') };
+  const env = { XDG_DATA_HOME: path.join(root, 'home'), HOME: path.join(root, 'home') };
+  if (process.platform !== 'win32') env.XDG_DATA_DIRS = sysData;
+  return env;
 }
 
 test('findDesktopEntry: names, ids, shadowing, hidden and TryExec', (t) => {
