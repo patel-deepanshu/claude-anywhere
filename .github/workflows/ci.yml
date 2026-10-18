@@ -71,3 +71,28 @@ jobs:
         run: |
           node --test test/os-linux.test.js test/integration-os-linux.test.js
           xvfb-run -a node --test test/integration-os-core.test.js
+
+  live-desktop:
+    name: Live desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Drive the runner's real desktop
+        env:
+          ANYWHERE_LIVE_DESKTOP: '1'
+          ANYWHERE_LIVE_OUT: ${{ runner.temp }}/anywhere-live
+        run: node scripts/test.js --test-name-pattern=live-desktop
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-desktop-${{ matrix.os }}
+          path: ${{ runner.temp }}/anywhere-live
+          if-no-files-found: ignore
