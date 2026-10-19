@@ -881,6 +881,10 @@ class UiHost {
     this._visibility = new Map(); // dialog page id → {visible, focused, seq}, from noteVisibility()
     this._visibilitySeq = 0; // numbers the reports, so show() can tell the ones that answer it
     this._visibilityWaiters = new Set();
+    // Report numbers of dialog pages that connected (notePages()): dialogState() counts each as on screen,
+    // with an unknown focus, until a newer report stands for it.
+    this._pageConnects = [];
+    this._pagesSeen = 0;
     this._launchUrlFn = typeof deps.launchUrl === 'function' ? deps.launchUrl : null;
     this._clientCountFn = typeof deps.clientCount === 'function' ? deps.clientCount : null;
     this._cleanupLeftovers = deps.cleanupLeftovers !== false;
@@ -997,13 +1001,15 @@ class UiHost {
    * handed to an already-running instance (Electron single-instance lock, Chromium profile lock).
    * @returns {Promise<{ok:boolean,child?:object|null,handedOff?:boolean,exited?:boolean,reason?:string,spawnError?:boolean}>}
    */
-  async _launch(cmd, args, { detached = false, shell = false, cwd, env, waitMs = this.earlyExitMs, windowsHide = false, logOutput = true } = {}) {
+  async _launch(cmd, args, { detached = false, shell = false, cwd, env, waitMs = this.earlyExitMs, windowsHide = false, logOutput = true, dialog = false } = {}) {
     const fd = logOutput ? this._stdioFd() : null;
     let child;
     try {
       child = this._spawn(cmd, args, {
         cwd,
-        env: env || this.env,
+        // dialog: the dialog's own window host. The mark is inherited by its helper processes, so quit_app
+        // can leave them alone where windows cannot be listed (src/os/apps.js DIALOG_ENV_MARK).
+        env: dialog ? { ...(env || this.env), ANYWHERE_DIALOG: '1' } : env || this.env,
         detached,
         shell,
         windowsHide,
@@ -1117,8 +1123,8 @@ class UiHost {
     // Last resort for a bare electron.cmd: without windowsHide its cmd.exe (and `node cli.js`)
     // would keep a console window open beside the dialog.
     const r = isShim
-      ? await this._launch(proc.quoteWinArg(found.path), args.map(proc.quoteWinArg), { shell: true, env, windowsHide: true })
-      : await this._launch(found.path, args, { env });
+      ? await this._launch(proc.quoteWinArg(found.path), args.map(proc.quoteWinArg), { shell: true, env, windowsHide: true, dialog: true })
+      : await this._launch(found.path, args, { env, dialog: true });
     if (!r.ok) return { ok: false, reason: `Electron ${r.reason}` };
     if (r.child) this._own(r.child, 'electron', false);
     return { ok: true, detail: `Electron (${found.path})`, handedOff: r.handedOff };
@@ -1232,10 +1238,10 @@ class UiHost {
       if (viaOpen) {
         // Launching through LaunchServices makes the browser its own "responsible process", so the
         // microphone prompt names the browser instead of the terminal that started the daemon.
-        r = await this._launch(this._which('open'), ['-n', '-a', c.bundle, '--args', ...args], { detached: true });
+        r = await this._launch(this._which('open'), ['-n', '-a', c.bundle, '--args', ...args], { detached: true, dialog: true });
       } else {
         // Own process group on POSIX so wrapper scripts (snap, flatpak) can be stopped as a unit.
-        r = await this._launch(c.cmd, [...c.prefixArgs, ...args], { detached: posix });
+        r = await this._launch(c.cmd, [...c.prefixArgs, ...args], { detached: posix, dialog: true });
       }
       if (r.ok) {
         if (r.child) this._own(r.child, 'app', posix);
@@ -1436,6 +1442,40 @@ class UiHost {
     this._visibility.set(page, entry);
     while (this._visibility.size > MAX_VISIBILITY_PAGES) this._visibility.delete(this._visibility.keys().next().value);
     for (const w of [...this._visibilityWaiters]) w(entry);
+  }
+
+  /**
+   * The daemon's dialog pages connected or left (the hub's 'clients' event): a page that connected counts
+   * as on screen, with an unknown focus, until it reports (dialogState()).
+   */
+  notePages() {
+    const n = this._clientCount();
+    for (let i = this._pagesSeen; i < n; i += 1) {
+      this._visibilitySeq += 1;
+      this._pageConnects.push(this._visibilitySeq);
+    }
+    while (this._pageConnects.length > MAX_VISIBILITY_PAGES) this._pageConnects.shift();
+    this._pagesSeen = n;
+  }
+
+  /**
+   * Whether a dialog page is on screen and has the focus, from the pages' reports: the newest report (or
+   * connection, see notePages()) for each connected page decides. focused null: unknown (a page that has
+   * not reported yet). F3-SAFE-D1: where windows cannot be listed (GNOME/KDE Wayland), an engine's pointer
+   * input waits while a page is on screen, and its keys while one may have the focus.
+   * @returns {{visible:boolean, focused:boolean|null}|null} null: no dialog page is connected
+   */
+  dialogState() {
+    const n = this._clientCount();
+    if (n <= 0) return null;
+    const entries = [...this._visibility.values(), ...this._pageConnects.map((seq) => ({ visible: true, focused: null, seq }))];
+    const recent = entries.sort((a, b) => b.seq - a.seq).slice(0, n);
+    const unreported = recent.length < n;
+    const visible = unreported || recent.some((e) => e.visible);
+    let focused = false;
+    if (recent.some((e) => e.focused === true)) focused = true;
+    else if (unreported || recent.some((e) => e.focused == null)) focused = null;
+    return { visible, focused };
   }
 
   /**

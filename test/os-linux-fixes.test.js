@@ -301,7 +301,8 @@ xwininfo: Window id: 0x21f (the root window) (has no name)
 
 test('parseXwininfoTree maps client ids to absolute origins', () => {
   const m = L.parseXwininfoTree(XWININFO_TREE);
-  assert.deepEqual(m.get('0x0040000c'), { x: 301, y: 220, width: 244, height: 134 });
+  // The xterm sits in openbox's frame (title bar and borders): that is its frame.
+  assert.deepEqual(m.get('0x0040000c'), { x: 301, y: 220, width: 244, height: 134, frame: { x: 300, y: 200, width: 246, height: 159 } });
   assert.deepEqual(m.get('0x0060000c'), { x: -60, y: 44, width: 640, height: 480 });
   assert.deepEqual(m.get('0x0020011f'), { x: -100, y: -100, width: 1, height: 1 });
   assert.equal(m.has('0x0000021f'), false, 'header lines are not windows');

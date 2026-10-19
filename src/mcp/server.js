@@ -29,6 +29,8 @@ const ERR = {
 
 // ---------------------------------------------------------------- argument validation
 
+// How long the Computer waits for the daemon's word on the dialog (only where windows cannot be listed).
+const DIALOG_STATE_TIMEOUT_MS = 1500;
 const TYPE_NAMES = { integer: 'a whole number', number: 'a number', string: 'a string', boolean: 'true or false', array: 'an array', object: 'an object' };
 
 function isPlainObject(v) {
@@ -563,10 +565,12 @@ function createConfigSource({ load, file, log } = {}) {
  * call refreshes the config first, so a changed computer.* setting (failsafe,
  * actionDelayMs, maxWidth...) applies to the next action without a restart.
  * @param {{source:{config:object, refresh:()=>boolean, version:()=>number},
- *   getDriver?:()=>Promise<object>, log?:object}} opts
+ *   getDriver?:()=>Promise<object>, log?:object,
+ *   dialogState?:()=>Promise<{visible:boolean, focused:boolean|null}|null>}} opts
+ *   dialogState: where the dialog stands, for desktops that cannot place its window (see Computer)
  * @returns {{getComputer:()=>Promise<object>, driver:()=>object|null}}
  */
-function createComputerSource({ source, getDriver, log } = {}) {
+function createComputerSource({ source, getDriver, log, dialogState } = {}) {
   const { Computer } = require('../os/computer');
   const startDriver = getDriver || (() => require('../os/index').getDriver());
   let computerPromise = null;
@@ -578,8 +582,9 @@ function createComputerSource({ source, getDriver, log } = {}) {
       const created = (async () => {
         const driver = await startDriver();
         driverRef = driver;
-        // F3-SAFE-D1: an engine never clicks, drags or types in the Claude Anywhere dialog itself.
-        return new Computer({ driver, config: source.config.computer, geometryStore: 'file', protect: require('../context/desktop').isOwnWindow });
+        // F3-SAFE-D1: an engine never clicks, drags or types in the Claude Anywhere dialog itself, also where
+        // the desktop cannot say where the dialog is (dialogState: the daemon's word, from the dialog's pages).
+        return new Computer({ driver, config: source.config.computer, geometryStore: 'file', protect: require('../context/desktop').isOwnWindow, dialogState });
       })();
       computerPromise = created;
       created.catch((err) => {
@@ -656,11 +661,6 @@ async function main() {
   require('../shared/log').applyPrivacyConfig(configSource.config);
   const config = configSource.config;
   const role = process.env.ANYWHERE_ROLE || 'interactive';
-  // Always serve the tools. The daemon keeps a plugin copy of this server out of its own
-  // engine with --disallowedTools mcp__plugin_anywhere_anywhere, so no environment marker is
-  // needed (an ANYWHERE_ENGINE_CHILD left over from an older daemon is ignored).
-  const computers = createComputerSource({ source: configSource, log });
-
   const { DaemonClient } = require('../shared/client');
   let cached = { at: 0, client: null };
   let pending = null;
@@ -677,6 +677,20 @@ async function main() {
     }
     return pending;
   };
+
+  // F3-SAFE-D1 where windows cannot be listed (GNOME/KDE Wayland): whether the dialog is on screen and
+  // has the focus, from the daemon's guard (the dialog's pages report it). No daemon: no dialog. A daemon
+  // that does not answer: unknown, which the Computer treats as a dialog on screen.
+  const dialogState = async () => {
+    const c = await getClient();
+    if (!c) return null;
+    const verdict = await c.request('GET', '/api/mcp/guard', undefined, { timeoutMs: DIALOG_STATE_TIMEOUT_MS });
+    return verdict && verdict.dialog && typeof verdict.dialog === 'object' ? verdict.dialog : null;
+  };
+  // Always serve the tools. The daemon keeps a plugin copy of this server out of its own
+  // engine with --disallowedTools mcp__plugin_anywhere_anywhere, so no environment marker is
+  // needed (an ANYWHERE_ENGINE_CHILD left over from an older daemon is ignored).
+  const computers = createComputerSource({ source: configSource, log, dialogState });
 
   const { createTools } = require('./tools');
   const tools = createTools({ computer: computers.getComputer, getClient, config, role });

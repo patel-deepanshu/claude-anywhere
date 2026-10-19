@@ -122,6 +122,45 @@ test('F3-SAFE-D1: the engines\' token cannot answer cards, change settings or mo
   }
 });
 
+test('SEC-1: an engine cannot report the dialog hidden, and the approval policy is not loosened while Claude works', async () => {
+  const hub = new Hub();
+  const broker = new PermissionBroker({ config: { permissions: { mode: 'smart' } }, hub, audit: () => {} });
+  const reports = [];
+  const d = await daemon({ broker, hub, extra: { config: { calls: {}, voice: {}, permissions: { mode: 'smart', alwaysAllow: [], alwaysAsk: ['Bash(git push:*)'] } }, uihost: { noteVisibility: (r) => reports.push(r) } } });
+  let working = true;
+  d.server.session = { engineWorking: () => working };
+  try {
+    // Where windows cannot be listed, these reports decide whether an engine's clicks may run.
+    const fake = await d.api('POST', '/api/ui/visibility', { page: 'p', visible: false, focused: false }, { token: ENGINE });
+    assert.equal(fake.status, 403);
+    assert.equal(fake.json.code, 'ENGINE_FORBIDDEN');
+    assert.equal((await d.api('POST', '/api/ui/visibility', { page: 'p', visible: true, focused: true }, { headers: d.dialog })).status, 200);
+    assert.deepEqual(reports, [{ page: 'p', visible: true, focused: true }]);
+    // ...nor through a command that uses the user's token (self-escalation, as for /api/config).
+    assert.equal(classify('Bash', { command: `curl -s -X POST -H "Authorization: Bearer $T" -d '{"page":"p","visible":false}' http://127.0.0.1:47120/api/ui/visibility` }).risk, 'critical');
+    // The reviewer's escalation: Settings → Autopilot → Save, pressed by the engine's own input during its turn.
+    for (const body of [
+      { permissions: { mode: 'auto' } },
+      { permissions: { alwaysAllow: ['Bash'] } },
+      { permissions: { alwaysAsk: [] } },
+    ]) {
+      const r = await d.api('POST', '/api/config', body, { headers: d.dialog });
+      assert.equal(r.status, 409, JSON.stringify(body));
+      assert.equal(r.json.code, 'LOOSENING_WHILE_WORKING');
+    }
+    assert.equal(d.server.deps.config.permissions.mode, 'smart');
+    // Tightening, and other settings, still save during a turn; loosening saves once Claude is idle.
+    assert.equal((await d.api('POST', '/api/config', { permissions: { mode: 'ask' } }, { headers: d.dialog })).status, 200);
+    assert.equal((await d.api('POST', '/api/config', { voice: { speakResponses: false } }, { headers: d.dialog })).status, 200);
+    working = false;
+    assert.equal((await d.api('POST', '/api/config', { permissions: { mode: 'auto' } }, { headers: d.dialog })).status, 200);
+    assert.equal(d.server.deps.config.permissions.mode, 'auto');
+  } finally {
+    await d.close();
+    hub.close();
+  }
+});
+
 test('F3-SAFE-D1: the dialog credential comes only from a dialog launch code; API-minted pages get the caller\'s own token', async () => {
   const d = await daemon({ broker: new PermissionBroker({ config: { permissions: { mode: 'ask' } }, hub: new Hub(), audit: () => {} }) });
   try {
@@ -164,6 +203,30 @@ test('F3-SAFE-D1: reading run files is a credential read; commands that reach th
     assert.equal(classify('Bash', { command: cmd }, ctx).risk, 'critical', cmd);
   }
   assert.notEqual(classify('Bash', { command: 'curl https://api.example.com/api/config' }, ctx).risk, 'critical', 'someone else\'s API');
+});
+
+test('LIVE-1: interpreter code that reads the run files or daemon.json is a credential read too, not "Runs python3 code"', () => {
+  const ctx = { homeDir: os.homedir(), anywhereHome: HOME };
+  // The live repro: these ran with no card (medium) and printed the token's length, while cat/grep/jq asked.
+  for (const cmd of [
+    `python3 -c "import json;print(len(json.load(open('${HOME}/daemon.json'))['token']))"`,
+    `node -e "require('${HOME}/daemon.json').token.length"`,
+    `node -p "require('fs').readFileSync('${HOME}/run/mcp-1234.json','utf8')"`,
+    `python3 -c "import os,json;print(json.load(open(os.environ['ANYWHERE_HOME']+'/daemon.json'))['token'])"`,
+    `node -e "console.log(require(require('path').join(require('os').homedir(),'.claude-anywhere','daemon.json')).token)"`,
+    `ruby -e 'puts File.read("${HOME}/daemon.json")'`,
+    'python3 -c "print(open(\'/home/u/.ssh/id_rsa\').read())"',
+    `python3 tool.py ${HOME}/daemon.json`,
+  ]) {
+    const r = classify('Bash', { command: cmd }, ctx);
+    assert.equal(r.risk, 'high', cmd);
+    assert.match(r.reason, /^Reads /, cmd);
+    assert.equal(sessionRuleFor('Bash', { command: cmd }, r, ctx), null, `no "always" rule: ${cmd}`);
+  }
+  // Other inline code stays as it was.
+  for (const cmd of ['python3 -c "print(1+1)"', `node -e "console.log(require('./package.json').version)"`, 'python3 manage.py runserver', `python3 -c "import json; json.load(open('/etc/docker/daemon.json'))"`]) {
+    assert.equal(classify('Bash', { command: cmd }, ctx).risk, 'medium', cmd);
+  }
 });
 
 test('F3-SAFE-D1: engine input never clicks, drags, scrolls or types in the Claude Anywhere dialog; actions pause while a critical card waits', async () => {
@@ -451,8 +514,24 @@ function managerFixture({ answerCall, quietHours = { enabled: false }, bridgeOps
     broker.resolve(card.id, 'allow', undefined, { via: 'click', dialog: true });
     return p;
   };
-  return { mgr, det, RING, arm, broker, bridgeOps };
+  return { mgr, det, RING, arm, broker, bridgeOps, bridge };
 }
+
+test('LIVE-4: calls on with no call audio route fails before the click-only card, not after it', async () => {
+  const f = managerFixture();
+  f.bridge.check = async () => ({ mode: 'virtual', ready: false, issues: [{ level: 'error', code: 'NO_SOUND_SERVER', message: 'pactl: Connection refused', hint: 'Start PipeWire or PulseAudio' }] });
+  const r = await f.mgr.requestArm({ minutes: 30 });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'AUDIO_NOT_READY');
+  assert.match(r.error, /Call audio is not ready: pactl: Connection refused/);
+  assert.equal(r.hint, 'Start PipeWire or PulseAudio');
+  assert.equal(f.broker.pending().length, 0, 'no card was shown, so no click was spent');
+  // With a route the card comes as before.
+  f.bridge.check = async () => ({ mode: 'virtual', ready: true, issues: [] });
+  const armed = await f.arm();
+  assert.equal(armed.ok, true);
+  await f.mgr.disarm('test');
+});
 
 test('F3-SAFE-D2: "stop answering calls" during the answer routine stops it before Accept; the routine releases the audio itself', async () => {
   let clicked = 0;

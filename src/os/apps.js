@@ -1689,12 +1689,22 @@ $hwnds = @($hwndCsv.Split(',') | Where-Object { $_ })
 $pids = @($pidCsv.Split(',') | Where-Object { $_ } | ForEach-Object { [int]$_ })
 $names = @($nameCsv.Split(',') | Where-Object { $_ })
 $hosts = @($hostCsv.Split(',') | Where-Object { $_ })
+$own = @($ownCsv.Split(',') | Where-Object { $_ } | ForEach-Object { [int]$_ })
 $protect = @{}
+foreach ($o in $own) { $protect[$o] = $true }
 try {
   $parents = @{}
   foreach ($row in @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId)) { $parents[[int]$row.ProcessId] = [int]$row.ParentProcessId }
   $cur = [int]$PID
   for ($i = 0; $i -lt 64 -and $cur -gt 0 -and -not $protect.ContainsKey($cur); $i++) { $protect[$cur] = $true; $cur = [int]$parents[$cur] }
+  # The Claude Anywhere dialog's browser and its helper processes (children of the dialog's process).
+  if ($own.Count -gt 0) {
+    $grew = $true
+    for ($i = 0; $i -lt 16 -and $grew; $i++) {
+      $grew = $false
+      foreach ($k in @($parents.Keys)) { if (-not $protect.ContainsKey($k) -and $own -contains $parents[$k]) { $protect[$k] = $true; $own += $k; $grew = $true } }
+    }
+  }
 } catch { $protect[[int]$PID] = $true }
 $closedWindows = 0
 try {
@@ -1812,6 +1822,69 @@ async function ancestorPids(ctx) {
   return set;
 }
 
+/** pid -> parent pid of every process (Linux /proc, macOS ps), or null where it cannot be read. */
+async function processParents(ctx) {
+  const parent = new Map();
+  try {
+    if (ctx.flavor === 'linux' || ctx.flavor === 'wsl') {
+      for (const ent of listDir(ctx, '/proc')) {
+        if (!/^\d+$/.test(ent.name)) continue;
+        const stat = readText(ctx, `/proc/${ent.name}/stat`);
+        if (!stat) continue;
+        const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+        parent.set(Number(ent.name), Number(rest[1]));
+      }
+    } else if (ctx.flavor === 'darwin') {
+      const r = await ctx.run('ps', ['-A', '-o', 'pid=,ppid='], { timeoutMs: 5000 });
+      for (const line of String(r.stdout || '').split('\n')) {
+        const m = /^\s*(\d+)\s+(\d+)/.exec(line);
+        if (m) parent.set(Number(m[1]), Number(m[2]));
+      }
+    } else {
+      return null;
+    }
+  } catch (err) {
+    log.debug('process table unreadable', err && err.message);
+    return null;
+  }
+  return parent;
+}
+
+/**
+ * The Claude Anywhere dialog's processes: those of its own windows and their children (a browser's
+ * renderer, GPU and zygote helpers). The dialog's browser is the daemon's child, not one of our
+ * ancestors, so quitting "chrome" by name must still leave it alone (LIVE-2). On Windows the quit
+ * script adds the children itself.
+ * @returns {Promise<{roots:number[], all:Set<number>}>}
+ */
+async function dialogPids(ctx, windows) {
+  const own = ctx.isOwnWindow || defaultIsOwnWindow;
+  const roots = [...new Set((windows || []).filter((w) => w && own(w)).map((w) => Number(w.pid)).filter((p) => p > 1))];
+  const all = new Set(roots);
+  if (!roots.length || ctx.flavor === 'win32') return { roots, all };
+  const parent = await processParents(ctx);
+  if (!parent) return { roots, all };
+  for (let grew = true, i = 0; grew && i < 16; i++) {
+    grew = false;
+    for (const [pid, ppid] of parent) {
+      if (!all.has(pid) && all.has(ppid)) {
+        all.add(pid);
+        grew = true;
+      }
+    }
+  }
+  return { roots, all };
+}
+
+// Set in the environment of the dialog's browser by src/daemon/uihost.js, and so of its helpers: on a
+// desktop that cannot list windows (GNOME/KDE Wayland) it still tells the dialog's processes apart.
+const DIALOG_ENV_MARK = 'ANYWHERE_DIALOG=1';
+
+function isDialogProcess(ctx, pid) {
+  const environ = readText(ctx, `/proc/${pid}/environ`);
+  return Boolean(environ) && environ.split('\0').includes(DIALOG_ENV_MARK);
+}
+
 function pidAlive(ctx, pid) {
   try {
     ctx.kill(pid, 0);
@@ -1858,7 +1931,7 @@ async function linuxQuit(ctx, app, windows, force, timeoutMs, driver, protectedP
     const r = await ctx.run(ctx.which('pgrep'), ['-x', ...(ctx.uid != null ? ['-u', String(ctx.uid)] : []), app.execName.slice(0, 15)], { timeoutMs: 3000 });
     pids = String(r.stdout || '').split(/\s+/).map(Number).filter((p) => p > 1);
   }
-  pids = pids.filter((p) => !protectedPids.has(p) && !LINUX_HOSTS.has(comm(p)));
+  pids = pids.filter((p) => !protectedPids.has(p) && !LINUX_HOSTS.has(comm(p)) && !isDialogProcess(ctx, p));
   const still = close && driver && windows.length ? await waitWindowsGone(ctx, driver, app, windows.map((w) => w.id), Math.min(timeoutMs, force ? 2000 : 4000)) : [];
   const stillPids = new Set(still.map((w) => Number(w.pid)));
   const signaled = [];
@@ -1893,7 +1966,7 @@ async function linuxQuit(ctx, app, windows, force, timeoutMs, driver, protectedP
   return { how, closedWindows, signaled, remaining, found: Math.max(windows.length, pids.length), note };
 }
 
-async function windowsQuit(ctx, app, windows, force, timeoutMs) {
+async function windowsQuit(ctx, app, windows, force, timeoutMs, dialogRoots) {
   const names = [...new Set([app.execName, app.target ? winBase(app.target) : '', ...windows.map((w) => String(w.process || '').replace(/\.exe$/i, ''))]
     .map((n) => String(n || '').toLowerCase())
     .filter((n) => n && /^[\w .+-]+$/.test(n) && !WIN_HOSTS.includes(n)))];
@@ -1902,6 +1975,7 @@ async function windowsQuit(ctx, app, windows, force, timeoutMs) {
     `$pidCsv = ${psValue([...new Set(windows.map((w) => Number(w.pid)).filter((p) => p > 0))].join(','))}`,
     `$nameCsv = ${psValue(names.join(','))}`,
     `$hostCsv = ${psValue(WIN_HOSTS.join(','))}`,
+    `$ownCsv = ${psValue([...(dialogRoots || [])].join(','))}`,
     `$force = ${psValue(force ? '1' : '0')}`,
     `$waitMs = ${psValue(String(Math.max(500, Math.min(timeoutMs, 15000))))}`,
     QUIT_PS,
@@ -1940,7 +2014,8 @@ async function macQuit(ctx, app, force, protectedPids) {
 
 /**
  * Quit an app: politely (its windows close; an app asking to save its work stays open and is
- * reported), or with force (terminated). Claude's own process chain is never touched.
+ * reported), or with force (terminated). Claude's own process chain and the Claude Anywhere dialog's
+ * processes are never touched.
  * @param {string} name
  * @param {{force?:boolean, driver?:object, timeoutMs?:number}} [opts]
  * @param {object} [deps]
@@ -1953,8 +2028,11 @@ async function quit(name, opts = {}, deps) {
   const found = await findAppIn(ctx, name);
   const app = found.app || { name: String(name).trim(), id: `name:${String(name).trim()}`, kind: 'exec', execName: String(name).trim().toLowerCase(), altNames: [], keywords: [] };
   const own = ctx.isOwnWindow || defaultIsOwnWindow;
-  const windows = driver ? rankWindows((await listWindowsSafe(driver)).filter((w) => !own(w) && windowMatchesApp(w, app))) : [];
+  const allWindows = driver ? await listWindowsSafe(driver) : [];
+  const windows = rankWindows(allWindows.filter((w) => !own(w) && windowMatchesApp(w, app)));
   const protectedPids = await ancestorPids(ctx);
+  const dialog = await dialogPids(ctx, allWindows);
+  for (const p of dialog.all) protectedPids.add(p);
   const mine = windows.find((w) => protectedPids.has(Number(w.pid)));
   if (mine) {
     throw appError(
@@ -1966,14 +2044,14 @@ async function quit(name, opts = {}, deps) {
   let r;
   if (ctx.flavor === 'darwin') r = await macQuit(ctx, app, force, protectedPids);
   else if (ctx.flavor === 'linux') r = await linuxQuit(ctx, app, windows, force, timeoutMs, driver, protectedPids);
-  else r = await windowsQuit(ctx, app, windows, force, timeoutMs);
+  else r = await windowsQuit(ctx, app, windows, force, timeoutMs, dialog.roots);
   const notes = [];
   if (!r.found && !windows.length) {
     return { app, how: r.how, found: 0, closedWindows: 0, signaled: [], remaining: [], windowsLeft: [], running: false, notes: [`${app.name} was not running.`] };
   }
   const windowsLeft = driver && windows.length ? await waitWindowsGone(ctx, driver, app, windows.map((w) => w.id), ctx.flavor === 'darwin' ? Math.min(timeoutMs, 5000) : 1500) : [];
   if (r.note) notes.push(r.note);
-  if (r.skipped && r.skipped.length) notes.push(`Left process ${r.skipped.join(', ')} alone: Claude runs inside it.`);
+  if (r.skipped && r.skipped.length) notes.push(`Left process ${r.skipped.join(', ')} alone: Claude or the Claude Anywhere dialog runs inside it.`);
   const running = windowsLeft.length > 0 || (r.remaining && r.remaining.length > 0);
   if (running && !force) notes.push(`${app.name} is still open: it may be asking to save changes. Take a screenshot to check, answer it, or call quit_app again with force (unsaved work is lost).`);
   return { app, how: r.how, found: r.found, closedWindows: r.closedWindows, signaled: r.signaled, remaining: r.remaining || [], windowsLeft, running, notes };
@@ -2005,6 +2083,8 @@ module.exports = {
   waitForAppWindow,
   rankWindows,
   ancestorPids,
+  dialogPids,
+  DIALOG_ENV_MARK,
   catalog,
   clearCache,
   lastJson,

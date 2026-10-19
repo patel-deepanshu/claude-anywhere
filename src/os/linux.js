@@ -423,16 +423,26 @@ function parseXwininfoRoot(text) {
 function parseXwininfoTree(text) {
   const out = new Map();
   const re = /^\s*(0x[0-9a-f]+)\s.*\s(\d+)x(\d+)\+-?\d+\+-?\d+\s+\+(-?\d+)\+(-?\d+)\s*$/i;
-  for (const line of String(text || '').split('\n')) {
-    const m = re.exec(line.replace(/\r$/, ''));
+  const ancestors = []; // {indent, rect} of the windows enclosing the current line, outermost first
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    const m = re.exec(line);
     if (!m) continue;
+    const indent = line.length - line.trimStart().length;
+    while (ancestors.length && ancestors[ancestors.length - 1].indent >= indent) ancestors.pop();
+    const rect = { x: +m[4], y: +m[5], width: +m[2], height: +m[3] };
+    ancestors.push({ indent, rect });
     let id;
     try {
       id = normalizeX11Id(m[1]);
     } catch {
       continue;
     }
-    out.set(id, { x: +m[4], y: +m[5], width: +m[2], height: +m[3] });
+    // A reparenting window manager draws the title bar and borders in a frame window around the client: the
+    // root's child that holds it (only when it is at least as large).
+    const top = ancestors.length > 1 ? ancestors[0].rect : null;
+    const frame = top && top.width >= rect.width && top.height >= rect.height && (top.width > rect.width || top.height > rect.height) ? top : null;
+    out.set(id, frame ? { ...rect, frame: { ...frame } } : rect);
   }
   return out;
 }
@@ -2863,6 +2873,7 @@ class X11Driver extends LinuxDriverBase {
           if (a) {
             w.x = a.x;
             w.y = a.y;
+            if (a.frame) w.frame = a.frame;
           }
         }
       } else {
@@ -2901,6 +2912,8 @@ class X11Driver extends LinuxDriverBase {
       focused: w.id === activeId,
       minimized: Boolean(w.minimized),
       ...(Number.isInteger(w.stackIndex) ? { stackIndex: w.stackIndex } : {}),
+      // The window manager's frame (title bar and borders) around the client area, when known.
+      ...(w.frame ? { frame: w.frame } : {}),
     }));
   }
 

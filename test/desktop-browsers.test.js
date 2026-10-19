@@ -568,6 +568,45 @@ test('open with an executable path starts it and finds the new window titled aft
   await assert.rejects(browsers.open({ browser: '/no/such/browser', url: 'https://x', driver: d }, deps), (e) => e.code === 'NOT_FOUND');
 });
 
+test('SEC-2: a browser path that is not a browser is never started, and is judged as the program it is', async () => {
+  // The reviewer's repro: browser_open {browser: <a script>} ran the script with the URL, at medium (no card in smart mode).
+  const dir = tmpdir();
+  const script = path.join(dir, 'not-a-browser.sh');
+  const marker = path.join(dir, 'ran.txt');
+  write(script, `#!/bin/sh\necho "ran with: $1" > '${marker}'\n`);
+  fs.chmodSync(script, 0o755);
+  let launched = 0;
+  const deps = { platform: 'linux', isWSL: false, env: { HOME: '/nowhere' }, which: () => null, launch: async () => ((launched += 1), { ok: true, pid: 1, running: true }) };
+  await assert.rejects(browsers.open({ browser: script, url: 'https://example.com/x' }, deps), (e) => e.code === 'NOT_A_BROWSER' && /launch_app/.test(e.hint));
+  assert.equal(launched, 0);
+  assert.equal(fs.existsSync(marker), false, 'the script did not run');
+  for (const p of ['/usr/bin/google-chrome-stable', '/opt/pw-browsers/chromium-1194/chrome-linux/chrome', 'C:\\Program Files\\Mozilla Firefox\\firefox.exe', '/Applications/Brave Browser.app', 'C:\\Users\\u\\AppData\\Local\\Programs\\Opera GX\\launcher.exe']) {
+    assert.equal(browsers.isBrowserExecutable(p), true, p);
+  }
+  for (const p of ['/home/u/proj/deploy.sh', '/usr/bin/sudo', 'C:\\Users\\u\\proj\\tool.bat', '/home/u/Downloads/evil.AppImage', '/tmp/launcher', '/home/u/.claude/hooks/x']) {
+    assert.equal(browsers.isBrowserExecutable(p), false, p);
+  }
+
+  // The approval policy agrees: such a path is at least high (no card-less run in smart or auto mode).
+  const { classify } = require('../src/daemon/permissions');
+  const bo = (input, platform = 'linux') => classify('mcp__anywhere__browser_open', input, { platform });
+  for (const [input, platform] of [
+    [{ browser: '/home/u/proj/tool.sh', url: 'https://x.example/' }],
+    [{ browser: '/home/u/proj/deploy', url: 'https://x.example/' }],
+    [{ browser: '/home/u/Downloads/evil.AppImage', url: 'https://x.example/' }],
+    [{ browser: '/usr/bin/sudo', url: 'https://x.example/' }],
+    [{ browser: 'C:\\Users\\u\\proj\\tool.bat', url: 'https://x.example/' }, 'win32'],
+  ]) {
+    assert.ok(['high', 'critical'].includes(bo(input, platform).risk), `${JSON.stringify(input)}: ${bo(input, platform).reason}`);
+  }
+  assert.equal(bo({ browser: '/bin/bash', url: 'https://x' }).risk, 'high');
+  // Real browsers keep the URL's own verdict.
+  assert.equal(bo({ browser: '/usr/bin/google-chrome', url: 'https://x' }).risk, 'medium');
+  assert.equal(bo({ browser: '/Applications/Brave Browser.app', url: 'https://x' }, 'darwin').risk, 'medium');
+  assert.equal(bo({ browser: 'brave', url: 'https://x' }).risk, 'medium');
+  assert.equal(bo({ browser: '/usr/bin/firefox', url: 'file:///tmp/a.sh' }).risk, 'high');
+});
+
 function kbDeps() {
   const clock = fakeClock();
   return { platform: 'linux', isWSL: false, env: { HOME: '/nowhere' }, now: clock.now, sleep: clock.sleep, which: () => null };

@@ -178,6 +178,33 @@ function validateConfigUpdate(partial, defaults = configMod.DEFAULTS, prefix = '
   return null;
 }
 
+const PERMISSION_MODE_RANK = { ask: 0, smart: 1, auto: 2 };
+
+/**
+ * F3-SAFE-D1: what in a settings update loosens the approval policy (a more permissive permissions.mode,
+ * a new alwaysAllow rule, an alwaysAsk rule taken away), or '' when nothing does.
+ * @param {object} current config.permissions
+ * @param {object} update the update's permissions section
+ * @returns {string}
+ */
+function permissionsLoosening(current, update) {
+  if (!isPlainObject(update)) return '';
+  const cur = isPlainObject(current) ? current : {};
+  const from = Object.prototype.hasOwnProperty.call(PERMISSION_MODE_RANK, cur.mode) ? cur.mode : 'smart';
+  if (Object.prototype.hasOwnProperty.call(PERMISSION_MODE_RANK, update.mode) && PERMISSION_MODE_RANK[update.mode] > PERMISSION_MODE_RANK[from]) {
+    return `Switching approvals from ${from} to ${update.mode}`;
+  }
+  if (Array.isArray(update.alwaysAllow)) {
+    const had = new Set((Array.isArray(cur.alwaysAllow) ? cur.alwaysAllow : []).map(String));
+    if (update.alwaysAllow.some((r) => !had.has(String(r)))) return 'Adding an always-allow rule';
+  }
+  if (Array.isArray(update.alwaysAsk)) {
+    const kept = new Set(update.alwaysAsk.map(String));
+    if ((Array.isArray(cur.alwaysAsk) ? cur.alwaysAsk : []).some((r) => !kept.has(String(r)))) return 'Removing an always-ask rule';
+  }
+  return '';
+}
+
 /**
  * A non-secret id of a state directory (and so of one user's install) for /api/health, so a
  * starting daemon can tell its own daemon on a port from another user's or ANYWHERE_HOME's.
@@ -410,7 +437,8 @@ class DaemonServer {
     add('GET', '/api/context', this.context, { noBody: true });
     add('GET', '/api/permissions', this.osPermissions, { noBody: true });
     add('POST', '/api/show', this.show, { notWhileStopping: true });
-    add('POST', '/api/ui/visibility', this.uiVisibility);
+    // noEngine: where windows cannot be listed, these reports decide whether an engine's input may run (F3-SAFE-D1).
+    add('POST', '/api/ui/visibility', this.uiVisibility, { noEngine: true });
     add('POST', '/api/shutdown', this.shutdown, { noEngine: true });
     add('POST', '/api/mcp/permission', this.mcpPermission);
     add('POST', '/api/mcp/ask', this.mcpAsk);
@@ -775,6 +803,15 @@ class DaemonServer {
       const greetingProblem = callsSettingProblem('calls.greeting', partial.calls.greeting, { ownerName: owner });
       if (greetingProblem) throw httpError(400, greetingProblem);
     }
+    // F3-SAFE-D1, defense in depth: while Claude works, its own clicks or keys could be what pressed Save
+    // (where the dialog cannot be placed on screen). Loosening the approval policy waits for the turn to end.
+    const loosening = permissionsLoosening((this.deps.config || {}).permissions, partial.permissions);
+    if (loosening && this.session && typeof this.session.engineWorking === 'function' && this.session.engineWorking()) {
+      throw httpError(409, `${loosening} waits until Claude is not working`, {
+        code: 'LOOSENING_WHILE_WORKING',
+        hint: 'Stop the task (or wait for it to finish), then save again.',
+      });
+    }
     const prev = JSON.parse(JSON.stringify(this.deps.config));
     const next = configMod.save(partial);
     // Update the shared config object in place so every module sees the change.
@@ -1097,4 +1134,4 @@ function createServer(deps) {
   return new DaemonServer(deps);
 }
 
-module.exports = { createServer, DaemonServer, tokenMatches, validateConfigUpdate, homeId, currentUid, SECURITY_HEADERS, CSP, MIME };
+module.exports = { createServer, DaemonServer, tokenMatches, validateConfigUpdate, permissionsLoosening, homeId, currentUid, SECURITY_HEADERS, CSP, MIME };

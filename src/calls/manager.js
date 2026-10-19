@@ -594,6 +594,18 @@ class CallManager extends EventEmitter {
       const located = await this._locateClaude().catch(() => null);
       if (!located) return { ok: false, error: 'The claude CLI was not found, so the assistant cannot talk.', hint: 'Install Claude Code or set engine.claudePath in Settings.', code: 'CLAUDE_NOT_FOUND' };
     }
+    // A call needs an audio route: without one the click would be spent on a card that cannot arm
+    // (LIVE-4). _prepare() checks again after the click, in case it changed.
+    try {
+      const check = await this.bridge().check();
+      this._lastAudioCheck = check;
+      if (!check.ready) {
+        const issue = (check.issues || []).find((i) => i.level === 'error') || (check.issues || [])[0] || {};
+        return { ok: false, error: `Call audio is not ready: ${issue.message || 'no usable audio route'}`, hint: issue.hint || 'Run: anywhere calls doctor', code: 'AUDIO_NOT_READY' };
+      }
+    } catch (err) {
+      return { ok: false, error: `Call audio cannot be checked: ${err.message}`, hint: err.hint || 'Run: anywhere calls doctor', code: err.code || 'AUDIO_NOT_READY' };
+    }
     return { ok: true };
   }
 
