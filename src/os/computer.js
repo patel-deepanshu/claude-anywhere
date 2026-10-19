@@ -171,6 +171,30 @@ function ownDialogUiError(target) {
   );
 }
 
+/** F3-SAFE-D1: pointer input where the dialog is on screen but this desktop cannot say where. */
+function unplacedDialogError() {
+  return inputError(
+    'The Claude Anywhere dialog is on screen and this desktop cannot tell where, so Claude may not click, drag or scroll',
+    'OWN_DIALOG',
+    'Ask the user to minimize the Claude Anywhere dialog (or to use an X11 session), then try again.',
+  );
+}
+
+/** The rectangles of a protected window: its client area and the window manager's frame around it, when known. */
+function windowRects(w) {
+  const rects = [];
+  for (const r of [w, w && w.frame]) {
+    if (!r || typeof r !== 'object') continue;
+    const b = { x: Number(r.x), y: Number(r.y), width: Number(r.width), height: Number(r.height) };
+    if (validRect(b)) rects.push(b);
+  }
+  return rects;
+}
+
+function inRect(p, b) {
+  return p.x >= b.x && p.y >= b.y && p.x < b.x + b.width && p.y < b.y + b.height;
+}
+
 function validRect(b) {
   return Boolean(b) && [b.x, b.y, b.width, b.height].every(Number.isFinite) && b.width > 0 && b.height > 0;
 }
@@ -208,9 +232,10 @@ function normalizeConfig(config) {
 class Computer {
   /**
    * @param {{driver:object, config?:object, guard?:()=>Promise<{allowed:boolean,reason?:string}>,
-   *   geometryStore?:'memory'|'file', platform?:string}} opts
+   *   geometryStore?:'memory'|'file', platform?:string, protect?:(w:object)=>boolean,
+   *   dialogState?:()=>Promise<{visible:boolean, focused:boolean|null}|null>}} opts
    */
-  constructor({ driver, config, guard, geometryStore = 'memory', platform: plat, protect } = {}) {
+  constructor({ driver, config, guard, geometryStore = 'memory', platform: plat, protect, dialogState } = {}) {
     if (!driver || typeof driver !== 'object') throw new TypeError('Computer needs a driver (see src/os/index.js getDriver())');
     if (geometryStore !== 'memory' && geometryStore !== 'file') {
       throw new TypeError(`geometryStore must be 'memory' or 'file' (got ${JSON.stringify(geometryStore)})`);
@@ -222,6 +247,11 @@ class Computer {
     // the Claude Anywhere dialog, for input an engine asks for): a click, drag or scroll on one, or a
     // key or text while one has the focus, is refused.
     this.protect = typeof protect === 'function' ? protect : null;
+    // dialogState() → {visible, focused} of the dialog as its pages report it (null: none is open), for
+    // desktops that cannot say where the dialog is or which window has the focus (GNOME/KDE Wayland):
+    // there, protect() cannot judge, so pointer input waits while the dialog is on screen and keys while
+    // it may have the focus.
+    this.dialogState = typeof dialogState === 'function' ? dialogState : null;
     this.geometryStore = geometryStore;
     this.platform = plat || platform.info().platform;
     this._mem = emptyStore();
@@ -450,20 +480,48 @@ class Computer {
     throw err;
   }
 
+  /**
+   * @private F3-SAFE-D1 where the desktop cannot place the dialog (no window list, no active window: GNOME
+   * and KDE on Wayland): whether a dialog page is on screen and has the focus, as the pages report it to
+   * the daemon. null: no dialog page is open, or this Computer has no such source (the CLI's, the
+   * daemon's own). A source that fails counts as a dialog on screen whose focus is unknown (fails closed).
+   * @returns {Promise<{visible:boolean, focused:boolean|null}|null>}
+   */
+  async _dialogOnScreen() {
+    if (!this.dialogState) return null;
+    let s;
+    try {
+      s = await this.dialogState();
+    } catch (err) {
+      log.debug('dialog state unknown:', err && err.message);
+      return { visible: true, focused: null };
+    }
+    if (!s || typeof s !== 'object') return null;
+    return { visible: s.visible !== false, focused: typeof s.focused === 'boolean' ? s.focused : null };
+  }
+
   /** @private refuse a pointer action on a protected window (wherever it is in the stacking order) */
   async _refuseProtectedAt(points) {
-    if (!this.protect || typeof this.driver.listWindows !== 'function') return;
-    let wins;
-    try {
-      wins = await this.driver.listWindows();
-    } catch {
-      return; // windows cannot be listed here: the daemon's guard still pauses input while a critical card waits
+    if (!this.protect) return;
+    let wins = null;
+    if (typeof this.driver.listWindows === 'function') {
+      try {
+        wins = await this.driver.listWindows();
+      } catch {
+        wins = null;
+      }
     }
-    for (const w of Array.isArray(wins) ? wins : []) {
+    if (!Array.isArray(wins)) {
+      // Windows cannot be listed here (GNOME/KDE Wayland), so where the dialog is is unknown: no pointer
+      // input while it is on screen (a click could land on its settings).
+      const d = await this._dialogOnScreen();
+      if (d && d.visible) throw unplacedDialogError();
+      return;
+    }
+    for (const w of wins) {
       if (!w || w.minimized || !this.protect(w)) continue;
-      const b = { x: Number(w.x), y: Number(w.y), width: Number(w.width), height: Number(w.height) };
-      if (![b.x, b.y].every(Number.isFinite) || !(b.width > 0) || !(b.height > 0)) continue;
-      if (points.some((p) => p.x >= b.x && p.y >= b.y && p.x < b.x + b.width && p.y < b.y + b.height)) {
+      // Its frame too: the title bar's close and minimize buttons belong to the dialog.
+      if (windowRects(w).some((b) => points.some((p) => inRect(p, b)))) {
         throw inputError('That point is inside the Claude Anywhere dialog, which Claude may not click', 'OWN_DIALOG', 'Only the user answers the dialog. Click somewhere else, or ask the user.');
       }
     }
@@ -501,9 +559,7 @@ class Computer {
         const cx = b.x + b.width / 2;
         const cy = b.y + b.height / 2;
         for (const w of own) {
-          if (w.minimized) continue;
-          const r = { x: Number(w.x), y: Number(w.y), width: Number(w.width), height: Number(w.height) };
-          if (validRect(r) && cx >= r.x && cy >= r.y && cx < r.x + r.width && cy < r.y + r.height) throw ownDialogUiError(target);
+          if (!w.minimized && windowRects(w).some((r) => inRect({ x: cx, y: cy }, r))) throw ownDialogUiError(target);
         }
       }
       return;
@@ -519,19 +575,42 @@ class Computer {
       const { sameWindowId } = require('./linux');
       if (a && this.protect(a) && (!windowId || a.id == null || sameWindowId(a.id, windowId))) throw ownDialogUiError(target);
     }
+    // The lookup that found the element names its window, and that is not the dialog (checked above).
+    if (target.win) return;
+    // Its window is unknown: nothing while the dialog is on screen.
+    const d = await this._dialogOnScreen();
+    if (d && d.visible) {
+      throw inputError(
+        `"${target.name || target.id || 'That element'}" may be in the Claude Anywhere dialog (this desktop cannot tell which window it is in), which Claude may not operate`,
+        'OWN_DIALOG',
+        'Find it again with ui_find in the window you mean, or ask the user to minimize the Claude Anywhere dialog.',
+      );
+    }
   }
 
   /** @private refuse keys and text while a protected window has the focus */
   async _refuseProtectedFocus() {
-    if (!this.protect || typeof this.driver.activeWindow !== 'function') return;
+    if (!this.protect) return;
     let w = null;
-    try {
-      w = await this.driver.activeWindow();
-    } catch {
-      return;
+    if (typeof this.driver.activeWindow === 'function') {
+      try {
+        w = await this.driver.activeWindow();
+      } catch {
+        w = null;
+      }
     }
     if (w && this.protect(w)) {
       throw inputError('The Claude Anywhere dialog has the focus, and Claude may not type into it', 'OWN_DIALOG', 'Focus the window you want to type in first (focus_window), or ask the user.');
+    }
+    if (w) return;
+    // The active window is unknown here (GNOME/KDE Wayland): the dialog's own report decides.
+    const d = await this._dialogOnScreen();
+    if (d && (d.focused === true || (d.visible && d.focused == null))) {
+      throw inputError(
+        d.focused ? 'The Claude Anywhere dialog has the focus, and Claude may not type into it' : 'The Claude Anywhere dialog may have the focus (this desktop cannot tell which window has it), and Claude may not type into it',
+        'OWN_DIALOG',
+        'Ask the user to click into the window you want to type in, then try again.',
+      );
     }
   }
 
@@ -894,7 +973,9 @@ class Computer {
     for (const n of list) {
       if (!n || typeof n.id !== 'string') continue;
       this._uiSeen.delete(n.id);
-      this._uiSeen.set(n.id, { bounds: n.bounds || null, role: n.role, name: n.name, windowId: n.windowId || windowId || null, win: n.windowId ? null : w, relative, at: now });
+      // The window searched is the element's own unless the element names another (as in _uiPick).
+      const own = !n.windowId || (windowId != null && String(n.windowId) === String(windowId));
+      this._uiSeen.set(n.id, { bounds: n.bounds || null, role: n.role, name: n.name, windowId: n.windowId || windowId || null, win: own ? w : null, relative, at: now });
     }
     while (this._uiSeen.size > UI_SEEN_MAX) this._uiSeen.delete(this._uiSeen.keys().next().value);
   }
@@ -1057,6 +1138,8 @@ class Computer {
     if (idx < 0) {
       throw inputError(`"${target.name || target.id}" is off screen`, 'OFFSCREEN', 'Scroll it into view (or bring its window on screen) and try again.');
     }
+    // F3-SAFE-D1 as for click: an element under the (always-on-top) dialog would be a click on the dialog.
+    await this._refuseProtectedAt([{ x: lx, y: ly }]);
     const res = await this.driver.click(lx, ly, { button: 'left', clicks: 1, modifiers: [] });
     this._notePointer({ x: lx, y: ly });
     return { res, logical: { x: lx, y: ly }, display: idx };
@@ -1202,6 +1285,9 @@ class Computer {
       how = 'click';
     }
     await sleep(UI_FOCUS_SETTLE_MS);
+    // F3-SAFE-D1 as for type_text: the keys go to the focused window, which must not be the dialog (the
+    // window could not be brought to the front, or the accessibility focus did not raise it).
+    await this._refuseProtectedFocus();
     const results = [found, set.res, focus.res, clicked && clicked.res];
     results.push(await this.driver.keyCombo(keys.normalizeCombo('primary+a', { platform: this.platform })));
     let typed = 'type';

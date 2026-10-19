@@ -32,6 +32,19 @@ safeguards and what remains your responsibility.
   `via`, by voice or by a key is refused (409 `CRITICAL_NEEDS_CLICK`). The arm-calls card is click-only. Claude's
   own mouse and keyboard tools refuse to click, drag, scroll or type in the Claude Anywhere dialog, and all of
   them pause while a critical card is waiting.
+- **The desktop assistant cannot operate the dialog either** (`OWN_DIALOG`). Its accessibility actions
+  (`ui_click`, `ui_set_value`, `ui_action`, a `ui_click` step of `batch_actions`) refuse elements of the dialog,
+  found by the window the lookup searched, the window or process named in the element id, or else the element's
+  position on screen; their real-pointer and keyboard fallbacks are checked like `click` and `type_text`.
+  `set_window` refuses the dialog, and `quit_app` never ends the dialog's own browser or its helper processes.
+  On GNOME and KDE under Wayland, where no program can tell where the dialog is or which window has the focus,
+  the dialog's pages report whether they are on screen and focused (an engine cannot send that report): Claude's
+  clicks wait while the dialog is visible, and its keys while it may have the focus (minimize the dialog, or use
+  an X11 session, sway or Hyprland). Settings that loosen approvals (a more permissive mode, a new always-allow
+  rule, an always-ask rule removed) are refused (409 `LOOSENING_WHILE_WORKING`) while Claude is working, so its
+  own input can never be what pressed Save.
+- **Reading the daemon's tokens needs a card.** `daemon.json` and the run files hold the tokens; reading them is
+  high risk whether `cat`, `jq`, or interpreter code on the command line (`python3 -c`, `node -e`) does it.
 
 ## 2. What Claude may do without asking
 

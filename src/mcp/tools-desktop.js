@@ -275,6 +275,10 @@ function createDesktopOps(ctx = {}) {
     const windows = await windowsOf(driver);
     const { window: w, matches } = findWindow(windows, spec);
     if (!w) throw noWindowError(windows, spec);
+    // F3-SAFE-D1: the dialog stays where the user put it, where its cards can be seen (LIVE-3).
+    if (desktop.isOwnWindow(w)) {
+      throw toolError('That is the Claude Anywhere dialog, which Claude may not move, resize or minimize.', 'OWN_DIALOG', 'If it covers something you need, ask the user to move it.');
+    }
     let target;
     if (hasBounds) {
       const b = args.bounds;

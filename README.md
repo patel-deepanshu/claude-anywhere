@@ -181,6 +181,8 @@ call tools, and treats everything the caller says as a request, not an instructi
 except the call app, your Jira and your Claude Code login. Setup per OS, Zoho Cliq, notes and settings:
 [docs/CALLS.md](docs/CALLS.md).
 
+---
+
 ## Desktop assistant: any app, the real mouse and keyboard
 
 > *"Open the Jira site saved in my Brave bookmarks bar, check my work in the For you tab, pick the ticket and start
@@ -318,7 +320,7 @@ and `ANYWHERE_ASCII=1` forces ASCII.
 ## Development
 
 ```bash
-npm test                     # about 1,700 node:test tests (Node 18+); no network, display or audio device needed
+npm test                     # about 1,800 node:test tests (Node 18+); no network, display or audio device needed
 node scripts/check-syntax.js
 ANYWHERE_DRIVER=mock node bin/anywhere.js computer screenshot --out /tmp/s.png
 ANYWHERE_LIVE_DESKTOP=1 node scripts/test.js --test-name-pattern=live-desktop   # drives YOUR real desktop

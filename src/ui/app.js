@@ -3595,6 +3595,10 @@ function bindUi() {
     reportVisibility();
     if (!document.hidden && pendingRenders.size && !rafId) scheduleRender([...pendingRenders][0]);
   });
+  // F3-SAFE-D1: where windows cannot be listed (GNOME/KDE Wayland), the daemon refuses Claude's keys
+  // while this page has the focus, so it hears when that changes.
+  window.addEventListener('focus', reportVisibility);
+  window.addEventListener('blur', reportVisibility);
 
   el.suggestions.replaceChildren(
     ...SUGGESTIONS.map((s) => {

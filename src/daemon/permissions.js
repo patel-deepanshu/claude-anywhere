@@ -910,6 +910,8 @@ function classifyContext(opts = {}) {
     focusedApp: typeof opts.focusedApp === 'string' && opts.focusedApp.trim() ? opts.focusedApp.trim() : null,
     // Its process name (cmd.exe, conhost, kgx) when the driver reports one.
     focusedProcess: typeof opts.focusedProcess === 'string' && opts.focusedProcess.trim() ? opts.focusedProcess.trim() : null,
+    // The program launch_app / open {kind: 'app'} starts for the app it names (the broker's lookup), or null.
+    appProgram: typeof opts.appProgram === 'string' && opts.appProgram.trim() ? opts.appProgram.trim() : null,
     shell: 'bash',
     cwd: projectDir,
     depth: 0,
@@ -3668,6 +3670,36 @@ function readerVerdict(prog, psProg, args, tk, ctx) {
   return null;
 }
 
+/**
+ * LIVE-1: a credential file that interpreter code given on the command line (python -c, node -e, perl
+ * -e...) or its arguments name, as cat would read it: the paths in its string literals and arguments,
+ * and Claude Anywhere's state folder by name, since code can build that path from pieces
+ * (path.join(home, '.claude-anywhere', 'daemon.json')). daemon.json and the run files hold the tokens
+ * that answer approval cards. The code is not otherwise inspected.
+ * @returns {{what:string}|null}
+ */
+function interpreterCredentialRead(args, ctx) {
+  const texts = [];
+  for (const a of args) {
+    if (!a || a.length > 100000) continue;
+    if (!a.startsWith('-')) texts.push(a);
+    else if (a.startsWith('--') && a.includes('=')) texts.push(a.slice(a.indexOf('=') + 1));
+    const lit = /(['"`])((?:\\.|(?!\1)[^\\\n])*)\1/g;
+    let m;
+    while ((m = lit.exec(a))) texts.push(m[2]);
+  }
+  for (const t of texts) {
+    if (!t || t.length > 4096 || !/[\\/]|^~/.test(t)) continue;
+    const cred = readCredentialKind(t, ctx, ctx.cwd);
+    if (cred && !cred.env) return cred;
+  }
+  const all = args.join('\n');
+  if (/\.claude-anywhere\b|\bANYWHERE_HOME\b/.test(all) || (ctx.anywhereHome && all.includes(ctx.anywhereHome)) || (/\bdaemon\.json\b/.test(all) && /anywhere/i.test(all))) {
+    return { what: 'Claude Anywhere files that hold its access tokens' };
+  }
+  return null;
+}
+
 // ------------------------------------------------------------------ PowerShell expressions
 
 /** Replace PowerShell string literals with \u0001N\u0001 placeholders, keeping their values. */
@@ -5469,6 +5501,8 @@ function baseVerdict(prog, args, u, tk, ctx, raw) {
   if (/^(--?(version|help)|-v|-h)$/.test(args[0] || '') && args.length === 1) return V('low', `Shows ${prog} version or help`);
   if (INTERPRETERS.test(prog)) {
     if (!args.length || (args.length === 1 && args[0] === '-')) return { ...V('medium', `Starts ${prog}`), stdinExecutor: true };
+    const cred = interpreterCredentialRead(args, ctx);
+    if (cred) return V('high', `Reads ${cred.what} (${prog} code)`);
     return V('medium', `Runs ${prog} code`);
   }
   if (isScriptPath(argv0Of(u))) return V('medium', `Runs ${truncate(argv0Of(u).split(/[\\/]/).pop(), 60)}`);
@@ -5921,21 +5955,107 @@ const OPEN_TERMINALS =
 // Terminal hosts whose positional arguments are already a command line.
 const OPEN_TERMINAL_CMDLINE = /^(wt|windowsterminal|windows terminal|conhost)$/i;
 
+// The display names launch_app and open accept for terminals and shells (apps.js finds the app by them),
+// squashed (lower case, no spaces, hyphens or "(x64)"), and the program each starts: the checks below
+// know programs, and "GNOME Terminal" must not pass where "gnome-terminal" is judged (SEC-3).
+const APP_DISPLAY_EXECS = {
+  gnometerminal: 'gnome-terminal',
+  console: 'kgx',
+  gnomeconsole: 'kgx',
+  xfceterminal: 'xfce4-terminal',
+  xfce4terminal: 'xfce4-terminal',
+  mateterminal: 'mate-terminal',
+  lxqtterminal: 'qterminal',
+  windowsterminal: 'wt',
+  windowspowershell: 'powershell',
+  powershell7: 'pwsh',
+  powershellcore: 'pwsh',
+  commandprompt: 'cmd',
+  windowscommandprocessor: 'cmd',
+};
+
+/** The program an app name stands for: an executable's own name, or the one a known display name starts. */
+function appExecName(name, platform) {
+  const base = progName(name).replace(/\.app$/i, '');
+  const key = base.replace(/\((x64|x86|arm64)\)/g, '').replace(/[\s_-]+/g, '');
+  if (key === 'console' && platform === 'darwin') return base; // macOS Console is the log viewer
+  if (key === 'terminal' && platform === 'win32') return 'powershell'; // apps.js: Windows Terminal, PowerShell or cmd
+  return Object.prototype.hasOwnProperty.call(APP_DISPLAY_EXECS, key) ? APP_DISPLAY_EXECS[key] : base;
+}
+
+// Flags that hand the rest of the arguments to a command line, in the programs that have them: terminals
+// (-e, -x, --, --execute, --command), shells (-c, -lc...), PowerShell (-Command, -EncodedCommand and their
+// prefixes, also with /) and cmd (/c, /k, /r).
+const ARGV_RUN_FLAG = /^(--|-e|-x|--execute|--command)$/;
+const SHELL_RUN_FLAG = /^-[eilx]*c[eilx]*$/;
+const PS_RUN_FLAG = /^[-/](c|co|com|comm|comma|comman|command|commandwithargs|cwa)$/i;
+const PS_ENCODED_FLAG = /^[-/]e(c|n(c(o(d(e(d(c(o(m(m(a(n(d)?)?)?)?)?)?)?)?)?)?)?)?)?$/i;
+const CMD_RUN_FLAG = /^\/[ckr]$/i;
+
+function isRunFlag(a) {
+  return ARGV_RUN_FLAG.test(a) || SHELL_RUN_FLAG.test(a) || PS_RUN_FLAG.test(a) || PS_ENCODED_FLAG.test(a) || CMD_RUN_FLAG.test(a) || /^--command=/.test(a);
+}
+
+/**
+ * SEC-3: the command a flag hands to a command line (see isRunFlag), judged by every reading of that
+ * flag, whatever the program is called: a localized, custom or aliased terminal or shell must not hide
+ * `rm -rf ~`. null when the arguments have no such flag.
+ */
+function runFlagVerdict(args, ctx) {
+  const i = args.findIndex(isRunFlag);
+  if (i === -1) return null;
+  const flag = args[i];
+  const rest = args.slice(i + 1);
+  const sub = { ...ctx, depth: ctx.depth || 0, shell: ctx.platform === 'win32' ? 'powershell' : 'bash' };
+  const readings = [];
+  const eq = /^--command=([\s\S]*)$/.exec(flag);
+  if (eq) readings.push(() => recurse(eq[1], sub.shell, sub));
+  if (ARGV_RUN_FLAG.test(flag) && rest.length) {
+    // `gnome-terminal --command "bash -c ..."` passes one command line; `xterm -e bash -c ...` passes words.
+    readings.push(() => (rest.length === 1 && /\s/.test(rest[0]) ? recurse(rest[0], sub.shell, sub) : recurseArgv(rest, sub)));
+  }
+  if (SHELL_RUN_FLAG.test(flag)) readings.push(() => recurseArgv(['bash', flag, ...rest], sub));
+  if (PS_RUN_FLAG.test(flag) || PS_ENCODED_FLAG.test(flag)) readings.push(() => recurseArgv(['powershell', flag.replace(/^\//, '-'), ...rest], sub));
+  if (CMD_RUN_FLAG.test(flag)) readings.push(() => recurseArgv(['cmd', '/c', ...rest], sub));
+  let v = V('high', 'Starts a program that runs a command line');
+  for (const read of readings) {
+    try {
+      v = maxVerdict(v, read());
+    } catch {
+      v = maxVerdict(v, V('high', 'Could not inspect the command it runs'));
+    }
+  }
+  return v;
+}
+
 /** Verdict for open {target, args}: the target run with those arguments, like a command. */
 function openArgsVerdict(t, args, ctx) {
-  const base = progName(t).replace(/\.app$/i, '');
+  const base = appExecName(t, ctx.platform);
+  const sub = { ...ctx, depth: ctx.depth || 0, shell: ctx.platform === 'win32' ? 'powershell' : 'bash' };
   let v = null;
-  try {
-    v = recurseArgv([t, ...args], { ...ctx, depth: ctx.depth || 0, shell: ctx.platform === 'win32' ? 'powershell' : 'bash' });
-  } catch {
-    v = null;
+  for (const prog of base === progName(t).replace(/\.app$/i, '') ? [t] : [t, base]) {
+    try {
+      v = maxVerdict(v, recurseArgv([prog, ...args], sub));
+    } catch {
+      /* judged below */
+    }
   }
   if (SHELLS.test(base) || INTERPRETERS.test(base) || PS_HOSTS.test(base) || OPEN_RUNNERS.test(base)) {
     v = maxVerdict(v, V('high', 'Launches an interpreter or shell with arguments'));
   } else if (OPEN_TERMINALS.test(base)) {
     const runs = OPEN_TERMINAL_CMDLINE.test(base) || args.some((a) => a === '-e' || a === '--' || a === '-x' || a === '--command' || /^--command=/.test(a));
     if (runs) v = maxVerdict(v, V('high', `Opens a terminal running a command (${base})`));
+    // wt / conhost: the arguments are the command line itself.
+    if (OPEN_TERMINAL_CMDLINE.test(base) && args.length) {
+      try {
+        v = maxVerdict(v, recurseArgv(args, sub));
+      } catch {
+        /* high already */
+      }
+    }
   }
+  const run = runFlagVerdict(args, ctx);
+  if (run) v = maxVerdict(v, run.risk === 'high' && run.reason === 'Starts a program that runs a command line' ? V('high', `Starts ${base} running a command line`) : run);
   return v;
 }
 
@@ -5971,6 +6091,8 @@ function anywhereToolVerdict(tool, input, ctx) {
     // Arguments make `open` a way to run commands: {target:'bash', args:['-c', ...]}.
     const args = Array.isArray(input.args) ? input.args.map(String) : [];
     if (args.length && t) v = maxVerdict(v, openArgsVerdict(t, args, ctx));
+    // ...judged also as the program the app name starts, when the broker looked it up (SEC-3).
+    if (args.length && ctx.appProgram) v = maxVerdict(v, openArgsVerdict(ctx.appProgram, args, ctx));
     return v;
   }
   const desk = desktopToolVerdict(tool, input, ctx);
@@ -5989,9 +6111,10 @@ function anywhereToolVerdict(tool, input, ctx) {
 // permission mode. The tool call that leads to it is therefore marked ownCard: decide() lets it reach that
 // card instead of showing a second critical card first (the user would have to click twice).
 const CALLS_ARM_REASON = 'Answer phone calls for you with your voice';
-// F3-SAFE-D1: the daemon routes that answer approval cards and questions, change settings or modes, or
-// trade launch codes for the dialog's credentials. Only the user's own dialog, terminal and CLI use them.
-const DAEMON_USER_API_RE = /\/api\/(approval|answer|config|mode|launch|shutdown)\b/i;
+// F3-SAFE-D1: the daemon routes that answer approval cards and questions, change settings or modes,
+// trade launch codes for the dialog's credentials, or report whether the dialog is on screen (which
+// decides an engine's input where windows cannot be listed). Only the user's own dialog, terminal and CLI use them.
+const DAEMON_USER_API_RE = /\/api\/(approval|answer|config|mode|launch|shutdown|ui\/visibility)\b/i;
 const DAEMON_USER_API_REASON = 'Answers approval cards or changes Claude Anywhere settings through its API (self-escalation)';
 
 /**
@@ -6214,8 +6337,28 @@ function quitAppVerdict(input) {
   return V('medium', `Quits ${shown} (it may ask to save unsaved work)`);
 }
 
-/** browser_open: web pages are medium; other schemes and local executables are high, as for open. */
-function browserOpenVerdict(input) {
+// The executables (and macOS app names) of the browsers browser_open knows; must agree with
+// src/os/browsers.js KNOWN_BROWSER_EXEC, which refuses any other path (NOT_A_BROWSER).
+const KNOWN_BROWSER_EXEC =
+  /^(chrome|google-chrome(-stable|-beta|-unstable)?|google chrome( beta| dev| canary)?|chromium(-browser)?|brave(-browser(-stable|-beta|-nightly)?)?|brave browser( beta| nightly)?|msedge|microsoft-edge(-stable|-beta|-dev)?|microsoft edge( beta| dev| canary)?|firefox(-esr)?|firefox (developer edition|nightly)|vivaldi(-stable)?|opera|safari|arc|librewolf|waterfox|floorp)$/i;
+
+/**
+ * browser_open: web pages are medium; other schemes and local executables are high, as for open. A
+ * browser given as a path runs that program with the URL: one that is not a known browser is judged as
+ * launch_app would judge it, and at least high (SEC-2).
+ */
+function browserOpenVerdict(input, ctx = {}) {
+  const v = browserUrlVerdict(input);
+  const b = str(input.browser).trim();
+  if (!b || !/[\\/]/.test(b) || /^[a-z][a-z0-9+.-]*:\/\//i.test(b)) return v;
+  const parts = b.replace(/[\\/]+$/, '').split(/[\\/]/);
+  const base = progName(parts.pop() || '').replace(/\.app$/i, '');
+  if (KNOWN_BROWSER_EXEC.test(base) || (base === 'launcher' && /^opera( gx)?$/i.test(parts.pop() || ''))) return v;
+  const asApp = anywhereToolVerdict('open', { target: b, kind: 'app', args: [str(input.url)] }, ctx);
+  return maxVerdict(maxVerdict(v, asApp), V('high', `Starts ${truncate(oneLine(b), 60)}, which is not a known browser`));
+}
+
+function browserUrlVerdict(input) {
   const u = str(input.url).trim();
   const where = input.browser ? ` in ${truncate(oneLine(input.browser), 30)}` : ' in the browser';
   if (!u) return V('medium', `Opens a new tab or window${where}`);
@@ -6271,7 +6414,7 @@ function desktopToolVerdict(tool, input, ctx) {
     case 'set_window':
       return V('medium', 'Moves, resizes, maximizes or minimizes a window');
     case 'browser_open':
-      return browserOpenVerdict(input);
+      return browserOpenVerdict(input, ctx);
     case 'browser_switch_tab':
       return V('medium', 'Switches to another browser tab');
     case 'batch_actions':
@@ -7056,12 +7199,15 @@ class PermissionBroker extends EventEmitter {
    *   getExtraDirs: the folders the engine was given with --add-dir (VS Code workspaces); edits
    *   there are judged like project edits (HEADLINE-SCENARIO-10).
    */
-  constructor({ config, hub, onNeedAttention, audit, now, projectDir, getProjectDir, getExtraDirs, platform, homeDir, activeWindow } = {}) {
+  constructor({ config, hub, onNeedAttention, audit, now, projectDir, getProjectDir, getExtraDirs, platform, homeDir, activeWindow, resolveApp } = {}) {
     super();
     this.getExtraDirs = typeof getExtraDirs === 'function' ? getExtraDirs : null;
     this.config = config || {};
     // () => Promise<{app?:string}|null>: the focused window, so typed text is judged by where it lands.
     this.activeWindow = typeof activeWindow === 'function' ? activeWindow : null;
+    // (name) => Promise<string|null>: the program an app name starts (src/os/apps.js findApp), so
+    // launch_app {name: 'GNOME Terminal', args} is judged as the gnome-terminal it runs (SEC-3).
+    this.resolveApp = typeof resolveApp === 'function' ? resolveApp : null;
     this.hub = hub || null;
     this.onNeedAttention = typeof onNeedAttention === 'function' ? onNeedAttention : null;
     this.auditFn = typeof audit === 'function' ? audit : logMod.audit;
@@ -7157,6 +7303,32 @@ class PermissionBroker extends EventEmitter {
     }
   }
 
+  /**
+   * @private SEC-3: the program launch_app (or open {kind: 'app'}) would start for an app given with
+   * arguments, or null (no arguments, a path or link judged as it is, unknown, or a slow lookup).
+   */
+  async appProgram(toolName, input) {
+    if (!this.resolveApp) return null;
+    const launch = /launch_app$/.test(toolName);
+    const name = str(launch ? input.name : input.target).trim();
+    if (!name || !Array.isArray(input.args) || !input.args.length) return null;
+    if (/[\\/]/.test(name) || /^[a-z][a-z0-9+.-]*:/i.test(name) || (!launch && input.kind != null && input.kind !== 'app')) return null;
+    let timer;
+    try {
+      const p = await Promise.race([
+        Promise.resolve().then(() => this.resolveApp(name)),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(null), 1500);
+        }),
+      ]);
+      return typeof p === 'string' && p.trim() ? p.trim() : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** @private the focused window's app name, or null */
   async focusedApp() {
     return (await this.focusedWindow()).app;
@@ -7223,6 +7395,10 @@ class PermissionBroker extends EventEmitter {
         const f = await this.focusedWindow();
         opts.focusedApp = f.app;
         opts.focusedProcess = f.process;
+      }
+      if (/^mcp__(.+_)?anywhere__(launch_app|open)$/.test(toolName)) {
+        const prog = await this.appProgram(toolName, inp);
+        if (prog) opts.appProgram = prog;
       }
       cls = classify(toolName, inp, opts);
     } catch (err) {

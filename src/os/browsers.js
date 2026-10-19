@@ -1283,6 +1283,20 @@ function looksLikePath(s) {
   return /[\\/]/.test(String(s)) && !/^[a-z]+:\/\//i.test(String(s));
 }
 
+// The executables (and macOS app names) of the browsers this module knows. browser_open with a path runs
+// that program with the URL, so a path to anything else is refused (SEC-2); src/daemon/permissions.js
+// KNOWN_BROWSER_EXEC must agree.
+const KNOWN_BROWSER_EXEC =
+  /^(chrome|google-chrome(-stable|-beta|-unstable)?|google chrome( beta| dev| canary)?|chromium(-browser)?|brave(-browser(-stable|-beta|-nightly)?)?|brave browser( beta| nightly)?|msedge|microsoft-edge(-stable|-beta|-dev)?|microsoft edge( beta| dev| canary)?|firefox(-esr)?|firefox (developer edition|nightly)|vivaldi(-stable)?|opera|safari|arc|librewolf|waterfox|floorp)$/i;
+
+/** Whether a path names a browser's executable or app bundle (Opera's launcher.exe only in its own folder). */
+function isBrowserExecutable(p) {
+  const parts = String(p).replace(/[\\/]+$/, '').split(/[\\/]/);
+  const base = (parts.pop() || '').replace(/\.(exe|app)$/i, '');
+  if (base.toLowerCase() === 'launcher') return /^opera( gx)?$/i.test(parts.pop() || '');
+  return KNOWN_BROWSER_EXEC.test(base);
+}
+
 /** Flags that open `url` in a family's browser: a new tab (default) or a new window. */
 function openArgs(family, url, { newWindow = false } = {}) {
   if (family === 'firefox') return newWindow ? ['-new-window', url] : ['-new-tab', url];
@@ -1378,6 +1392,9 @@ async function pickBrowser(ctx, browser, driver) {
   const b = browser == null ? '' : String(browser).trim();
   if (b && looksLikePath(b)) {
     if (!exists(ctx, b)) throw browserError(`No browser at ${b}`, 'NOT_FOUND');
+    if (!isBrowserExecutable(b)) {
+      throw browserError(`${b} is not a browser this tool knows, so it was not started`, 'NOT_A_BROWSER', 'Name the browser instead (chrome, brave, edge, firefox, vivaldi, opera, safari, arc), or start other programs with launch_app.');
+    }
     const def = defFromPath(b);
     return { def, path: b, name: def ? def.name : path.basename(b), query: '', window: null, windows: wins };
   }
@@ -1822,6 +1839,7 @@ module.exports = {
   openPlan,
   openArgs,
   defFromPath,
+  isBrowserExecutable,
   winTabs,
   FIREFOX_SQL,
   MAC_TABS_JXA,

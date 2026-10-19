@@ -485,6 +485,14 @@ class Computer {
   does not raise windows in every toolkit and a covered centre belongs to another window; if it stays behind, the
   error is FOCUS_FAILED and nothing is sent. Warnings from the driver (also uiFind's
   non-enumerable `warnings`) are passed on. Ids seen in results are remembered 30 s for the fallback click.
+- F3-SAFE-D1 (`protect`, the MCP server's Computer only): `uiClick`, `uiSetValue` and `uiAction` throw OWN_DIALOG for
+  an element of the Claude Anywhere dialog, known by the window the lookup searched, the window or process its id
+  names (`lx:<window | @pid.n>:…`, `mac:<pid>:<window>:…`, `<hwnd>.…`, `mock:<window>:…`), or else by its centre
+  lying in the dialog's rectangle; the fallback click goes through the same point check as `click`, and the
+  fallback keys through the focus check of `type_text`. `dialogState()` (constructor option; the daemon's
+  `GET /api/mcp/guard` `dialog: {visible, focused}`, from the pages' `POST /api/ui/visibility` reports, which the
+  engine token cannot send) decides where windows cannot be listed (GNOME/KDE Wayland): pointer input is refused
+  while the dialog is on screen, keys while it may have the focus.
 
 ### ocr.js (on-device text recognition)
 ```js

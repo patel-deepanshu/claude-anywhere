@@ -592,6 +592,32 @@ function writeSessions(obj) {
 
 // ------------------------------------------------------------------ SessionManager
 
+/**
+ * F3-SAFE-D1: whether a dialog page of this session's daemon is on screen and has the focus (focused null:
+ * unknown), or null when none is open. Without the pages' reports (no window host), an open page counts
+ * as on screen with an unknown focus.
+ * @param {{hub?:object, dialogStateFn?:Function}} s the session
+ * @returns {{visible:boolean, focused:boolean|null}|null}
+ */
+function dialogOnScreen(s) {
+  let pages = 0;
+  try {
+    pages = s.hub && typeof s.hub.clientCount === 'function' ? Number(s.hub.clientCount('ui')) || 0 : 0;
+  } catch {
+    pages = 0;
+  }
+  if (typeof s.dialogStateFn === 'function') {
+    try {
+      const d = s.dialogStateFn();
+      if (!d) return null;
+      return { visible: d.visible !== false, focused: typeof d.focused === 'boolean' ? d.focused : null };
+    } catch (err) {
+      log.debug(`dialog state unknown: ${err.message}`);
+    }
+  }
+  return pages > 0 ? { visible: true, focused: null } : null;
+}
+
 class SessionManager extends EventEmitter {
   /**
    * @param {object} opts
@@ -614,6 +640,8 @@ class SessionManager extends EventEmitter {
    * @param {Function} [opts.buildSystemPrompt]
    * @param {Function} [opts.settingsNotes] (config) → the settings section of buildSystemPrompt's text
    * @param {object} [opts.platformInfo]
+   * @param {()=>({visible:boolean, focused:boolean|null}|null)} [opts.dialogState] whether a dialog page is on
+   *   screen and has the focus, as the pages report it (UiHost.dialogState()); guard() passes it on
    * @param {Function} [opts.Engine] engine class (tests)
    * @param {number} [opts.preTurnHoldMs] how long an empty pre-turn result is held (tests)
    */
@@ -639,6 +667,7 @@ class SessionManager extends EventEmitter {
     this._getComputer = typeof opts.getComputer === 'function' ? opts.getComputer : null;
     this._getDriver = typeof opts.getDriver === 'function' ? opts.getDriver : null;
     this.driverName = (opts.driver && opts.driver.name) || opts.driverName || null;
+    this.dialogStateFn = typeof opts.dialogState === 'function' ? opts.dialogState : null;
 
     this.mode = opts.mode === 'bridge' ? 'bridge' : 'companion';
     this.projectDir = path.resolve(opts.projectDir || process.cwd());
@@ -954,29 +983,44 @@ class SessionManager extends EventEmitter {
   }
 
   /**
-   * Input-action guard for the MCP server (GET /api/mcp/guard).
-   * @returns {{allowed:boolean, reason?:string}}
+   * Input-action guard for the MCP server (GET /api/mcp/guard). With a dialog page open it also says
+   * whether the dialog is on screen and has the focus (dialog), for desktops that cannot place its window
+   * (GNOME/KDE Wayland): the MCP server's Computer then refuses input that could reach it (F3-SAFE-D1).
+   * @returns {{allowed:boolean, reason?:string, dialog?:{visible:boolean, focused:boolean|null}}}
    */
   guard() {
+    const dialog = dialogOnScreen(this);
+    const verdict = (v) => (dialog ? { ...v, dialog } : v);
     const left = this.pauseUntil - Date.now();
-    if (left > 0) return { allowed: false, reason: `the user pressed Stop; actions resume in ${Math.ceil(left / 1000)} s` };
-    if (this.status === 'stopping') return { allowed: false, reason: 'the user is stopping Claude' };
+    if (left > 0) return verdict({ allowed: false, reason: `the user pressed Stop; actions resume in ${Math.ceil(left / 1000)} s` });
+    if (this.status === 'stopping') return verdict({ allowed: false, reason: 'the user is stopping Claude' });
     // Bridge mode: the terminal keeps working on a command the user stopped until it learns of
     // the Stop (its next reply is refused) and listens again.
     if (this.mode === 'bridge' && this.bridge && this.bridge.commandStopped && Date.now() - this.bridgeStoppedAt < BRIDGE_STOP_GUARD_MS) {
-      return { allowed: false, reason: 'the user pressed Stop in the dialog, so this command was cancelled; abandon it and run "anywhere listen" for the next one' };
+      return verdict({ allowed: false, reason: 'the user pressed Stop in the dialog, so this command was cancelled; abandon it and run "anywhere listen" for the next one' });
     }
     // F3-SAFE-D1: while a critical card waits for the user's click, no mouse or keyboard action may run
     // (it could click that card's own "Allow once").
     try {
       const pending = this.permissions && typeof this.permissions.pending === 'function' ? this.permissions.pending() : [];
       if (Array.isArray(pending) && pending.some((c) => c && c.risk === 'critical')) {
-        return { allowed: false, reason: 'a critical action is waiting for the user to decide in the Claude Anywhere dialog' };
+        return verdict({ allowed: false, reason: 'a critical action is waiting for the user to decide in the Claude Anywhere dialog' });
       }
     } catch {
       /* no broker */
     }
-    return { allowed: true };
+    return verdict({ allowed: true });
+  }
+
+  /**
+   * Whether Claude may be driving the mouse and keyboard now: a companion turn (or its start) is running,
+   * or the terminal holds a bridge command. F3-SAFE-D1: a setting that loosens the approval policy waits
+   * until it is not (server.saveConfig), since Claude's own input could be what pressed Save.
+   * @returns {boolean}
+   */
+  engineWorking() {
+    if (this.turnActive || this.startingPromise) return true;
+    return this.mode === 'bridge' && Boolean(this.bridgeBusy);
   }
 
   /** @returns {object} the SSE `snapshot` payload */

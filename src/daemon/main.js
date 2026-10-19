@@ -749,6 +749,8 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
       log.error('UiHost failed to start; the dialog URL will be printed instead:', err);
     }
   }
+  // F3-SAFE-D1: a dialog page that connects counts as on screen until it reports (uihost.dialogState()).
+  if (uihost && typeof uihost.notePages === 'function') hub.on('clients', () => uihost.notePages());
   const notifyOS = commonMod ? (title, body) => commonMod.notify(title, body) : null;
   // The pending card of a broker (null once answered, undefined when unknown); `permissions` and
   // `questions` are created below, and this is only called after that.
@@ -814,6 +816,12 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
         getExtraDirs: () => (session ? session.engineAddDirs || [] : []),
         // type_text is judged by where it lands: a terminal runs it, an email does not (REGRESSIONS-7).
         activeWindow: () => lazyDriver.activeWindow(),
+        // launch_app {name, args} is judged as the program the name starts ("GNOME Terminal" → gnome-terminal, SEC-3).
+        resolveApp: async (name) => {
+          const found = await require('../os/apps').findApp(name);
+          const app = found && found.app;
+          return app ? app.target || app.path || app.execName || null : null;
+        },
       });
     } catch (err) {
       log.error('PermissionBroker failed to start; using the basic always-ask broker:', err);
@@ -988,6 +996,8 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     // Its settings section reaches a running engine by message, without a restart (LIVE-E2E-R3-4).
     settingsNotes: promptMod && typeof promptMod.settingsNotes === 'function' ? promptMod.settingsNotes : null,
     platformInfo,
+    // GET /api/mcp/guard says where the dialog stands, for desktops that cannot place its window (F3-SAFE-D1).
+    dialogState: uihost && typeof uihost.dialogState === 'function' ? () => uihost.dialogState() : undefined,
   });
   server.session = session;
   server.deps.session = session;

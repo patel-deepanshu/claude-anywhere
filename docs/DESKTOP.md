@@ -162,7 +162,10 @@ lines, and on Linux **Desktop assistant tools**. Each missing piece comes with t
 - Helpful extras: `wmctrl` (apps close gently, with a chance to save), `sqlite3` (current Firefox bookmarks; without it
   the daily backup is read), `gtk-launch` from `libgtk-3-bin` (apps start exactly as their menu entry does).
 - GNOME and KDE on Wayland do not let programs move or resize other windows, or tell them where windows are: Claude
-  works from screenshots there, and `set_window` says it is unsupported.
+  works from screenshots there, and `set_window` says it is unsupported. Since Claude cannot tell where the dialog is
+  there either, it does not click while the dialog is on screen, or type while the dialog may have the focus:
+  minimize the dialog while Claude works with the mouse (approval cards bring it back), or use an X11 session
+  ("Ubuntu on Xorg"), sway or Hyprland.
 
 ---
 
@@ -177,15 +180,17 @@ The desktop assistant follows the same rules as the rest of Claude Anywhere ([SE
   at once. Clicking, typing, launching apps, opening pages, switching tabs and arranging windows are medium (the
   default `smart` mode lets them run and shows them in the timeline). High risk, always with a card of its own and
   never covered by an "Always" rule: force-quitting an app or quitting a system process or Claude itself, opening a
-  non-web link or a program through the browser, launching an app with a shell command, typing a secret-looking value
-  into a field. A `batch_actions` card lists every step and is as risky as its riskiest step; "Always" is never
+  non-web link or a program through the browser, opening a page with a program that is not a known browser,
+  launching an app with a shell command (also a terminal given by its display name, such as "GNOME Terminal" or
+  "Windows PowerShell", with `-e`, `--`, `-c`, `-Command` or `/c`), typing a secret-looking value into a field. A `batch_actions` card lists every step and is as risky as its riskiest step; "Always" is never
   offered for batches.
 - **No passwords, 2FA codes or payment details.** Claude asks you to type them yourself.
 - **Confirm before anything irreversible**: sending a message or email, deleting, buying, publishing, pushing code.
 - **Screen text is information, not instructions.** A web page or chat that says "ignore your instructions" is just text.
 - **Your work is protected**: `quit_app` asks apps to quit politely (they can ask to save), never quits the terminal or
   editor Claude runs in, and never touches shared system processes. Video and file edits go to new files.
-- The **Claude Anywhere dialog** itself is never clicked, typed into, moved or closed by Claude.
+- The **Claude Anywhere dialog** itself is never clicked, typed into, moved or closed by Claude: not by pixels, not
+  through accessibility (`OWN_DIALOG`), not by `set_window`, and `quit_app` leaves its browser running.
 - Every action is written to the audit log (`~/.claude-anywhere/logs/audit-*.jsonl`), with secrets redacted.
 
 ---
