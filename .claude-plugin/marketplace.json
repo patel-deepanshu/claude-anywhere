@@ -15,7 +15,8 @@
       "version": "0.1.0",
       "category": "productivity",
       "author": {
-        "name": "Deepanshu Patel"
+        "name": "Deepanshu Patel",
+        "url": "https://github.com/patel-deepanshu"
       },
       "homepage": "https://github.com/patel-deepanshu/claude-anywhere",
       "repository": "https://github.com/patel-deepanshu/claude-anywhere",

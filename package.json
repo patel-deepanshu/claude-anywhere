@@ -3,11 +3,17 @@
   "version": "0.1.0",
   "description": "/anywhere for Claude Code: a floating, voice-enabled dialog that lets Claude Code see and operate your whole desktop (screen, mouse, keyboard, apps, browser, terminal) on macOS, Windows, WSL and Linux.",
   "license": "MIT",
-  "author": "Deepanshu Patel",
+  "author": {
+    "name": "Deepanshu Patel",
+    "url": "https://github.com/patel-deepanshu"
+  },
   "homepage": "https://github.com/patel-deepanshu/claude-anywhere",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/patel-deepanshu/claude-anywhere.git"
+  },
+  "bugs": {
+    "url": "https://github.com/patel-deepanshu/claude-anywhere/issues"
   },
   "keywords": [
     "claude",
@@ -32,7 +38,8 @@
     ".claude-plugin/",
     "docs/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=18.17"

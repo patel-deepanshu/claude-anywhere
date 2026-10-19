@@ -103,7 +103,7 @@ test('plugin.json basics', () => {
   assert.equal(p.version, '0.1.0');
   assert.equal(p.version, pkg.version);
   assert.equal(typeof p.description, 'string');
-  assert.deepEqual(p.author, { name: 'Deepanshu Patel' });
+  assert.deepEqual(p.author, { name: 'Deepanshu Patel', url: 'https://github.com/patel-deepanshu' });
   assert.equal(p.repository, 'https://github.com/patel-deepanshu/claude-anywhere');
   assert.match(p.homepage, /^https:\/\//);
   assert.equal(p.license, 'MIT');

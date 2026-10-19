@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "description": "/anywhere: a floating, voice-enabled dialog that lets Claude Code see and operate your whole desktop (screen, mouse, keyboard, windows, apps, browser, terminal) on macOS, Windows, WSL and Linux. Adds the anywhere MCP computer-use tools and the anywhere CLI.",
   "author": {
-    "name": "Deepanshu Patel"
+    "name": "Deepanshu Patel",
+    "url": "https://github.com/patel-deepanshu"
   },
   "homepage": "https://github.com/patel-deepanshu/claude-anywhere",
   "repository": "https://github.com/patel-deepanshu/claude-anywhere",
