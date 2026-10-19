@@ -77,7 +77,8 @@ package version is `0.1.0`.
   detection through the focused window's process.
 - macOS: screen-capture permission detection through functions bound by name, layout-aware shortcuts,
   symlinked home folders in the permission classifier.
-- Linux: X11 window stacking and frame geometry, ydotool 0.1.x support, platform-correct tests.
+- Linux: X11 window stacking and frame geometry, detection of the unsupported ydotool 0.1.x with instructions to
+  install 1.x, platform-correct tests.
 - Tests: retries for temporary-folder removal on Windows, platform-correct Unicode and path tests, robust
   headless Chromium start.
 

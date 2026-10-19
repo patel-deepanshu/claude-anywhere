@@ -53,15 +53,18 @@ Voice intents:
 
 ## The spoken voice (free, offline, sounds like a person)
 
-Claude Anywhere can speak with **Piper**, a free and open-source neural text-to-speech engine
-(MIT, [github.com/rhasspy/piper](https://github.com/rhasspy/piper)). Its voices sound like a person
+Claude Anywhere can speak with **Piper**, a free and open-source neural text-to-speech engine. The release
+binaries come from [github.com/rhasspy/piper](https://github.com/rhasspy/piper) (MIT); on macOS, and where those
+binaries do not run, it installs the `piper-tts` package from
+[OHF-Voice/piper1-gpl](https://github.com/OHF-Voice/piper1-gpl) (GPL-3.0-or-later) into a private virtual
+environment. Piper is downloaded only when you ask for it and is not part of Claude Anywhere's own code. Its voices sound like a person
 reading, not a robot. It runs entirely on your computer: nothing is sent anywhere, there is no
 account or API key, and it costs nothing, ever.
 
 ### Install it once
 
 ```sh
-anywhere voice install                          # Piper + the default voice (Lessac, US English, ~63 MB)
+anywhere voice install                          # Piper + the default voice (Lessac, US English; about 80-100 MB)
 anywhere voice install --voice en_GB-alba-medium # another voice
 ```
 

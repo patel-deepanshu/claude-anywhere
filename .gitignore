@@ -7,3 +7,14 @@ coverage/
 .claude/worktrees/
 __pycache__/
 *.pyc
+# Local secrets, keys, virtual environments and recordings (never commit these)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+.venv/
+venv/
+*.wav
+*.webm
+.claude/settings.local.json

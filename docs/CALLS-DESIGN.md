@@ -1,6 +1,7 @@
 # Feature 3 design: cloned voice and AI-answered calls
 
-Status: design, ready to build. Researched and measured on 2026-10-18.
+Status: design, ready to build. Researched and measured on 2026-10-18. This is the original plan: where the
+built modules or test files differ (for example the test file names in §11), §16 and the code are authoritative.
 Scope: `/anywhere:clone-voice` (consent-gated voice cloning) and "answer my calls and assist"
 (detect a ringing call, answer it, talk in the cloned voice, act on safe requests, write notes).
 Everything is free and runs locally. The only network services are the user's existing Jira, the

@@ -102,9 +102,11 @@ timeline:
 - **Claude Code**, with `claude` on your PATH and logged in.
 - **A desktop**: macOS, Windows 10/11, WSL, or Linux with X11 or Wayland. Per-OS setup and permissions are in
   [docs/PLATFORMS.md](docs/PLATFORMS.md):
-  - **macOS**: grant **Accessibility** and **Screen Recording** to the app that runs Claude Code.
+  - **macOS 11 or newer** (13 or newer for call audio capture): grant **Accessibility** and **Screen Recording** to
+    the app that runs Claude Code.
   - **Windows**: nothing extra (it uses the built-in PowerShell).
-  - **Linux X11**: `xdotool wmctrl xclip imagemagick`. **Wayland**: `ydotool` 1.0+, `grim` and `wl-clipboard`.
+  - **Linux X11**: `xdotool wmctrl xclip imagemagick x11-xserver-utils`. **Wayland**: `ydotool` 1.0+, `grim` and
+    `wl-clipboard`.
 - **Optional**: Chrome or Edge for in-browser speech recognition; Python 3 for the voice clone runtime; free Linux
   packages for the desktop assistant (`python3-gi gir1.2-atspi-2.0 at-spi2-core`, `tesseract-ocr`).
 
@@ -145,13 +147,14 @@ on your PATH, run `node ~/.claude-anywhere/app/bin/anywhere.js doctor`) and foll
 - `anywhere install` links the `anywhere` command into `~/.local/bin` on macOS, Linux and WSL. For the plugin
   (Option A), the link and the hotkey run a small launcher in `~/.claude-anywhere/launcher` that finds the
   installed plugin version each time, so they keep working after `/plugin update`.
-- On macOS, Option B, and Option C on macOS/Linux, show the permission prompts for you when run in a terminal; the
-  others print the System Settings shortcuts.
+- On macOS, Option B and Option C show the Accessibility and Screen Recording prompts when run in a terminal;
+  Option A and `/anywhere setup` print the System Settings shortcuts instead.
 
 Optional extras:
 
 - `anywhere install --electron`: an always-on-top window, a global hotkey (Ctrl/Cmd+Shift+Space), and a dialog
-  that is hidden from Claude's screenshots.
+  that is hidden from Claude's screenshots. It installs the current Electron release, which needs Node.js 22.12 or
+  newer.
 - `anywhere install --hotkey`: an OS-level shortcut or launcher (Windows Ctrl+Alt+F12, GNOME Ctrl+Alt+A, a macOS
   app to bind in Shortcuts).
 
@@ -227,7 +230,7 @@ something failed. For a voice that sounds like a person, install **Piper**, a fr
 text-to-speech engine that runs offline on your computer (no account, no API key, no cost):
 
 ```bash
-anywhere voice install            # Piper + a natural US English voice (~63 MB, into ~/.claude-anywhere/voice)
+anywhere voice install            # Piper + a natural US English voice (about 80-100 MB, into ~/.claude-anywhere/voice)
 anywhere voice list               # more voices: US/UK English, German, French, Spanish, Italian, …
 anywhere voice use en_US-ryan-high
 anywhere voice test
@@ -385,7 +388,8 @@ Per-OS setup and permissions: [docs/PLATFORMS.md](docs/PLATFORMS.md).
 | `ui.alwaysOnTop`, `ui.hotkey` | `true`, `CommandOrControl+Shift+Space` | Electron and app-window behaviour |
 | `voice.stt` / `voice.tts` | `auto` | `browser` · `server` · `off` |
 | `voice.language`, `voice.handsFree`, `voice.wakeWord` | `en-US`, `false`, `hey claude` | |
-| `voice.sttProvider`, `voice.sttBaseUrl`, `voice.sttApiKey`, `voice.sttModel` | `auto` | Server speech-to-text |
+| `voice.sttProvider` | `auto` | Server speech-to-text provider |
+| `voice.sttBaseUrl`, `voice.sttApiKey`, `voice.sttModel` | (empty) | A custom OpenAI-compatible speech-to-text endpoint |
 | `voice.ttsEngine` | `auto` | `piper` · `browser` · `os` (auto = Piper when installed) |
 | `voice.piperVoice` | `en_US-lessac-medium` | The Piper voice (`anywhere voice use …`) |
 | `voice.announce.done` / `.permission` / `.question` / `.error`, `voice.chime` | `true` | What is said aloud, and the chime before it |
@@ -532,7 +536,9 @@ Claude Anywhere was created by **Deepanshu Patel** ([@patel-deepanshu](https://g
 maintains the project. Contributors are listed in [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 Claude Anywhere works with these free and open-source projects, used only when you choose to install or enable
-them: [Piper](https://github.com/rhasspy/piper) (text to speech), [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
+them: [Piper](https://github.com/rhasspy/piper) (text to speech; the release binaries are MIT, and the `piper-tts`
+package used on macOS and as a fallback comes from [OHF-Voice/piper1-gpl](https://github.com/OHF-Voice/piper1-gpl)
+under GPL-3.0-or-later), [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
 with Kyutai Pocket TTS and Moonshine models (voice clone and speech recognition),
 [whisper.cpp](https://github.com/ggerganov/whisper.cpp) (optional local speech recognition),
 [tesseract](https://github.com/tesseract-ocr/tesseract) (optional screen text on Linux) and

@@ -4,7 +4,7 @@
 fix for each problem. Run it first. What the desktop assistant (app controls through accessibility, on-screen text
 recognition, apps and browsers) needs on each OS is in [DESKTOP.md](DESKTOP.md#requirements-per-operating-system).
 
-## macOS (13+; Apple Silicon and Intel)
+## macOS (11+, 13+ for call audio capture; Apple Silicon and Intel)
 
 | Feature | Mechanism |
 |---|---|

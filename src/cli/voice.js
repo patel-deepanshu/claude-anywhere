@@ -354,7 +354,7 @@ function commands(h) {
       summary: 'Free natural-sounding voice (Piper): install, choose, test',
       usage: 'anywhere voice install [ID] [--force] | list | use ID [--install] | test ["text"] [--local] | status | remove ID  [--json]',
       details: [
-        'install downloads Piper (MIT, offline neural text-to-speech) and a voice (default en_US-lessac-medium, ~63 MB) into ~/.claude-anywhere/voice.',
+        'install downloads Piper (free, offline neural text-to-speech) and a voice (default en_US-lessac-medium, ~63 MB) into ~/.claude-anywhere/voice.',
         'Nothing is sent anywhere and nothing costs money. A running dialog switches to the new voice at once.',
         'list shows the curated voices (✓ installed, * in use); any id from huggingface.co/rhasspy/piper-voices also installs.',
         'test plays a sample through the dialog when it is open, else through the speakers (--local forces the speakers).',
