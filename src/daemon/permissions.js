@@ -910,6 +910,8 @@ function classifyContext(opts = {}) {
     focusedApp: typeof opts.focusedApp === 'string' && opts.focusedApp.trim() ? opts.focusedApp.trim() : null,
     // Its process name (cmd.exe, conhost, kgx) when the driver reports one.
     focusedProcess: typeof opts.focusedProcess === 'string' && opts.focusedProcess.trim() ? opts.focusedProcess.trim() : null,
+    // The program launch_app / open {kind: 'app'} starts for the app it names (the broker's lookup), or null.
+    appProgram: typeof opts.appProgram === 'string' && opts.appProgram.trim() ? opts.appProgram.trim() : null,
     shell: 'bash',
     cwd: projectDir,
     depth: 0,
@@ -1002,6 +1004,11 @@ function credentialSegments(raw) {
     if (sg === '.local' && next === 'share' && ['keyrings', 'kwalletd'].includes(segs[i + 2])) return { what: 'your keyring (saved passwords)', env: false };
     if (sg === 'library' && next === 'keychains') return { what: 'your keychain (saved passwords)', env: false };
     if (sg === '.claude-anywhere' && ['config.json', 'daemon.json'].includes(next)) return { what: 'a Claude Anywhere file that holds keys or tokens', env: false };
+    // F3-SAFE-D1: the run files (MCP configs with the daemon token) and a call engine's files.
+    if (sg === '.claude-anywhere' && next === 'run' && (i + 2 === segs.length - 1 ? /\.json$|[*?[]/.test(segs[i + 2] || '') : i + 2 < segs.length)) {
+      return { what: 'a Claude Anywhere run file that holds its access token', env: false };
+    }
+    if (sg === '.claude-anywhere' && next === 'calls' && segs[i + 3] === 'engine') return { what: "a call engine's files, which hold the Claude Anywhere access token", env: false };
     if (/^(\.pgpass|\.mylogin\.cnf|\.vault-token|\.git-credentials|\.netrc|_netrc)$/.test(sg) && i === segs.length - 1)
       return { what: 'a file with login tokens or passwords', env: false };
   }
@@ -1226,6 +1233,21 @@ function credentialKind(t, ctx) {
   if (inHome('.kube')) return { what: 'your Kubernetes credentials', env: false };
   if (inHome('.gnupg') || inHome('.password-store')) return { what: 'your GPG keys or password store', env: false };
   if (inHome('.config', 'gh') || inHome('.terraform.d')) return { what: 'CLI login tokens', env: false };
+  // F3-SAFE-D1: <state>/run/*.json (the MCP configs carry the daemon's token) and a call engine's
+  // folder <state>/calls/<id>/engine/ are credential files, like daemon.json.
+  for (const root of [home ? P.join(home, '.claude-anywhere') : null, ctx.anywhereHome || null]) {
+    if (!root) continue;
+    const r = normFor(t.win, root);
+    const runDir = normFor(t.win, P.join(r, 'run'));
+    if (isUnder(a, runDir, t.win) && a !== runDir && (/\.json$/.test(lbase) || /[*?[]/.test(lbase) || P.dirname(a) !== runDir)) {
+      return { what: 'a Claude Anywhere run file that holds its access token', env: false };
+    }
+    const callsDir = normFor(t.win, P.join(r, 'calls'));
+    if (isUnder(a, callsDir, t.win)) {
+      const rest = a.slice(callsDir.length + 1).split(/[\\/]+/);
+      if (rest[1] && rest[1].toLowerCase() === 'engine') return { what: "a call engine's files, which hold the Claude Anywhere access token", env: false };
+    }
+  }
   if (
     isHome('.docker', 'config.json') ||
     isHome('.netrc') ||
@@ -3528,7 +3550,9 @@ function credLocations(ctx, win) {
   if ((ctx.platform === 'win32') !== win) return [];
   // (_netrc and AppData are Windows names; elsewhere they would only make `cat ~/*` look risky.)
   const out = CRED_HOME_PATHS.filter((segs) => win || !/^(_netrc|AppData)$/.test(segs[0])).map((segs) => normFor(win, P.join(ctx.homeDir, ...segs)));
-  if (ctx.anywhereHome) for (const f of ['config.json', 'daemon.json']) out.push(normFor(win, P.join(ctx.anywhereHome, f)));
+  if (ctx.anywhereHome) {
+    for (const f of [['config.json'], ['daemon.json'], ['run', 'mcp.json'], ['calls', 'call', 'engine', 'mcp.json']]) out.push(normFor(win, P.join(ctx.anywhereHome, ...f)));
+  }
   return out;
 }
 
@@ -3642,6 +3666,36 @@ function readerVerdict(prog, psProg, args, tk, ctx) {
     const t = resolveTarget(p, ctx, ctx.cwd);
     const where = t && credentialAncestor(t, ctx, { recursive: true });
     if (where) return V('high', `${archiver ? 'Archives' : 'Searches'} ${where}, which holds credential files`);
+  }
+  return null;
+}
+
+/**
+ * LIVE-1: a credential file that interpreter code given on the command line (python -c, node -e, perl
+ * -e...) or its arguments name, as cat would read it: the paths in its string literals and arguments,
+ * and Claude Anywhere's state folder by name, since code can build that path from pieces
+ * (path.join(home, '.claude-anywhere', 'daemon.json')). daemon.json and the run files hold the tokens
+ * that answer approval cards. The code is not otherwise inspected.
+ * @returns {{what:string}|null}
+ */
+function interpreterCredentialRead(args, ctx) {
+  const texts = [];
+  for (const a of args) {
+    if (!a || a.length > 100000) continue;
+    if (!a.startsWith('-')) texts.push(a);
+    else if (a.startsWith('--') && a.includes('=')) texts.push(a.slice(a.indexOf('=') + 1));
+    const lit = /(['"`])((?:\\.|(?!\1)[^\\\n])*)\1/g;
+    let m;
+    while ((m = lit.exec(a))) texts.push(m[2]);
+  }
+  for (const t of texts) {
+    if (!t || t.length > 4096 || !/[\\/]|^~/.test(t)) continue;
+    const cred = readCredentialKind(t, ctx, ctx.cwd);
+    if (cred && !cred.env) return cred;
+  }
+  const all = args.join('\n');
+  if (/\.claude-anywhere\b|\bANYWHERE_HOME\b/.test(all) || (ctx.anywhereHome && all.includes(ctx.anywhereHome)) || (/\bdaemon\.json\b/.test(all) && /anywhere/i.test(all))) {
+    return { what: 'Claude Anywhere files that hold its access tokens' };
   }
   return null;
 }
@@ -3912,6 +3966,7 @@ function classifyArgv(u, tk, ctx, raw) {
   const extra = { stdinExecutor: false, downloader: DOWNLOADERS.has(prog), cwd: undefined };
   if (v && v.stdinExecutor) extra.stdinExecutor = true;
   if (v && v.cwd !== undefined) extra.cwd = v.cwd;
+  const ownCard = Boolean(v && v.ownCard);
   v = V(v.risk, v.reason);
   // .NET and COM calls hide behind expressions and cmdlets that look harmless (CLASSIFIER-R3-08/09).
   if (ctx.shell === 'powershell') v = maxVerdict(v, psExpressionVerdict(raw, tk, ctx));
@@ -3976,6 +4031,19 @@ function classifyArgv(u, tk, ctx, raw) {
         if (cred) v = maxVerdict(v, V('high', `May send ${cred.what} over the network`));
       }
     }
+  }
+  // The daemon's own feature routes, called directly (CALLS-DESIGN §13.4): deleting the voice is high, and
+  // arming calls is critical (the route still raises its own click-only card).
+  if (NETWORK_PROGS.has(prog) || NETWORK_PROGS.has(psProg)) {
+    if (args.some((a) => /\/api\/calls\/arm\b/i.test(a))) v = maxVerdict(v, V('critical', CALLS_ARM_REASON));
+    else if (args.some((a) => /\/api\/clone\/delete\b/i.test(a))) v = maxVerdict(v, V('high', 'Deletes your cloned voice'));
+  }
+  // F3-SAFE-D1: any program (curl, node -e, python -c, a script given inline) that names the daemon
+  // routes which answer cards or change settings and modes is self-escalation, and so is one that
+  // names the calls arm route outside curl/wget.
+  if (namesDaemonRoute(str(raw), DAEMON_USER_API_RE)) v = maxVerdict(v, V('critical', DAEMON_USER_API_REASON));
+  else if (!(NETWORK_PROGS.has(prog) || NETWORK_PROGS.has(psProg)) && namesDaemonRoute(str(raw), /\/api\/calls\/arm\b/i)) {
+    v = maxVerdict(v, V('critical', 'Turns on answering your calls through the Claude Anywhere API'));
   }
   // Reading credential stores is not harmless, whatever program prints them (CLASSIFIER-R3-04),
   // and neither is a credential file fed on stdin (CLASSIFIER-R3-02).
@@ -4055,6 +4123,8 @@ function classifyArgv(u, tk, ctx, raw) {
       v = V('high', `Forced ${psVerb} without confirmation (${prog})`);
     }
   }
+  // `anywhere calls on` keeps its own-card mark only while nothing else (sudo, a redirect) raised the verdict.
+  if (ownCard && v.risk === 'critical' && v.reason === CALLS_ARM_REASON) extra.ownCard = true;
   return { ...v, ...extra };
 }
 
@@ -4525,6 +4595,8 @@ function baseVerdict(prog, args, u, tk, ctx, raw) {
     if (w[0] === 'config' && ['set', 'reset', 'unset'].includes(w[1]))
       return V('critical', 'Changes Claude Anywhere settings (self-escalation)');
     if (['install', 'uninstall'].includes(w[0])) return V('high', `Runs anywhere ${w[0]}`);
+    const callsCli = anywhereCallsCliVerdict(w);
+    if (callsCli) return callsCli;
     if (w[0] === 'computer') {
       const op = w[1] || '';
       if (op === 'type') return anywhereToolVerdict('type_text', { text: w.slice(2).join(' ') }, ctx);
@@ -5429,6 +5501,8 @@ function baseVerdict(prog, args, u, tk, ctx, raw) {
   if (/^(--?(version|help)|-v|-h)$/.test(args[0] || '') && args.length === 1) return V('low', `Shows ${prog} version or help`);
   if (INTERPRETERS.test(prog)) {
     if (!args.length || (args.length === 1 && args[0] === '-')) return { ...V('medium', `Starts ${prog}`), stdinExecutor: true };
+    const cred = interpreterCredentialRead(args, ctx);
+    if (cred) return V('high', `Reads ${cred.what} (${prog} code)`);
     return V('medium', `Runs ${prog} code`);
   }
   if (isScriptPath(argv0Of(u))) return V('medium', `Runs ${truncate(argv0Of(u).split(/[\\/]/).pop(), 60)}`);
@@ -5502,6 +5576,7 @@ function classifyShellCommand(command, shell, ctx) {
         (Boolean(u.sudo) && u.argv.length === 0),
       downloader: Boolean(r.downloader),
       decoder: isDecoder(progName(u.argv[0] || ''), u.argv.slice(1)),
+      ownCard: Boolean(r.ownCard),
       part,
       u,
     });
@@ -5655,10 +5730,13 @@ function classifyShellCommand(command, shell, ctx) {
   if (!best) return { risk: 'low', reason: 'Empty command', parts: [] };
   let reason = best.reason;
   if (results.length > 1 && best.risk !== 'low') reason = `${reason} — in: ${truncate(oneLine(best.command), 80)}`;
+  // `anywhere calls on` asks on its own click-only card; only when nothing else in the command needs one.
+  const ownCard = best.ownCard && best.risk === 'critical' && results.every((r) => r.ownCard || r.risk === 'low');
   return {
     risk: best.risk,
     reason,
     parts: results.map((r) => ({ command: r.command, normalized: r.normalized, risk: r.risk, reason: r.reason })),
+    ...(ownCard ? { ownCard: true } : {}),
   };
 }
 
@@ -5877,21 +5955,107 @@ const OPEN_TERMINALS =
 // Terminal hosts whose positional arguments are already a command line.
 const OPEN_TERMINAL_CMDLINE = /^(wt|windowsterminal|windows terminal|conhost)$/i;
 
+// The display names launch_app and open accept for terminals and shells (apps.js finds the app by them),
+// squashed (lower case, no spaces, hyphens or "(x64)"), and the program each starts: the checks below
+// know programs, and "GNOME Terminal" must not pass where "gnome-terminal" is judged (SEC-3).
+const APP_DISPLAY_EXECS = {
+  gnometerminal: 'gnome-terminal',
+  console: 'kgx',
+  gnomeconsole: 'kgx',
+  xfceterminal: 'xfce4-terminal',
+  xfce4terminal: 'xfce4-terminal',
+  mateterminal: 'mate-terminal',
+  lxqtterminal: 'qterminal',
+  windowsterminal: 'wt',
+  windowspowershell: 'powershell',
+  powershell7: 'pwsh',
+  powershellcore: 'pwsh',
+  commandprompt: 'cmd',
+  windowscommandprocessor: 'cmd',
+};
+
+/** The program an app name stands for: an executable's own name, or the one a known display name starts. */
+function appExecName(name, platform) {
+  const base = progName(name).replace(/\.app$/i, '');
+  const key = base.replace(/\((x64|x86|arm64)\)/g, '').replace(/[\s_-]+/g, '');
+  if (key === 'console' && platform === 'darwin') return base; // macOS Console is the log viewer
+  if (key === 'terminal' && platform === 'win32') return 'powershell'; // apps.js: Windows Terminal, PowerShell or cmd
+  return Object.prototype.hasOwnProperty.call(APP_DISPLAY_EXECS, key) ? APP_DISPLAY_EXECS[key] : base;
+}
+
+// Flags that hand the rest of the arguments to a command line, in the programs that have them: terminals
+// (-e, -x, --, --execute, --command), shells (-c, -lc...), PowerShell (-Command, -EncodedCommand and their
+// prefixes, also with /) and cmd (/c, /k, /r).
+const ARGV_RUN_FLAG = /^(--|-e|-x|--execute|--command)$/;
+const SHELL_RUN_FLAG = /^-[eilx]*c[eilx]*$/;
+const PS_RUN_FLAG = /^[-/](c|co|com|comm|comma|comman|command|commandwithargs|cwa)$/i;
+const PS_ENCODED_FLAG = /^[-/]e(c|n(c(o(d(e(d(c(o(m(m(a(n(d)?)?)?)?)?)?)?)?)?)?)?)?)?$/i;
+const CMD_RUN_FLAG = /^\/[ckr]$/i;
+
+function isRunFlag(a) {
+  return ARGV_RUN_FLAG.test(a) || SHELL_RUN_FLAG.test(a) || PS_RUN_FLAG.test(a) || PS_ENCODED_FLAG.test(a) || CMD_RUN_FLAG.test(a) || /^--command=/.test(a);
+}
+
+/**
+ * SEC-3: the command a flag hands to a command line (see isRunFlag), judged by every reading of that
+ * flag, whatever the program is called: a localized, custom or aliased terminal or shell must not hide
+ * `rm -rf ~`. null when the arguments have no such flag.
+ */
+function runFlagVerdict(args, ctx) {
+  const i = args.findIndex(isRunFlag);
+  if (i === -1) return null;
+  const flag = args[i];
+  const rest = args.slice(i + 1);
+  const sub = { ...ctx, depth: ctx.depth || 0, shell: ctx.platform === 'win32' ? 'powershell' : 'bash' };
+  const readings = [];
+  const eq = /^--command=([\s\S]*)$/.exec(flag);
+  if (eq) readings.push(() => recurse(eq[1], sub.shell, sub));
+  if (ARGV_RUN_FLAG.test(flag) && rest.length) {
+    // `gnome-terminal --command "bash -c ..."` passes one command line; `xterm -e bash -c ...` passes words.
+    readings.push(() => (rest.length === 1 && /\s/.test(rest[0]) ? recurse(rest[0], sub.shell, sub) : recurseArgv(rest, sub)));
+  }
+  if (SHELL_RUN_FLAG.test(flag)) readings.push(() => recurseArgv(['bash', flag, ...rest], sub));
+  if (PS_RUN_FLAG.test(flag) || PS_ENCODED_FLAG.test(flag)) readings.push(() => recurseArgv(['powershell', flag.replace(/^\//, '-'), ...rest], sub));
+  if (CMD_RUN_FLAG.test(flag)) readings.push(() => recurseArgv(['cmd', '/c', ...rest], sub));
+  let v = V('high', 'Starts a program that runs a command line');
+  for (const read of readings) {
+    try {
+      v = maxVerdict(v, read());
+    } catch {
+      v = maxVerdict(v, V('high', 'Could not inspect the command it runs'));
+    }
+  }
+  return v;
+}
+
 /** Verdict for open {target, args}: the target run with those arguments, like a command. */
 function openArgsVerdict(t, args, ctx) {
-  const base = progName(t).replace(/\.app$/i, '');
+  const base = appExecName(t, ctx.platform);
+  const sub = { ...ctx, depth: ctx.depth || 0, shell: ctx.platform === 'win32' ? 'powershell' : 'bash' };
   let v = null;
-  try {
-    v = recurseArgv([t, ...args], { ...ctx, depth: ctx.depth || 0, shell: ctx.platform === 'win32' ? 'powershell' : 'bash' });
-  } catch {
-    v = null;
+  for (const prog of base === progName(t).replace(/\.app$/i, '') ? [t] : [t, base]) {
+    try {
+      v = maxVerdict(v, recurseArgv([prog, ...args], sub));
+    } catch {
+      /* judged below */
+    }
   }
   if (SHELLS.test(base) || INTERPRETERS.test(base) || PS_HOSTS.test(base) || OPEN_RUNNERS.test(base)) {
     v = maxVerdict(v, V('high', 'Launches an interpreter or shell with arguments'));
   } else if (OPEN_TERMINALS.test(base)) {
     const runs = OPEN_TERMINAL_CMDLINE.test(base) || args.some((a) => a === '-e' || a === '--' || a === '-x' || a === '--command' || /^--command=/.test(a));
     if (runs) v = maxVerdict(v, V('high', `Opens a terminal running a command (${base})`));
+    // wt / conhost: the arguments are the command line itself.
+    if (OPEN_TERMINAL_CMDLINE.test(base) && args.length) {
+      try {
+        v = maxVerdict(v, recurseArgv(args, sub));
+      } catch {
+        /* high already */
+      }
+    }
   }
+  const run = runFlagVerdict(args, ctx);
+  if (run) v = maxVerdict(v, run.risk === 'high' && run.reason === 'Starts a program that runs a command line' ? V('high', `Starts ${base} running a command line`) : run);
   return v;
 }
 
@@ -5927,16 +6091,522 @@ function anywhereToolVerdict(tool, input, ctx) {
     // Arguments make `open` a way to run commands: {target:'bash', args:['-c', ...]}.
     const args = Array.isArray(input.args) ? input.args.map(String) : [];
     if (args.length && t) v = maxVerdict(v, openArgsVerdict(t, args, ctx));
+    // ...judged also as the program the app name starts, when the broker looked it up (SEC-3).
+    if (args.length && ctx.appProgram) v = maxVerdict(v, openArgsVerdict(ctx.appProgram, args, ctx));
     return v;
   }
+  const desk = desktopToolVerdict(tool, input, ctx);
+  if (desk) return desk;
+  const ticket = ticketToolVerdict(tool, input, ctx);
+  if (ticket) return ticket;
+  const calls = callsToolVerdict(tool);
+  if (calls) return calls;
   if (ANYWHERE_LOW.has(tool)) return V('low', 'Reads the screen or talks to the user');
   if (ANYWHERE_MEDIUM.has(tool)) return V('medium', 'Controls the mouse, keyboard or windows');
   return V('medium', `Runs ${tool}`);
 }
 
-function anywhereSummary(tool, input) {
-  const i = input;
+// Feature 3 (docs/CALLS-DESIGN.md §1.3(d), §13.4). Arming calls is CRITICAL and click-only, and the
+// card that asks is raised by POST /api/calls/arm itself (CallManager, through requestCritical) in every
+// permission mode. The tool call that leads to it is therefore marked ownCard: decide() lets it reach that
+// card instead of showing a second critical card first (the user would have to click twice).
+const CALLS_ARM_REASON = 'Answer phone calls for you with your voice';
+// F3-SAFE-D1: the daemon routes that answer approval cards and questions, change settings or modes,
+// trade launch codes for the dialog's credentials, or report whether the dialog is on screen (which
+// decides an engine's input where windows cannot be listed). Only the user's own dialog, terminal and CLI use them.
+const DAEMON_USER_API_RE = /\/api\/(approval|answer|config|mode|launch|shutdown|ui\/visibility)\b/i;
+const DAEMON_USER_API_REASON = 'Answers approval cards or changes Claude Anywhere settings through its API (self-escalation)';
+
+/**
+ * Does a command's text name one of the daemon's routes? A route on a named internet host
+ * (https://example.com/api/config) is someone else's API; anything else (localhost, an IP address,
+ * a port, a variable, a path built in a script) may be the daemon.
+ * @param {string} text
+ * @param {RegExp} routeRe
+ */
+function namesDaemonRoute(text, routeRe) {
+  const t = String(text || '');
+  if (!routeRe.test(t)) return false;
+  const re = new RegExp(routeRe.source, 'gi');
+  let m;
+  while ((m = re.exec(t))) {
+    const before = t.slice(Math.max(0, m.index - 300), m.index);
+    const url = /([a-z][a-z0-9+.-]*):\/\/([^\s'"`/]+)[^\s'"`]*$/i.exec(before);
+    const host = url ? url[2].replace(/^[^@]*@/, '').replace(/:\d*$/, '').toLowerCase() : '';
+    const internetHost = host && /^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(host) && !/(^|\.)localhost$/.test(host);
+    if (!internetHost) return true;
+  }
+  return false;
+}
+
+/** @returns {{risk:string, reason:string, ownCard?:boolean}|null} null: not a calls or clone-voice tool */
+function callsToolVerdict(tool) {
+  if (tool === 'calls_arm') return { ...V('critical', CALLS_ARM_REASON), ownCard: true, sensitive: true };
+  if (tool === 'calls_disarm') return V('low', 'Stops answering your calls');
+  if (tool === 'calls_status' || tool === 'clone_voice_status') return V('low', 'Reads the status of call answering or the voice clone');
+  if (tool === 'clone_voice_open') return V('low', 'Opens the voice enrollment in the Claude Anywhere dialog');
+  // The call engine's own tools are never run by the companion session; a stray one asks.
+  if (/^call_/.test(tool)) return V('high', 'A tool for the call assistant only');
+  return null;
+}
+
+/** `anywhere calls …` / `anywhere clone-voice …` (w: the words after the program, without flags). */
+function anywhereCallsCliVerdict(w) {
+  if (w[0] === 'calls') {
+    const sub = w[1] || 'status';
+    if (sub === 'on') return { ...V('critical', CALLS_ARM_REASON), ownCard: true };
+    if (['off', 'status', 'doctor', 'notes', 'help'].includes(sub)) return V('low', 'Claude Anywhere command');
+    if (sub === 'cliq') return V('medium', 'Sets up Zoho Cliq messages for calls');
+    if (sub === 'audio') return w[2] === 'check' ? V('low', 'Claude Anywhere command') : V('medium', 'Changes the call audio devices');
+    if (sub === 'learn') return V('medium', 'Watches the screen to learn how a call rings');
+    if (sub === 'test-audio') return V('medium', 'Runs the call audio self-test');
+    return V('medium', `Runs anywhere calls ${sub}`);
+  }
+  if (w[0] === 'clone-voice') {
+    const sub = w[1] || 'start';
+    if (sub === 'delete') return V('high', 'Deletes your cloned voice');
+    if (sub === 'install') return V('medium', 'Downloads the free voice runtime and models (about 425 MB)');
+    if (sub === 'bench') return V('medium', 'Benchmarks the voice engines (uses the CPU for a minute)');
+    // F3-SAFE-B3: the cloned voice saying any text aloud, outside a call and without the disclosure.
+    if (sub === 'test' && w.slice(2).some((x) => !['pocket', 'zipvoice'].includes(x))) return V('high', 'Speaks text of your choice aloud in your cloned voice');
+    if (['start', 'status', 'test', 'help'].includes(sub)) return V('low', 'Claude Anywhere command');
+    return V('medium', `Runs anywhere clone-voice ${sub}`);
+  }
+  return null;
+}
+
+// ------------------------------------------------------------------ desktop assistant tools
+
+// The virtual-assistant tools (tools-ui, tools-ocr, tools-desktop) and batch_actions. Reads are low
+// (most are pre-approved for the engine; browser_tabs is not, since {cycle: true} uses the keyboard
+// and is medium); input and app control is medium, high where it can run code,
+// leak a secret or lose work. A session rule ("Always") never covers a high call of these tools:
+// none is offered for one, and an "Always" given on a medium call does not stretch to it.
+const DESKTOP_READS = {
+  ui_find: 'Reads the controls of an app window (accessibility, read-only)',
+  ui_tree: 'Reads the controls of an app window (accessibility, read-only)',
+  find_text: 'Reads text on the screen (OCR, read-only)',
+  read_screen_text: 'Reads text on the screen (OCR, read-only)',
+  list_apps: 'Lists apps on this computer (read-only)',
+  browser_bookmarks: 'Reads browser bookmarks (read-only)',
+  browser_tabs: 'Lists open browser tabs (read-only)',
+  wait_for: 'Waits for a window or text on the screen (read-only)',
+};
+const DESKTOP_TOOLS = new Set([
+  ...Object.keys(DESKTOP_READS),
+  'ui_click',
+  'ui_set_value',
+  'launch_app',
+  'quit_app',
+  'set_window',
+  'browser_open',
+  'browser_switch_tab',
+  'batch_actions',
+]);
+
+// batch_actions: each step is classified as its single tool (must agree with batchStepCall in src/mcp/tools.js).
+const BATCH_STEP_TOOL = {
+  click: 'click',
+  double_click: 'click',
+  right_click: 'click',
+  move: 'mouse_move',
+  drag: 'drag',
+  type: 'type_text',
+  key: 'key',
+  scroll: 'scroll',
+  wait: 'wait',
+  focus_window: 'focus_window',
+  ui_click: 'ui_click',
+};
+
+/**
+ * The single tool a batch_actions step runs as, with that tool's arguments.
+ * @returns {{type:string, tool:string, args:object}|null} null for an unknown step
+ */
+function batchStepCall(step) {
+  if (!isPlainObject(step)) return null;
+  const type = str(step.type).trim().toLowerCase();
+  const tool = Object.prototype.hasOwnProperty.call(BATCH_STEP_TOOL, type) ? BATCH_STEP_TOOL[type] : null;
+  if (!tool) return null;
+  const pick = (...keys) => {
+    const o = {};
+    for (const k of keys) if (step[k] !== undefined && step[k] !== null) o[k] = step[k];
+    return o;
+  };
+  const idText = (o) => {
+    if (o.id != null) o.id = String(o.id);
+    return o;
+  };
+  let args;
+  switch (type) {
+    case 'click':
+      args = pick('x', 'y', 'button', 'clicks', 'modifiers', 'display');
+      break;
+    case 'double_click':
+      args = { ...pick('x', 'y', 'modifiers', 'display'), clicks: 2 };
+      break;
+    case 'right_click':
+      args = { ...pick('x', 'y', 'modifiers', 'display'), button: 'right' };
+      break;
+    case 'move':
+      args = pick('x', 'y', 'display');
+      break;
+    case 'drag':
+      args = pick('fromX', 'fromY', 'toX', 'toY', 'button', 'display');
+      break;
+    case 'type':
+      args = pick('text', 'method');
+      break;
+    case 'key':
+      args = pick('combo', 'repeat');
+      break;
+    case 'scroll':
+      args = pick('direction', 'amount', 'x', 'y', 'display');
+      break;
+    case 'wait':
+      args = pick('seconds');
+      break;
+    case 'focus_window':
+      args = idText(pick('id', 'title', 'app'));
+      break;
+    default: // ui_click
+      args = idText(pick('id', 'name', 'text', 'role', 'window', 'exact'));
+  }
+  return { type, tool, args };
+}
+
+/**
+ * batch_actions: as risky as its riskiest step (each classified as its single tool), with every
+ * step listed on the card.
+ * @returns {{verdict:{risk:string, reason:string}, steps:string[]}}
+ */
+function batchClassification(input, ctx) {
+  const steps = Array.isArray(input.actions) ? input.actions : [];
+  if (!steps.length) return { verdict: V('low', 'Runs no actions'), steps: [] };
+  let worst = null;
+  let worstIndex = -1;
+  const lines = [];
+  steps.forEach((s, i) => {
+    const call = batchStepCall(s);
+    let v;
+    if (!call) {
+      v = V('medium', 'A step of unknown type (the batch is rejected before anything runs)');
+      lines.push(`unknown step '${truncate(oneLine(isPlainObject(s) ? s.type : s), 30)}'`);
+    } else {
+      v = anywhereToolVerdict(call.tool, call.args, ctx);
+      lines.push(anywhereSummary(call.tool, call.args, ctx));
+    }
+    if (!worst || RANK[v.risk] > RANK[worst.risk]) {
+      worst = v;
+      worstIndex = i;
+    }
+  });
+  let reason;
+  if (steps.length === 1) reason = worst.reason;
+  else if (RANK[worst.risk] >= RANK.high) reason = `Step ${worstIndex + 1} of ${steps.length}: ${worst.reason}`;
+  else if (worst.risk === 'medium') reason = `Runs ${steps.length} mouse, keyboard or window actions in a row`;
+  else reason = 'Only waits or reads the screen';
+  return { verdict: V(worst.risk, reason), steps: lines };
+}
+
+/** Card summary of a batch: every step, numbered, cut to a readable length. */
+function batchSummary(input, ctx) {
+  const { steps } = batchClassification(input, ctx);
+  if (!steps.length) return 'Run actions (none listed)';
+  const max = 400;
+  let out = `Run ${steps.length} action${steps.length === 1 ? '' : 's'}: `;
+  for (let i = 0; i < steps.length; i += 1) {
+    const part = `${i ? '; ' : ''}${i + 1}. ${steps[i]}`;
+    if (out.length + part.length > max) return `${out}; +${steps.length - i} more`;
+    out += part;
+  }
+  return out;
+}
+
+// System processes and desktop shells: quitting one can log the user out or break the desktop.
+const SYSTEM_APP_RE =
+  /^(finder|dock|systemuiserver|loginwindow|windowserver|controlcenter|launchd|kernel_task|explorer|dwm|winlogon|csrss|lsass|services|svchost|smss|wininit|sihost|fontdrvhost|ctfmon|taskhostw|startmenuexperiencehost|shellexperiencehost|searchhost|gnome-shell|gnome-session(-binary)?|plasmashell|kwin(_x11|_wayland)?|ksmserver|xorg|xwayland|mutter|systemd|init|sddm|gdm3?|lightdm|xfwm4|xfce4-panel|xfce4-session|openbox|lxsession|mate-session|cinnamon(-session)?|budgie-wm|i3|sway|hyprland|weston|wayfire|labwc|pulseaudio|pipewire|dbus-daemon)$/i;
+
+function quitAppVerdict(input) {
+  const name = oneLine(input.name);
+  const base = name.replace(/\.(exe|app)$/i, '').trim();
+  const shown = truncate(name, 40) || 'an app';
+  if (base && SYSTEM_APP_RE.test(base)) return V('high', `Quits a system process (${shown}), which can log you out or break the desktop`);
+  if (/\b(claude|anywhere)\b/i.test(base)) return V('high', 'Quits Claude Anywhere or Claude Code itself');
+  if (input.force === true) return V('high', `Force-quits ${shown}: unsaved work is lost`);
+  return V('medium', `Quits ${shown} (it may ask to save unsaved work)`);
+}
+
+// The executables (and macOS app names) of the browsers browser_open knows; must agree with
+// src/os/browsers.js KNOWN_BROWSER_EXEC, which refuses any other path (NOT_A_BROWSER).
+const KNOWN_BROWSER_EXEC =
+  /^(chrome|google-chrome(-stable|-beta|-unstable)?|google chrome( beta| dev| canary)?|chromium(-browser)?|brave(-browser(-stable|-beta|-nightly)?)?|brave browser( beta| nightly)?|msedge|microsoft-edge(-stable|-beta|-dev)?|microsoft edge( beta| dev| canary)?|firefox(-esr)?|firefox (developer edition|nightly)|vivaldi(-stable)?|opera|safari|arc|librewolf|waterfox|floorp)$/i;
+
+/**
+ * browser_open: web pages are medium; other schemes and local executables are high, as for open. A
+ * browser given as a path runs that program with the URL: one that is not a known browser is judged as
+ * launch_app would judge it, and at least high (SEC-2).
+ */
+function browserOpenVerdict(input, ctx = {}) {
+  const v = browserUrlVerdict(input);
+  const b = str(input.browser).trim();
+  if (!b || !/[\\/]/.test(b) || /^[a-z][a-z0-9+.-]*:\/\//i.test(b)) return v;
+  const parts = b.replace(/[\\/]+$/, '').split(/[\\/]/);
+  const base = progName(parts.pop() || '').replace(/\.app$/i, '');
+  if (KNOWN_BROWSER_EXEC.test(base) || (base === 'launcher' && /^opera( gx)?$/i.test(parts.pop() || ''))) return v;
+  const asApp = anywhereToolVerdict('open', { target: b, kind: 'app', args: [str(input.url)] }, ctx);
+  return maxVerdict(maxVerdict(v, asApp), V('high', `Starts ${truncate(oneLine(b), 60)}, which is not a known browser`));
+}
+
+function browserUrlVerdict(input) {
+  const u = str(input.url).trim();
+  const where = input.browser ? ` in ${truncate(oneLine(input.browser), 30)}` : ' in the browser';
+  if (!u) return V('medium', `Opens a new tab or window${where}`);
+  if (/^https?:\/\//i.test(u)) return V('medium', `Opens a web page${where}`);
+  if (/^about:/i.test(u)) return V('medium', `Opens a browser page${where}`);
+  const localPath = /^file:/i.test(u) ? u.replace(/^file:(\/\/)?/i, '') : /^([a-z]:[\\/]|[\\/~])/i.test(u) ? u : null;
+  if (localPath != null) {
+    let p = localPath.replace(/[?#].*$/, '');
+    try {
+      p = decodeURIComponent(p);
+    } catch {
+      /* keep it encoded */
+    }
+    if (EXEC_EXT.test(p.replace(/[\\/]+$/, ''))) return V('high', 'Opens a local executable, script or installer through the browser');
+    return V('medium', `Opens a local file${where}`);
+  }
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(u);
+  // "localhost:3000/x" and "example.com:8443" are hosts with a port, not schemes.
+  if (scheme && !/^[a-z0-9.-]+:\d+(?:[/?#]|$)/i.test(u)) {
+    return V('high', `Opens a ${scheme[1].toLowerCase()}: link, which can run code or launch other programs`);
+  }
+  return V('medium', `Opens a web page${where}`);
+}
+
+/** launch_app: an app by name is medium; arguments, executables and links are judged as for open. */
+function launchAppVerdict(input, ctx) {
+  const name = str(input.name).trim();
+  const args = Array.isArray(input.args) ? input.args.map(String) : [];
+  const v = anywhereToolVerdict('open', { target: name, kind: 'app', args }, ctx);
+  if (v.risk === 'medium') return V('medium', args.length ? 'Launches an app with arguments' : 'Launches an app');
+  return v;
+}
+
+/** @returns {{risk:string, reason:string}|null} null: not a desktop-assistant tool */
+function desktopToolVerdict(tool, input, ctx) {
+  // browser_tabs {cycle: true} steps through the tabs with Ctrl+PageDown where they cannot be read.
+  if (tool === 'browser_tabs' && input.cycle === true) return V('medium', 'Steps through the browser tabs with the keyboard (brings the browser to the front)');
+  if (Object.prototype.hasOwnProperty.call(DESKTOP_READS, tool)) return V('low', DESKTOP_READS[tool]);
   switch (tool) {
+    case 'ui_click':
+      return V('medium', 'Presses a control in an app window');
+    case 'ui_set_value': {
+      const value = str(input.value);
+      const why = secretLike(value);
+      const v = why ? V('high', `Enters text into a field that ${why}`) : V('medium', 'Sets the text of a field in an app window');
+      // It types into whatever field it finds (a terminal's too): the same scrutiny as type_text.
+      return maxVerdict(v, typedTextVerdict(value, ctx, { typed: true }));
+    }
+    case 'launch_app':
+      return launchAppVerdict(input, ctx);
+    case 'quit_app':
+      return quitAppVerdict(input);
+    case 'set_window':
+      return V('medium', 'Moves, resizes, maximizes or minimizes a window');
+    case 'browser_open':
+      return browserOpenVerdict(input, ctx);
+    case 'browser_switch_tab':
+      return V('medium', 'Switches to another browser tab');
+    case 'batch_actions':
+      return batchClassification(input, ctx).verdict;
+    default:
+      return null;
+  }
+}
+
+function quotedArg(s, max = 40) {
+  return `'${truncate(oneLine(s), max)}'`;
+}
+
+/** Card summaries of the desktop-assistant tools (null: not one of them). */
+function desktopSummary(tool, input, ctx) {
+  const i = input;
+  const named = (v) => v != null && str(v).trim() !== '';
+  const win = (w) => (named(w) ? ` in ${quotedArg(w, 40)}` : '');
+  switch (tool) {
+    case 'ui_find': {
+      const what = i.name || i.text;
+      return `Find ${named(i.role) ? `${truncate(oneLine(i.role), 20)} ` : ''}${named(what) ? quotedArg(what) : 'elements'}${win(i.window)}`;
+    }
+    case 'ui_tree':
+      return `Read the controls of ${named(i.window) ? quotedArg(i.window) : 'the active window'}`;
+    case 'ui_click':
+      if (named(i.id) && !named(i.name) && !named(i.text)) return `Press UI element ${truncate(oneLine(i.id), 50)}`;
+      return `Press ${quotedArg(i.name || i.text || i.id)}${named(i.role) ? ` (${truncate(oneLine(i.role), 20)})` : ''}${win(i.window)}`;
+    case 'ui_set_value': {
+      const field = named(i.id) && !named(i.name) && !named(i.text) ? `UI element ${truncate(oneLine(i.id), 40)}` : quotedArg(i.name || i.text || i.id || 'a field');
+      const value = str(i.value);
+      if (secretLike(value)) return `Set ${field} to a secret-looking value (${value.length} characters)`;
+      return value === '' ? `Clear ${field}` : `Set ${field} to ${quotedArg(value)}`;
+    }
+    case 'find_text':
+      return `Find ${quotedArg(i.text)} on the screen`;
+    case 'read_screen_text':
+      return i.region ? 'Read the text in a region of the screen' : 'Read the text on the screen';
+    case 'list_apps':
+      return named(i.query) ? `List apps matching ${quotedArg(i.query)}` : 'List apps';
+    case 'launch_app': {
+      const args = Array.isArray(i.args) ? i.args.map((a) => (/^[\w@%+=:,./-]+$/.test(String(a)) ? String(a) : `'${String(a)}'`)) : [];
+      return `Launch ${truncate(oneLine([str(i.name), ...args].join(' ')), 140)}`;
+    }
+    case 'quit_app':
+      return `${i.force === true ? 'Force-quit' : 'Quit'} ${truncate(oneLine(i.name), 60) || 'an app'}`;
+    case 'set_window': {
+      const w = truncate(oneLine(i.window), 60) || 'a window';
+      const state = str(i.state).toLowerCase().trim();
+      if (state) return `${state === 'fullscreen' ? 'Make full screen' : humanize(state)}: ${w}`;
+      const b = isPlainObject(i.bounds) ? i.bounds : {};
+      const size = b.width != null && b.height != null ? `, ${Math.round(Number(b.width))}x${Math.round(Number(b.height))}` : '';
+      return `Move ${w} to ${pt(b.x, b.y) || 'a new place'}${size}`;
+    }
+    case 'wait_for': {
+      const sec = Number(i.timeoutSec) > 0 ? ` (up to ${Number(i.timeoutSec)} s)` : '';
+      const what = named(i.text) ? `the text ${quotedArg(i.text)}` : named(i.window) ? `the window ${quotedArg(i.window)}` : 'the screen';
+      return `Wait for ${what}${i.gone === true ? ' to go away' : ''}${sec}`;
+    }
+    case 'browser_bookmarks':
+      return `Read ${named(i.browser) ? `${truncate(oneLine(i.browser), 30)} ` : ''}bookmarks${named(i.query) ? ` matching ${quotedArg(i.query)}` : ''}${named(i.folder) ? ` in ${quotedArg(i.folder, 30)}` : ''}`;
+    case 'browser_open': {
+      const how = i.newWindow === true ? ' (new window)' : i.newTab === false ? ' (current tab)' : '';
+      return `Open ${truncate(oneLine(i.url), 120)} in ${named(i.browser) ? truncate(oneLine(i.browser), 30) : 'the browser'}${how}`;
+    }
+    case 'browser_tabs':
+      return `List the tabs of ${named(i.browser) ? truncate(oneLine(i.browser), 30) : 'the browser'}${i.cycle === true ? ' (stepping through them with the keyboard)' : ''}`;
+    case 'browser_switch_tab': {
+      const which = named(i.match) ? `the tab ${quotedArg(i.match)}` : i.index != null && Number.isFinite(Number(i.index)) ? `tab ${Number(i.index)}` : 'another tab';
+      return `Switch ${named(i.browser) ? truncate(oneLine(i.browser), 30) : 'the browser'} to ${which}`;
+    }
+    case 'batch_actions':
+      return batchSummary(i, ctx);
+    default:
+      return null;
+  }
+}
+
+// The ticket workflow's tools (tools-browser, tools-jira, tools-project). Reads are low; Jira writes
+// and the hand-off to another folder are medium: smart mode runs them without a card (they still show
+// as tool rows in the transcript), ask mode asks.
+const JIRA_READS = new Set(['jira_status', 'jira_get_issue', 'jira_search', 'jira_my_issues', 'jira_find_user']);
+const JIRA_WRITES = {
+  jira_transition: 'Changes the status of a Jira issue',
+  jira_assign: 'Changes who a Jira issue is assigned to',
+  jira_comment: 'Posts a comment on a Jira issue (your team sees it)',
+};
+
+/** @returns {{risk:string, reason:string}|null} null: not a ticket-workflow tool */
+function ticketToolVerdict(tool, input, ctx) {
+  if (tool === 'read_browser_tab') {
+    return input.includeText === true
+      ? V('medium', 'Copies the page text of a browser tab (briefly uses the keyboard and clipboard)')
+      : V('low', 'Reads the address and title of a browser tab');
+  }
+  if (tool === 'find_repos') return V('low', 'Looks for git repositories in local folders (read-only)');
+  if (JIRA_READS.has(tool)) return V('low', 'Reads from Jira');
+  if (tool === 'jira_comment') {
+    const why = secretLike(input.text);
+    if (why) return V('high', `Posts a Jira comment that ${why}`);
+  }
+  if (JIRA_WRITES[tool]) return V('medium', JIRA_WRITES[tool]);
+  if (tool === 'switch_project') return switchProjectVerdict(input, ctx);
+  return null;
+}
+
+/** switch_project: medium for an ordinary folder; high for system, credential or out-of-home creation. */
+function switchProjectVerdict(input, ctx) {
+  const raw = str(input.dir).trim();
+  if (!raw) return V('medium', 'Continues the work in another folder');
+  const t = resolveTarget(raw, ctx, ctx.projectDir);
+  if (!t || t.glob) return V('high', 'Continues the work in a folder whose location could not be resolved');
+  const create = input.create === true;
+  const inHome = (ctx.platform === 'win32') === t.win && isUnder(t.abs, ctx.homeDir, t.win);
+  const root = rootLike(t, ctx);
+  if (root) return V('high', `Continues the work in ${root}`);
+  const sens = sensitiveKind(t, ctx) || realSensitiveKind(t, ctx);
+  // "A system location" is about writing files there; a home under /root, or an existing repository
+  // under /opt or /srv, is an ordinary place to work.
+  const generic = sens && /^a (system location|Windows system folder)$/.test(sens.what);
+  if (sens && !(generic && (inHome || (!create && isGitRepo(t))))) return V('high', `Continues the work in ${sens.what}`);
+  if (create) {
+    if (!inHome && !isTempPath(t, ctx) && !insideProject(t, ctx)) return V('high', `Creates a folder outside your home folder (${truncate(t.abs, 100)})`);
+    return V('medium', 'Creates a folder and continues the work there in a fresh session');
+  }
+  return V('medium', 'Continues the work in another folder, in a fresh session');
+}
+
+/** Does a resolved local folder hold a git repository? (false for another platform's paths) */
+function isGitRepo(t) {
+  if (t.win !== (process.platform === 'win32')) return false;
+  try {
+    return fs.existsSync(path.join(t.abs, '.git'));
+  } catch {
+    return false;
+  }
+}
+
+// Jira / Confluence MCP servers (Atlassian's own, mcp-atlassian, jira-mcp…): reads are low; writes
+// medium; deletes and the server's own "destructive" tier high.
+const TRACKER_SERVER_RE = /atlassian|jira|confluence/i;
+
+function trackerServerVerdict(tool) {
+  const t = str(tool).toLowerCase();
+  if (/destructive|delete|remove|destroy|purge|archive/.test(t)) return V('high', 'Deletes or irreversibly changes Jira or Confluence data');
+  if (/^(get|search|list|lookup|fetch|read|find|query|view|discover|describe)|userinfo|executeread|whoami/.test(t)) return V('low', 'Reads from Jira or Confluence');
+  return V('medium', 'Changes Jira or Confluence data (your team sees it)');
+}
+
+function firstLineOf(s) {
+  return (
+    str(s)
+      .split(/\r?\n/)
+      .find((l) => l.trim()) || ''
+  );
+}
+
+function anywhereSummary(tool, input, ctx) {
+  const i = input;
+  const desk = desktopSummary(tool, i, ctx);
+  if (desk != null) return desk;
+  switch (tool) {
+    case 'read_browser_tab':
+      return `Read the ${i.browser ? `${truncate(oneLine(i.browser), 30)} ` : ''}browser tab${i.includeText === true ? ' and copy its text' : ''}`;
+    case 'find_repos':
+      return i.query ? `Find git repositories matching '${truncate(oneLine(i.query), 60)}'` : 'Find git repositories on this computer';
+    case 'switch_project': {
+      const where = ctx ? displayPath(i.dir, ctx) : truncate(str(i.dir), 100);
+      const task = truncate(oneLine(firstLineOf(i.task)), 70);
+      return `Continue in ${where}${i.create === true ? ' (new folder)' : ''}${task ? `: ${task}` : ''}`;
+    }
+    case 'jira_status':
+      return 'Check the Jira connection';
+    case 'jira_get_issue':
+      return `Read Jira issue ${truncate(oneLine(i.key), 60)}`;
+    case 'jira_search':
+      return `Search Jira: ${truncate(oneLine(i.jql), 80)}`;
+    case 'jira_my_issues':
+      return `List your Jira issues${i.status ? ` (${truncate(oneLine(i.status), 30)})` : ''}`;
+    case 'jira_transition':
+      return `Move ${truncate(oneLine(i.key), 40)} to '${truncate(oneLine(i.to), 40)}'`;
+    case 'jira_assign': {
+      const user = oneLine(i.user);
+      return `Assign ${truncate(oneLine(i.key), 40)} to ${/^me$/i.test(user) ? 'you' : `'${truncate(user, 50)}'`}`;
+    }
+    case 'jira_comment': {
+      const text = str(i.text);
+      if (secretLike(text)) return `Comment on ${truncate(oneLine(i.key), 40)} with a secret-looking value (${text.length} characters)`;
+      return `Comment on ${truncate(oneLine(i.key), 40)}: '${truncate(oneLine(text), 60)}'`;
+    }
+    case 'jira_find_user':
+      return `Find the Jira user '${truncate(oneLine(i.query), 40)}'`;
     case 'screenshot':
       return i.region ? 'Take a screenshot of a region' : 'Take a screenshot';
     case 'click': {
@@ -5992,6 +6662,19 @@ function anywhereSummary(tool, input) {
       return `Notify: ${truncate(oneLine(i.message), 80)}`;
     case 'ask_user':
       return `Ask: ${truncate(oneLine(i.question), 80)}`;
+    case 'calls_arm': {
+      const mins = Number(i.minutes);
+      const apps = Array.isArray(i.apps) ? i.apps.filter((a) => typeof a === 'string').slice(0, 6).join(', ') : '';
+      return `Answer your calls${Number.isFinite(mins) && mins > 0 ? ` for ${Math.round(mins)} min` : ''}${apps ? ` (${truncate(apps, 60)})` : ''}`;
+    }
+    case 'calls_disarm':
+      return 'Stop answering your calls';
+    case 'calls_status':
+      return 'Read the call-answering status';
+    case 'clone_voice_status':
+      return 'Read the voice clone status';
+    case 'clone_voice_open':
+      return 'Open the voice enrollment';
     default:
       return humanize(tool);
   }
@@ -6095,6 +6778,38 @@ function displayName(name) {
     notify_user: 'Notify',
     ask_user: 'Ask you',
     permission_prompt: 'Permission',
+    read_browser_tab: 'Read browser tab',
+    find_repos: 'Find repositories',
+    switch_project: 'Switch project',
+    jira_status: 'Jira connection',
+    jira_get_issue: 'Read Jira issue',
+    jira_search: 'Search Jira',
+    jira_my_issues: 'My Jira issues',
+    jira_transition: 'Move Jira issue',
+    jira_assign: 'Assign Jira issue',
+    jira_comment: 'Comment on Jira issue',
+    jira_find_user: 'Find Jira user',
+    calls_arm: 'Answer my calls',
+    calls_disarm: 'Stop answering calls',
+    calls_status: 'Calls status',
+    clone_voice_status: 'Voice clone status',
+    clone_voice_open: 'Clone my voice',
+    ui_find: 'Find UI elements',
+    ui_tree: 'Read window controls',
+    ui_click: 'Click UI element',
+    ui_set_value: 'Set field value',
+    find_text: 'Find text on screen',
+    read_screen_text: 'Read screen text',
+    list_apps: 'List apps',
+    launch_app: 'Launch app',
+    quit_app: 'Quit app',
+    set_window: 'Arrange window',
+    wait_for: 'Wait for screen',
+    browser_bookmarks: 'Read bookmarks',
+    browser_open: 'Open in browser',
+    browser_tabs: 'List browser tabs',
+    browser_switch_tab: 'Switch browser tab',
+    batch_actions: 'Run several actions',
   };
   const m = /^mcp__(.+?)__(.+)$/.exec(n);
   if (m) {
@@ -6125,7 +6840,9 @@ function classify(toolName, input, opts = {}) {
     // A risky command's card shows all of it (a cut-off `--allow-unauthenticated` is how a
     // service goes public unnoticed, HEADLINE-SCENARIO-6), with secret-looking values masked.
     const limit = RANK[r.risk] >= RANK.high ? 300 : 120;
-    return { risk: r.risk, reason: r.reason, summary: `Run: ${truncate(redactSecrets(oneLine(command)), limit)}`, parts: r.parts };
+    const out = { risk: r.risk, reason: r.reason, summary: `Run: ${truncate(redactSecrets(oneLine(command)), limit)}`, parts: r.parts };
+    if (r.ownCard) out.ownCard = true;
+    return out;
   }
 
   if (FILE_EDIT_TOOLS.has(name)) {
@@ -6204,7 +6921,18 @@ function classify(toolName, input, opts = {}) {
     const [, server, tool] = m;
     if (server === 'anywhere' || /(^|_)anywhere$/.test(server)) {
       const v = anywhereToolVerdict(tool, inp, ctx);
-      return { risk: v.risk, reason: v.reason, summary: anywhereSummary(tool, inp) };
+      const out = { risk: v.risk, reason: v.reason, summary: anywhereSummary(tool, inp, ctx) };
+      if (v.ownCard) out.ownCard = true;
+      if (v.sensitive) out.sensitive = true;
+      // A high desktop-assistant call gets its own card: no session rule covers it.
+      if (DESKTOP_TOOLS.has(tool) && RANK[v.risk] >= RANK.high) out.sensitive = true;
+      return out;
+    }
+    if (TRACKER_SERVER_RE.test(server)) {
+      const v = trackerServerVerdict(tool);
+      const arg = firstString(inp);
+      const label = server.replace(/^plugin_/, '');
+      return { risk: v.risk, reason: v.reason, summary: `${label}: ${humanize(tool)}${arg ? ` ${truncate(oneLine(arg), 70)}` : ''}` };
     }
     if (BROWSER_SERVER_RE.test(server)) {
       const v = browserVerdict(tool, inp);
@@ -6420,6 +7148,20 @@ function sessionRuleFor(toolName, input, cls, opts = {}) {
     if (dirAbs === t.abs || rootLike({ ...t, abs: dirAbs }, ctx)) return `${name}(${fwd(t.abs)})`;
     return `${name}(${fwd(dirAbs).replace(/\/+$/, '')}/**)`;
   }
+  const mcp = /^mcp__(.+?)__(.+)$/.exec(name);
+  if (mcp && (mcp[1] === 'anywhere' || /(^|_)anywhere$/.test(mcp[1]))) {
+    // Each hand-off names its own folder; a secret in a Jira comment always gets its own card.
+    if (mcp[2] === 'switch_project') return null;
+    if (mcp[2] === 'jira_comment' && secretLike(str(isPlainObject(input) ? input.text : ''))) return null;
+    // A batch can hold any steps: an "Always" for one would approve every later batch.
+    if (mcp[2] === 'batch_actions') return null;
+    // A high desktop-assistant call (a secret typed into a field, a force-quit, a non-web link, an
+    // executable) is approved one at a time.
+    if (DESKTOP_TOOLS.has(mcp[2])) {
+      const c = cls && RISKS.includes(cls.risk) ? cls : classify(name, input, opts);
+      if (RANK[c.risk] >= RANK.high) return null;
+    }
+  }
   return name;
 }
 
@@ -6457,12 +7199,15 @@ class PermissionBroker extends EventEmitter {
    *   getExtraDirs: the folders the engine was given with --add-dir (VS Code workspaces); edits
    *   there are judged like project edits (HEADLINE-SCENARIO-10).
    */
-  constructor({ config, hub, onNeedAttention, audit, now, projectDir, getProjectDir, getExtraDirs, platform, homeDir, activeWindow } = {}) {
+  constructor({ config, hub, onNeedAttention, audit, now, projectDir, getProjectDir, getExtraDirs, platform, homeDir, activeWindow, resolveApp } = {}) {
     super();
     this.getExtraDirs = typeof getExtraDirs === 'function' ? getExtraDirs : null;
     this.config = config || {};
     // () => Promise<{app?:string}|null>: the focused window, so typed text is judged by where it lands.
     this.activeWindow = typeof activeWindow === 'function' ? activeWindow : null;
+    // (name) => Promise<string|null>: the program an app name starts (src/os/apps.js findApp), so
+    // launch_app {name: 'GNOME Terminal', args} is judged as the gnome-terminal it runs (SEC-3).
+    this.resolveApp = typeof resolveApp === 'function' ? resolveApp : null;
     this.hub = hub || null;
     this.onNeedAttention = typeof onNeedAttention === 'function' ? onNeedAttention : null;
     this.auditFn = typeof audit === 'function' ? audit : logMod.audit;
@@ -6558,6 +7303,32 @@ class PermissionBroker extends EventEmitter {
     }
   }
 
+  /**
+   * @private SEC-3: the program launch_app (or open {kind: 'app'}) would start for an app given with
+   * arguments, or null (no arguments, a path or link judged as it is, unknown, or a slow lookup).
+   */
+  async appProgram(toolName, input) {
+    if (!this.resolveApp) return null;
+    const launch = /launch_app$/.test(toolName);
+    const name = str(launch ? input.name : input.target).trim();
+    if (!name || !Array.isArray(input.args) || !input.args.length) return null;
+    if (/[\\/]/.test(name) || /^[a-z][a-z0-9+.-]*:/i.test(name) || (!launch && input.kind != null && input.kind !== 'app')) return null;
+    let timer;
+    try {
+      const p = await Promise.race([
+        Promise.resolve().then(() => this.resolveApp(name)),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(null), 1500);
+        }),
+      ]);
+      return typeof p === 'string' && p.trim() ? p.trim() : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** @private the focused window's app name, or null */
   async focusedApp() {
     return (await this.focusedWindow()).app;
@@ -6574,6 +7345,9 @@ class PermissionBroker extends EventEmitter {
    * @returns {{allow:boolean, rule?:string, why:string}}
    */
   decide(toolName, input, cls) {
+    // Arming calls: the click-only critical card is raised by the arm route itself (CallManager), in every
+    // mode, so the tool call goes on to that card rather than a second one (CALLS-DESIGN §13.4).
+    if (cls.ownCard && cls.risk === 'critical') return { allow: true, why: 'it asks on its own click-only card' };
     if (cls.risk === 'critical') return { allow: false, why: 'critical' };
     const opts = this.ctxOpts();
     const ask = this.rulesOf('alwaysAsk').find((r) => matchRule(r, toolName, input, { ...opts, any: true }));
@@ -6622,6 +7396,10 @@ class PermissionBroker extends EventEmitter {
         opts.focusedApp = f.app;
         opts.focusedProcess = f.process;
       }
+      if (/^mcp__(.+_)?anywhere__(launch_app|open)$/.test(toolName)) {
+        const prog = await this.appProgram(toolName, inp);
+        if (prog) opts.appProgram = prog;
+      }
       cls = classify(toolName, inp, opts);
     } catch (err) {
       log.error(`classify failed for ${toolName}:`, err);
@@ -6651,6 +7429,28 @@ class PermissionBroker extends EventEmitter {
     return this.prompt(toolName, inp, cls, toolUseId, d.why);
   }
 
+  /**
+   * Raise a critical card that is not tied to an engine tool call, and wait for it. CallManager arms
+   * calls with it (CALLS-DESIGN §1.3(d)): the card has no "Always" rule, and resolve() refuses an allow
+   * by voice or key. The 'decision' event of the answer carries `via` and this toolUseId.
+   * @param {{toolName:string, input?:object, reason?:string, summary?:string, toolUseId?:string}} req
+   * @returns {Promise<{behavior:'allow', updatedInput:object}|{behavior:'deny', message:string}>}
+   */
+  requestCritical({ toolName, input, reason, summary, toolUseId, clickOnly = false } = {}) {
+    const name = str(toolName) || 'critical_action';
+    const inp = isPlainObject(input) ? input : {};
+    const cls = {
+      risk: 'critical',
+      reason: str(reason) || 'Needs your click',
+      summary: truncate(oneLine(str(summary)), 600) || displayName(name),
+      sensitive: true,
+      // F3-SAFE-D1: only a click in the dialog window (the request carries the dialog's credential)
+      // allows it; the terminal dialog's typed "allow" does not.
+      clickOnly: clickOnly === true,
+    };
+    return this.prompt(name, inp, cls, toolUseId, 'needs a click');
+  }
+
   /** @private */
   prompt(toolName, input, cls, toolUseId, why) {
     const id = `ap_${uuid()}`;
@@ -6668,6 +7468,7 @@ class PermissionBroker extends EventEmitter {
       sessionRule: cls.risk === 'critical' ? null : sessionRuleFor(toolName, input, cls, this.ctxOpts()),
       timeoutSec,
       mode: this.mode,
+      ...(cls.clickOnly ? { clickOnly: true } : {}),
     };
     log.info(`approval needed (${cls.risk}, ${why}): ${card.summary}`);
     return new Promise((resolve) => {
@@ -6719,7 +7520,7 @@ class PermissionBroker extends EventEmitter {
    * @private settle a pending card
    * @param {string} [via] how the user answered: 'click', 'key', 'typed' or 'voice' (audit only)
    */
-  finish(id, decision, message, by, via) {
+  finish(id, decision, message, by, via, dialog) {
     const e = this.entries.get(id);
     if (!e) return false;
     this.entries.delete(id);
@@ -6736,6 +7537,7 @@ class PermissionBroker extends EventEmitter {
       decision: allow ? decision : 'deny',
       by,
       via,
+      dialog: dialog === true ? true : undefined,
       summary: e.card.summary,
       reason: e.card.reason,
       rule: rule || undefined,
@@ -6753,44 +7555,64 @@ class PermissionBroker extends EventEmitter {
    * Answer a pending approval card.
    *
    * A critical card is allowed only by a deliberate act: a click on "Allow once" in the dialog
-   * or the typed word "allow" in the terminal dialog. An allow that says it came from speech or
-   * from Enter on the card (opts.via 'voice' or 'key') is refused and the card stays pending;
-   * those can still deny. Clients that send no via (older ones) are not refused.
+   * window (opts.dialog: the request carried the dialog's own credential, which DaemonServer checks)
+   * or, for a critical card that is not click-only, the typed word "allow" in the terminal dialog.
+   * An allow by speech, by Enter on the card, without a `via`, or a "click" that did not come from
+   * the dialog is refused and the card stays pending; any of them can still deny. Click-only cards
+   * (answering calls) accept only the dialog's click.
    * @param {string} id
    * @param {'allow'|'allow_session'|'deny'} decision
    * @param {string} [message] optional note from the user (deny)
-   * @param {{via?:'click'|'key'|'typed'|'voice'}} [opts] how the user answered (anything else is ignored)
+   * @param {{via?:'click'|'key'|'typed'|'voice', dialog?:boolean}} [opts] how the user answered
+   *   (anything else is ignored); dialog: the request came from the dialog window
    * @returns {boolean} false if no such pending card
-   * @throws {Error} status 409, code CRITICAL_NEEDS_CLICK: a critical card allowed by voice or key
+   * @throws {Error} status 409, code CRITICAL_NEEDS_CLICK: a critical card allowed another way
    */
-  resolve(id, decision, message, { via } = {}) {
+  resolve(id, decision, message, { via, dialog } = {}) {
     if (!['allow', 'allow_session', 'deny'].includes(decision)) return false;
     const how = APPROVAL_VIA.includes(via) ? via : undefined;
+    const fromDialog = dialog === true;
     const entry = this.entries.get(id);
     if (!entry) return false;
-    if (decision !== 'deny' && entry.card.risk === 'critical' && (how === 'voice' || how === 'key')) {
-      this.record({
-        tool: entry.toolName,
-        risk: 'critical',
-        decision: 'refused',
-        by: 'user',
-        via: how,
-        summary: entry.card.summary,
-        reason: `${how === 'voice' ? 'a spoken' : 'a keyboard'} ${decision === 'allow_session' ? 'always' : 'allow'} does not allow a critical action`,
-        toolUseId: entry.card.toolUseId || undefined,
-      });
-      const err = new Error('Critical actions need a click on “Allow once”');
-      err.status = 409;
-      err.code = 'CRITICAL_NEEDS_CLICK';
-      err.hint = 'Click “Allow once” on the card in the dialog (or type allow in the terminal dialog). Voice and Esc can still deny it.';
-      throw err;
+    if (decision !== 'deny' && entry.card.risk === 'critical') {
+      const clicked = how === 'click' && fromDialog;
+      const typed = how === 'typed' && !entry.card.clickOnly;
+      if (!clicked && !typed) {
+        const what =
+          how === 'voice'
+            ? 'a spoken'
+            : how === 'key'
+              ? 'a keyboard'
+              : how === 'click'
+                ? 'a click that did not come from the dialog window:'
+                : how === 'typed'
+                  ? 'a typed'
+                  : 'an unspecified';
+        this.record({
+          tool: entry.toolName,
+          risk: 'critical',
+          decision: 'refused',
+          by: 'user',
+          via: how || 'none',
+          summary: entry.card.summary,
+          reason: `${what} ${decision === 'allow_session' ? 'always' : 'allow'} does not allow a critical action`,
+          toolUseId: entry.card.toolUseId || undefined,
+        });
+        const err = new Error('Critical actions need a click on “Allow once”');
+        err.status = 409;
+        err.code = 'CRITICAL_NEEDS_CLICK';
+        err.hint = entry.card.clickOnly
+          ? 'Click “Allow once” on the card in the Claude Anywhere dialog window. Voice, keys and the terminal can still deny it.'
+          : 'Click “Allow once” on the card in the dialog (or type allow in the terminal dialog). Voice and Esc can still deny it.';
+        throw err;
+      }
     }
     let msg;
     if (decision === 'deny') {
       const note = typeof message === 'string' ? message.trim() : '';
       msg = note ? `User denied: ${truncate(note, 2000)}` : 'User denied this action.';
     }
-    return this.finish(id, decision, msg, 'user', how);
+    return this.finish(id, decision, msg, 'user', how, fromDialog);
   }
 
   /**
@@ -6880,6 +7702,8 @@ module.exports = {
   sessionRuleFor,
   exposesCredentials,
   displayName,
+  batchStepCall,
+  DESKTOP_TOOLS,
   secretLike,
   normalizeKeyCombo,
   maxRisk,

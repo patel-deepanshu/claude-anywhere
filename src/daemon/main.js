@@ -651,6 +651,9 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
   }
   const instanceId = uuid();
   const token = randomToken();
+  // F3-SAFE-D1: the engines' MCP servers (written into run files an engine can read) get their own
+  // token, which cannot answer approval cards or questions, change settings or modes, or shut down.
+  const engineToken = randomToken();
   const startedAt = nowIso();
 
   // ---- optional modules
@@ -661,6 +664,7 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
   const promptMod = optionalRequire('./prompt', ['buildSystemPrompt']);
   const permMod = optionalRequire('./permissions', ['PermissionBroker']);
   const voiceMod = optionalRequire('./voice', ['VoiceService']);
+  const announcerMod = optionalRequire('./announcer', ['Announcer']);
   const uihostMod = optionalRequire('./uihost', ['UiHost']);
 
   // ---- lazy driver / computer (created by the first request that needs them)
@@ -745,9 +749,43 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
       log.error('UiHost failed to start; the dialog URL will be printed instead:', err);
     }
   }
+  // F3-SAFE-D1: a dialog page that connects counts as on screen until it reports (uihost.dialogState()).
+  if (uihost && typeof uihost.notePages === 'function') hub.on('clients', () => uihost.notePages());
   const notifyOS = commonMod ? (title, body) => commonMod.notify(title, body) : null;
+  // The pending card of a broker (null once answered, undefined when unknown); `permissions` and
+  // `questions` are created below, and this is only called after that.
+  const findCard = (kind, id) => {
+    const broker = kind === 'question' ? questions : permissions;
+    if (!broker || typeof broker.pending !== 'function') return undefined;
+    return broker.pending().find((c) => c && c.id === id) || null;
+  };
+  const secretLike = permMod && typeof permMod.secretLike === 'function' ? permMod.secretLike : null;
 
-  // `permissions` and `questions` are created below with this handler; it looks their cards up later.
+  // The announcer says aloud when work is done, a permission card or question waits, or something
+  // failed: to the visible dialog ('announce' events), else through the speakers (chime + voice).
+  let announcer = null;
+  if (announcerMod) {
+    try {
+      announcer = new announcerMod.Announcer({ config, hub, voice, findCard, secretLike }).start();
+    } catch (err) {
+      log.error('The announcer failed to start; announcements are off:', err);
+      announcer = null;
+    }
+  }
+  // Dialog pages report whether they can be seen (POST /api/ui/visibility → uihost.noteVisibility);
+  // the announcer needs the same reports to tell a visible dialog from a minimized one.
+  if (uihost && announcer && typeof uihost.noteVisibility === 'function') {
+    const noteVisibility = uihost.noteVisibility.bind(uihost);
+    uihost.noteVisibility = (report) => {
+      noteVisibility(report);
+      try {
+        announcer.noteVisibility(report || {});
+      } catch (err) {
+        log.debug(`announcer visibility update failed: ${err.message}`);
+      }
+    };
+  }
+
   const onNeedAttention = createAttentionHandler({
     config,
     // Dialog pages and TUIs show cards; a CLI watcher (`anywhere send --wait`) does not.
@@ -755,13 +793,10 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     getUihost: () => uihost,
     getUrl: () => (server ? server.url : null),
     notifyOS,
-    getVoice: () => voice,
-    findCard: (kind, id) => {
-      const broker = kind === 'question' ? questions : permissions;
-      if (!broker || typeof broker.pending !== 'function') return undefined;
-      return broker.pending().find((c) => c && c.id === id) || null;
-    },
-    secretLike: permMod && typeof permMod.secretLike === 'function' ? permMod.secretLike : null,
+    // The announcer speaks cards now; the attention handler only reopens the dialog and notifies.
+    getVoice: () => (announcer ? null : voice),
+    findCard,
+    secretLike,
     isShuttingDown: () => Boolean(shuttingDown),
   });
 
@@ -781,6 +816,12 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
         getExtraDirs: () => (session ? session.engineAddDirs || [] : []),
         // type_text is judged by where it lands: a terminal runs it, an email does not (REGRESSIONS-7).
         activeWindow: () => lazyDriver.activeWindow(),
+        // launch_app {name, args} is judged as the program the name starts ("GNOME Terminal" → gnome-terminal, SEC-3).
+        resolveApp: async (name) => {
+          const found = await require('../os/apps').findApp(name);
+          const app = found && found.app;
+          return app ? app.target || app.path || app.execName || null : null;
+        },
       });
     } catch (err) {
       log.error('PermissionBroker failed to start; using the basic always-ask broker:', err);
@@ -838,7 +879,8 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
       .then((caps) => {
         if (!caps || !session) return;
         const before = JSON.stringify(session.voiceInfo);
-        session.setVoiceInfo(caps);
+        // announcer: the dialog must not speak results, cards and questions itself (no double speech).
+        session.setVoiceInfo({ ...caps, announcer: Boolean(announcer) });
         if (broadcastSnapshot && JSON.stringify(session.voiceInfo) !== before) hub.broadcast('snapshot', session.snapshot());
       })
       .catch((err) => log.warn(`voice capabilities failed: ${err.message}`));
@@ -853,11 +895,14 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     shuttingDown = (async () => {
       log.info(`shutting down (${reason})`);
       audit({ type: 'daemon_stop', reason, instanceId });
+      // A call in progress gets up to 15 s more to write its notes (CallManager.shutdown); the
+      // process 'exit' hook of routes-calls restores the microphone even when this timer fires.
+      const callActive = Boolean(server && server.deps.calls && server.deps.calls.call);
       const hard = setTimeout(() => {
         log.warn('shutdown is taking too long; exiting now');
         state.clearDaemonState(instanceId);
         if (exitProcess) process.exit(0);
-      }, SHUTDOWN_HARD_MS);
+      }, SHUTDOWN_HARD_MS + (callActive ? 16000 : 0));
       if (hard.unref) hard.unref();
       const step = async (what, fn) => {
         try {
@@ -870,8 +915,13 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
       await step('cancel approvals', () => permissions.cancelAll('Claude Anywhere is shutting down'));
       await step('cancel questions', () => questions.cancelAll('Claude Anywhere is shutting down'));
       await step('close bridge', () => bridge.close());
+      // Calls first: a call in progress gets up to 15 s to write its notes, then the user's microphone
+      // and the audio routing are restored and the voice sidecar stops (CALLS-DESIGN §13.3).
+      if (server && server.deps.calls) await step('stop calls', () => server.deps.calls.shutdown());
+      if (server && server.deps.clone) await step('stop voice sidecar', () => server.deps.clone.shutdown());
       if (session) await step('stop session', () => session.shutdown());
       if (uihost) await step('close dialog', () => uihost.close());
+      if (announcer) await step('stop announcer', () => announcer.stop());
       if (voice) await step('stop voice', () => voice.stop());
       await step('remove CLI screenshots', () => removeCliScreenshots());
       if (driverInstance) {
@@ -901,12 +951,21 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     getDriver,
     config,
     token,
+    engineToken,
     instanceId,
     version,
     applyConfig,
     notifyOS,
     onShutdown: (why) => shutdown(why),
   });
+  // Used by src/daemon/routes-voice.js: announcements for /api/voice/test, and a capability
+  // refresh (snapshot broadcast) after a voice is installed, chosen or removed.
+  server.deps.announcer = announcer;
+  server.deps.refreshVoice = () => refreshVoice(true);
+  // Feature 3 (docs/CALLS-DESIGN.md §13.3): routes-calls answers calls with the daemon's own Computer
+  // (one geometry cache, one guard) and needs the platform for audio routing and notes.
+  server.deps.getComputer = getComputer;
+  server.deps.platformInfo = platformInfo;
   const wanted = Number.isInteger(port) ? port : Number.isInteger(config.port) ? config.port : 47120;
   let boundPort;
   try {
@@ -925,7 +984,7 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     questions,
     bridge,
     port: boundPort,
-    token,
+    token: engineToken,
     projectDir,
     mode: daemonMode,
     instanceId,
@@ -937,9 +996,14 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     // Its settings section reaches a running engine by message, without a restart (LIVE-E2E-R3-4).
     settingsNotes: promptMod && typeof promptMod.settingsNotes === 'function' ? promptMod.settingsNotes : null,
     platformInfo,
+    // GET /api/mcp/guard says where the dialog stands, for desktops that cannot place its window (F3-SAFE-D1).
+    dialogState: uihost && typeof uihost.dialogState === 'function' ? () => uihost.dialogState() : undefined,
   });
   server.session = session;
   server.deps.session = session;
+  // Before the voice probe answers: a dialog that connects now must already know that the daemon
+  // announces results and cards, or it would speak them too.
+  if (announcer) session.setVoiceInfo({ announcer: true });
   hub.setSnapshotProvider(() => session.snapshot());
   if (osMod && typeof osMod.selectBackend === 'function') {
     try {
@@ -1062,6 +1126,7 @@ async function startDaemon(opts = {}, releaseStartLock = () => {}) {
     questions,
     bridge,
     voice,
+    announcer,
     uihost,
     shutdown,
     done,

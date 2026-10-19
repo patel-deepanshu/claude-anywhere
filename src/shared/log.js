@@ -20,6 +20,8 @@ const SECRET_PATTERNS = [
   [/ya29\.[0-9A-Za-z_-]{20,}/g, 'ya29.***'],
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[PRIVATE KEY]'],
   [/\b(Bearer)\s+[A-Za-z0-9._~+/=-]{16,}/gi, '$1 ***'],
+  [/ATATT[A-Za-z0-9_\-=]{20,}/g, 'ATATT***'],
+  [/\b(Basic)\s+[A-Za-z0-9+/=]{16,}/gi, '$1 ***'],
   [/\b(password|passwd|pwd|secret|token|api[_-]?key)(\s*[:=]\s*)("[^"]*"|'[^']*'|\S+)/gi, '$1$2***'],
 ];
 
@@ -41,7 +43,7 @@ function scrub(value, secrets) {
   if (typeof value === 'object') {
     const out = {};
     for (const [k, v] of Object.entries(value)) {
-      if (/^(token|apiKey|sttApiKey|password|secret|authorization)$/i.test(k) && typeof v === 'string' && v) {
+      if (/^(token|apiKey|apiToken|sttApiKey|password|secret|authorization)$/i.test(k) && typeof v === 'string' && v) {
         out[k] = '***';
       } else if ((k === 'image' || k === 'data' || k === 'dataUrl') && typeof v === 'string' && v.length > 256) {
         out[k] = `[${v.length} chars]`;

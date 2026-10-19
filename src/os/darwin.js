@@ -15,6 +15,10 @@
  * macOS grants Accessibility and Screen Recording to the app that launched the
  * process (Terminal, iTerm, VS Code, Electron...), never to node or osascript,
  * so permission errors name that app and link the right Settings pane.
+ *
+ * UI automation (uiTree, uiFind, uiAction, setWindowBounds) reads and drives
+ * apps' accessibility trees through the helper: the AX API, or System Events
+ * when the AX bridge is unusable. It needs Accessibility only.
  */
 
 const fs = require('fs');
@@ -63,7 +67,49 @@ const INPUT_SOURCE_TTL_MS = 3000;
 const AX_STALL_SKIP_MS = 30000;
 
 /** Helper commands that are safe to re-run if the helper dies mid-request. */
-const IDEMPOTENT = new Set(['ping', 'perms', 'displays', 'cursor', 'windows', 'active', 'clipGet', 'inputSource', 'automation']);
+const IDEMPOTENT = new Set([
+  'ping', 'perms', 'displays', 'cursor', 'windows', 'active', 'clipGet', 'inputSource', 'automation', 'browserTab', 'uiTree', 'uiFind',
+]);
+
+// UI automation (uiTree, uiFind, uiAction, setWindowBounds); see darwin-helper.js.
+/** Time the helper may spend walking one tree; it stops there and reports truncated. */
+const UI_BUDGET_MS = 8000;
+/**
+ * uiTree/uiFind: the helper walks for at most twice the budget in all (once, and again after
+ * switching on a Chromium or Electron app's web content tree), plus a slow accessibility request
+ * (3 s) and the waits for the switched-on tree.
+ */
+const UI_REQUEST_TIMEOUT_MS = 2 * (UI_BUDGET_MS + 3000) + 4000;
+const UI_ACTION_TIMEOUT_MS = 20000;
+const SET_BOUNDS_TIMEOUT_MS = 20000;
+/** Element ids remember where uiFind/uiTree saw the element, to pick it again if the window changed. */
+const UI_CACHE_TTL_MS = 30000;
+const UI_CACHE_MAX = 4000;
+const UI_ACTIONS = new Set(['press', 'focus', 'setValue', 'select', 'expand', 'collapse', 'scrollIntoView', 'showMenu']);
+const WINDOW_STATES = new Set(['maximize', 'minimize', 'restore', 'fullscreen']);
+const WINDOW_STATE_ALIASES = {
+  maximized: 'maximize', max: 'maximize', zoom: 'maximize',
+  minimized: 'minimize', min: 'minimize',
+  restored: 'restore', normal: 'restore', unmaximize: 'restore',
+  'full screen': 'fullscreen', 'full-screen': 'fullscreen', fullscreened: 'fullscreen',
+};
+/** mac:<pid>:<window>:<root><path>:<hash> (darwin-helper.js uiMakeId). */
+const UI_ID_RE = /^mac:(\d+):(\d+|i\d+|-):([wa])((?:v?\d+)(?:\.v?\d+)*)?:([0-9a-z]+)$/;
+
+/** Browsers whose AppleScript dictionary exposes the active tab (identifyBrowser ids -> helper kind). */
+const SCRIPTABLE_BROWSERS = Object.freeze({
+  chrome: 'chromium',
+  brave: 'chromium',
+  edge: 'chromium',
+  chromium: 'chromium',
+  vivaldi: 'chromium',
+  opera: 'chromium',
+  arc: 'chromium',
+  safari: 'safari',
+});
+/** First AppleScript request to a browser: macOS may show the Automation consent prompt and wait for it. */
+const BROWSER_CONSENT_TIMEOUT_MS = 60000;
+const BROWSER_TAB_TIMEOUT_MS = 10000;
 
 const SETTINGS_URLS = Object.freeze({
   accessibility: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
@@ -170,6 +216,20 @@ function permissionHint(kind, app) {
   return (
     `Grant Accessibility to ${who}: System Settings → Privacy & Security → Accessibility, turn it on ` +
     `(use + to add it if it is missing), then ${restart}. Open the pane with: open "${SETTINGS_URLS.accessibility}". ${owner}`
+  );
+}
+
+/**
+ * How to let the app that launched Claude Code control a browser through AppleScript.
+ * @param {string} browser e.g. "Brave Browser"
+ * @param {string|null} [app] the host app, e.g. "iTerm"
+ */
+function browserAutomationHint(browser, app) {
+  const who = app ? `"${app}"` : 'the app that launched Claude Code (Terminal, iTerm, VS Code, ...)';
+  return (
+    `Allow ${who} to control "${browser}": System Settings → Privacy & Security → Automation → ` +
+    `${app || 'your terminal app'} → turn on ${browser}. Open the pane with: open "${SETTINGS_URLS.automation}". ` +
+    'Until then the address is read with the keyboard, which briefly brings the browser to the front.'
   );
 }
 
@@ -542,6 +602,125 @@ async function detectHostApp({ env = process.env, run = proc.run, pid = process.
   if (env.TERM_PROGRAM && TERM_PROGRAMS[env.TERM_PROGRAM]) return TERM_PROGRAMS[env.TERM_PROGRAM];
   if (/kitty/.test(env.TERM || '')) return 'kitty';
   return bundle || null;
+}
+
+/**
+ * Parse a UI element id from uiFind/uiTree.
+ * @returns {{pid:number, windowId:string|null, root:'w'|'a', path:string[], hash:string}|null}
+ *   windowId is the listWindows() id ("pid:number") when the id names one
+ */
+function parseUiId(id) {
+  const m = UI_ID_RE.exec(typeof id === 'string' ? id : '');
+  if (!m) return null;
+  const pid = Number(m[1]);
+  if (!(pid > 0)) return null;
+  return {
+    pid,
+    windowId: /^\d+$/.test(m[2]) ? `${pid}:${m[2]}` : null,
+    root: m[3],
+    path: m[4] ? m[4].split('.') : [],
+    hash: m[5],
+  };
+}
+
+/** {x, y, width, height} with finite numbers (all zero when the element has no frame). */
+function normalizeBounds(b) {
+  const r = b && typeof b === 'object' ? b : {};
+  const n = (v) => (typeof v === 'number' && Number.isFinite(v) ? clean(v) : 0);
+  return { x: n(r.x), y: n(r.y), width: Math.max(0, n(r.width)), height: Math.max(0, n(r.height)) };
+}
+
+function normalizeUiWindow(w) {
+  const r = w && typeof w === 'object' ? w : {};
+  return {
+    id: r.id != null ? String(r.id) : '',
+    app: typeof r.app === 'string' ? r.app : '',
+    title: typeof r.title === 'string' ? r.title : '',
+  };
+}
+
+function normalizeUiNode(n) {
+  if (!n || typeof n !== 'object' || typeof n.id !== 'string' || !n.id) return null;
+  const out = { id: n.id, role: typeof n.role === 'string' && n.role ? n.role : 'other', name: typeof n.name === 'string' ? n.name : '' };
+  if (typeof n.value === 'string' && n.value) out.value = n.value;
+  if (typeof n.description === 'string' && n.description) out.description = n.description;
+  out.bounds = normalizeBounds(n.bounds);
+  out.enabled = n.enabled !== false;
+  out.focused = n.focused === true;
+  if (typeof n.selected === 'boolean') out.selected = n.selected;
+  if (typeof n.expanded === 'boolean') out.expanded = n.expanded;
+  out.parent = typeof n.parent === 'string' && n.parent ? n.parent : null;
+  out.children = Array.isArray(n.children) ? n.children.filter((c) => typeof c === 'string' && c) : [];
+  return out;
+}
+
+/** What the model should know about a uiTree/uiFind answer. */
+function uiNotes(r) {
+  const notes = [];
+  if (r.enabledAccessibility) {
+    const what = r.enabledAccessibility === 'chromium' ? 'this Chromium browser' : r.enabledAccessibility === 'electron' ? 'this Electron app' : 'this app';
+    notes.push(
+      `The accessibility tree of ${what} was empty, so it was switched on (AXManualAccessibility${
+        r.enabledAccessibility === 'chromium' ? ' and AXEnhancedUserInterface' : ''
+      }). It stays on until the app quits.`,
+    );
+  }
+  if (r.sparse) {
+    notes.push(
+      'This app exposes little to accessibility (its web content may still be loading, or it draws its own UI): ' +
+        'use a screenshot with find_text (OCR) or coordinates instead.',
+    );
+  }
+  if (r.notResponding) notes.push('The app stopped answering accessibility requests part way, so the result is incomplete.');
+  if (r.truncated) notes.push('The walk stopped at its node, depth or time limit; narrow it down with ui_find, or ask for more nodes.');
+  if (r.engine === 'systemEvents') {
+    notes.push(`Read through System Events (slower) because the accessibility API bridge failed${r.bridgeError ? `: ${r.bridgeError}` : ''}.`);
+  }
+  return notes;
+}
+
+/** The helper's uiTree answer as the Driver contract's {window, nodes} (plus truncated, engine, notes). */
+function normalizeUiTree(res) {
+  const r = res && typeof res === 'object' ? res : {};
+  const out = {
+    window: normalizeUiWindow(r.window),
+    nodes: (Array.isArray(r.nodes) ? r.nodes : []).map(normalizeUiNode).filter(Boolean),
+    truncated: r.truncated === true,
+    engine: typeof r.engine === 'string' && r.engine ? r.engine : 'ax',
+  };
+  if (r.enabledAccessibility) out.enabledAccessibility = String(r.enabledAccessibility);
+  const notes = uiNotes(r);
+  if (notes.length) out.notes = notes;
+  return out;
+}
+
+/**
+ * The helper's uiFind answer as the Driver contract's array of {id, role, name, value, bounds,
+ * windowId, path} (plus enabled and description). The array also carries non-enumerable
+ * window, truncated, engine and notes properties.
+ */
+function normalizeUiMatches(res) {
+  const r = res && typeof res === 'object' ? res : {};
+  const window = normalizeUiWindow(r.window);
+  const list = [];
+  for (const m of Array.isArray(r.matches) ? r.matches : []) {
+    if (!m || typeof m !== 'object' || typeof m.id !== 'string' || !m.id) continue;
+    const out = {
+      id: m.id,
+      role: typeof m.role === 'string' && m.role ? m.role : 'other',
+      name: typeof m.name === 'string' ? m.name : '',
+      value: typeof m.value === 'string' ? m.value : '',
+      bounds: normalizeBounds(m.bounds),
+      windowId: window.id,
+      path: typeof m.path === 'string' ? m.path : '',
+      enabled: m.enabled !== false,
+    };
+    if (typeof m.description === 'string' && m.description) out.description = m.description;
+    list.push(out);
+  }
+  const hidden = { window, truncated: r.truncated === true, engine: typeof r.engine === 'string' ? r.engine : 'ax', notes: uiNotes(r) };
+  for (const [k, v] of Object.entries(hidden)) Object.defineProperty(list, k, { value: v, enumerable: false });
+  return list;
 }
 
 function spawnFailure(err) {
@@ -937,6 +1116,12 @@ class DarwinDriver {
     this._held = new Set();
     this._hostAppPromise = null;
     this._warned = new Set();
+    /** Browsers (lowercase app names) that already answered an AppleScript request: no consent prompt pending. */
+    this._browserConsent = new Set();
+    /** UI element id -> {bounds, at}: where uiFind/uiTree last saw it (see UI_CACHE_TTL_MS). */
+    this._uiCache = new Map();
+    /** Window id -> its frame before setWindowBounds maximized it or made it full screen (for restore). */
+    this._savedFrames = new Map();
   }
 
   // ----- plumbing -----
@@ -1153,7 +1338,7 @@ class DarwinDriver {
   // ----- capabilities -----
 
   async capabilities() {
-    const none = { screenshot: false, mouse: false, keyboard: false, windows: false, clipboard: false, notify: false, speak: false };
+    const none = { screenshot: false, mouse: false, keyboard: false, windows: false, clipboard: false, notify: false, speak: false, ui: false };
     try {
       const notes = [];
       const osascript = Boolean(this._opts.transport) || Boolean(this._tool('osascript', '/usr/bin/osascript'));
@@ -1199,6 +1384,18 @@ class DarwinDriver {
       if (!shot) notes.push('screencapture was not found (it ships with macOS in /usr/sbin).');
       const clip = (Boolean(this._tool('pbcopy', '/usr/bin/pbcopy')) && Boolean(this._tool('pbpaste', '/usr/bin/pbpaste'))) || helperOk;
       notes.push('Keeping a window always on top is not supported on macOS.');
+      const ui = helperOk && ax !== false;
+      if (ui) {
+        notes.push(
+          "UI automation (ui_find, ui_tree, ui_click) reads apps' accessibility trees through the macOS accessibility API. " +
+            'Chromium browsers (Chrome, Brave, Edge...) and Electron apps (Slack, VS Code, Discord...) get their web content ' +
+            'tree switched on automatically (AXEnhancedUserInterface, AXManualAccessibility) the first time it comes back empty; ' +
+            'apps that draw their own UI (games, some design and video editors) expose little, so use screenshots there. ' +
+            'Moving and resizing windows goes through System Events (Automation), like focusing them.',
+        );
+      } else if (helperOk) {
+        notes.push('UI automation (ui_find, ui_tree, ui_click) reads the accessibility tree, which also needs Accessibility.');
+      }
       return {
         screenshot: shot && sr !== false,
         mouse: helperOk && ax !== false,
@@ -1208,6 +1405,8 @@ class DarwinDriver {
         notify: true,
         speak: Boolean(this._tool('say', '/usr/bin/say')),
         topmost: false,
+        ui,
+        ...(ui ? {} : { uiHint: helperOk ? permissionHint('accessibility', host) : 'The macOS helper (osascript) must work first.' }),
         notes,
         permissions: {
           accessibility: ax,
@@ -1583,6 +1782,269 @@ class DarwinDriver {
     return false;
   }
 
+  // ----- browser tabs -----
+
+  /**
+   * Read the active tab of a browser window (Driver.browserTab). Chromium browsers (Chrome, Brave,
+   * Edge, Chromium, Vivaldi, Opera, Arc) and Safari answer through AppleScript, without keystrokes,
+   * once the user allowed the Automation prompt for that browser; Firefox, a refused prompt and the
+   * page text use the keyboard reader (src/os/linux.js), with Cmd as the primary modifier.
+   * @param {{app?:string, windowId?:string, includeText?:boolean, maxChars?:number, keyboard?:boolean,
+   *   beforeInput?:Function}} [opts]
+   */
+  async browserTab(opts = {}) {
+    const tabs = require('./linux');
+    return tabs.readBrowserTab(this, opts, {
+      platform: 'darwin',
+      native: (win, browser, want) => this._browserTabScript(win, browser, want),
+    });
+  }
+
+  /** AppleScript half of browserTab: {url, title, tabTitle, text?, method:'applescript'} or null (not scriptable). */
+  async _browserTabScript(win, browser, want = {}) {
+    const kind = SCRIPTABLE_BROWSERS[browser.id];
+    if (!kind) return null;
+    const app = win.app || browser.name;
+    const ref = parseWindowId(win.id);
+    const args = { app: win.app || '', kind, title: win.title || '', wantText: Boolean(want.text) };
+    if (ref) args.pid = ref.pid;
+    const key = app.toLowerCase();
+    const firstAsk = !this._browserConsent.has(key);
+    let r;
+    try {
+      r = await this._call('browserTab', args, { timeoutMs: firstAsk ? BROWSER_CONSENT_TIMEOUT_MS : BROWSER_TAB_TIMEOUT_MS });
+    } catch (err) {
+      if (err.code === 'PERMISSION' || err.code === 'TIMEOUT') {
+        this._browserConsent.delete(key);
+        const host = await this._hostAppName();
+        const e =
+          err.code === 'TIMEOUT'
+            ? new Error(`macOS is still asking whether ${host || 'your terminal app'} may control ${app} (the Automation prompt was not answered)`)
+            : err;
+        e.code = 'PERMISSION';
+        e.permission = 'automation';
+        e.settingsUrl = SETTINGS_URLS.automation;
+        e.hint = browserAutomationHint(app, host);
+        throw e;
+      }
+      throw err;
+    }
+    this._browserConsent.add(key);
+    if (want.text && r && r.textError) log.debug(`${app} did not return the page text through AppleScript (${r.textError}); using the keyboard`);
+    if (!r) return null;
+    const title = typeof r.title === 'string' ? r.title : '';
+    return {
+      url: typeof r.url === 'string' && r.url ? r.url : null,
+      title,
+      tabTitle: title,
+      text: typeof r.text === 'string' ? r.text : undefined,
+      method: 'applescript',
+    };
+  }
+
+  // ----- UI automation (accessibility tree) -----
+
+  /** ANYWHERE_DARWIN_UI=ax|systemEvents forces an engine; by default the AX API, System Events as a fallback. */
+  _uiEngine() {
+    const e = String(this._env.ANYWHERE_DARWIN_UI || '').trim().toLowerCase();
+    if (e === 'ax') return 'ax';
+    if (e === 'systemevents' || e === 'system-events' || e === 'se') return 'systemEvents';
+    return undefined;
+  }
+
+  /** Helper args {pid, number?} for a window id ("pid:number", "pid", a listWindows entry); {} = the active window. */
+  _uiWindowArgs(windowId) {
+    if (windowId == null || windowId === '') return {};
+    const raw = typeof windowId === 'object' && windowId.id != null ? windowId.id : windowId;
+    const ref = parseWindowId(raw);
+    if (!ref) throw invalidArg(`windowId must be a macOS window id like "501:41" (got ${JSON.stringify(windowId)})`);
+    return ref.number != null ? { pid: ref.pid, number: ref.number } : { pid: ref.pid };
+  }
+
+  async _uiCall(cmd, args, timeoutMs) {
+    const engine = this._uiEngine();
+    try {
+      return await this._call(cmd, engine ? { ...args, engine } : args, { timeoutMs });
+    } catch (err) {
+      if (!err.hint) {
+        if (err.code === 'NOT_RESPONDING') {
+          err.hint = 'The app is busy or showing a modal dialog. Wait a moment and try again, or use a screenshot and coordinates.';
+        } else if (err.code === 'AX_BRIDGE') {
+          err.hint = 'Unset ANYWHERE_DARWIN_UI so System Events can read the tree instead.';
+        } else if (err.code === 'NOT_FOUND' && cmd === 'uiAction') {
+          err.hint = 'The window changed since the element was found: call ui_find or ui_tree again for a fresh id.';
+        }
+      }
+      throw err;
+    }
+  }
+
+  _uiRemember(items) {
+    const now = Date.now();
+    for (const n of items) {
+      if (!n || typeof n.id !== 'string' || !n.bounds) continue;
+      this._uiCache.delete(n.id);
+      this._uiCache.set(n.id, { bounds: n.bounds, at: now });
+    }
+    if (this._uiCache.size > UI_CACHE_MAX) {
+      // Oldest first (Map insertion order).
+      for (const id of this._uiCache.keys()) {
+        if (this._uiCache.size <= Math.floor(UI_CACHE_MAX * 0.75)) break;
+        this._uiCache.delete(id);
+      }
+    }
+  }
+
+  _uiBoundsOf(id) {
+    const c = this._uiCache.get(id);
+    if (!c) return null;
+    if (Date.now() - c.at > UI_CACHE_TTL_MS) {
+      this._uiCache.delete(id);
+      return null;
+    }
+    return c.bounds;
+  }
+
+  /**
+   * The accessibility tree of a window (Driver.uiTree), breadth first: up to `depth` levels below
+   * the window and `maxNodes` nodes. Unnamed groups are left out (their children take their place),
+   * as are elements scrolled out of the window. Open menus of the app are extra roots; for an app
+   * without windows, the menu bar is. A Chromium browser or Electron app whose web content tree is
+   * empty gets it switched on once (AXEnhancedUserInterface / AXManualAccessibility) and is read again.
+   * @param {{windowId?:string|object, depth?:number, maxNodes?:number}} [opts] windowId defaults to the active window
+   * @returns {Promise<{window:{id,app,title}, nodes:object[], truncated:boolean, engine:string, notes?:string[], enabledAccessibility?:string}>}
+   */
+  async uiTree({ windowId, depth = 6, maxNodes = 400 } = {}) {
+    const args = {
+      ...this._uiWindowArgs(windowId),
+      depth: clampInt(depth, 0, 50, 6),
+      maxNodes: clampInt(maxNodes, 1, 5000, 400),
+      budgetMs: UI_BUDGET_MS,
+    };
+    await this._ensurePermission('accessibility');
+    const out = normalizeUiTree(await this._uiCall('uiTree', args, UI_REQUEST_TIMEOUT_MS));
+    this._uiRemember(out.nodes);
+    return out;
+  }
+
+  /**
+   * Find elements (Driver.uiFind) in a window and the app's open menus, and in its menu bar for
+   * menu queries or when the window has no match. name and text match case-insensitively as a
+   * substring (exact: the whole string); role is a shared role (button, textbox...) or an AX role
+   * (AXButton). Best matches first: exact, then prefix, then substring; enabled and visible first.
+   * @param {{windowId?:string|object, name?:string, role?:string, text?:string, exact?:boolean, limit?:number}} [opts]
+   * @returns {Promise<Array<{id, role, name, value, bounds, windowId, path, enabled, description?}>>}
+   */
+  async uiFind({ windowId, name, role, text, exact = false, limit = 20 } = {}) {
+    const query = {};
+    for (const [k, v] of Object.entries({ name, role, text })) {
+      if (v != null && String(v).trim() !== '') query[k] = String(v);
+    }
+    if (!query.name && !query.role && !query.text) throw invalidArg('uiFind needs a name, role or text');
+    const args = { ...this._uiWindowArgs(windowId), ...query, exact: exact === true, limit: clampInt(limit, 1, 200, 20), budgetMs: UI_BUDGET_MS };
+    await this._ensurePermission('accessibility');
+    const list = normalizeUiMatches(await this._uiCall('uiFind', args, UI_REQUEST_TIMEOUT_MS));
+    this._uiRemember(list);
+    return list;
+  }
+
+  /**
+   * Act on an element from uiFind/uiTree (Driver.uiAction). ok false (with a reason) means the
+   * element does not support the action, so the caller may click it instead. ok true with
+   * confirmed false: the app did not answer in time, usually because the action opened a dialog.
+   * @param {{id:string, action:'press'|'focus'|'setValue'|'select'|'expand'|'collapse'|'scrollIntoView'|'showMenu'|string, value?:any}} opts
+   *   action may also be a raw AX action name (AXIncrement, AXCancel...); select with a value picks that option of a pop-up
+   * @returns {Promise<{ok:boolean, method:string, reason?:string, confirmed?:boolean, id?:string, bounds?:object, role?:string, name?:string, resolved?:string}>}
+   */
+  async uiAction({ id, action, value } = {}) {
+    if (!parseUiId(id)) throw invalidArg(`id must be a macOS UI element id from uiFind or uiTree (got ${JSON.stringify(id)})`);
+    const act = String(action == null ? '' : action);
+    if (!UI_ACTIONS.has(act) && !/^AX[A-Za-z]+$/.test(act)) {
+      throw invalidArg(`Unknown UI action "${act}" (use press, focus, setValue, select, expand, collapse, scrollIntoView or showMenu)`);
+    }
+    if (act === 'setValue' && (value === undefined || value === null)) throw invalidArg('setValue needs a value');
+    const args = { id, action: act };
+    if (value !== undefined && value !== null) {
+      args.value = typeof value === 'number' || typeof value === 'boolean' ? value : String(value);
+    }
+    const bounds = this._uiBoundsOf(id);
+    if (bounds && (bounds.width > 0 || bounds.height > 0)) args.frame = bounds;
+    await this._ensurePermission('accessibility');
+    const res = (await this._uiCall('uiAction', args, UI_ACTION_TIMEOUT_MS)) || {};
+    const out = { ok: res.ok === true, method: typeof res.method === 'string' && res.method ? res.method : 'none' };
+    if (typeof res.reason === 'string' && res.reason) out.reason = res.reason;
+    if (res.confirmed === false) out.confirmed = false;
+    if (typeof res.value === 'number' || typeof res.value === 'string') out.value = res.value;
+    if (typeof res.id === 'string' && res.id) out.id = res.id;
+    if (typeof res.role === 'string') out.role = res.role;
+    if (typeof res.name === 'string') out.name = res.name;
+    if (res.bounds) out.bounds = normalizeBounds(res.bounds);
+    if (typeof res.windowId === 'string') out.windowId = res.windowId;
+    if (typeof res.resolved === 'string') out.resolved = res.resolved;
+    if (out.id && out.bounds) this._uiRemember([{ id: out.id, bounds: out.bounds }]);
+    return out;
+  }
+
+  /**
+   * Move, resize, maximize, minimize, restore or full-screen a window (Driver.setWindowBounds).
+   * Bounds are logical global points; any of x, y, width, height may be left out (kept). maximize
+   * fills the visible frame (without menu bar and Dock) of the window's screen; restore
+   * un-minimizes, leaves full screen and returns to the frame from before maximize or fullscreen.
+   * @param {string|object} windowId "pid:number" (or "pid": the app's front window)
+   * @param {{x?:number,y?:number,width?:number,height?:number}|{state:'maximize'|'minimize'|'restore'|'fullscreen'}} spec
+   * @returns {Promise<boolean>}
+   */
+  async setWindowBounds(windowId, spec) {
+    const raw = windowId && typeof windowId === 'object' && windowId.id != null ? windowId.id : windowId;
+    const ref = parseWindowId(raw);
+    if (!ref) throw invalidArg(`windowId must be a macOS window id like "501:41" (got ${JSON.stringify(windowId)})`);
+    const s = spec && typeof spec === 'object' ? spec : {};
+    const args = { pid: ref.pid };
+    if (ref.number != null) args.number = ref.number;
+    const key = ref.number != null ? `${ref.pid}:${ref.number}` : String(ref.pid);
+    let state = null;
+    if (s.state != null && s.state !== '') {
+      const st = String(s.state).trim().toLowerCase();
+      state = WINDOW_STATE_ALIASES[st] || st;
+      if (!WINDOW_STATES.has(state)) throw invalidArg(`Unknown window state "${s.state}" (use maximize, minimize, restore or fullscreen)`);
+      args.state = state;
+      const saved = state === 'restore' ? this._savedFrames.get(key) : null;
+      if (saved) args.frame = { ...saved };
+    } else {
+      let any = false;
+      for (const k of ['x', 'y', 'width', 'height']) {
+        if (s[k] == null || s[k] === '') continue;
+        const n = finite(s[k], k);
+        if ((k === 'width' || k === 'height') && n < MIN_WINDOW_SIZE) throw invalidArg(`${k} must be at least ${MIN_WINDOW_SIZE} (got ${s[k]})`);
+        args[k] = n;
+        any = true;
+      }
+      if (!any) throw invalidArg('setWindowBounds needs {x, y, width, height} (any of them) or {state}');
+    }
+    await this._ensurePermission('accessibility');
+    let res;
+    try {
+      res = await this._call('setBounds', args, { timeoutMs: SET_BOUNDS_TIMEOUT_MS });
+    } catch (err) {
+      if (err.code === 'PERMISSION' || err.code === 'UNSUPPORTED' || err.code === 'BAD_ARGS') throw err;
+      log.warn(`setting the bounds of window ${raw} failed: ${err.message}`);
+      return false;
+    }
+    if (!res || !res.ok) {
+      log.debug(`setting the bounds of window ${raw} did not work: ${(res && res.reason) || 'no answer'}`);
+      return false;
+    }
+    if (state === 'maximize' || state === 'fullscreen') {
+      if (validRect(res.before) && !this._savedFrames.has(key)) {
+        const b = res.before;
+        this._savedFrames.set(key, { x: b.x, y: b.y, width: b.width, height: b.height });
+      }
+    } else if (state !== 'minimize') {
+      this._savedFrames.delete(key);
+    }
+    return true;
+  }
+
   // ----- clipboard -----
 
   async clipboardGet() {
@@ -1611,6 +2073,7 @@ class DarwinDriver {
 
   async close() {
     this._held.clear();
+    this._uiCache.clear();
     await this._transport.close();
   }
 }
@@ -1646,4 +2109,11 @@ module.exports = {
   detectHostApp,
   permissionHint,
   permissionError,
+  browserAutomationHint,
+  SCRIPTABLE_BROWSERS,
+  parseUiId,
+  normalizeBounds,
+  normalizeUiTree,
+  normalizeUiMatches,
+  UI_CACHE_TTL_MS,
 };

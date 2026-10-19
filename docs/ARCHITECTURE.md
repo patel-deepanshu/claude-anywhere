@@ -66,20 +66,51 @@ bin/anywhere.js                     CLI entry point
 bin/anywhere, bin/anywhere.cmd      tiny shims (plugin bin/ dirs are added to the Bash PATH while the plugin is enabled)
 src/shared/{paths,config,log,state,client,proc,platform,util}.js
 src/os/{index,computer,png,keys,common,darwin,win32,linux}.js
+src/os/audio.js                     WAV playback (afplay / SoundPlayer / pw-play|paplay|aplay|ffplay)
 src/os/darwin-helper.js             JXA script run via `osascript -l JavaScript`
 src/os/win32-host.ps1               persistent PowerShell JSON-lines host
+src/os/{ocr,apps,browsers}.js       desktop assistant: on-device OCR, installed apps (launch, quit), browser bookmarks / open / tabs
+src/os/atspi-helper.py              Linux AT-SPI helper for uiTree / uiFind / uiAction (python3 -I, one JSON request per run)
+src/os/darwin-ocr.js, win32-ocr.ps1 one-shot OCR scripts: Apple Vision (osascript -l JavaScript), Windows.Media.Ocr (powershell.exe 5.1)
 src/context/desktop.js
 src/mcp/{server,tools}.js
+src/mcp/tools-{browser,jira,project}.js   feature tools: read_browser_tab · jira_* · find_repos, switch_project
+src/mcp/tools-{ui,ocr,desktop}.js   desktop assistant tools: ui_* · find_text, read_screen_text · apps, windows, browsers
 src/daemon/{main,server,hub,session,engine-cli,permissions,questions,bridge,prompt,voice,uihost}.js
+src/daemon/{piper,announcer,chime,routes-voice}.js   free neural voice (Piper), spoken announcements, chimes, voice routes
+src/daemon/routes-{jira,project}.js  GET /api/jira/status, POST /api/jira/test · POST /api/mcp/switch-project
+src/daemon/routes-{clone,calls}.js  /api/clone/* (voice enrollment) · /api/calls/* (AI-answered calls), §13
+src/voice/clone/                    cloned voice: Python sidecar (sidecar.py, audio_io.py, requirements.txt) and
+                                    {models,installer,client,quality,consent,script,profile,index}.js
+src/calls/                          {signatures,notifications,screen-diff,vision,detector,answer,audio-bridge,
+                                    policy,greeting,prompt,session,manager,notes,cliq}.js
+src/integrations/jira.js            Jira Cloud / Server REST client (zero dependencies)
+src/cli/{voice,jira,clone,calls,desktop}.js anywhere voice … · anywhere jira … · anywhere clone-voice … · anywhere calls … · anywhere desktop …
 src/ui/{index.html,app.css,app.js,voice.js,wav-recorder.js,markdown.js}
+src/ui/{calls-ui,calls-panel,clone,calls-audio-test}.js, calls.css, clone.html, calls-audio-test.html
+skills/clone-voice/{SKILL.md,run.js}  /anywhere:clone-voice (plugin)
 src/electron/{main,preload}.js
 src/tui/tui.js
 scripts/{install.js,install.sh,install.ps1}
 scripts/{check-syntax,test}.js          npm run lint / npm test
 test/*.test.js, test/fixtures/fake-claude.js
-docs/{PLAN,ARCHITECTURE}.md
+docs/{PLAN,ARCHITECTURE,VOICE,JIRA,PLATFORMS,SECURITY,CALLS,CALLS-DESIGN,DESKTOP}.md
 package.json, README.md, .github/workflows/ci.yml
 ```
+
+**Feature modules.** New features live in their own files, loaded when present (a missing file is skipped,
+any other load error still throws):
+- `src/mcp/tools.js` loads `src/mcp/tools-{browser,jira,project,calls,ui,ocr,desktop}.js` (`TOOL_MODULES`); each exports
+  `createTools(ext) -> tool[]` with `ext = {computer, getClient, config, role, progressIntervalMs, deps, getComputer,
+  getDriver, client, checkGuard, postActivity, keepAlive, ok, fail, daemonRequest, objectSchema, annotations,
+  screenshotAfter, screenshotAfterSchema}` (§6).
+- `src/daemon/server.js` loads `src/daemon/routes-{voice,jira,project,clone,calls}.js`; each exports `register(add, server)`.
+  A route may set `rawLimit` (bytes) to lower the 25 MB raw upload limit.
+  Handlers are bound to the DaemonServer and get `({req, res, url, body, raw})` like the built-in ones; paths match
+  exactly (ids go in the query string).
+- `bin/anywhere.js` loads `src/cli/{voice,jira,clone,calls,desktop}.js`; each exports `commands(helpers) -> {name: {run, group,
+  summary, usage, spec, details?}}` with `helpers = {spec, shared, call, requireDaemon, ensureDaemon, writeOut,
+  writeErr, printJson, sym, color, EXIT}`.
 
 ---
 
@@ -112,7 +143,8 @@ save(partial)     -> config   // deep-merge into current, write 0600, return mer
 get(cfg, 'a.b.c')             // dotted path read
 setPath(cfg, 'a.b', value)    // dotted path write (returns cfg)
 coerce(str)                   // 'true'/'false'/numbers/JSON → typed
-publicConfig(cfg) -> object   // secrets replaced: voice.sttApiKey → '' plus voice.sttApiKeySet: bool
+publicConfig(cfg) -> object   // secrets replaced: voice.sttApiKey → '' plus voice.sttApiKeySet: bool,
+                              // jira.apiToken → '' plus jira.apiTokenSet: bool
 ```
 `DEFAULTS`:
 ```js
@@ -136,7 +168,13 @@ publicConfig(cfg) -> object   // secrets replaced: voice.sttApiKey → '' plus v
            language: 'en-US', autoSend: true, speakResponses: true, handsFree: false,
            wakeWord: 'hey claude', ttsRate: 1.0, ttsVoice: '',
            sttProvider: 'auto',      // 'auto'|'openai'|'groq'|'custom'|'whisper.cpp'
-           sttBaseUrl: '', sttApiKey: '', sttModel: '', whisperCppPath: '', whisperModel: '' },
+           sttBaseUrl: '', sttApiKey: '', sttModel: '', whisperCppPath: '', whisperModel: '',
+           ttsEngine: 'auto',        // 'auto' (Piper when installed, else browser/OS) | 'piper' | 'browser' | 'os'
+           piperVoice: 'en_US-lessac-medium',
+           announce: { done: true, permission: true, question: true, error: true },   // what is said aloud
+           chime: true },            // a short tone before announcements
+  jira: { baseUrl: '', email: '', apiToken: '' },   // optional; env JIRA_BASE_URL/JIRA_EMAIL/JIRA_API_TOKEN… also work
+  workspace: { roots: [] },          // folders find_repos searches first ('~', POSIX, C:\…, UNC)
   privacy: { redactSecretsInLogs: true,   // masks secrets in daemon/MCP log lines and the audit log
              auditLog: true }
 }
@@ -149,8 +187,9 @@ createLogger(name) -> { debug, info, warn, error }   // writes "[ts] [name] leve
                                                      // debug only when env ANYWHERE_DEBUG=1
 audit(event)                                         // JSONL append {ts, ...redact(event)} to auditLogPath()
 redact(value) -> value                               // deep; masks secrets in strings (API keys, tokens, bearer
-                                                     // headers, key=value passwords, private keys), masks the
-                                                     // values of token/apiKey/password/secret/authorization keys,
+                                                     // headers, Basic auth headers, Atlassian ATATT… tokens, key=value
+                                                     // passwords, private keys), masks the values of
+                                                     // token/apiKey/apiToken/sttApiKey/password/secret/authorization keys,
                                                      // and elides Buffers and long image/data strings. Always masks.
 setAuditEnabled(on)                                  // privacy.auditLog
 setRedactLogs(on)                                    // privacy.redactSecretsInLogs (default on)
@@ -220,7 +259,7 @@ deepMerge(a, b), stripMarkdownForSpeech(text), escapeRegExp(s), nowIso(), deboun
 async getDriver() -> Driver            // cached singleton; picks darwin | win32 (also WSL) | linux-x11 | linux-wayland | unsupported
 Driver {
   name                                  // string
-  async capabilities() -> { screenshot, mouse, keyboard, windows, clipboard, notify, speak: bool, notes: string[] }
+  async capabilities() -> { screenshot, mouse, keyboard, windows, clipboard, notify, speak, ui: bool, notes: string[], uiHint?: string }
   async displays() -> [{ index, id, x, y, width, height, scale, primary }]   // logical; index 0 = primary
   async captureDisplay(index) -> { png: Buffer, width, height }             // native pixels of that display
   async cursorPosition() -> { x, y }                                         // logical global
@@ -241,8 +280,29 @@ Driver {
   async close()                         // stop persistent helpers
   windowsZOrdered?                      // optional flag: true when listWindows() is front to back on every backend
   async closeWindow?(id) -> bool        // optional (macOS): press the window's close button; the app keeps running
+  async browserTab({ app?, windowId?, window?, includeText? = false, maxChars? = 20000, keyboard? = true, beforeInput?, timing? })
+    -> { browser, app, title, url: string|null, method: 'applescript'|'uia'|'keyboard'|'title', windowId, tookFocus,
+         clipboard?: 'restored'|'changed'|'unknown'|'lost', text?, truncated?, textChars?, textMethod?, tabTitle?,
+         hint?, permission?: 'automation'|'accessibility', settingsUrl?, notes?: string[] }
+  // UI automation (accessibility) and window geometry: see "UI automation and window geometry" below
+  async uiTree({ windowId?, depth = 6, maxNodes = 400 }) -> { window: { id, app, title }, nodes: Node[], truncated, notes? }
+  async uiFind({ windowId?, name?, role?, text?, exact = false, limit = 20 }) -> Match[]   // + non-enumerable window, truncated, notes…
+  async uiAction({ id, action, value? }) -> { ok, method, reason?, pending?, confirmed?, disabled?, item?, id?, role, name, bounds?, warnings? }
+  async setWindowBounds(windowId, { x?, y?, width?, height? } | { state: 'maximize'|'minimize'|'restore'|'fullscreen' }) -> bool
 }
 ```
+`browserTab` reads a browser window's address (and with `includeText` its page text). `app` is a browser query
+("brave", "Google Chrome", "ff"), `window` a `listWindows()` entry the caller already picked, `keyboard: false`
+never sends input. Native first: macOS asks the browser through the helper command `browserTab` (`darwin-helper.js`;
+`{app, pid?, kind:'chromium'|'safari', title?, wantText?}`, PERMISSION -1743 → Automation hint), Windows and WSL read
+the address bar through UI Automation (host command `browsertab` `{hwnd, budgetMs?, maxNodes?}` in `win32-host.ps1`).
+Otherwise (X11, Wayland, or a native miss) the shared keyboard reader in `src/os/linux.js` (`readBrowserTab`,
+`keyboardReadTab`) saves the clipboard, focuses the window, checks it is active, sends primary+L / primary+C (and
+primary+A / primary+C for the text, F6 between attempts until the copy is page text), collapses the selection,
+restores the clipboard unless something else changed it, and refocuses the previous window. `beforeInput` runs before
+the first keystroke and again before select-all; a PAUSED/FAILSAFE error aborts with no further input. No matching
+browser → NOT_FOUND with a hint; other failures degrade to method `title` with notes. `src/os/linux.js` also exports
+`browserWindows`, `identifyBrowser`, `normalizeTabUrl`, `cleanPageText`, `BROWSERS` for reuse.
 Unsupported operations throw `Error` with `.code = 'UNSUPPORTED'` and an
 actionable `.hint` (e.g. "Install xdotool: sudo apt install xdotool").
 - `stackIndex` (optional) is the window's place in the stacking order, 0 = frontmost: X11 reads it
@@ -261,6 +321,87 @@ actionable `.hint` (e.g. "Install xdotool: sudo apt install xdotool").
   titles through System Events (which can raise the Automation prompt); UiHost uses it for background
   polling and other drivers ignore the argument. `DarwinDriver.supportsTopmost` is `false` and
   `capabilities().permissions` also reports `automation` (System Events consent), from what is already known.
+
+### UI automation and window geometry (every backend and the mock)
+
+The desktop assistant reads and drives the controls of any app through the platform's accessibility API, so Claude
+can press "For you" or fill "Search" by name instead of guessing pixels.
+```js
+Node  = { id, role, name, value?, description?, bounds: { x, y, width, height } /* logical global; all 0 = unknown */,
+          enabled, focused, selected?, checked?, expanded?, parent: id | null, children: id[] }   // + per-backend extras
+Match = { id, role, name, value, bounds, windowId, path, enabled, focused?, description?, offscreen?, selected?, checked?, expanded? }
+```
+- **Roles** (shared vocabulary): button, link, textbox, checkbox, radio, combobox, listitem, menuitem, menu, tab,
+  tablist, treeitem, image, text, heading, window, toolbar, group, table, row, cell, slider, other. Role filters also
+  take aliases ("edit", "hyperlink", "page tab", "list item", "dropdown"…), `"a|b"` and arrays
+  (`linux.js` exports `UI_ROLES`, `normalizeUiRole`, `uiRoleFilter`, `uiMatchScore`; `win32.js` its own `normalizeUiRole`).
+- **Matching**: `name` matches the accessible name, `text` the name, value or description; case-insensitive substring,
+  or the whole string with `exact`. Ranked whole match, then prefix, then substring; enabled and on-screen first.
+- **Trees are compact**: unnamed containers, decorative images and repeated labels are walked through but not listed
+  (their children attach to the nearest listed ancestor); `depth` counts listed levels.
+- **Ids** are opaque, cached about 30 s per window and re-resolved by their path (plus a role+name hash) after that,
+  so a stale id never acts on a different element: it fails with a STALE code and a hint to look the element up again.
+- **uiAction**: `press | focus | setValue | select | expand | collapse | scrollIntoView | showMenu`. `ok:false` with
+  `method:'none'` means "no accessibility action: click the centre of `bounds` instead"; `disabled:true` means the
+  element is disabled; `pending:true` (Windows) or `confirmed:false` (macOS) means the app did not answer in time,
+  usually because the press opened a modal dialog or menu: the press happened, so the caller must not click again.
+- **setWindowBounds** takes `{x, y, width, height}` (partial bounds keep the rest, in the coordinates `listWindows`
+  reports) or a `state`; it returns false for an unknown window or one the OS refuses to resize.
+- `capabilities().ui` says whether this works on the machine; `uiHint` (when false) is the fix, and `notes` explain
+  the Chromium/Electron accessibility switches.
+
+**macOS** (`darwin.js`, helper commands `uiTree`, `uiFind`, `uiAction`, `setBounds` in `darwin-helper.js`; `uiTree`
+and `uiFind` are retried after a helper crash like other idempotent commands). The AX C API through JXA, calibrated
+at runtime, with System Events as the fallback; `ANYWHERE_DARWIN_UI=ax|systemEvents` forces one. Accessibility is
+checked before every call (PERMISSION with a Settings hint; System Events paths can also need Automation). Ids are
+`mac:<pid>:<window>:<w|a><path>:<hash>` (FNV-1a of role and name; `a` = the app's menu bar), so they validate
+themselves; bounds are remembered 30 s. The walk is breadth first; unnamed groups are flattened, scrolled-away
+elements and zero-size leaves are left out; the app's open menus are extra roots, and an app without windows shows
+its menu bar. When a Chromium/Electron web area comes back empty, `AXManualAccessibility` (and
+`AXEnhancedUserInterface` for Chromium browsers) is set once per pid and the tree read again. Extras: `engine`
+(`ax`|`systemEvents`), `enabledAccessibility`, `uiAction` returns `resolved: 'path'|'search'` and may return a fresh
+`id`; `focus` is ok:false when the app did not come to the front; `setValue` is ok:false (method `AXValue`) when the
+app did not keep the value. `setWindowBounds` goes through System Events (Automation, like `focusWindow`); maximize
+fills the screen's visible frame and `restore` returns to the frame saved before maximize or fullscreen.
+
+**Windows and WSL** (`win32.js`; host commands `uiinfo`, `uitree`, `uifind`, `uiaction`, `winbounds` in
+`win32-host.ps1`, UI Automation loaded lazily; `uitree`/`uifind`/`uiinfo` are retried once after a host crash).
+Breadth-first over the ControlView with one `GetUpdatedCache` round trip per expanded element (21 cached properties),
+stopping at depth, `maxNodes`, a scan cap or a 3 s budget; ScrollBar and Thumb subtrees are skipped; `compact:false`
+gives the raw tree. Ids are `<hwnd>.<raw child index>…~<tag>` (2-character FNV-1a of role and lowercased name),
+cached in the host 30 s, then re-walked by path; a tag mismatch is STALE_ELEMENT. `uiFind` searches visible pop-ups of
+the same process (open `#32768` menus, drop-downs) first, ranks as above, and carries non-enumerable `truncated`,
+`scanned`, `window` and `warnings` (a Chromium/Electron window that exposes almost nothing is walked again after
+500 ms, then a warning suggests `--force-renderer-accessibility`); `uiTree` may list `popups: [hwnd]`. `press` tries
+Invoke, Toggle, SelectionItem, ExpandCollapse, then the MSAA default action (oleacc `AccessibleObjectFromPoint` at the
+centre, only when the names agree). Every pattern call runs on a worker thread with a 2 s wait (`pending:true` when the
+provider has not returned). Values never come from password fields. Elevated windows throw UIPI_BLOCKED.
+`setWindowBounds` works on the visible frame (DWM extended frame, as `listWindows` reports), compensates the invisible
+resize borders, restores a minimized or maximized window first, re-applies after a per-monitor DPI change, and maps
+`fullscreen` to maximize.
+
+**Linux** (`linux.js` + `atspi-helper.py`). The helper runs as `python3 -I atspi-helper.py` with one JSON request on
+stdin and one answer on stdout (`version`, `roles`, `match`, `probe`, `tree`, `find`, `action`; codes NO_BINDINGS,
+NO_BUS, NO_WINDOW, STALE, BAD_REQUEST). It checks the session bus through Gio before libatspi (which aborts without
+one), matches the top-level window by pid and title (plus bounds and the active state), walks breadth first with
+depth, node and time budgets (6 s by default), never reads password values, and acts through
+`Action.do_action`, `Selection`, `Component.grab_focus` / `scroll_to`, `EditableText.set_text_contents` and
+`Value.set_current_value`. The interpreter is the first with the Atspi typelib among `$ANYWHERE_PYTHON`, `python3`,
+`/usr/bin/python3`, `/usr/bin/python3.N`. Ids are `lx:<listWindows id | @pid.appIndex>:<w|p<k>>:<child path>:<6-hex
+hash>`, re-resolved by path then by a hash search, cached 30 s. On GNOME/KDE Wayland applications do not know screen
+positions: results carry `relativeBounds` and no screenshot point. Chromium/Electron apps join the bus only with
+`ACCESSIBILITY_ENABLED=1` and show page content only with `--force-renderer-accessibility` (`CHROMIUM_A11Y_ENV`,
+`CHROMIUM_A11Y_ARGS`, `CHROMIUM_A11Y_HINT`). `setWindowBounds`: X11 bounds are the client area as `listWindows`
+reports it (frame offset corrected), states through EWMH with wmctrl (xdotool fallback), verified through
+`_NET_WM_STATE`; sway (floating, fullscreen, scratchpad) and Hyprland (setfloating, resize/move window pixel,
+fullscreen modes, `special:minimized`); GNOME/KDE Wayland throw UNSUPPORTED with a hint. `capabilities()` probes the
+helper (cached 30 s) and adds notes (Python version, application count) or `uiHint`
+(`sudo apt install python3-gi gir1.2-atspi-2.0 at-spi2-core`).
+
+**Mock** (`createMockDriver`): `state.ui` maps window ids to trees (`MOCK_UI`: a VS Code window and a Jira-like
+"Your work" page in Chrome); ids are `mock:<window id>:<child path>`; `uiAction` selects tabs and list items, toggles
+check boxes, sets values and appends to `state.uiLog`; `setWindowBounds` moves windows (maximize to the window's
+display, restore to the saved frame). The unsupported driver throws UNSUPPORTED for all four.
 
 ### common.js (OS-agnostic helpers that shell out)
 ```js
@@ -309,6 +450,16 @@ class Computer {
   async cursorPosition() -> { x, y, display }      // shot space
   async screenInfo() -> { displays, lastShot }
   toLogical(display, x, y) -> { x, y }; toShot(display, lx, ly) -> { x, y }
+  async browserTab(opts) -> driver.browserTab(opts)   // in the action queue; opts.beforeInput, then the guard and failsafe, before any key
+  // UI elements (not input actions: uiFind, uiTree)
+  async uiFind(opts) -> Match[]   // driver.uiFind + shot: { x, y, width, height, cx, cy, display } | null, metadata kept
+  async uiTree(opts) -> { window, nodes /* each with shot */, truncated, notes? }
+  // input actions (guard, failsafe, settle delay)
+  async uiClick({ id? | name? | text?, role?, windowId?, exact? })
+     -> { ok, action: 'ui_click', method, id, role, name, windowId?, shot?, pending?, logical?, display?, reason?, warnings? }
+  async uiSetValue({ id? | name? | text? | query?, value, role?, windowId?, exact? })
+     -> { ok, action: 'ui_set_value', method, chars, id, role, name, shot?, warnings? }
+  async uiAction({ id, action, value? })   // any driver.uiAction, guarded; ok:false is returned as is
 }
 ```
 - Mapping: `logical = display.x + shotX * (display.width / shot.width)` (same for y). If
@@ -320,6 +471,103 @@ class Computer {
 - Paste method: save the clipboard, set the text, send primary+v, restore the clipboard after 400 ms.
   `auto` uses paste when text length > `pasteThreshold` or text contains newlines or non-BMP characters.
 - Sleeps `actionDelayMs` after each input action.
+- UI elements: `shot` is the element in the latest-screenshot space of the display holding its centre (null with no
+  size, off every display, or `relativeBounds`), so `click` and `ui_click` agree. `uiClick` uses the accessibility
+  action (`focus` for a text box, else `press`) and clicks the centre with the real mouse only when the driver says
+  the element has no such action (`ok:false`); it never clicks after `pending` / `confirmed:false`. Disabled elements
+  throw DISABLED; several equally good matches throw AMBIGUOUS (listing ids, nothing pressed); nothing found is
+  NOT_FOUND; no position to click is UI_ACTION_FAILED; off screen is OFFSCREEN. Errors meaning the element or window
+  is gone or protected (STALE, STALE_ELEMENT, NOT_FOUND, BAD_ARGS, PERMISSION, UIPI_BLOCKED) are never followed by a
+  click; a query (not an id) that hits STALE/STALE_ELEMENT is looked up once more. `uiSetValue` prefers
+  `setValue`, else focus (or a centre click), primary+A and types (pastes long or multi-line text, deletes for "");
+  without a role it prefers textbox, combobox and slider matches. Before a fallback click or typing, the element's
+  window (when `listWindows` shows it; pop-up menus are left alone) is brought to the front, since the focus action
+  does not raise windows in every toolkit and a covered centre belongs to another window; if it stays behind, the
+  error is FOCUS_FAILED and nothing is sent. Warnings from the driver (also uiFind's
+  non-enumerable `warnings`) are passed on. Ids seen in results are remembered 30 s for the fallback click.
+- F3-SAFE-D1 (`protect`, the MCP server's Computer only): `uiClick`, `uiSetValue` and `uiAction` throw OWN_DIALOG for
+  an element of the Claude Anywhere dialog, known by the window the lookup searched, the window or process its id
+  names (`lx:<window | @pid.n>:…`, `mac:<pid>:<window>:…`, `<hwnd>.…`, `mock:<window>:…`), or else by its centre
+  lying in the dialog's rectangle; the fallback click goes through the same point check as `click`, and the
+  fallback keys through the focus check of `type_text`. `dialogState()` (constructor option; the daemon's
+  `GET /api/mcp/guard` `dialog: {visible, focused}`, from the pages' `POST /api/ui/visibility` reports, which the
+  engine token cannot send) decides where windows cannot be listed (GNOME/KDE Wayland): pointer input is refused
+  while the dialog is on screen, keys while it may have the focus.
+
+### ocr.js (on-device text recognition)
+```js
+async available({ refresh? }) -> { engine: 'vision'|'windows'|'tesseract'|null, hint, engines: [{ engine, ok, note?, languages?, hint? }] }
+async recognize({ png, region?, engine?, lang?, upscale?, pixelScale?, timeoutMs? })
+  -> { engine, width, height, region, lines: [{ text, bounds, confidence, words: [{ text, bounds, confidence }] }], language?, notes? }
+async findText(computer, { text, display?, region?, exact?, limit? })
+  -> [{ text, shot: { x, y, width, height, cx, cy }, confidence, score, match: 'exact'|'contains'|'fuzzy', display, line }]  // .scan non-enumerable
+async scanScreen(computer, opts), async readScreenText(computer, { display?, region? }) -> { engine, display, region, lines: [{ text, shot, confidence }], hint? }
+matchText, normalizeText
+```
+- Engines: **Vision** on macOS (`darwin-ocr.js` under `osascript -l JavaScript`: `VNRecognizeTextRequest`, accurate,
+  language correction, automatic language detection on macOS 13+, word boxes from `boundingBoxForRange`;
+  `parseVisionOutput` flips the bottom-left origin); **Windows.Media.Ocr** on Windows and WSL (`win32-ocr.ps1`, always
+  `powershell.exe` 5.1, never pwsh: WinRT through `System.Runtime.WindowsRuntime`, `TryCreateFromUserProfileLanguages`
+  then any installed recognizer, `-Probe` mode; from WSL the script and image are staged in a private folder in the
+  Windows `%TEMP%` and passed as `wslpath -w` paths); **tesseract** on Linux (and wherever installed): TSV from three
+  parallel passes (`--psm 11`, `6`, `3`, each with `OMP_THREAD_LIMIT=1`) over a grayscale PGM with light-on-dark blocks
+  flipped, plus a `--psm 6` pass over the dark regions stacked as clean inverted crops; small images are upscaled 2x;
+  words merge by confidence and group into lines by position.
+- A working engine is cached 5 minutes, a missing one 10 s; concurrent callers share one probe. No engine:
+  `recognize` returns `{engine: null, lines: [], hint}`, `findText` throws OCR_UNAVAILABLE with the install hint
+  (`sudo apt install tesseract-ocr`, an OCR language on Windows); nothing is installed automatically.
+- `findText` captures the whole display at native resolution through `Computer.screenshot` with a region (which never
+  changes the stored mapping), crops the requested region itself and maps the result to screenshot space.
+  Matching ignores case, width and whitespace; fuzzy matching allows an edit distance of 1 for words of 3–7 letters
+  and 2 for 8+ (at most 3 in all) and never swaps one digit for another.
+- Environment: `ANYWHERE_OCR_ENGINE` (vision|windows|tesseract|none), `ANYWHERE_OCR_LANG`, `ANYWHERE_OCR_PSM`,
+  `ANYWHERE_TESSERACT`.
+
+### apps.js (installed apps)
+```js
+async listApps({ query?, limit?, refresh? }, deps?) -> { platform, total, apps: App[], notes }
+async findApp(name, opts, deps?) -> { app, score, alternatives } | null
+async launch(name, { args?, waitForWindow = true, timeoutMs = 20000, newInstance?, accessibility?, driver?, focus = true, signal? }, deps?)
+  -> { app, launched, alreadyRunning, how, window, focused, timedOut?, waitedMs?, alternatives, notes }
+async quit(name, { force?, driver?, timeoutMs = 8000 }, deps?) -> { app, found, running, how, windowsLeft, notes }
+matchApps, windowMatchesApp, appWindows, launchPlan, catalog, clearCache, parseLnk, parseDesktopFile, parseExecLine, parsePlistXml/readPlist, runPowerShell, windowsFolders
+```
+- Catalog (cached 5 minutes): macOS `*.app` bundles in /Applications, ~/Applications and /System/Applications (names and
+  bundle ids from Info.plist; binary plists through `plutil`); Windows and WSL Start Menu shortcuts (.lnk parsed here)
+  plus `Get-StartApps` for Store apps; Linux `.desktop` files (XDG dirs, flatpak and snap exports; Hidden, NoDisplay,
+  TryExec, OnlyShowIn/NotShowIn). Fuzzy matching knows everyday names ("vs code", "premiere", "terminal").
+- `launch` focuses an app that already has a window unless `newInstance`; otherwise `open -a`, the shortcut or
+  `shell:AppsFolder\<AUMID>`, `gtk-launch` or the Exec line; then waits for a new window (by pid, app or title) and
+  focuses it. `accessibility` adds `--force-renderer-accessibility` for Chromium/Electron apps and, on Linux,
+  `ACCESSIBILITY_ENABLED=1` / `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`.
+- `quit` is polite by default: macOS `NSRunningApplication.terminate` (`forceTerminate` with `force`), Windows UI
+  Automation WindowPattern.Close / CloseMainWindow, then `taskkill` (`/F` only with `force`), Linux `driver.closeWindow`
+  when a driver has it, else `wmctrl -c`, then SIGTERM (SIGKILL only with `force`). It refuses Claude's own ancestor
+  processes (PROTECTED) and never signals shared host processes.
+- Every OS command goes through injectable `deps` (`run, which, launch, openTarget, fs, kill, now, sleep, env, platform,
+  isWSL`); user data reaches PowerShell only as base64 literals (`-EncodedCommand`) and osascript only as argv.
+
+### browsers.js (bookmarks, opening pages, tabs)
+```js
+BROWSER_DEFS, resolveBrowser(query) -> def | null
+async bookmarks({ browser?, query?, folder?, profile?, limit?, prefer? }, deps?) -> { items, total, sources, notes, hints }
+async open({ browser?, url, newTab = true, newWindow?, driver?, computer?, beforeInput?, timeoutMs?, signal? }, deps?)
+async listTabs({ browser?, driver, computer?, cycle?, beforeInput? }, deps?) -> { browser, method, windows: [{ windowId, tabs }], note?, hint? }
+async switchTab({ browser?, match?, index?, driver, computer?, beforeInput? }, deps?) -> { browser, method, tab, window }
+```
+- Bookmarks are read from disk for every profile, the bar first: Chromium family (`Bookmarks` JSON; Chrome, Brave,
+  Edge, Chromium, Vivaldi, Opera, Arc), Firefox (`places.sqlite` through the `sqlite3` CLI on a copy, else the newest
+  `bookmarkbackups/*.jsonlz4`, decoded here), Safari (`Bookmarks.plist`; needs Full Disk Access). Paths honour `HOME`,
+  `XDG_CONFIG_HOME`, `LOCALAPPDATA` and `APPDATA`; WSL reads the Windows profiles under /mnt/c. `folder: 'bar'` means the
+  bookmarks bar, toolbar or favourites.
+- `open` reuses the running browser (a new tab, or `newWindow`; `newTab:false` loads in the current tab through
+  AppleScript on macOS, else the keyboard); `javascript:`, `data:` and `vbscript:` URLs are refused.
+- Tab methods: `applescript` (macOS Chromium browsers and Safari: titles, URLs, the active tab), `uia` (Windows: the
+  tab strip's TabItems), `accessibility` (Linux: the tab strip through AT-SPI `uiFind {role: 'tab'}`, the top-most row of
+  sibling tabs whose selected one is named like the window title; switched with `uiAction` press; no keys, and tabs with
+  the same title stay apart), `keyboard` (with `cycle`: primary+1..8 / primary+9 and Ctrl+PageDown, checking the title
+  after each key, `beforeInput` before every key; a later tab titled like the first one ends the cycle early), `title`
+  (only each window's active tab).
 
 ---
 
@@ -332,6 +580,9 @@ async gatherContext({ driver, projectDir, config }) -> {
   windows: [{ app, title }],                         // ≤ 25, excludes our own "Claude Anywhere" window
   editors: [{ app, workspaceName, path | null, active }],   // VS Code / Cursor / Windsurf / VSCodium / Zed / JetBrains from titles + VS Code storage.json
   browsers: [{ app, title, url | null }],
+  tickets: [{ key, summary, browser, tracker: 'jira'|'linear'|'github'|'gitlab'|'azure', active? }],  // ≤ 8, from tab titles
+  apps: [{ app, windows }],                          // running apps by window count (most first, ≤ 12; our dialog left out)
+  defaultBrowser: { name, id, source: 'launchservices'|'registry'|'mimeapps'|'xdg-settings'|'default' } | null,
   project: { dir, name, git: { branch, remote, dirty } | null, stack: string[] },
   cloud: { gcloud: { account, project } | null, aws: { profile, region } | null, az: { subscription } | null,
            kubectl: { context } | null, docker: { running, accessible? } | null },  // accessible:false = daemon up, socket not readable by the user
@@ -342,6 +593,15 @@ async detectProjects({ driver }) -> [{ dir, name, source: 'vscode'|'recent'|'cwd
 async projectInfo(dir) -> ctx.project
 ```
 Every probe has a 2.5 s timeout and never throws.
+`tickets` come from `parseTicketTitle(title)` (also exported, with `ticketsFromBrowsers`): Jira ("[ABC-1] Summary - Jira",
+"ABC-1: Summary - Jira", "Summary - ABC-1 - Jira", Server "… - Acme JIRA"), Linear, GitHub and GitLab issues, and Azure
+Boards ("AB#1234"); unbracketed keys count only next to a tracker's name. `formatContext` adds a line
+`Tickets (from tab titles): ABC-1 "Summary" (Jira in Brave) [active]`. `read_browser_tab` falls back to the same parser,
+so the tool and the context agree.
+`formatContext` also prints `Running apps (by window count): Code (3), Brave Browser (2), …` and `Default browser: Brave`.
+`readDefaultBrowser(sys?, deps?)` (exported; macOS LaunchServices plist, Windows/WSL the HKCU UrlAssociations choice
+through reg.exe, Linux mimeapps.list then `xdg-settings`; cached 60 s, never throws) and `runningApps(windows, max?)`
+(exported) feed them, and `anywhere computer apps` prints both.
 
 ---
 
@@ -376,13 +636,70 @@ Every probe has a 2.5 s timeout and never throws.
 | `notify_user` | `{message, level?, speak?}` | POST /api/mcp/notify; falls back to OS notification |
 | `ask_user` | `{question, options?, timeoutSec?}` | POST /api/mcp/ask (blocks); an answer → text, a timeout or a cancelled/dismissed question → error result; without a daemon → error "dialog not running" |
 | `permission_prompt` | `{tool_name, input, tool_use_id?}` | POST /api/mcp/permission (blocks) → text JSON `{"behavior":"allow","updatedInput":…}` or `{"behavior":"deny","message":…}`; without a daemon → allow |
+| `read_browser_tab` | `{browser?, includeText?, maxChars? (200..200000, default 20000), windowId?}` | text JSON `{browser, title, url, jira: {key, baseUrl\|null, summary?}\|null, method, note?, hint?, settingsUrl?, windowId, otherWindows?, truncated?, text?}` (text last). `Computer.browserTab` (guard + failsafe before keys); isError when no (matching) browser window. Read-only annotations unless `includeText` |
+| `jira_status` | `{}` | text JSON: `{configured:true, connected:true, baseUrl, email, deployment:'Cloud'\|'Server', user}`, `{configured:true, connected:false, …, error, hint}` or `{configured:false, how, missing?}`; never isError |
+| `jira_get_issue` | `{key}` (ABC-123 or a Jira URL) | Markdown: facts (type, status, priority, assignee, reporter, sprint, points, labels, components, fix versions, parent, dates, link, `**Suggested branch:** \`KEY-slug\``), then Description, Acceptance criteria, Steps to Reproduce…, Subtasks, Linked issues, Attachments, last 10 Comments |
+| `jira_search` | `{jql, max? (1..100, default 20)}` | "N issues match: <jql>" then `- KEY [Status] Summary (Type · Priority · Assignee)` lines |
+| `jira_my_issues` | `{status?}` | open (default) \| todo \| in progress \| done \| all \| a status name; same lines |
+| `jira_transition` | `{key, to}` | by status or transition name, case-insensitive; a miss is isError listing the valid ones |
+| `jira_assign` | `{key, user}` | `me` \| `none` \| email \| accountId \| username \| display name; several matches → isError listing them (use ask_user) |
+| `jira_comment` | `{key, text}` | Markdown, sent as ADF (Cloud) or wiki markup (Server) |
+| `jira_find_user` | `{query}` | display name, email, accountId (Cloud) or username (Server) |
+| `find_repos` | `{query?, limit? (1..50, default 12)}` | text JSON `{query, repos:[{name, path, remote, branch, lastCommit, source: editor\|current\|recent\|workspace\|scan\|home\|query, score?, …}], searched, timedOut?, hint?}`: git repositories (open editors, `workspace.roots`, common code folders, the current project), ranked; read-only, no git process except `git log -1` |
+| `switch_project` | `{dir, task, create?, gitInit?}` | POST /api/mcp/switch-project; the daemon switches when the turn ends, a fresh session there gets `task` with source `handoff` |
+| `batch_actions` | `{actions: [{type, …args}] (1..20), screenshotAfter?}` | step types click, double_click, right_click, move, drag, type, key, scroll, wait (≤ 10 s), focus_window, ui_click, each run as its single tool (`batchStepCall`); every step is validated before any runs; the guard is checked before each step; stops at the first failure and says which steps ran; no final screenshot after PAUSED or FAILSAFE |
+| `ui_find` | `{name?, text?, role?, window?, exact?, limit? (≤ 50, default 10)}` | tools-ui: matches as `- role "name" = "value" at (x, y) on display d [state] · id`, (x, y) in screenshot pixels; driver notes and warnings as `Note:` lines. `window` = id, part of a title or app name; default the focused window, or the frontmost other one while the dialog has focus |
+| `ui_tree` | `{window?, depth? (≤ 20, default 8), maxNodes? (≤ 300, default 200)}` | indented outline with roles, names, values, centres, states (checked, expanded, off screen…) and ids; lists open pop-ups (Windows) |
+| `ui_click` | `{id? \| name? \| text?, role?, window?, exact?, screenshotAfter?}` | `Computer.uiClick`: accessibility press, else a real click at the centre; AMBIGUOUS lists candidate ids |
+| `ui_set_value` | `{value, id? \| name? \| text?, role?, window?, exact?, screenshotAfter?}` | `Computer.uiSetValue`; `value: ""` clears the field (`minLength: 0` lets a required string be empty in the validator) |
+| `find_text` | `{text, display?, region?, exact?, limit?}` | tools-ocr: `1. "For you" center (311, 216), box 290,210 41x11, exact, confidence 0.97`; a miss lists lines with similar words; no engine → isError with the install hint. Read-only |
+| `read_screen_text` | `{display?, region?, maxLines?}` | lines in reading order as `(cx, cy) WxH: text`, at most 40,000 characters. Read-only |
+| `list_apps` | `{query?, limit?}` | tools-desktop: installed apps, `[running]` when a window is open. Read-only |
+| `launch_app` | `{name, args?, waitForWindow? = true, timeoutSec? = 20, newInstance?, accessibility?, screenshotAfter?}` | fuzzy name; focuses an app that already has a window; returns the window (id, title, geometry) |
+| `quit_app` | `{name, force?}` | polite quit; `force` terminates; PROTECTED for Claude's own terminal/editor |
+| `set_window` | `{window, bounds? \| state?, screenshotAfter?}` | states maximize, minimize, restore, fullscreen, left-half, right-half; bounds in `list_windows` coordinates (`driver.setWindowBounds`) |
+| `wait_for` | `{window?, text?, gone?, timeoutSec? (≤ 120, default 15), display?, exact?}` | polls `listWindows`; text through `ocr.findText` within the window's region, else `Computer.uiFind`; a timeout is isError. Read-only |
+| `browser_bookmarks` | `{browser?, query?, folder?, profile?, limit?}` | `folder: "bar"` = bookmarks bar / toolbar / favourites. Read-only |
+| `browser_open` | `{url, browser?, newTab? = true, newWindow?, screenshotAfter?}` | `browser` may also be an executable path |
+| `browser_tabs` | `{browser?, cycle?}` | AppleScript (macOS), UI Automation (Windows), AT-SPI (Linux), else window titles; `cycle` reads every tab with the keyboard |
+| `browser_switch_tab` | `{browser?, match? \| index?, screenshotAfter?}` | `index: -1` = last tab |
+
+**screenshotAfter.** `click`, `mouse_move`, `drag`, `scroll`, `type_text`, `key` and `focus_window` (plus `ui_click`,
+`ui_set_value`, `launch_app`, `set_window`, `browser_open`, `browser_switch_tab` and `batch_actions`) take
+`screenshotAfter: true`: after a 350 ms settle (`SHOT_AFTER_SETTLE_MS`) the result also carries a screenshot of at most
+1024x640 (`SHOT_AFTER_MAX_WIDTH/HEIGHT`) of the display the action happened on (else the window's, else the pointer's),
+which becomes the latest screenshot for later coordinates; the "take a screenshot to verify" advice is dropped from
+the text. Feature modules get it as `ext.screenshotAfter` in two forms: `screenshotAfter(result, args, {display?,
+window?, signal?})` appends the blocks to a non-error result when `args.screenshotAfter` is true, and
+`screenshotAfter({display?, window?, signal?})` returns just the `[image, text]` blocks; `ext.screenshotAfterSchema`
+is the shared property schema. Exports: `TOOL_NAMES` (the 19 contract tools, unchanged), `EXTRA_TOOL_NAMES`
+(`batch_actions`, listed right after them, before the module tools), `TOOL_MODULES`, `BATCH_STEP_TYPES`,
+`BATCH_STEP_TOOL`, `SCREENSHOT_AFTER_TOOLS`, `MAX_BATCH_STEPS = 20`, `MAX_BATCH_WAIT_SEC = 10`, and the helpers
+`batchStepCall`, `batchStepProblem`, `batchStepLabel`, `withoutVerifyHint`.
+The desktop tools (tools-ui, tools-ocr, tools-desktop) that change the desktop call the guard (and the failsafe
+corner) first and post activity afterwards; the reads only post activity. `createDesktopOps(ctx)` in tools-desktop
+is shared with the CLI (`anywhere desktop …`).
+
+Jira tools without a connection (config `jira.*`, else env `JIRA_BASE_URL`/`JIRA_URL`, `JIRA_EMAIL`/`JIRA_USER`,
+`JIRA_API_TOKEN`/`JIRA_TOKEN` and `ATLASSIAN_*` equivalents) return isError with exactly: "Jira isn't connected: run
+\`anywhere jira setup\`, or add it in Settings → Jira, or read the ticket from the browser with read_browser_tab."
+Writes (`jira_transition`, `jira_assign`, `jira_comment`, `switch_project`) call the guard first and post activity.
+The client (`src/integrations/jira.js`, `JiraClient({baseUrl, email, apiToken, deployment?, timeoutMs=15000})`) uses
+Basic email:token with REST v3 on Cloud and a Bearer personal access token with REST v2 on Server/Data Center (on a
+401 it retries once with Basic username:password when a username is set), follows redirects only within the site, honours
+`HTTPS_PROXY`/`NO_PROXY`, and never puts the token in an error. `server.js` `buildInstructions()` tells Claude when to
+use `read_browser_tab`, the Jira tools (or an Atlassian MCP server, or the page) and `find_repos`, and, for the
+engine role, `switch_project`.
 
 Every input-action tool posts fire-and-forget `POST /api/mcp/activity` `{tool, summary, ok, error?}` and
 `screenshot` also posts `{tool:'screenshot', image: <base64 png>, width, height}`. Before each input action the
 server calls `GET /api/mcp/guard` (200 ms timeout; unreachable daemon → allowed).
 
 Environment: `ANYWHERE_DAEMON_URL`, `ANYWHERE_TOKEN`, `ANYWHERE_ROLE` (`engine` when spawned by the daemon's
-engine, else `interactive`).
+engine, else `interactive`). The daemon gives its engines' MCP servers a separate engine token, which the server
+refuses on `/api/approval`, `/api/answer`, `POST /api/config`, `/api/mode` and `/api/shutdown` (403
+`ENGINE_FORBIDDEN`); the plugin's MCP server in the user's own Claude Code uses the daemon token from
+`daemon.json`.
 
 While a blocking call (`ask_user`, `permission_prompt`) waits, the server sends
 `notifications/progress` (`{progressToken: params._meta.progressToken, progress: n, message}`) every 15 s when the
@@ -432,7 +749,7 @@ Bind `127.0.0.1` only. Security on **every** request:
 | GET `/api/state` | | snapshot |
 | POST `/api/command` | `{text, attachScreenshot?, images?:[{mediaType,data}], source?:'text'|'voice'|'cli'|'skill'}` | `{ok, id, mode, bridge:{listening}}` |
 | POST `/api/interrupt` | | `{ok}` |
-| POST `/api/approval` | `{id, decision:'allow'|'allow_session'|'deny', message?, via?:'click'|'key'|'typed'|'voice'}` | `{ok}`; 409 `{code:'CRITICAL_NEEDS_CLICK'}` for an allow of a critical card sent by voice or key (the card stays). `via` is how the user answered: the dialog sends click or key (Enter/Esc on the card) or voice, the TUI typed or voice; other values are ignored, and older clients send none |
+| POST `/api/approval` | `{id, decision:'allow'|'allow_session'|'deny', message?, via?:'click'|'key'|'typed'|'voice'}` | `{ok}`; 403 `{code:'CLICK_NEEDS_DIALOG'}` for `via:'click'` without the dialog's `X-Anywhere-UI` credential and origin; 409 `{code:'CRITICAL_NEEDS_CLICK'}` for an allow of a critical card that is not such a click (or the TUI's typed allow on a card that is not click-only): by voice, key or without `via` (the card stays). `via` is how the user answered: the dialog sends click or key (Enter/Esc on the card) or voice, the TUI typed or voice; other values are ignored, and older clients send none |
 | POST `/api/answer` | `{id, text}` | `{ok}` |
 | POST `/api/session/new` | | `{ok, sessionId}` |
 | POST `/api/project` | `{dir, force?}` | `{ok, project}` (restarts engine in the new cwd); 409 while a task runs unless `force:true`, which stops it first. Bridge commands that only wait for a terminal get their own 409 text ("A command is waiting for a Claude Code terminal…"); forced, they are dropped (`commands_cancelled` reason `reset`) |
@@ -441,7 +758,17 @@ Bind `127.0.0.1` only. Security on **every** request:
 | POST `/api/mode` | `{mode, force?}` | `{ok, mode, moved?}`; 409 while a task runs unless `force:true`. Bridge commands that only wait for a terminal (none listens, none took a command, no card is open) do not make it busy: a switch to companion mode sends them to the dialog's own session under their ids (`moved`: how many) |
 | POST `/api/stt` | raw `audio/wav` (also webm/ogg/mp4 pass-through) `?language=` | `{text, provider}` |
 | POST `/api/tts` | `{text}` | `{ok, provider}` |
-| POST `/api/tts/stop` | | `{ok}` |
+| POST `/api/tts/stop` | | `{ok}`: stops daemon speech and playback, and drops the announcements still queued (barge-in) |
+| GET `/api/tts/audio?id=` | | `audio/wav` bytes of a `/api/tts/synthesize` id (32 hex) or a chime (`chime-done\|info\|permission\|question\|error`); 400 malformed id, 404 unknown (gone from the cache of the last 60); HEAD supported |
+| POST `/api/tts/synthesize` | `{text, voice?, rate?}` | `{id, mime:'audio/wav', engine:'piper', durationMs, cached}`; 503 + hint when Piper is not installed |
+| GET `/api/voice/status` | | `{engine, ttsEngine, piper:{installed, binary, binaryKind, voice, installedVoices, installing, catalog:[{id, name, language, gender, quality, sizeMb, sampleText, description, installed}]}, os:{provider, hint?}, player:{available, players, hint?}, announcer}` |
+| POST `/api/voice/install` | `{voice?, force?}` | `{ok, started:true, voice}` (or `{ok, started:false, running:true, voice}` while one runs); progress as SSE `voice_install`; on success saves `voice.piperVoice` and refreshes the snapshot |
+| POST `/api/voice/use` | `{voice}` | `{ok, voice}`; 400 bad id, 409 + hint when that voice is not installed |
+| POST `/api/voice/test` | `{text?}` | `{ok, delivered:'dialog'\|'local'\|'none'\|'skipped', engine, text, error?}`: a sample through the announce path (ignores the announce toggles) |
+| POST `/api/voice/remove` | `{voice}` | `{ok, removed}` |
+| GET `/api/jira/status[?check=1]` | | `{configured, baseUrl, email, tokenSet, missing:[…], source:{baseUrl, email, apiToken: 'config'\|'env:NAME'\|null}, urlError?, deployment:'Cloud'\|'Server'\|null}`; `check=1` adds `{connected, user?, error?, hint?}`. Never returns the token |
+| POST `/api/jira/test` | `{baseUrl?, email?, apiToken?}` | 200 `{ok:true, user:{displayName, email, accountId}, deployment, baseUrl, serverTitle?}`; a Jira failure 422 `{ok:false, error, code, hint?, jiraStatus?}`; bad input 400 `{error, hint?, code:'JIRA_NOT_CONFIGURED'\|'JIRA_BAD_URL'\|'JIRA_NO_TOKEN'}`. Unsent or empty fields come from the saved settings; the saved token goes only to the saved site |
+| POST `/api/mcp/switch-project` | `{dir, task, create?, gitInit?, role?}` | from the dialog's session during its turn: `{ok, scheduled:true, dir, replaced?, created?, initialized?}` (switches when the turn ends); from the user's terminal (`role:'interactive'`) to an idle dialog: `{ok, scheduled:true, immediate:true, dir}`; already the project: `{ok, scheduled:false, same:true, dir}`. 400 bad input / relative path / missing folder without `create`; 409 `BRIDGE_MODE`, `BUSY` or `NO_TURN` (checked before any mkdir); 413 task too long; 422 git init failed. On WSL `C:\x` becomes `/mnt/c/x` |
 | GET `/api/context` | | gatherContext JSON |
 | POST `/api/show` | | `{ok, host}` |
 | POST `/api/shutdown` | | `{ok}` then exit |
@@ -452,17 +779,18 @@ Bind `127.0.0.1` only. Security on **every** request:
 | GET `/api/mcp/guard` | | `{allowed, reason?}`; bridge mode refuses the screen actions of a command the user stopped until the terminal listens again (at most 10 min) |
 | POST `/api/bridge/listen` | `{timeoutSec ≤ 590}` | `{command:{id,text,images:[path],context,source}}` or `{timeout:true}` or `{stop:true}` |
 | POST `/api/bridge/reply` | `{text, final?, speak?}` | `{ok}`; 409 (with a hint) when the dialog is in companion mode: `anywhere reply` then prints STOP and exits 3. 409 `{code:'COMMAND_STOPPED'}` after Stop cancelled the terminal's command, until its next listen: the reply is not shown, and `anywhere reply` prints STOPPED and exits 5 |
-| POST `/api/ui/visibility` | `{page, visible, focused?}` | `{ok}`: a dialog page (its own id per page load) reports whether it can be seen, after a `show` event and on `visibilitychange`; `UiHost.show()` opens a window when every page reports hidden |
+| POST `/api/ui/visibility` | `{page, visible, focused?}` | `{ok}`: a dialog page (its own id per page load) reports whether it can be seen when its event stream opens, after a `show` event and on `visibilitychange`; `UiHost.show()` opens a window when every page reports hidden, and the announcer plays announcements itself then |
 
 ### SSE events (server → UI): `event: <type>` + `data: <json>`
-- `snapshot` `{version, mode, status, statusDetail, project:{dir,name,git}, session:{id, model, costUsd, turns}, messages:[…], pending:{approvals:[…], questions:[…]}, config:<public>, voice:{serverStt, sttProvider, serverTts, ttsProvider}, bridge:{listening, queued}, platform:{platform, displayServer, driver}, screenshot:{dataUrl,width,height,ts}|null}`
+- `snapshot` `{version, mode, status, statusDetail, project:{dir,name,git}, session:{id, model, costUsd, turns}, messages:[…], pending:{approvals:[…], questions:[…]}, config:<public>, voice:{serverStt, sttProvider, serverTts, ttsProvider, engine:'piper'|'os'|'browser'|null, ttsEngine, piper:{installed, voice}, announcer, sttHint?, ttsHint?}, bridge:{listening, queued}, platform:{platform, displayServer, driver}, screenshot:{dataUrl,width,height,ts}|null}`
 - `status` `{status:'idle'|'starting'|'thinking'|'acting'|'waiting_approval'|'waiting_answer'|'stopping'|'queued'|'error'|'offline', detail?}`
   (`queued`: bridge commands wait for a terminal to run `/anywhere here`; Stop drops them)
 - `message` (transcript item; see below), `delta` `{id, text}` (append to an assistant item)
 - `tool_update` `{toolUseId, status:'ok'|'error', output?, image?}`
 - `approval_request` `{id, toolName, displayName, summary, input, risk, reason, sessionRule, ts}` · `approval_resolved` `{id, decision, by?, via?, message?}`
 - `question` `{id, question, options, ts}` · `question_resolved` `{id, answer}`
-- `notify` `{text, level, speak}` · `result` `{text, costUsd, totalCostUsd, durationMs, isError, sessionId, numTurns, commandIds, interrupted?}`
+- `notify` `{text, level, speak}` · `result` `{text, costUsd, totalCostUsd, durationMs, isError, sessionId, numTurns, commandIds, interrupted?, handoff?:{dir}}`
+  (`handoff`: switch_project moves the work on to `dir`; a `project` event and a new user item with source `handoff` follow)
   (`commandIds`: the commands this result answers, so a command queued during a turn waits for the next result;
   `interrupted` marks a turn the user stopped; `engineInitiated:true` with `commandIds: []` marks a turn Claude Code
   started by itself after a background task finished)
@@ -472,10 +800,15 @@ Bind `127.0.0.1` only. Security on **every** request:
   stopped and interrupted)
 - `screenshot` `{dataUrl, width, height, ts}` · `project` `{dir, name, git}` · `session` `{id, model}`
 - `config` `<public config>` · `mode` `{mode}` · `bridge` `{listening}` · `show` `{}` · `error` `{message}`
+- `announce` `{id:'an_<uuid>', kind:'done'|'permission'|'question'|'error'|'info', text, audio:null|{id, mime:'audio/wav', durationMs}, chime, ts}`:
+  sent only while a dialog page (`?client=ui`) is connected and visible; the page plays it (see §8). `audio.id` is for
+  `GET /api/tts/audio`; `chime` is false for spoken notifications and hand-offs, else `voice.chime !== false`
+- `voice_install` `{stage:'binary'|'voice'|'verify'|'done'|'error', percent (overall 0-100, never decreasing), stagePercent:number|null, message, voice}`;
+  the last event is `done` or `error` (its message includes the fix)
 
 Transcript items (`message` event and `snapshot.messages`):
 ```js
-{ id, role: 'user', text, source, ts, images }                                  // images = count
+{ id, role: 'user', text, source, ts, images }                                  // images = count; source text|voice|cli|skill|handoff
 { id, role: 'assistant', text, ts, streaming: bool }
 { id, role: 'tool', toolUseId, name, displayName, summary, input, status: 'running'|'ok'|'error', output, image, parentToolUseId, ts }
 { id, role: 'system', text, level: 'info'|'success'|'warning'|'error', ts }
@@ -543,8 +876,10 @@ class SessionManager extends EventEmitter {
   async submit({ text, images, attachScreenshot, source }) -> { id }
   async interrupt()
   async newSession()
-  async setProject(dir, { force })   // 409 while busy (a turn, queued follow-ups, approvals, questions, busy bridge) unless force
+  async setProject(dir, { force, fresh?, keepTranscript?, note? })   // 409 while busy (a turn, queued follow-ups, approvals, questions, busy bridge) unless force
   setMode(mode, { force })
+  handoffCheck({ dir, from }) -> { same, dir }       // throws 503 / 400 / 409 BRIDGE_MODE | BUSY | NO_TURN
+  handoff({ dir, task, from: 'engine'|'interactive' }) -> { scheduled, dir, same?, immediate?, replaced? }
   async shutdown()
 }
 ```
@@ -575,13 +910,26 @@ class SessionManager extends EventEmitter {
 - Settings: only engine settings (model, effort, Chrome, extra args… see `signature()`) restart the engine, with the
   next command (the conversation resumes); while Claude Code runs background tasks the restart waits, with a notice.
   Prompt-only settings (approval mode, spoken replies…) reach Claude as a `<settings>` block with the next message.
-- Approval and question cards are announced with their content: `createAttentionHandler()` in main.js reopens the
-  dialog when no dialog page or TUI is connected (`dialogCount()` is 0), posts an OS notification (both throttled),
-  and, with spoken replies on, says `attentionSpeech(info)` aloud: the action and its summary, or the question and
-  its options, with secret-looking values left out. A card answered before its turn to be spoken is skipped.
+- Approval and question cards: `createAttentionHandler()` in main.js reopens the dialog when no dialog page or TUI is
+  connected (`dialogCount()` is 0) and posts an OS notification (both throttled). Speaking them is the announcer's job
+  (`announcer.js`, below); the handler's own `attentionSpeech()` is used only when the announcer could not start.
 - Bridge mode, mode switch: commands that only wait for a terminal move to the companion session (same ids, their
   context and images); a terminal's command in progress is announced `interrupted`.
 - The transcript keeps at most 12 screenshots and 8 MB of image data; older images are dropped from the items.
+- Hand-off (`switch_project`, `POST /api/mcp/switch-project`): from the dialog's own session it is scheduled for the
+  end of the current turn; that turn's `result` carries `handoff:{dir}`, then `setProject(dir, {force, fresh: true,
+  keepTranscript: true, note})` starts a new conversation there (the transcript stays on screen) and `submit({text:
+  task, source:'handoff'})` sends the task. A Stop, an error result, a new session, a mode or project switch, or the
+  engine exiting cancels it (with a transcript line); commands the user sent during the turn go first, with a note to
+  Claude that the switch did not happen. From the user's terminal (`role:'interactive'`) an idle dialog switches at once.
+- `READ_ONLY_TOOLS` (`--allowedTools`): screenshot, cursor_position, screen_info, list_windows, get_desktop_context,
+  wait, notify_user, ask_user, clipboard_get, find_repos, jira_status, jira_get_issue, jira_search, jira_my_issues,
+  jira_find_user, and the desktop assistant's reads ui_find, ui_tree, find_text, read_screen_text, list_apps,
+  browser_bookmarks, wait_for. `read_browser_tab` and `browser_tabs` are not (with `includeText` / `cycle` they send
+  keystrokes), so the broker judges each call. Every pre-approved tool is low risk in permissions.js.
+- Transcript names of the desktop tools match `permissions.displayName` (ui_click → "Click UI element", set_window →
+  "Arrange window", batch_actions → "Run several actions"…); their summaries are short (`"For you" (tab) in Brave`,
+  `3 steps: click, type, key`), and a secret-looking `ui_set_value` value shows only its length.
 - main.js: `run/daemon.lock` is the start lock. Ports are tried in this order: the one recorded in
   `run/last-port.json` for the configured port, the configured port, its 19 neighbours in an order rotated by a hash of
   the state dir, then a random free port. A busy port means ALREADY_RUNNING (exit 0; `anywhere start` keeps waiting for
@@ -624,6 +972,21 @@ PowerShell, cmd/osascript/wscript/cscript/mshta, and terminal emulators given a 
 driver for the focused window): command-shaped text keeps its full verdict in any app (focus never lowers it);
 only known non-terminal apps (chat, mail, office, notes) relax a plain sentence to medium; in a terminal, with a
 Return, or in an unknown app the text gets full scrutiny.
+Ticket tools: `read_browser_tab` is low without `includeText`, medium with it (it focuses the browser and uses the
+keyboard and clipboard); `find_repos` and the Jira reads are low; `jira_transition`, `jira_assign` and `jira_comment`
+are medium (a comment with a secret-looking value is high and gets no session rule); `switch_project` is medium, high
+for a system, credential or root folder or for creating a folder outside home, and never gets a session rule. Tools
+of a Jira/Atlassian/Confluence MCP server: reads low, writes medium, deletes and "destructive" tiers high.
+Desktop-assistant tools (`desktopToolVerdict`, `DESKTOP_TOOLS`): the reads (ui_find, ui_tree, find_text,
+read_screen_text, list_apps, browser_bookmarks, browser_tabs, wait_for) are low, except `browser_tabs {cycle: true}`
+(keyboard) which is medium. `ui_click`, `set_window` and `browser_switch_tab` are medium. `ui_set_value` is medium, high
+for a secret-looking value, and gets `type_text`'s scrutiny of the text. `launch_app` is judged like `open {kind:'app',
+args}` (medium for an app, at least high with a shell or interpreter command). `quit_app` is medium, high with `force`,
+for a system process (Finder, explorer, dwm, gnome-shell…) or Claude Anywhere / Claude Code itself. `browser_open` is
+medium for web pages, `about:` and local files, high for other schemes and executables. `batch_actions` classifies
+each step as its single tool (`batchStepCall`, which must agree with the one in tools.js) and takes the riskiest; its
+card lists every step. A high desktop-tool call is `sensitive` (its own card), and `sessionRuleFor` returns null for it
+and for every `batch_actions` (an "Always" for one batch would approve any later batch).
 
 ### questions.js · bridge.js
 ```js
@@ -641,23 +1004,90 @@ zoom with `region`); ignoring the "Claude Anywhere" window; safety (`ask_user` b
 or financial actions; never type passwords, 2FA codes, or payment data, so the user does those; no CAPTCHA solving);
 progress (`notify_user` for milestones); voice-friendly final answers (≤ 3 sentences, no markdown tables); "this repo"
 means the project dir or the active editor workspace from `<desktop_context>`; and a deployment playbook (detect the
-stack, Dockerfile or buildpacks, Cloud Run / App Engine / GKE, enable APIs, `gcloud run deploy --source`, verify the URL).
-Platform specifics: key names (`primary` = Cmd on macOS, Ctrl elsewhere), shells.
+stack, Dockerfile or buildpacks, Cloud Run / App Engine / GKE, enable APIs, `gcloud run deploy --source`, verify the URL);
+and a "Work on a ticket" playbook (find the ticket from the context's Tickets line or `read_browser_tab`, read it with
+`jira_get_issue` / an Atlassian MCP / the page, summarize with a plan, one `ask_user` for where to work from
+`find_repos`, one for the transition and assignment, `switch_project` when the repo is elsewhere, then branch
+`KEY-123-slug`, implement, test, commit, ask before pushing, comment on the ticket).
+A "Desktop assistant (any app)" section says how to target elements (ui_find / ui_click / ui_set_value, then
+find_text, then pixels), to save turns (screenshotAfter, batch_actions), to open apps (launch_app, wait_for,
+focus_window, set_window), bookmarks and tabs (browser_bookmarks, browser_open, browser_tabs, browser_switch_tab), and
+covers Jira "For you", Figma (the Figma MCP server first), messaging (send only dictated or approved text) and video
+(ffmpeg first, new files only). Platform specifics: key names (`primary` = Cmd on macOS, Ctrl elsewhere), shells. At
+most 18,000 characters (`MAX_CHARS`).
 
 ### voice.js
 ```js
 class VoiceService {
-  constructor({ config })
-  async capabilities() -> { serverStt: bool, sttProvider, serverTts: bool, ttsProvider }
+  constructor({ config, piper?, player?, ttsCache?, … })
+  async capabilities() -> { serverStt, sttProvider, serverTts, ttsProvider /* 'piper' when Piper speaks */,
+                            engine: 'piper'|'os'|'browser'|null, ttsEngine, piper: { installed, voice }, sttHint?, ttsHint? }
   async transcribe(buffer, { contentType = 'audio/wav', language }) -> { text, provider }
-  async speak(text, { rate, voice }) -> { ok, provider }
-  stop()
+  async speak(text, { rate, voice }) -> { ok, provider }   // Piper (synthesize + play) when the engine is piper, else the OS voice
+  stop()                                                   // stops speech and playback; tells onStop() listeners
+  piper                                                    // PiperManager
+  player() -> AudioPlayer
+  ttsEngineSetting() -> 'auto'|'piper'|'browser'|'os'      // unknown values count as auto
+  piperVoiceId() -> string
+  async engineInfo() -> { setting, engine, piper, os: { provider, hint? } }
+  invalidate()                                             // forget cached capabilities
+  async voiceStatus() -> GET /api/voice/status body (without announcer)
+  async installPiper({ voice?, force?, onProgress?, signal? })
+  async synthesize(text, { voice?, rate? }) -> { id, path, mime: 'audio/wav', engine: 'piper', durationMs, cached, voice }
+  audioFile(id) -> path | null
+  playFile(file, opts) -> Promise<{ ok, player, stopped? }>
+  onStop(fn) -> unsubscribe
 }
 ```
+`auto` uses Piper when it is installed, else the OS voice; `piper` only Piper (503 with the install command until it is
+installed); `os` the OS voice; `browser` leaves speaking to the dialog. A new utterance replaces the old one without
+notifying `onStop` listeners. Synthesized WAVs are cached in `runDir()/tts-cache` (the last 60; the same voice, speed and
+text give the same id).
 STT: OpenAI-compatible `POST {base}/audio/transcriptions` (multipart: `file`, `model`, `language`) using
 `voice.sttApiKey` | `ANYWHERE_STT_API_KEY` | `GROQ_API_KEY` (base `https://api.groq.com/openai/v1`, model
 `whisper-large-v3-turbo`) | `OPENAI_API_KEY` (base `https://api.openai.com/v1`, model `gpt-4o-mini-transcribe`).
 Then whisper.cpp (`whisper-cli` | `whisper-cpp` | `main` + model file; needs 16 kHz WAV).
+
+### piper.js · chime.js · announcer.js · src/os/audio.js
+```js
+class PiperManager {   // free, offline neural TTS (MIT), installed on request into stateDir()/voice
+  constructor({ root?, venvDir?, env?, platformInfo?, which?, runner?, releaseBase?, voicesBase?, legacyBase?, ca?, arch?, pipSpec? })
+  findBinary({ refresh }) -> { bin, kind: 'env'|'bundled'|'venv'|'path' } | null
+  async status(voice) -> { installed, binary, binaryKind, voice, installedVoices, … }
+  async install({ voice, force, onProgress, signal })      // release binary (Linux x64/arm64/armv7, Windows x64), else pip piper-tts in a private venv (macOS)
+  async synthesize(text, { voice, outFile, lengthScale, speaker, timeoutMs, signal }) -> { path, durationMs, sampleRate, voice, binaryKind, ms }
+  removeVoice(id), voiceInstalled(id), installedVoices(), voicePaths(id)
+}
+// also: TtsCache, CATALOG, DEFAULT_VOICE, parseVoiceId, validVoiceName, voiceUrls, releaseAsset, wavInfo, wavFileInfo,
+// downloadFile(url, dest, {onProgress, minBytes, maxBytes, signal, timeoutMs, ca, env, resume}), httpGet, proxyFor
+// env: ANYWHERE_PIPER_PATH, ANYWHERE_PYTHON, ANYWHERE_PIPER_RELEASE_BASE / _VOICES_BASE / _LEGACY_BASE, ANYWHERE_PIPER_PIP_SPEC
+
+chimeWav(kind) -> Buffer; chimeFile(kind, { dir? }) -> runDir()/chimes/chime-<kind>.wav; CHIME_KINDS   // two soft notes per kind
+
+class Announcer {
+  constructor({ config, hub, voice, findCard?, secretLike?, chimeFile?, now?, random?, minQuietTurnMs = 4000 })
+  start(); stop(); noteVisibility({ page, visible }); dialogVisible() -> bool
+  handle(type, data) -> queued item | null; async deliver(item); async test(text?); cancelPending()
+}
+// composers: composeDone, composeError, composePermission, composeQuestion, humanizeAction, humanizeCommand, firstSentences
+
+class AudioPlayer { constructor({ platformInfo?, which?, runner?, env?, isFile? }); async playFile(file, { device?, timeoutMs? }) -> { ok, player, stopped? }; stop() -> bool; isPlaying(); async status() -> { available, players, hint? } }
+// errors carry .code ENOENT | NO_PLAYER | PLAY_FAILED and .hint; also buildPlayCommand, soundPlayerScript, mntToWindowsPath
+```
+The **announcer** decides what is said aloud and when, in one place. It listens to the hub's `event` and `clients`
+emits: `result` → `done` ("All done." + the first sentence or two; not for a stopped turn, a `speak:false` bridge reply,
+or a quick turn under 4 s that used no tools; a result with `handoff` → info "Switching to <folder> to continue."),
+`approval_request` → `permission`, `question` → `question`, an error result, `status` error or `error` event → `error`,
+and `notify` with `speak:true` → info (no chime; only `voice.tts = off` mutes it). It honours `voice.speakResponses`,
+`voice.tts`, `voice.announce.*` and `voice.chime`, masks secrets, says each event once, plays one at a time (queue of 4;
+cards are kept over older items), and skips a card answered meanwhile. Delivery: when a dialog page is connected and
+visible (pages report through `/api/ui/visibility`; a page that has not reported counts as visible) it broadcasts
+`announce`, with a Piper WAV id when the engine is piper; otherwise it plays the chime and speaks through the OS
+(Piper WAV or OS voice). With `ttsEngine` `browser` it stays silent when no page is visible; with `os` the OS always
+speaks. `voice.stop()` (barge-in, Stop, `POST /api/tts/stop`) drops what is queued. main.js wires it: hub listeners,
+`uihost.noteVisibility` also feeds it, `server.deps.announcer` / `server.deps.refreshVoice`, the attention handler stops
+speaking cards, `session.setVoiceInfo({…caps, announcer:true})` (set before the first probe, so a dialog never speaks
+results, cards or notifications itself), and `POST /api/mcp/notify` leaves `speak:true` to it.
 
 ### uihost.js
 ```js
@@ -713,11 +1143,27 @@ header on fetch and `?token=` on EventSource. Features:
   wait…", "yes, but…", "always ask me first") is not applied and the card stays. With a pending question, the
   utterance answers it: options match whole words, and hedged or ambiguous answers are sent as said. The wake word
   must open the utterance (after at most one filler such as "okay"; later only the exact phrase); while Claude
-  speaks and ~0.7 s after, only the exact wake phrase (or "stop" with no wake word set) gets through. TTS: `speechSynthesis` or `/api/tts`; speak
-  `result` text (via stripMarkdown, ≤ 600 chars) and `notify` with `speak:true`; barge-in cancels speech. With
-  several dialog windows open, only the most recently focused or shown one speaks and listens hands-free
-  (BroadcastChannel `claude-anywhere`).
-- Settings drawer: permission mode, voice options, engine model and Claude in Chrome, context options, UI theme and always-on-top.
+  speaks and ~0.7 s after, only the exact wake phrase (or "stop" with no wake word set) gets through.
+  TTS: `speechSynthesis` or `/api/tts`. While `snapshot.voice.announcer` is true (always with a current daemon)
+  the page never speaks `result` events, cards or `notify` messages by itself: it plays the daemon's `announce` events. Only without the announcer (an older daemon) does it speak `result` text
+  (via stripMarkdown, ≤ 600 chars) and `notify` with `speak:true`. With several dialog windows open, only the most
+  recently focused or shown one speaks and listens hands-free (BroadcastChannel `claude-anywhere`).
+- Announcements (`voice.announce(item)`): only the speaker window plays them. An optional WebAudio chime (two notes per
+  kind, `CHIME_NOTES`) when the event's `chime` is true and `voice.chime !== false`; then `GET /api/tts/audio?id=` with
+  the Bearer header → Blob → `URL.createObjectURL` → `new Audio()` (revoked after); without audio, or when it fails,
+  `speechSynthesis` with the chosen voice, else the most natural one (`rankVoices`/`pickNaturalVoice`; the picker
+  defaults to "Most natural available"), else `POST /api/tts`. Queue of 8; permission and question go first; entries
+  older than 120 s are dropped; an entry waits up to 20 s behind a read-aloud the user started; ids are de-duplicated;
+  `voice.tts === 'off'` ignores them. Answering a card drops its announcement (`dropAnnouncements('permission' |
+  'question')`). Barge-in (mic, typing, Esc, Stop) cancels browser speech and announcements and POSTs `/api/tts/stop`
+  (daemon playback and its queue). Read aloud uses Piper (`POST /api/tts/synthesize`, then the WAV) when
+  `snapshot.voice.engine === 'piper'`, else the browser voice.
+- Settings drawer, in tabs **General | Voice | Jira & repos | Advanced**: permission mode, mode, theme and
+  always-on-top; voice input and spoken replies (engine `voice.ttsEngine`, the Piper voice picker with Install and a
+  progress bar from `voice_install`, Test, `voice.announce.*` toggles, chime); Jira (`jira.baseUrl` normalized to
+  `https://host[/context]`, email, the token as a password field showing "•••• set" and never sent empty, Test
+  connection → `POST /api/jira/test`, status from `GET /api/jira/status`); workspace roots (`workspace.roots`, the whole
+  list, with suggestions from `GET /api/projects`); engine model, Claude in Chrome, context and privacy options.
   Save sends only the fields changed in the drawer; a config change made elsewhere while it is open refreshes the
   untouched fields. A project or mode switch the daemon refuses because a task is running (409) asks for
   confirmation, then retries with `force`.
@@ -729,10 +1175,15 @@ header on fetch and `?token=` on EventSource. Features:
   Ctrl/Cmd+Alt+N starts a new session (Ctrl/Cmd+Shift+N also works in the app window and Electron; ordinary browser
   tabs keep it for a private window). On macOS these shortcuts use Cmd only, so Ctrl+K keeps its kill-line meaning
   in text fields.
-- Credentials: `?token=` (Electron, or a URL the user opened) or `?launch=<code>` (browsers the daemon starts) is read
-  once, the launch code is traded through `POST /api/launch` before the first API call, the token is kept in
-  sessionStorage, and both are removed from the address bar. A failed trade (used or expired code) falls back to the
-  stored token, so reloads keep working.
+- Credentials: `?launch=<code>` (every window the daemon starts, Electron included) or `?token=` (a URL the user
+  opened) is read once, the launch code is traded through `POST /api/launch` before the first API call, the token is
+  kept in sessionStorage, and both are removed from the address bar. A failed trade (used or expired code) falls back
+  to the stored token, so reloads keep working. A code minted for a dialog window also returns `ui`, the dialog's
+  own credential (sessionStorage `anywhere.ui`, sent as `X-Anywhere-UI`); only requests with it, from the daemon's
+  origin, may answer a card with `via: 'click'`, and a page without it shows a critical card's Allow disabled.
+- Transcript: a user item with source `handoff` (the task `switch_project` handed to the new session) is labelled
+  "Handed over by Claude" and collapsed to its first line when long; ticket tools show a ticket icon, `find_repos` and
+  `switch_project` a folder.
 - Reconnect banner; dark and light themes (`prefers-color-scheme` + manual); aria-live transcript.
 - `window.anywhereFocusInput()` is exposed for the Electron hotkey.
 
@@ -741,7 +1192,8 @@ header on fetch and `?token=` on EventSource. Features:
 through the environment because command lines are readable by every local user, and browsers get single-use launch
 codes instead, see server.js; `--url <url>` still works for manual runs): one
 `BrowserWindow` titled "Claude Anywhere" (440×720, positioned right, `alwaysOnTop`, `setContentProtection(hideFromScreenshots)`),
-mic permission granted only for the daemon origin, `globalShortcut` hotkey toggles show/focus, and the window is
+mic permission granted only for the daemon origin, `autoplay-policy=no-user-gesture-required` (announcements play
+before the first click; the app windows get the same flag), `globalShortcut` hotkey toggles show/focus, and the window is
 hidden on close (tray menu with Show and Quit). `preload.js` exposes `window.anywhereShell = { isElectron: true, platform, hide(), setAlwaysOnTop(bool) }`.
 
 ## 10. CLI (`bin/anywhere.js`)
@@ -758,10 +1210,20 @@ anywhere computer <op> …                     # screenshot [--display N] [--out
                                              # | move X Y | drag X1 Y1 X2 Y2 | scroll DIR [AMOUNT] [--at X Y]
                                              # | type TEXT | key COMBO | windows | focus QUERY | open TARGET
                                              # | clipboard get|set [TEXT] | cursor | screens | context
+                                             # | ui-find NAME [--role R] [--contains T] [--window W] [--exact] [--limit N]
+                                             # | ocr [TEXT] [--display N] [--region X,Y,W,H] [--exact] | apps [QUERY]
+anywhere desktop apps [QUERY] | launch NAME [--no-wait] [--timeout SEC] [--new] [--accessibility] [-- ARGS]
+             | quit NAME [--force] | bookmarks [QUERY] [--browser B] [--folder F] [--profile P] [--limit N]
+             | open-url URL [--browser B] [--new-window] [--same-tab] | tabs [--browser B] [--cycle]
+             | switch-tab TEXT|--index N [--browser B] | window QUERY --state S|--bounds X,Y,W,H
+             | wait [--window W] [--text T] [--gone] [--timeout SEC] [--display N] [--exact]   [--json]
 anywhere doctor [--json]
 anywhere install [--electron] [--no-mcp] [--hotkey [--hotkey-key COMBO]] [--no-permissions] | uninstall
 anywhere show [--launcher]                    # --launcher (macOS applet): only show a running dialog; else open Terminal to start it
-anywhere config [path | get KEY | set KEY VALUE | reset]
+anywhere config [path | get KEY | set KEY VALUE | reset]   # voice.sttApiKey and jira.apiToken are masked unless --reveal
+anywhere voice install [ID] [--voice ID] [--force] | list | use ID [--install] | test ["text"] [--local] | status | remove ID [--json]
+anywhere jira setup [--url URL] [--email EMAIL] [--token-stdin] [--no-test] | test | status | issue KEY
+             | search "JQL" [--max N] | mine [--status S] | remove [--json]   # --token VALUE is refused
 anywhere logs [--audit] [-n N]
 anywhere tui
 anywhere mcp                                  # MCP stdio server
@@ -778,6 +1240,18 @@ other process with the token URL: `show` posts `/api/show`, so the daemon's UiHo
 - Hotkeys (`install --hotkey`): Ctrl+Alt+F12 on Windows and WSL (Ctrl+Alt+<letter> is AltGr on many layouts),
   Ctrl+Alt+A on GNOME, a launcher app to bind in Shortcuts on macOS; `--hotkey-key COMBO` picks another. `install.json`
   records `envPath` (the install-time PATH) so daemons started by launchers find node and claude.
+- `voice install`, `list`, `use` and `remove` work without the daemon (`use`/`install` then tell a running one through
+  `POST /api/voice/use`); `test` plays through the dialog when it is open, else locally. `jira setup` prompts on a TTY
+  (hidden token), probes Cloud vs Server, tests, saves with `config.save` (0600) and tells a running daemon.
+- `doctor`'s Voice line also shows the natural voice: `Piper ✓ <voice>`, or `not installed (anywhere voice install)`.
+- Desktop assistant: `computer ui-find` prints `Computer.uiFind` matches (with `shot`) as JSON, `computer ocr` runs
+  `ocr.findText` (with TEXT) or `ocr.readScreenText`, and `computer apps` prints `runningApps` and the default browser.
+  `src/cli/desktop.js` (group "Desktop control") runs the same operations as the MCP tools through `createDesktopOps`:
+  text by default, `--json` for JSON; actions honour the dialog's pause guard (`GET /api/mcp/guard` when a daemon runs)
+  and the failsafe corner and post to the activity feed; `wait` exits 2 on timeout. `doctor` adds "App controls
+  (accessibility)" (`capabilities().ui`, its notes, and `uiHint` as the fix; UI notes no longer turn the Desktop
+  control line into a warning), "Screen text (OCR)" (`ocr.available()`), and on Linux "Desktop assistant tools"
+  (wmctrl, sqlite3, gtk-launch, informational).
 - `doctor` also warns about broad Claude Code allow rules (`Bash`, `Bash(*)`, `Write`, `Edit`, `mcp__anywhere__*` in
   ~/.claude/settings.json and the project's .claude/settings(.local).json), which apply before the dialog's approval
   broker; on macOS it shows Automation consent and the running daemon's permissions (`GET /api/permissions`), and
@@ -800,7 +1274,11 @@ other process with the token URL: `show` posts `/api/show`, so the daemon's UiHo
   and `mcp__plugin_anywhere_anywhere__` (Claude Code 2.1.302 expands `${CLAUDE_SKILL_DIR}` in allowed-tools),
   `disable-model-invocation: true`.
 - `SKILL.md` handles `$ARGUMENTS`: empty → start the companion; `here`/`bridge` → bridge loop; `stop`; `status`;
-  `doctor`/`setup`; anything else → start, then send it as a command.
+  `doctor`/`setup`; `clone-voice …` → `run.js clone-voice …`; "answer my calls…" → `run.js calls on --instructions
+  "<their words>"` (exit 0 armed, 5 not allowed, 2 nobody clicked, 1 cannot arm), "stop answering calls" →
+  `run.js calls off`; anything else → start, then send it as a command.
+- `skills/clone-voice/` is the plugin's `/anywhere:clone-voice` (it runs `run.js clone-voice $ARGUMENTS`): its `run.js` spawns `../anywhere/run.js` with
+  the same arguments and forwards the exit code.
 - Install paths: (1) plugin: `/plugin marketplace add patel-deepanshu/claude-anywhere` then
   `/plugin install anywhere@anywhere-marketplace` (skill is `/anywhere:anywhere`, and bare `/anywhere` when unambiguous);
   (2) personal skill: `node bin/anywhere.js install` copies `skills/anywhere/` to `~/.claude/skills/anywhere/`
@@ -816,3 +1294,67 @@ is required (display tests skip unless `DISPLAY` is set and xdotool exists). `te
 the stream-json CLI. It also connects to the MCP server named in `--mcp-config` to exercise `permission_prompt`,
 `ask_user`, and `screenshot` end to end. CI (`.github/workflows/ci.yml`) runs `npm test` and `npm run lint` on
 ubuntu, macos and windows.
+The voice, Jira and ticket features are tested without network or audio: local fake HTTP servers stand in for the
+Piper release, Hugging Face and Jira, fake `piper`/player binaries for the real ones, the mock driver and
+`test/fixtures/fake-ps-host.js` for browser tabs, and `test/fixtures/ui-stub-server.js` (voice status, install,
+`/api/tts/audio`, `announce` and Jira routes) for the dialog in headless Chromium.
+Feature 3 runs the real `sidecar.py` in fake mode (`ANYWHERE_CLONE_FAKE=1`, no numpy or models; skipped without a
+Python), a fake sidecar and call engine (`test/fixtures/fake-call-claude.js`) with a real DaemonServer and MCP
+server, captured `dbus-monitor` / `pactl` / UIA fixtures, and a fake Jira server.
+
+The desktop assistant's tests need no display: `test/desktop-core.test.js` (screenshotAfter, batch_actions, permissions,
+prompt), `desktop-ui-tools.test.js` (mock driver, Computer UI methods, tools-ui), `desktop-linux.test.js`
+(atspi-helper protocol, linux.js through a fake `run`), `desktop-macos.test.js` (darwin.js and the JXA helper with a
+fake transport), `desktop-windows.test.js` (win32.js against `fake-ps-host.js`, PowerShell parse checks when pwsh is
+present), `desktop-ocr.test.js` (parsers, matching, coordinate mapping; real tesseract when installed),
+`desktop-apps.test.js` and `desktop-browsers.test.js` (catalogs, launch/quit plans, bookmark files, tab methods through
+injected deps), and `desktop-integration.test.js` (the seams between them). Opt-in live checks:
+`ANYWHERE_LIVE_DESKTOP=1` (Chromium through AT-SPI on Linux; on macOS the Finder menu bar and front window through the
+AX API, which CI's "Live desktop (macos-latest)" job runs with `--test-name-pattern=live-desktop`) and `ANYWHERE_LIVE_OCR=1` (find_text on a Chromium page). The CI Xvfb job also
+installs tesseract and the AT-SPI bindings and runs `desktop-linux` and `desktop-ocr`.
+
+## 13. Calls and the cloned voice (feature 3)
+
+User guide: [CALLS.md](CALLS.md). Build contract, measurements and the as-built differences:
+[CALLS-DESIGN.md](CALLS-DESIGN.md) (§16).
+
+```
+anywhere daemon
+ ├─ routes-clone.js ─► CloneService (src/voice/clone/index.js), one per daemon (server.deps.clone)
+ │    ├─ CloneInstaller: private venv <state>/voice/clone-venv + sherpa-onnx models (sha256-pinned GitHub assets)
+ │    └─ SidecarClient ─stdio JSON lines─► python -I -u sidecar.py --state <state> --models <dir>
+ │         TTS (Pocket | ZipVoice), STT (Moonshine…), Silero VAD, speaker embeddings,
+ │         audio_io.py plug-in: playback/capture backends, tts.say, barge-in, default-input switch
+ ├─ routes-calls.js ─► CallManager (src/calls/manager.js), created on first use (server.deps.calls)
+ │    ├─ CallDetector: window titles · notifications (busctl/dbus-monitor, Windows UIA toasts) · screen diffs · vision
+ │    ├─ answer.js: shortcut, learned point or vision click, all gated in code and verified
+ │    ├─ AudioBridge: pactl / VB-CABLE + IPolicyConfig / BlackHole + ScreenCaptureKit; crash-safe restore
+ │    ├─ CallSession: greeting first (disclosure in code) → caller ASR → call engine → clause TTS
+ │    │    call engine = claude -p --model haiku --tools "" --strict-mcp-config + MCP server (ANYWHERE_ROLE=call)
+ │    │    ─► POST /api/calls/tool ─► CallPolicy (allowlist, caller binding, budgets, server-built JQL)
+ │    └─ wrap-up: Cliq message (cliq.js, window or API), notes (notes.js) on the Desktop, announcement
+ └─ PermissionBroker.requestCritical(): the click-only card that arms calls
+```
+
+- **Arming** is memory-only, expires, and needs a click on a critical card raised by `POST /api/calls/arm`
+  through `PermissionBroker.requestCritical({clickOnly: true})`; `CallManager` accepts only `via: 'click'` with
+  `dialog: true` (the request carried the dialog window's credential). `classify()` marks
+  `calls_arm` and `anywhere calls on` critical with `ownCard`, so the tool call reaches that card without a
+  second one (§13.4 of the design). `calls_disarm` / `anywhere calls off` never ask.
+- **Roles.** The MCP server in role `call` (`ANYWHERE_ROLE=call`, `ANYWHERE_CALL_ID`) lists only
+  `CALL_TOOL_NAMES` from `src/mcp/tools-calls.js`; the other roles get `calls_status`, `calls_arm`, `calls_disarm`,
+  `clone_voice_status` and `clone_voice_open`. Call tools post to `/api/calls/tool` with `X-Anywhere-Role: call`
+  (`DaemonClient.request(..., {headers})`).
+- **Voice profile**: `<state>/voice/clone/profiles/default/` (0700/0600). The sidecar's `tts.setVoice` takes
+  only that folder and checks the manifest's consent and the reference's sha256; no operation clones a free audio
+  path.
+- **Daemon lifecycle**: `main.js` sets `server.deps.getComputer` / `platformInfo`; on shutdown it stops the calls
+  (notes of a running call get up to 15 s), then the voice sidecar, then the session. routes-calls restores an
+  audio routing left by a crash at start and on process exit.
+- **Dialog**: `index.html` loads `calls-ui.js` after `app.js`, which re-dispatches every SSE event as window
+  `anywhere:event` {type, data} and exposes `window.anywhereApi(method, path, body, opts)`. `calls-ui.js` mounts the
+  calls pill and panel (`calls-panel.js`) and the enrollment overlay (`clone.js`; `/clone.html` runs it standalone).
+  SSE: `clone_install`, `clone_session`, `calls`, `call_transcript`, `call_action`, `call_notes`.
+- **Doctor**: `src/cli/calls.js` `doctorChecks()` (also appended to `anywhere doctor`, where its failures are
+  warnings): arming safeguards, voice runtime, cloned voice and speed (bench.json), audio routing
+  (`audio-bridge.doctorChecks`), detection, Claude, Jira, Cliq, notes.

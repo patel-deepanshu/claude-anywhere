@@ -1,14 +1,18 @@
 'use strict';
 
 /**
- * The 19 tools of the `anywhere` MCP server: screen and input control through
- * a Computer, window/app/clipboard helpers through its driver, desktop
- * context, and the dialog bridge (notify_user, ask_user, permission_prompt)
- * through the daemon's /api/mcp/* endpoints.
+ * The core tools of the `anywhere` MCP server (the 19 contract tools plus
+ * batch_actions): screen and input control through a Computer, window/app/
+ * clipboard helpers through its driver, desktop context, and the dialog bridge
+ * (notify_user, ask_user, permission_prompt) through the daemon's /api/mcp/*
+ * endpoints. Feature modules (TOOL_MODULES) add the rest.
  *
  * Every input action first asks the daemon whether the user paused Claude
  * (GET /api/mcp/guard, 200 ms budget, failures mean "allowed") and afterwards
- * reports itself to the dialog's activity feed (fire-and-forget).
+ * reports itself to the dialog's activity feed (fire-and-forget). With
+ * screenshotAfter it also returns a fresh (smaller) screenshot after a short
+ * settle delay, and batch_actions runs several of them in one call, checking
+ * the guard before each step and stopping at the first failure.
  */
 
 const { createLogger } = require('../shared/log');
@@ -31,6 +35,31 @@ const PERMISSION_HTTP_TIMEOUT_MS = 24 * 3600 * 1000;
 const CLIPBOARD_MAX_CHARS = 50000;
 const MAX_LISTED_WINDOWS = 100;
 const NO_DIALOG_MESSAGE = 'The Anywhere dialog is not running; ask the user in your normal reply instead.';
+// screenshotAfter: let the UI settle, then capture a smaller image than a plain screenshot
+// (1366x768) so verifying each step stays cheap. It becomes the latest screenshot, so later
+// coordinates are pixels of this image (its text says so).
+const SHOT_AFTER_SETTLE_MS = 350;
+const SHOT_AFTER_MAX_WIDTH = 1024;
+const SHOT_AFTER_MAX_HEIGHT = 640;
+const CURSOR_TIMEOUT_MS = 1000;
+// batch_actions
+const MAX_BATCH_STEPS = 20;
+const MAX_BATCH_WAIT_SEC = 10;
+/** Step types of batch_actions, each run as its single tool (BATCH_STEP_TOOL). */
+const BATCH_STEP_TYPES = ['click', 'double_click', 'right_click', 'move', 'drag', 'type', 'key', 'scroll', 'wait', 'focus_window', 'ui_click'];
+const BATCH_STEP_TOOL = {
+  click: 'click',
+  double_click: 'click',
+  right_click: 'click',
+  move: 'mouse_move',
+  drag: 'drag',
+  type: 'type_text',
+  key: 'key',
+  scroll: 'scroll',
+  wait: 'wait',
+  focus_window: 'focus_window',
+  ui_click: 'ui_click',
+};
 
 // ---------------------------------------------------------------- helpers
 
@@ -207,6 +236,152 @@ function describeShot(shot, active) {
   ].join(' ');
 }
 
+// ---------------------------------------------------------------- batch_actions steps
+
+function hasText(v) {
+  return v != null && String(v).trim() !== '';
+}
+
+function finiteNumber(v) {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+/**
+ * The single tool a batch_actions step runs as, with only the arguments that tool takes.
+ * permissions.js classifies each step the same way (batchStepCall there must agree).
+ * @param {object} step {type, ...arguments}
+ * @returns {{type:string, tool:string, args:object}|null} null for a step of unknown type
+ */
+function batchStepCall(step) {
+  if (!step || typeof step !== 'object' || Array.isArray(step)) return null;
+  const type = String(step.type == null ? '' : step.type).trim().toLowerCase();
+  const tool = Object.prototype.hasOwnProperty.call(BATCH_STEP_TOOL, type) ? BATCH_STEP_TOOL[type] : null;
+  if (!tool) return null;
+  const pick = (...keys) => {
+    const o = {};
+    for (const k of keys) if (step[k] !== undefined && step[k] !== null) o[k] = step[k];
+    return o;
+  };
+  const idText = (o) => {
+    if (o.id != null) o.id = String(o.id);
+    return o;
+  };
+  let args;
+  switch (type) {
+    case 'click':
+      args = pick('x', 'y', 'button', 'clicks', 'modifiers', 'display');
+      break;
+    case 'double_click':
+      args = { ...pick('x', 'y', 'modifiers', 'display'), clicks: 2 };
+      break;
+    case 'right_click':
+      args = { ...pick('x', 'y', 'modifiers', 'display'), button: 'right' };
+      break;
+    case 'move':
+      args = pick('x', 'y', 'display');
+      break;
+    case 'drag':
+      args = pick('fromX', 'fromY', 'toX', 'toY', 'button', 'display');
+      break;
+    case 'type':
+      args = pick('text', 'method');
+      break;
+    case 'key':
+      args = pick('combo', 'repeat');
+      break;
+    case 'scroll':
+      args = pick('direction', 'amount', 'x', 'y', 'display');
+      break;
+    case 'wait':
+      args = pick('seconds');
+      break;
+    case 'focus_window':
+      args = idText(pick('id', 'title', 'app'));
+      break;
+    default: // ui_click
+      args = idText(pick('id', 'name', 'text', 'role', 'window', 'exact'));
+  }
+  return { type, tool, args };
+}
+
+/**
+ * What is wrong with a batch step, checked for every step before any runs.
+ * @returns {string|null} the problem, or null when the step is complete
+ */
+function batchStepProblem(step) {
+  if (!step || typeof step !== 'object' || Array.isArray(step)) return 'each step must be an object like {"type": "click", "x": 100, "y": 200}';
+  const call = batchStepCall(step);
+  if (!call) return `unknown type ${JSON.stringify(step.type == null ? '' : step.type)}; use one of ${BATCH_STEP_TYPES.join(', ')}`;
+  const a = call.args;
+  const coords = (...keys) => keys.every((k) => finiteNumber(a[k]) && a[k] >= 0);
+  switch (call.tool) {
+    case 'click':
+    case 'mouse_move':
+      if (!coords('x', 'y')) return 'x and y (pixels of your latest screenshot) are required';
+      break;
+    case 'drag':
+      if (!coords('fromX', 'fromY', 'toX', 'toY')) return 'fromX, fromY, toX and toY (pixels of your latest screenshot) are required';
+      break;
+    case 'type_text':
+      if (typeof a.text !== 'string' || a.text === '') return 'text (the exact text to type) is required';
+      break;
+    case 'key':
+      if (!hasText(a.combo)) return 'combo is required, e.g. "enter" or "primary+s"';
+      break;
+    case 'scroll':
+      if (!['up', 'down', 'left', 'right'].includes(String(a.direction))) return 'direction must be up, down, left or right';
+      if ((a.x == null) !== (a.y == null)) return 'give both x and y, or neither to scroll at the mouse position';
+      if (a.x != null && !coords('x', 'y')) return 'x and y must be pixels of your latest screenshot';
+      break;
+    case 'wait':
+      if (!finiteNumber(a.seconds) || a.seconds < 0 || a.seconds > MAX_BATCH_WAIT_SEC) return `seconds must be a number from 0 to ${MAX_BATCH_WAIT_SEC}`;
+      break;
+    case 'focus_window':
+      if (!hasText(a.id) && !hasText(a.title) && !hasText(a.app)) return 'give the window id, or part of its title or app name';
+      break;
+    default: // ui_click
+      if (!hasText(a.id) && !hasText(a.name) && !hasText(a.text)) return 'give the element id (from ui_find or ui_tree), or its name or text';
+  }
+  if (a.display != null && !(Number.isInteger(a.display) && a.display >= 0 && a.display <= 15)) return 'display must be a display index from 0 to 15';
+  return null;
+}
+
+/** Short label of a step for messages: click (100, 200), type "hello", key "enter"… */
+function batchStepLabel(step) {
+  const call = batchStepCall(step);
+  if (!call) return `step of type ${JSON.stringify(step && step.type != null ? step.type : '')}`;
+  const a = call.args;
+  const at = (x, y) => (x != null && y != null ? ` (${num(x)}, ${num(y)})` : '');
+  switch (call.type) {
+    case 'click':
+    case 'double_click':
+    case 'right_click':
+    case 'move':
+      return `${call.type}${at(a.x, a.y)}`;
+    case 'drag':
+      return `drag${at(a.fromX, a.fromY)} to${at(a.toX, a.toY)}`;
+    case 'type':
+      return `type "${oneLine(a.text, 40)}"`;
+    case 'key':
+      return `key "${oneLine(a.combo, 40)}"${a.repeat > 1 ? ` x${a.repeat}` : ''}`;
+    case 'scroll':
+      return `scroll ${a.direction}${at(a.x, a.y)}`;
+    case 'wait':
+      return `wait ${num(a.seconds)} s`;
+    case 'focus_window':
+      return `focus_window ${hasText(a.id) ? `id ${a.id}` : [a.app && `app "${oneLine(a.app, 40)}"`, a.title && `title "${oneLine(a.title, 40)}"`].filter(Boolean).join(' ')}`;
+    default:
+      return `ui_click ${hasText(a.id) ? `id ${oneLine(a.id, 60)}` : `"${oneLine(a.name || a.text, 40)}"${a.role ? ` (${a.role})` : ''}`}`;
+  }
+}
+
+/** Drop the "Take a screenshot to verify." advice from a result text (a screenshot comes with it, or it is one step of many). */
+function withoutVerifyHint(text) {
+  return String(text == null ? '' : text)
+    .replace(/\s*Take (?:a|another) screenshot\b[^.\n]*\./g, '')
+    .trim();
+}
+
 // ---------------------------------------------------------------- schemas
 
 const DISPLAY = {
@@ -214,6 +389,11 @@ const DISPLAY = {
   minimum: 0,
   maximum: 15,
   description: 'Display index, 0-based: 0 is the primary display (the default). screen_info lists all displays.',
+};
+
+const SHOT_AFTER = {
+  type: 'boolean',
+  description: `Also return a fresh screenshot (at most ${SHOT_AFTER_MAX_WIDTH}x${SHOT_AFTER_MAX_HEIGHT}, taken ${SHOT_AFTER_SETTLE_MS} ms after the action) to verify the result without another call. It becomes your latest screenshot: later coordinates are pixels of it. Default false.`,
 };
 
 function coord(axis, extra) {
@@ -235,12 +415,21 @@ function annotations(title, { readOnly = false, destructive = false, idempotent 
 /**
  * Build the anywhere tool set.
  * @param {{computer: object|(()=>Promise<object>), getClient?: ()=>Promise<object|null>, config?: object,
- *   role?: 'engine'|'interactive', progressIntervalMs?: number,
+ *   role?: 'engine'|'interactive'|'call', progressIntervalMs?: number, screenshotSettleMs?: number,
  *   deps?: {notify?:Function, speak?:Function, openTarget?:Function, gatherContext?:Function}}} opts
  *   computer: a Computer, a promise of one, or a lazy factory returning one.
+ *   screenshotSettleMs: the pause before a screenshotAfter capture (default 350 ms).
  * @returns {{name:string,title:string,description:string,inputSchema:object,annotations:object,handler:Function}[]}
  */
-function createTools({ computer, getClient, config = {}, role = 'interactive', progressIntervalMs = PROGRESS_INTERVAL_MS, deps = {} } = {}) {
+function createTools({
+  computer,
+  getClient,
+  config = {},
+  role = 'interactive',
+  progressIntervalMs = PROGRESS_INTERVAL_MS,
+  screenshotSettleMs = SHOT_AFTER_SETTLE_MS,
+  deps = {},
+} = {}) {
   const common = () => require('../os/common');
   const notifyOs = deps.notify || ((title, body) => common().notify(title, body));
   const speakOs = deps.speak || ((text, opts) => common().speak(text, opts));
@@ -309,11 +498,90 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
     return () => clearInterval(timer);
   }
 
+  // ------------------------------------------------------------ screenshot after an action
+
+  /** The display index whose rectangle holds the centre of `rect` (logical coordinates), or null. */
+  function displayOfRect(displays, rect) {
+    if (!Array.isArray(displays) || !rect || ![rect.x, rect.y, rect.width, rect.height].every(Number.isFinite)) return null;
+    const cx = rect.x + rect.width / 2;
+    const cy = rect.y + rect.height / 2;
+    const i = displays.findIndex((d) => d && cx >= d.x && cy >= d.y && cx < d.x + d.width && cy < d.y + d.height);
+    if (i < 0) return null;
+    return Number.isInteger(displays[i].index) ? displays[i].index : i;
+  }
+
   /**
-   * Wrap an input action: guard → run → activity. `run` returns
-   * {text, summary?, isError?}; thrown errors become isError results upstream.
+   * Which display to capture after an action: the one it happened on, else the one holding the
+   * window it acted on, else the one under the mouse pointer, else the primary display.
+   */
+  async function displayForShot(comp, { display, window } = {}) {
+    if (Number.isInteger(display) && display >= 0) return display;
+    if (window && typeof comp.screenInfo === 'function') {
+      const info = await withTimeout(comp.screenInfo(), CURSOR_TIMEOUT_MS, null);
+      const d = displayOfRect(info && info.displays, window);
+      if (d != null) return d;
+    }
+    if (typeof comp.cursorPosition === 'function') {
+      const p = await withTimeout(comp.cursorPosition(), CURSOR_TIMEOUT_MS, null);
+      if (p && Number.isInteger(p.display)) return p.display;
+    }
+    return 0;
+  }
+
+  /**
+   * Content blocks [image, text] of a fresh, smaller screenshot taken after a settle delay. A failed
+   * capture becomes a text block (the action itself succeeded); only a cancelled call throws.
+   * @param {{display?:number, window?:object, signal?:AbortSignal}} [opts]
+   */
+  async function shotAfterBlocks({ display, window, signal } = {}) {
+    await sleepAbortable(Math.max(0, Number(screenshotSettleMs) || 0), signal);
+    try {
+      const comp = await getComputer();
+      const d = await displayForShot(comp, { display, window });
+      const shot = await comp.screenshot({ display: d, maxWidth: SHOT_AFTER_MAX_WIDTH, maxHeight: SHOT_AFTER_MAX_HEIGHT });
+      const active = await activeWindowOf(comp.driver);
+      const data = shot.png.toString('base64');
+      postActivity({ tool: 'screenshot', summary: `Screenshot of display ${shot.display} (${shot.width}x${shot.height}) after the action`, ok: true, image: data, width: shot.width, height: shot.height });
+      return [
+        { type: 'image', data, mimeType: 'image/png' },
+        { type: 'text', text: `After the action: ${describeShot(shot, active)}` },
+      ];
+    } catch (err) {
+      log.debug('screenshot after an action failed:', err && err.message);
+      return [{ type: 'text', text: `(No screenshot afterwards: ${oneLine(err && err.message, 200)}. Take one with screenshot.)` }];
+    }
+  }
+
+  /**
+   * screenshotAfter for feature modules (ext.screenshotAfter), in two forms:
+   * - screenshotAfter(result, args, {display?, window?, signal?}): when args.screenshotAfter is true and
+   *   the MCP result is not an error, a copy of it with a fresh screenshot appended (after the settle
+   *   delay, on opts.display, else args.display, else the window's or the pointer's display);
+   *   otherwise the result unchanged.
+   * - screenshotAfter({display?, window?, signal?}): just the content blocks [image, text].
+   */
+  async function screenshotAfter(result, args, opts = {}) {
+    if (!result || !Array.isArray(result.content)) {
+      const o = result && typeof result === 'object' ? result : {};
+      return shotAfterBlocks({ display: o.display, window: o.window, signal: o.signal });
+    }
+    if (!args || args.screenshotAfter !== true || result.isError) return result;
+    const o = opts && typeof opts === 'object' ? opts : {};
+    const display = Number.isInteger(o.display) ? o.display : Number.isInteger(args.display) ? args.display : undefined;
+    const blocks = await shotAfterBlocks({ display, window: o.window, signal: o.signal });
+    return { ...result, content: [...result.content, ...blocks] };
+  }
+
+  /** Tools made by inputTool: they check the guard themselves (batch_actions need not). */
+  const guardedTools = new Set();
+
+  /**
+   * Wrap an input action: guard → run → activity → optional screenshot. `run` returns
+   * {text, summary?, isError?, warnings?, display?, window?}; display/window pick the display the
+   * screenshotAfter capture shows. Thrown errors become isError results upstream.
    */
   function inputTool({ name, title, description, inputSchema, annotations: ann, summarize, run }) {
+    guardedTools.add(name);
     return {
       name,
       title,
@@ -330,14 +598,20 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
           throw err;
         }
         const isError = Boolean(out.isError);
+        const shotAfter = args.screenshotAfter === true && !isError;
         // Input the OS may have dropped silently (Windows UIPI: another account's window).
         const warnings = Array.isArray(out.warnings) ? out.warnings.filter((w) => typeof w === 'string' && w) : [];
-        const text = warnings.length ? `${out.text}\n\nWarning: ${warnings.join('\nWarning: ')}` : out.text;
+        const base = shotAfter ? withoutVerifyHint(out.text) : out.text;
+        const text = warnings.length ? `${base}\n\nWarning: ${warnings.join('\nWarning: ')}` : base;
         const activity = { tool: name, summary: out.summary || summarize(args), ok: !isError };
         if (isError) activity.error = oneLine(out.text, 300);
         if (warnings.length) activity.warning = oneLine(warnings.join(' '), 300);
         postActivity(activity);
-        return isError ? fail(text) : ok(text);
+        if (isError) return fail(text);
+        if (!shotAfter) return ok(text);
+        const display = Number.isInteger(out.display) ? out.display : Number.isInteger(args.display) ? args.display : undefined;
+        const blocks = await shotAfterBlocks({ display, window: out.window, signal: extra && extra.signal });
+        return { content: [{ type: 'text', text }, ...blocks] };
       },
     };
   }
@@ -411,7 +685,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
       description: [
         'Click the mouse at (x, y), given in pixels of your latest screenshot of that display.',
         'clicks: 2 double-clicks (open an item, select a word), 3 triple-clicks (select a line or paragraph). button "right" opens context menus. modifiers are held during the click, e.g. ["shift"] to extend a selection or ["primary"] (Cmd on macOS, Ctrl elsewhere) to open a link in a new tab.',
-        'Take a screenshot first so the coordinates are current, aim at the center of the target, then take another screenshot to verify. Never click inside the "Claude Anywhere" dialog.',
+        'Take a screenshot first so the coordinates are current, aim at the center of the target, then take another screenshot to verify (or pass screenshotAfter: true to get it with the result). When the target has a label, ui_click by name is more reliable than pixels. Never click inside the "Claude Anywhere" dialog.',
       ].join('\n\n'),
       inputSchema: objectSchema(
         {
@@ -421,6 +695,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
           clicks: { type: 'integer', minimum: 1, maximum: 3, description: '1 = single (default), 2 = double, 3 = triple click.' },
           modifiers: { type: 'array', items: MODIFIER, maxItems: 4, description: 'Keys held during the click, e.g. ["shift"] or ["primary"].' },
           display: DISPLAY,
+          screenshotAfter: SHOT_AFTER,
         },
         ['x', 'y']
       ),
@@ -440,6 +715,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
           text: `${verb} ${button} at (${num(x)}, ${num(y)}) on display ${display}${mods}. Take a screenshot to verify.`,
           summary: `${verb} ${button} at (${num(x)}, ${num(y)})${mods}`,
           warnings: r && r.warnings,
+          display,
         };
       },
     })
@@ -450,8 +726,8 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
     inputTool({
       name: 'mouse_move',
       title: 'Move mouse',
-      description: 'Move the mouse pointer to (x, y), in pixels of your latest screenshot of that display, without clicking. Use it to reveal hover menus or tooltips, or to put the pointer over a panel before scrolling.',
-      inputSchema: objectSchema({ x: coord('X'), y: coord('Y'), display: DISPLAY }, ['x', 'y']),
+      description: 'Move the mouse pointer to (x, y), in pixels of your latest screenshot of that display, without clicking. Use it to reveal hover menus or tooltips (screenshotAfter shows them in the same call), or to put the pointer over a panel before scrolling.',
+      inputSchema: objectSchema({ x: coord('X'), y: coord('Y'), display: DISPLAY, screenshotAfter: SHOT_AFTER }, ['x', 'y']),
       annotations: annotations('Move mouse', { idempotent: true }),
       summarize: (a) => `Move mouse to (${num(a.x)}, ${num(a.y)})`,
       run: async (a) => {
@@ -460,7 +736,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
         const x = r && Number.isFinite(r.x) ? r.x : a.x;
         const y = r && Number.isFinite(r.y) ? r.y : a.y;
         const display = r && Number.isInteger(r.display) ? r.display : a.display || 0;
-        return { text: `Moved the mouse to (${num(x)}, ${num(y)}) on display ${display}.`, summary: `Moved mouse to (${num(x)}, ${num(y)})` };
+        return { text: `Moved the mouse to (${num(x)}, ${num(y)}) on display ${display}.`, summary: `Moved mouse to (${num(x)}, ${num(y)})`, display };
       },
     })
   );
@@ -470,7 +746,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
     inputTool({
       name: 'drag',
       title: 'Drag',
-      description: 'Press a mouse button at (fromX, fromY), move to (toX, toY) and release. Coordinates are pixels of your latest screenshot of that display. Use it for sliders, moving files or windows, resizing panes and selecting a range of text. Take a screenshot afterwards to verify.',
+      description: 'Press a mouse button at (fromX, fromY), move to (toX, toY) and release. Coordinates are pixels of your latest screenshot of that display. Use it for sliders, moving files or windows, resizing panes, drawing shapes on a canvas and selecting a range of text. Take a screenshot afterwards to verify (or pass screenshotAfter: true).',
       inputSchema: objectSchema(
         {
           fromX: coord('Start X'),
@@ -479,6 +755,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
           toY: coord('End Y'),
           button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Mouse button (default left).' },
           display: DISPLAY,
+          screenshotAfter: SHOT_AFTER,
         },
         ['fromX', 'fromY', 'toX', 'toY']
       ),
@@ -495,6 +772,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
           text: `Dragged with the ${button} button from (${num(from.x)}, ${num(from.y)}) to (${num(to.x)}, ${num(to.y)}) on display ${display}. Take a screenshot to verify.`,
           summary: `Dragged from (${num(from.x)}, ${num(from.y)}) to (${num(to.x)}, ${num(to.y)})`,
           warnings: r && r.warnings,
+          display,
         };
       },
     })
@@ -505,7 +783,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
     inputTool({
       name: 'scroll',
       title: 'Scroll',
-      description: 'Turn the mouse wheel by `amount` notches (default 3, roughly three lines each) in a direction, at (x, y) when given (pixels of your latest screenshot) or at the current mouse position. The wheel scrolls whatever is under the pointer, so aim at the panel you want to scroll. Take a screenshot afterwards to see the new content. In browsers the keys pagedown, space and end are alternatives.',
+      description: 'Turn the mouse wheel by `amount` notches (default 3, roughly three lines each) in a direction, at (x, y) when given (pixels of your latest screenshot) or at the current mouse position. The wheel scrolls whatever is under the pointer, so aim at the panel you want to scroll. Take a screenshot afterwards to see the new content (or pass screenshotAfter: true). In browsers the keys pagedown, space and end are alternatives.',
       inputSchema: objectSchema(
         {
           direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'Scroll direction.' },
@@ -513,6 +791,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
           x: coord('X', 'optional, defaults to the current mouse position'),
           y: coord('Y', 'optional, defaults to the current mouse position'),
           display: DISPLAY,
+          screenshotAfter: SHOT_AFTER,
         },
         ['direction']
       ),
@@ -531,6 +810,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
           text: `Scrolled ${a.direction} ${n} notch${n === 1 ? '' : 'es'}${at} on display ${display}. Take a screenshot to see the new content.`,
           summary: `Scrolled ${a.direction} ${n}${at}`,
           warnings: r && r.warnings,
+          display,
         };
       },
     })
@@ -543,14 +823,15 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
       title: 'Type text',
       description: [
         'Type literal text into the window that has keyboard focus, as if typed on the keyboard (any Unicode). It does not press Enter: send key "enter" afterwards when needed.',
-        'First make sure the right window and field have focus (focus_window, then click the field) and confirm with a screenshot; keystrokes go wherever the focus is.',
-        'method: "auto" (default) types short text key by key and pastes long or multi-line text through the clipboard (restored afterwards); "keys" always types (use it where pasting is blocked); "paste" always pastes.',
+        'First make sure the right window and field have focus (focus_window, then click the field) and confirm with a screenshot; keystrokes go wherever the focus is. screenshotAfter: true shows the result in the same call.',
+        'method: "auto" (default) types short text key by key and pastes long or multi-line text through the clipboard (restored afterwards); "keys" always types (use it where pasting is blocked); "paste" always pastes. To replace a field\'s whole text, ui_set_value is more reliable.',
         'Never type passwords, 2FA codes or payment details; ask the user to enter them.',
       ].join('\n\n'),
       inputSchema: objectSchema(
         {
           text: { type: 'string', minLength: 1, description: 'The exact text to type.' },
           method: { type: 'string', enum: ['auto', 'keys', 'paste'], description: 'How to enter the text (default auto).' },
+          screenshotAfter: SHOT_AFTER,
         },
         ['text']
       ),
@@ -578,12 +859,13 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
       description: [
         'Press a key or key combination in the focused window, e.g. "enter", "escape", "tab", "shift+tab", "primary+s" (save), "primary+t" (new tab), "primary+l" (browser address bar), "primary+shift+p", "alt+tab", "f5", "pagedown", "up".',
         '"primary" is Cmd on macOS and Ctrl on Windows and Linux. Modifiers: ctrl, alt (option), shift, meta (cmd, win, super). Named keys: enter, escape, tab, space, backspace, delete, insert, home, end, pageup, pagedown, up, down, left, right, f1-f24, capslock, printscreen, menu, or any single character.',
-        'repeat presses the combination several times (e.g. "down" with repeat 5). Focus the target window first.',
+        'repeat presses the combination several times (e.g. "down" with repeat 5). Focus the target window first. screenshotAfter: true returns the result on screen in the same call.',
       ].join('\n\n'),
       inputSchema: objectSchema(
         {
           combo: { type: 'string', minLength: 1, description: 'Keys joined with "+", e.g. "primary+s" or "enter".' },
           repeat: { type: 'integer', minimum: 1, maximum: 100, description: 'How many times to press it (default 1).' },
+          screenshotAfter: SHOT_AFTER,
         },
         ['combo']
       ),
@@ -683,11 +965,12 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
     inputTool({
       name: 'focus_window',
       title: 'Focus window',
-      description: 'Bring a window to the front and give it keyboard focus. Identify it by id (from list_windows), or by a case-insensitive substring of its title and/or app name, e.g. {"app": "chrome"}, {"title": "Google Cloud console"} or {"app": "code", "title": "shop-api"}. If several windows match, nothing is focused and the candidates are listed: call again with an id. Take a screenshot afterwards and before typing.',
+      description: 'Bring a window to the front and give it keyboard focus. Identify it by id (from list_windows), or by a case-insensitive substring of its title and/or app name, e.g. {"app": "chrome"}, {"title": "Google Cloud console"} or {"app": "code", "title": "shop-api"}. If several windows match, nothing is focused and the candidates are listed: call again with an id. Take a screenshot afterwards and before typing (screenshotAfter: true includes one, of the window\'s display).',
       inputSchema: objectSchema({
         id: { type: 'string', description: 'Window id from list_windows.' },
         title: { type: 'string', description: 'Case-insensitive substring of the window title.' },
         app: { type: 'string', description: 'Case-insensitive substring of the application name.' },
+        screenshotAfter: SHOT_AFTER,
       }),
       annotations: annotations('Focus window', { idempotent: true }),
       summarize: (a) => `Focus window ${a.id ? `id ${a.id}` : [a.app && `app "${a.app}"`, a.title && `title "${a.title}"`].filter(Boolean).join(' ')}`,
@@ -721,7 +1004,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
             'The OS may refuse to switch focus; take a screenshot and click the window instead, or use open with kind "app".'
           );
         }
-        return { text: `Focused ${windowLabel(w)} (id ${w.id}). Take a screenshot to confirm it is in front before typing.`, summary: `Focused ${windowLabel(w)}` };
+        return { text: `Focused ${windowLabel(w)} (id ${w.id}). Take a screenshot to confirm it is in front before typing.`, summary: `Focused ${windowLabel(w)}`, window: w };
       },
     })
   );
@@ -814,7 +1097,7 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
   tools.push({
     name: 'get_desktop_context',
     title: 'Desktop context',
-    description: 'Describe what is open on the user\'s desktop right now, as JSON: OS and local time; the active window; every editor window with its workspace folder on disk (VS Code, Cursor, Windsurf, VSCodium, JetBrains IDEs, Zed, Sublime Text, Xcode); browser windows with their active tab\'s title (URLs are not captured) and recognized sites, e.g. the Google Cloud console with its project display name (not necessarily the project id); other windows; the project directory with git branch, remote, uncommitted changes and detected stack; and the active gcloud, aws, az, kubectl and docker contexts. Use it to resolve "this repo", "the project open in VS Code" or "the GCP console in Chrome".',
+    description: 'Describe what is open on the user\'s desktop right now, as JSON: OS and local time; the active window; every editor window with its workspace folder on disk (VS Code, Cursor, Windsurf, VSCodium, JetBrains IDEs, Zed, Sublime Text, Xcode); browser windows with their active tab\'s title (URLs are not captured) and recognized sites, e.g. the Google Cloud console with its project display name (not necessarily the project id); tickets named in tab titles (Jira, Linear, GitHub/GitLab issues, Azure Boards) as tickets: [{key, summary, browser, tracker}]; other windows; running apps by window count (apps) and the default browser (defaultBrowser); the project directory with git branch, remote, uncommitted changes and detected stack; and the active gcloud, aws, az, kubectl and docker contexts. Use it to resolve "this repo", "the project open in VS Code", "the GCP console in Chrome" or "my Jira ticket" (read_browser_tab gets the tab\'s URL).',
     inputSchema: objectSchema({}),
     annotations: annotations('Desktop context', { readOnly: true }),
     handler: async () => {
@@ -973,9 +1256,185 @@ function createTools({ computer, getClient, config = {}, role = 'interactive', p
     },
   });
 
+  // ------------------------------------------------------------ batch_actions
+  const BATCH_STEP = {
+    type: 'object',
+    description: 'One step: its type plus that action\'s arguments.',
+    properties: {
+      type: { type: 'string', enum: BATCH_STEP_TYPES, description: 'The action: click, double_click, right_click, move (mouse), drag, type (text), key, scroll, wait, focus_window or ui_click.' },
+      x: { type: 'number', minimum: 0, description: 'click, double_click, right_click, move, scroll: X in pixels of your latest screenshot.' },
+      y: { type: 'number', minimum: 0, description: 'click, double_click, right_click, move, scroll: Y in pixels of your latest screenshot.' },
+      fromX: { type: 'number', minimum: 0, description: 'drag: start X.' },
+      fromY: { type: 'number', minimum: 0, description: 'drag: start Y.' },
+      toX: { type: 'number', minimum: 0, description: 'drag: end X.' },
+      toY: { type: 'number', minimum: 0, description: 'drag: end Y.' },
+      button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'click, drag: mouse button (default left).' },
+      clicks: { type: 'integer', minimum: 1, maximum: 3, description: 'click: 1-3 (default 1).' },
+      modifiers: { type: 'array', items: MODIFIER, maxItems: 4, description: 'click, double_click, right_click: keys held, e.g. ["shift"].' },
+      display: DISPLAY,
+      text: { type: 'string', maxLength: 100000, description: 'type: the exact text to type. ui_click: text in the element\'s name, value or description.' },
+      method: { type: 'string', enum: ['auto', 'keys', 'paste'], description: 'type: how to enter the text (default auto).' },
+      combo: { type: 'string', maxLength: 100, description: 'key: e.g. "enter", "tab", "primary+s", "alt+tab".' },
+      repeat: { type: 'integer', minimum: 1, maximum: 100, description: 'key: how many presses (default 1).' },
+      direction: { type: 'string', enum: ['up', 'down', 'left', 'right'], description: 'scroll: direction.' },
+      amount: { type: 'integer', minimum: 1, maximum: 50, description: 'scroll: wheel notches (default 3).' },
+      seconds: { type: 'number', minimum: 0, maximum: MAX_BATCH_WAIT_SEC, description: `wait: seconds (0-${MAX_BATCH_WAIT_SEC}).` },
+      id: { type: 'string', maxLength: 600, description: 'focus_window: window id from list_windows. ui_click: element id from ui_find or ui_tree.' },
+      title: { type: 'string', maxLength: 300, description: 'focus_window: part of the window title.' },
+      app: { type: 'string', maxLength: 300, description: 'focus_window: part of the app name.' },
+      name: { type: 'string', maxLength: 300, description: 'ui_click: the accessible name, e.g. "Save" or "For you".' },
+      role: { type: 'string', maxLength: 60, description: 'ui_click: role filter, e.g. "button", "tab", "link".' },
+      window: { type: 'string', maxLength: 300, description: 'ui_click: window id, or part of its title or app name (default: the active window).' },
+      exact: { type: 'boolean', description: 'ui_click: match the whole name/text.' },
+    },
+    required: ['type'],
+    additionalProperties: false,
+  };
+
+  tools.push({
+    name: 'batch_actions',
+    title: 'Run several actions',
+    description: [
+      `Run a short sequence of input actions in one call (at most ${MAX_BATCH_STEPS} steps), e.g. click a field, type, press enter: [{"type": "click", "x": 640, "y": 120}, {"type": "type", "text": "quarterly report"}, {"type": "key", "combo": "enter"}]. Each step takes the same arguments as its tool (click, mouse_move, drag, type_text, key, scroll, wait, focus_window, ui_click); double_click and right_click are click shortcuts, wait is at most ${MAX_BATCH_WAIT_SEC} s.`,
+      'Steps run in order. The pause guard is checked before each one, and the batch stops at the first step that fails; the result says which steps ran. All coordinates refer to the screenshot you had before the call, so batch only steps whose targets do not move in between (typing into a field you just clicked, a known key sequence); take a screenshot (or screenshotAfter) before acting on what the batch changed.',
+      'screenshotAfter returns a fresh screenshot after the last step. The approval card lists every step and is as risky as the riskiest one.',
+    ].join('\n\n'),
+    inputSchema: objectSchema(
+      {
+        actions: { type: 'array', minItems: 1, maxItems: MAX_BATCH_STEPS, items: BATCH_STEP, description: 'The steps, in order: {"type": ..., plus that action\'s arguments}.' },
+        screenshotAfter: SHOT_AFTER,
+      },
+      ['actions']
+    ),
+    annotations: annotations('Run several actions', { destructive: true }),
+    handler: async (args = {}, extra = {}) => {
+      const steps = Array.isArray(args.actions) ? args.actions : [];
+      if (!steps.length) {
+        throw toolError('actions must list at least one step, e.g. [{"type": "click", "x": 100, "y": 200}, {"type": "type", "text": "hello"}, {"type": "key", "combo": "enter"}].', 'INVALID_INPUT');
+      }
+      if (steps.length > MAX_BATCH_STEPS) throw toolError(`A batch has at most ${MAX_BATCH_STEPS} steps (got ${steps.length}); split it into several calls.`, 'INVALID_INPUT');
+      steps.forEach((s, i) => {
+        const problem = batchStepProblem(s);
+        if (problem) throw toolError(`Step ${i + 1} (${batchStepLabel(s)}): ${problem}. Nothing was run.`, 'INVALID_INPUT');
+      });
+      const byName = new Map(tools.map((t) => [t.name, t]));
+      const done = [];
+      let failure = null;
+      let lastDisplay;
+      for (let i = 0; i < steps.length; i += 1) {
+        const call = batchStepCall(steps[i]);
+        const tool = byName.get(call.tool);
+        try {
+          if (extra && extra.signal && extra.signal.aborted) throw abortError(extra.signal);
+          if (!tool) {
+            throw toolError(
+              `${call.tool} is not available in this session`,
+              'UNSUPPORTED',
+              call.tool === 'ui_click' ? 'Click the element by its position (click with x, y) instead.' : undefined
+            );
+          }
+          // Input tools check the guard themselves; anything else (wait, module tools) is checked here.
+          if (!guardedTools.has(call.tool)) await checkGuard();
+          const res = await tool.handler(call.args, extra);
+          const text = withoutVerifyHint(
+            (res && Array.isArray(res.content) ? res.content : [])
+              .filter((c) => c && c.type === 'text')
+              .map((c) => c.text)
+              .join(' ')
+          ).replace(/\s*\n+\s*/g, ' ');
+          if (res && res.isError) {
+            failure = { index: i, text: text || 'the step reported an error' };
+            break;
+          }
+          done.push(`${i + 1}. ${text || 'Done.'}`);
+          if (Number.isInteger(call.args.display)) lastDisplay = call.args.display;
+        } catch (err) {
+          if (err && err.code === 'ABORTED') throw err;
+          failure = { index: i, text: oneLine(err && err.message, 500) || 'unknown error', code: err && err.code, hint: err && err.hint };
+          break;
+        }
+      }
+      const n = steps.length;
+      let text;
+      if (!failure) {
+        text = `Ran all ${n} step${n === 1 ? '' : 's'}:\n${done.join('\n')}`;
+        if (args.screenshotAfter !== true) text += '\nTake a screenshot (or pass screenshotAfter) to verify the result.';
+      } else {
+        const f = failure;
+        const lines = [`Step ${f.index + 1} of ${n} (${batchStepLabel(steps[f.index])}) failed: ${f.text}`];
+        if (f.hint) lines.push(`Hint: ${f.hint}`);
+        const left = n - f.index - 1;
+        if (left > 0) lines.push(left === 1 ? `Step ${n} was not run.` : `Steps ${f.index + 2}-${n} were not run.`);
+        lines.push(done.length ? `Done before it:\n${done.join('\n')}` : 'No step ran before it.');
+        text = lines.join('\n');
+      }
+      // Stopped by the user (Stop, the top-left corner): no more screen activity, not even a capture.
+      const stopped = Boolean(failure && (failure.code === 'PAUSED' || failure.code === 'FAILSAFE'));
+      const content = [{ type: 'text', text }];
+      if (args.screenshotAfter === true && !stopped) {
+        content.push(...(await shotAfterBlocks({ display: lastDisplay, signal: extra && extra.signal })));
+      }
+      return failure ? { content, isError: true } : { content };
+    },
+  });
+
   // permission_prompt is plumbing for the daemon's engine (--permission-prompt-tool).
   // Interactive sessions have Claude Code's own prompts, so keep it away from the model there.
-  return role === 'engine' ? tools : tools.filter((t) => t.name !== 'permission_prompt');
+  // Feature modules (src/mcp/tools-*.js) contribute their own tools: each exports
+  // createTools(ctx) -> [{name, description, inputSchema, annotations, handler}].
+  // ext.screenshotAfter(result, args, opts) appends a fresh screenshot when args.screenshotAfter is
+  // true (or, called with just {display}, returns the [image, text] blocks): see screenshotAfter above.
+  const ext = {
+    computer,
+    getClient,
+    config,
+    role,
+    progressIntervalMs,
+    deps,
+    getComputer,
+    getDriver,
+    client,
+    checkGuard,
+    postActivity,
+    keepAlive,
+    ok,
+    fail,
+    daemonRequest,
+    objectSchema,
+    annotations,
+    screenshotAfter,
+    screenshotAfterSchema: SHOT_AFTER,
+  };
+  for (const name of TOOL_MODULES) {
+    const mod = loadOptional(`./${name}`);
+    if (mod && typeof mod.createTools === 'function') tools.push(...mod.createTools(ext));
+  }
+
+  // The call engine (ANYWHERE_ROLE=call, CALLS-DESIGN §13.5) gets the call tools and nothing else: no
+  // screen, mouse, keyboard, Jira or project tools. Defense in depth: its --allowedTools and the
+  // always-deny call_permission already refuse the rest.
+  if (role === 'call') {
+    const callTools = loadOptional('./tools-calls');
+    const allowed = callTools && Array.isArray(callTools.CALL_TOOL_NAMES) ? callTools.CALL_TOOL_NAMES : [];
+    return tools.filter((t) => allowed.includes(t.name));
+  }
+  const out = role === 'engine' ? tools : tools.filter((t) => t.name !== 'permission_prompt');
+  // The shared context the feature modules got (tests check ext.screenshotAfter through it).
+  Object.defineProperty(out, 'ext', { value: ext, enumerable: false });
+  return out;
+}
+
+/** Optional feature modules that add tools (missing ones are skipped). */
+const TOOL_MODULES = ['tools-browser', 'tools-jira', 'tools-project', 'tools-calls', 'tools-ui', 'tools-ocr', 'tools-desktop'];
+
+/** require() a sibling module that may not exist; other load errors still throw. */
+function loadOptional(rel) {
+  try {
+    return require(rel);
+  } catch (err) {
+    if (err && err.code === 'MODULE_NOT_FOUND' && String(err.message).includes(rel.replace(/^\.\//, ''))) return null;
+    throw err;
+  }
 }
 
 /** Names of all tools in contract order. */
@@ -985,13 +1444,33 @@ const TOOL_NAMES = [
   'notify_user', 'ask_user', 'permission_prompt',
 ];
 
+/** Core tools after the contract ones (TOOL_NAMES), before the feature modules' tools. */
+const EXTRA_TOOL_NAMES = ['batch_actions'];
+
+/** Core tools that take screenshotAfter (ui_click and ui_set_value get it from tools-ui via ext). */
+const SCREENSHOT_AFTER_TOOLS = ['click', 'mouse_move', 'drag', 'scroll', 'type_text', 'key', 'focus_window', 'batch_actions'];
+
 module.exports = {
   createTools,
   TOOL_NAMES,
+  EXTRA_TOOL_NAMES,
+  TOOL_MODULES,
+  BATCH_STEP_TYPES,
+  BATCH_STEP_TOOL,
+  SCREENSHOT_AFTER_TOOLS,
+  MAX_BATCH_STEPS,
+  MAX_BATCH_WAIT_SEC,
+  SHOT_AFTER_SETTLE_MS,
+  SHOT_AFTER_MAX_WIDTH,
+  SHOT_AFTER_MAX_HEIGHT,
   // helpers exported for tests
   daemonRequest,
   matchWindows,
   describeShot,
   sameWindowId,
+  batchStepCall,
+  batchStepProblem,
+  batchStepLabel,
+  withoutVerifyHint,
   NO_DIALOG_MESSAGE,
 };

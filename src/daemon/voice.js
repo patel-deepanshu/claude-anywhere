@@ -2,13 +2,21 @@
 
 /**
  * Server-side voice for the dialog: speech-to-text (for browsers or shells
- * without the Web Speech API) and text-to-speech through the OS.
+ * without the Web Speech API) and text-to-speech.
  *
  * STT providers: any OpenAI-compatible /audio/transcriptions endpoint (Groq,
  * OpenAI, or a custom base URL such as a local faster-whisper server) or a
  * local whisper.cpp binary with a ggml model.
- * TTS: `say` on macOS, System.Speech (SAPI) through Windows PowerShell on
- * Windows and WSL, and spd-say / espeak-ng / espeak / festival on Linux.
+ * TTS (voice.ttsEngine):
+ *   auto     Piper, the free offline neural voice (src/daemon/piper.js), when it is installed;
+ *            else the OS voice
+ *   piper    Piper only (a clear error with the install command when it is missing)
+ *   os       the OS voice: `say` on macOS, System.Speech (SAPI) through Windows PowerShell on
+ *            Windows and WSL, and spd-say / espeak-ng / espeak / festival on Linux
+ *   browser  the dialog speaks; the daemon's announcer stays silent when no dialog is visible
+ *            (an explicit speak() request still uses the OS voice)
+ * synthesize() renders Piper speech to cached WAV files (GET /api/tts/audio?id=…), and
+ * playFile() plays a WAV through src/os/audio.js.
  */
 
 const fs = require('fs');
@@ -20,6 +28,7 @@ const paths = require('../shared/paths');
 const platformMod = require('../shared/platform');
 const { stripMarkdownForSpeech, truncate, safeJsonParse } = require('../shared/util');
 const { createLogger, redact } = require('../shared/log');
+const piperMod = require('./piper');
 
 const log = createLogger('voice');
 
@@ -38,6 +47,8 @@ const HTTP_PROVIDERS = {
 };
 const WHISPER_BINARIES = ['whisper-cli', 'whisper-cpp', 'whisper', 'main'];
 const LINUX_TTS = ['spd-say', 'espeak-ng', 'espeak', 'festival'];
+const TTS_ENGINES = ['auto', 'piper', 'browser', 'os'];
+const PIPER_HINT = 'Install the free neural voice (offline, about 80 MB): anywhere voice install, or Settings > Voice > Install.';
 
 const STT_SETUP_HINT =
   'Set GROQ_API_KEY (free tier) or OPENAI_API_KEY in the environment, add an API key in Settings > Voice, ' +
@@ -346,7 +357,7 @@ class VoiceService {
    * @param {{config?:object, runner?:Function, fetch?:Function, env?:object, which?:(name:string)=>string|null,
    *   platformInfo?:object, now?:()=>number, tmpDir?:string, modelsDir?:string}} [opts]
    */
-  constructor({ config, runner, fetch: fetchImpl, env, which, platformInfo, now, tmpDir, modelsDir } = {}) {
+  constructor({ config, runner, fetch: fetchImpl, env, which, platformInfo, now, tmpDir, modelsDir, piper, player, ttsCache } = {}) {
     this.config = config || {};
     this.runner = typeof runner === 'function' ? runner : defaultRunner;
     this.fetchImpl = typeof fetchImpl === 'function' ? fetchImpl : null;
@@ -361,6 +372,209 @@ class VoiceService {
     this.localVoices = null; // `say -v ?`, read once when a voice must be replaced
     this.current = null;
     this.sttTimeoutMs = STT_TIMEOUT_MS;
+    // Piper shares the injected environment, PATH lookup and platform (tests stay hermetic) but
+    // runs its own processes: its probes must not show up in an injected OS-speech runner.
+    this.piper = piper || new piperMod.PiperManager({ env: this.env, which: this.which, platformInfo: this.platformInfo });
+    this.playerOverride = player || null;
+    this.playerInstance = null;
+    this.ttsCache = ttsCache || new piperMod.TtsCache();
+    this.inflight = new Map(); // tts cache id → pending synthesis
+    this.stopListeners = new Set();
+  }
+
+  /** @returns {object} the audio player (src/os/audio.js AudioPlayer), created on first use */
+  player() {
+    if (this.playerOverride) return this.playerOverride;
+    if (!this.playerInstance) {
+      const { AudioPlayer } = require('../os/audio');
+      this.playerInstance = new AudioPlayer({ platformInfo: this.platformInfo, which: this.which, env: this.env });
+    }
+    return this.playerInstance;
+  }
+
+  /** @returns {'auto'|'piper'|'browser'|'os'} voice.ttsEngine (unknown values count as auto) */
+  ttsEngineSetting() {
+    const e = String(this.voice.ttsEngine || 'auto').toLowerCase().trim();
+    return TTS_ENGINES.includes(e) ? e : 'auto';
+  }
+
+  /** @returns {string} the configured Piper voice id (the default when unset or invalid) */
+  piperVoiceId() {
+    const id = this.voice.piperVoice;
+    return typeof id === 'string' && piperMod.validVoiceName(id) ? id : piperMod.DEFAULT_VOICE;
+  }
+
+  /**
+   * The engine the daemon speaks with for a setting.
+   * @private
+   * @returns {'piper'|'os'|'browser'|null}
+   */
+  pickEngine(setting, tts, piper) {
+    const piperOk = Boolean(piper && piper.installed);
+    const osOk = Boolean(tts && tts.name);
+    if (setting === 'piper') return piperOk ? 'piper' : null;
+    if (setting === 'os') return osOk ? 'os' : null;
+    if (setting === 'browser') return 'browser';
+    return piperOk ? 'piper' : osOk ? 'os' : null;
+  }
+
+  /**
+   * Which voice the daemon uses now.
+   * @returns {Promise<{setting:string, engine:'piper'|'os'|'browser'|null, piper:object, os:{provider:string|null, hint?:string}}>}
+   */
+  async engineInfo() {
+    const { tts, piper } = await this.resolveAll();
+    const setting = this.ttsEngineSetting();
+    const os = { provider: tts.name || null };
+    if (!tts.name && tts.hint) os.hint = tts.hint;
+    return { setting, engine: this.pickEngine(setting, tts, piper), piper: { ...piper }, os };
+  }
+
+  /** Forget cached capabilities (after a voice was installed, removed or chosen). */
+  invalidate() {
+    this.cache = null;
+    if (this.piper) this.piper.binaryCache = null;
+  }
+
+  /**
+   * Everything GET /api/voice/status reports (fresh, not cached).
+   * @returns {Promise<object>}
+   */
+  async voiceStatus() {
+    this.invalidate();
+    const info = await this.engineInfo();
+    const installed = new Set(info.piper.installedVoices || []);
+    let player = null;
+    try {
+      player = await this.player().status();
+    } catch {
+      player = null;
+    }
+    return {
+      engine: info.engine,
+      ttsEngine: info.setting,
+      piper: {
+        installed: Boolean(info.piper.installed),
+        binary: info.piper.binary || null,
+        binaryKind: info.piper.binaryKind || null,
+        voice: info.piper.voice,
+        installedVoices: [...installed],
+        installing: info.piper.installing || null,
+        catalog: piperMod.CATALOG.map((v) => ({
+          id: v.id,
+          name: v.name,
+          language: v.language,
+          gender: v.gender,
+          quality: v.quality,
+          sizeMb: v.sizeMb,
+          sampleText: v.sampleText,
+          description: v.description,
+          installed: installed.has(v.id),
+        })),
+      },
+      os: info.os,
+      player,
+    };
+  }
+
+  /**
+   * Install Piper and a voice (see PiperManager.install), then refresh capabilities.
+   * @param {{voice?:string, force?:boolean, onProgress?:Function, signal?:AbortSignal}} [opts]
+   */
+  async installPiper(opts = {}) {
+    try {
+      return await this.piper.install({ voice: this.piperVoiceId(), ...opts });
+    } finally {
+      this.invalidate();
+    }
+  }
+
+  /**
+   * Render text with Piper to a cached WAV (runDir()/tts-cache, the last 60 kept). The same
+   * voice, speed and text give the same id, so fixed phrases replay at once.
+   * @param {string} text markdown is stripped; at most about 1500 characters are spoken
+   * @param {{voice?:string, rate?:number}} [opts]
+   * @returns {Promise<{id:string, path:string, mime:'audio/wav', engine:'piper', durationMs:number, cached:boolean, voice:string}>}
+   */
+  async synthesize(text, { voice, rate } = {}) {
+    const clean = capSpeech(
+      stripMarkdownForSpeech(String(text == null ? '' : text))
+        .replace(/\s+/g, ' ')
+        .trim(),
+    );
+    if (!clean) throw voiceError(400, 'Nothing to speak');
+    const voiceId = typeof voice === 'string' && piperMod.validVoiceName(voice) ? voice : this.piperVoiceId();
+    const r = Number(rate != null ? rate : this.voice.ttsRate);
+    const lengthScale = Math.round((1 / clamp(Number.isFinite(r) && r > 0 ? r : 1, 0.5, 2)) * 100) / 100;
+    const id = this.ttsCache.keyFor(['piper', voiceId, lengthScale, clean]);
+    const hit = this.ttsCache.get(id);
+    const hitInfo = hit ? piperMod.wavFileInfo(hit) : null;
+    if (hitInfo) return { id, path: hit, mime: 'audio/wav', engine: 'piper', durationMs: hitInfo.durationMs, cached: true, voice: voiceId };
+    if (this.inflight.has(id)) return this.inflight.get(id);
+    const job = Promise.resolve()
+      .then(() => this.piper.synthesize(clean, { voice: voiceId, outFile: this.ttsCache.pathFor(id), lengthScale }))
+      .then((out) => {
+        try {
+          this.ttsCache.prune();
+        } catch (err) {
+          log.debug(`tts cache prune failed: ${err.message}`);
+        }
+        log.debug(`piper spoke ${clean.length} characters in ${out.ms} ms (${out.durationMs} ms of audio)`);
+        return { id, path: out.path, mime: 'audio/wav', engine: 'piper', durationMs: out.durationMs, cached: false, voice: voiceId };
+      })
+      .finally(() => this.inflight.delete(id));
+    this.inflight.set(id, job);
+    return job;
+  }
+
+  /**
+   * A synthesized WAV by id (from synthesize()).
+   * @param {string} id
+   * @returns {string|null} its path, or null for an unknown or malformed id
+   */
+  audioFile(id) {
+    return this.ttsCache.get(id);
+  }
+
+  /**
+   * Play a WAV through the OS (one sound at a time; stop() ends it).
+   * @param {string} file
+   * @param {{device?:string, timeoutMs?:number}} [opts]
+   */
+  playFile(file, opts) {
+    return this.player().playFile(file, opts);
+  }
+
+  /**
+   * Call fn whenever stop() is called from outside (the dialog's barge-in, Stop, shutdown);
+   * a new utterance replacing the old one does not count.
+   * @param {()=>void} fn
+   * @returns {()=>void} unsubscribe
+   */
+  onStop(fn) {
+    if (typeof fn !== 'function') return () => {};
+    this.stopListeners.add(fn);
+    return () => this.stopListeners.delete(fn);
+  }
+
+  /** @private speak with Piper: synthesize (cached), then play locally */
+  async speakPiper(clean, { rate } = {}) {
+    this.halt();
+    const ac = new AbortController();
+    const current = { ac, tts: { name: 'piper' } };
+    this.current = current;
+    try {
+      const s = await this.synthesize(clean, { rate });
+      if (ac.signal.aborted) return { ok: true, provider: 'piper', stopped: true };
+      const r = await this.playFile(s.path);
+      if (ac.signal.aborted || (r && r.stopped)) return { ok: true, provider: 'piper', stopped: true };
+      return { ok: true, provider: 'piper' };
+    } catch (err) {
+      if (ac.signal.aborted) return { ok: true, provider: 'piper', stopped: true };
+      throw err;
+    } finally {
+      if (this.current === current) this.current = null;
+    }
   }
 
   /** @private */
@@ -391,15 +605,25 @@ class VoiceService {
    * @returns {Promise<{serverStt:boolean, sttProvider:string|null, serverTts:boolean, ttsProvider:string|null, sttHint?:string, ttsHint?:string}>}
    */
   async capabilities() {
-    const { stt, tts } = await this.resolveAll();
+    const { stt, tts, piper } = await this.resolveAll();
+    const setting = this.ttsEngineSetting();
+    const engine = this.pickEngine(setting, tts, piper);
+    const usePiper = engine === 'piper';
+    const serverTts = usePiper || (engine !== null && Boolean(tts.name));
     const out = {
       serverStt: Boolean(stt.name),
       sttProvider: stt.name || null,
-      serverTts: Boolean(tts.name),
-      ttsProvider: tts.name || null,
+      serverTts,
+      ttsProvider: usePiper ? 'piper' : serverTts ? tts.name : null,
+      engine,
+      ttsEngine: setting,
+      piper: { installed: Boolean(piper && piper.installed), voice: (piper && piper.voice) || this.piperVoiceId() },
     };
     if (!stt.name && stt.hint) out.sttHint = stt.hint;
-    if (!tts.name && tts.hint) out.ttsHint = tts.hint;
+    if (!serverTts) {
+      if (setting === 'piper') out.ttsHint = PIPER_HINT;
+      else if (tts.hint) out.ttsHint = tts.hint;
+    }
     return out;
   }
 
@@ -421,7 +645,14 @@ class VoiceService {
       log.warn(`text-to-speech detection failed: ${err.message}`);
       tts = { name: null, hint: err.message };
     }
-    this.cache = { at: t, stt, tts };
+    let piper;
+    try {
+      piper = this.piper ? await this.piper.status(this.piperVoiceId()) : { installed: false, voice: this.piperVoiceId() };
+    } catch (err) {
+      log.warn(`Piper detection failed: ${err.message}`);
+      piper = { installed: false, voice: this.piperVoiceId(), installedVoices: [] };
+    }
+    this.cache = { at: t, stt, tts, piper };
     return this.cache;
   }
 
@@ -787,9 +1018,20 @@ class VoiceService {
         .trim(),
     );
     if (!clean) return { ok: false, provider: null, error: 'Nothing to speak' };
-    const { tts } = await this.resolveAll();
-    if (!tts.name) throw voiceError(503, 'No text-to-speech engine was found', tts.hint);
+    const { tts, piper } = await this.resolveAll();
     const ttsRate = rate != null ? rate : v.ttsRate;
+    const setting = this.ttsEngineSetting();
+    const engine = this.pickEngine(setting, tts, piper);
+    if (setting === 'piper' && engine !== 'piper') throw voiceError(503, 'The neural voice (Piper) is not installed', PIPER_HINT);
+    if (engine === 'piper') {
+      try {
+        return await this.speakPiper(clean, { rate: ttsRate });
+      } catch (err) {
+        if (setting === 'piper' || !tts.name) throw err;
+        log.warn(`Piper could not speak (${err.message}); using the OS voice (${tts.name}) instead`);
+      }
+    }
+    if (!tts.name) throw voiceError(503, 'No text-to-speech engine was found', tts.hint);
     let ttsVoice = voice || v.ttsVoice || '';
     // The dialog's voice list is the browser's: "Google US English" or an "Online" voice exists
     // only there, and say/espeak-ng fail on it (MACOS-2-9). Use a local voice for the language.
@@ -797,7 +1039,7 @@ class VoiceService {
       ttsVoice = await this.localVoiceFor(tts, v.language);
     }
     let cmd = buildTtsCommand(tts, clean, { rate: ttsRate, voice: ttsVoice, language: v.language });
-    this.stop();
+    this.halt();
     const ac = new AbortController();
     const current = { ac, tts, winPid: null };
     this.current = current;
@@ -888,13 +1130,40 @@ class VoiceService {
   }
 
   /**
-   * Stop the utterance being spoken, if any.
+   * Stop the utterance or sound being played, if any, and tell onStop() listeners (the announcer
+   * drops what it had queued).
    * @returns {boolean} whether something was stopped
    */
   stop() {
+    const stopped = this.halt();
+    for (const fn of [...this.stopListeners]) {
+      try {
+        fn();
+      } catch (err) {
+        log.debug(`stop listener failed: ${err.message}`);
+      }
+    }
+    return stopped;
+  }
+
+  /**
+   * Stop the current utterance and sound without notifying listeners (a new utterance replaces
+   * the old one).
+   * @private
+   * @returns {boolean}
+   */
+  halt() {
+    let played = false;
+    if (this.playerOverride || this.playerInstance) {
+      try {
+        played = Boolean(this.player().stop());
+      } catch {
+        played = false;
+      }
+    }
     const cur = this.current;
     this.current = null;
-    if (!cur) return false;
+    if (!cur) return played;
     try {
       cur.ac.abort();
     } catch {
@@ -917,6 +1186,8 @@ class VoiceService {
 
 module.exports = {
   VoiceService,
+  TTS_ENGINES,
+  PIPER_HINT,
   buildTtsCommand,
   parseSayVoices,
   parseWavHeader,

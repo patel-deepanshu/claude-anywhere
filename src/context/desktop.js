@@ -432,6 +432,399 @@ async function probeDocker(sys = sysInfo()) {
   return dockerInflight;
 }
 
+// ---------------------------------------------------------------- default browser
+
+const DEFAULT_BROWSER_CACHE_MS = 60000;
+const DEFAULT_BROWSER_EXEC_MS = 1500; // reg.exe / xdg-settings; the whole probe stays inside PROBE_TIMEOUT_MS
+let browserCache = null; // { key, at, value }
+let browserInflight = null; // { key, promise }
+
+/** Browser names by macOS bundle id, Windows URL ProgId and Linux desktop file id. */
+const BROWSER_IDS = [
+  { name: 'Google Chrome', mac: /^com\.google\.chrome$/i, win: /^ChromeHTML$/i, linux: /^(google-chrome(-stable)?|com\.google\.Chrome)$/i },
+  { name: 'Google Chrome Beta', mac: /^com\.google\.chrome\.beta$/i, win: /^ChromeBHTML$/i, linux: /^google-chrome-beta$/i },
+  { name: 'Google Chrome Dev', mac: /^com\.google\.chrome\.dev$/i, win: /^ChromeDHTML$/i, linux: /^google-chrome-unstable$/i },
+  { name: 'Google Chrome Canary', mac: /^com\.google\.chrome\.canary$/i, win: /^ChromeSSHTM$/i },
+  { name: 'Microsoft Edge', mac: /^com\.microsoft\.edgemac(\.\w+)?$/i, win: /^MSEdge(B|D|SS)?HTM$/i, linux: /^(microsoft-edge(-stable|-beta|-dev)?|com\.microsoft\.Edge)$/i },
+  { name: 'Firefox', mac: /^org\.mozilla\.(firefox|firefoxdeveloperedition|nightly)$/i, win: /^FirefoxURL(-[0-9A-F]+)?$/i, linux: /^(firefox(-esr|-developer-edition|-nightly)?|org\.mozilla\.firefox|firefox_firefox)$/i },
+  { name: 'Brave', mac: /^com\.brave\.browser(\.\w+)?$/i, win: /^Brave(HTML|BHTML|DHTML|SSHTM)$/i, linux: /^(brave-browser(-beta|-nightly)?|brave|com\.brave\.Browser|brave_brave)$/i },
+  { name: 'Safari', mac: /^com\.apple\.safari(technologypreview)?$/i },
+  { name: 'Arc', mac: /^company\.thebrowser\.(browser|arc)$/i, win: /^(Arc|TheBrowserCompany\.Arc)/i },
+  { name: 'Vivaldi', mac: /^com\.vivaldi\.vivaldi$/i, win: /^VivaldiHTM(\.\w+)?$/i, linux: /^(vivaldi(-stable|-snapshot)?|com\.vivaldi\.Vivaldi)$/i },
+  { name: 'Opera', mac: /^com\.operasoftware\.opera(gx|developer|next)?$/i, win: /^Opera ?(GX)?Stable$/i, linux: /^(opera|opera-beta|com\.opera\.Opera)$/i },
+  { name: 'Chromium', mac: /^org\.chromium\.chromium$/i, win: /^ChromiumHTM(\.\w+)?$/i, linux: /^(chromium(-browser)?|org\.chromium\.Chromium|chromium_chromium)$/i },
+  { name: 'Zen Browser', mac: /^app\.zen-browser\.zen$/i, win: /^Zen(HTML|URL)?(-[0-9A-F]+)?$/i, linux: /^(zen|zen-browser|app\.zen_browser\.zen)$/i },
+  { name: 'LibreWolf', mac: /^(org\.mozilla\.librewolf|io\.gitlab\.librewolf-community)$/i, win: /^LibreWolf(HTM|URL)/i, linux: /^(librewolf|io\.gitlab\.librewolf-community)$/i },
+  { name: 'Waterfox', mac: /^net\.waterfox\.waterfox$/i, win: /^Waterfox(URL|HTML)/i, linux: /^(waterfox|net\.waterfox\.waterfox)$/i },
+  { name: 'Orion', mac: /^com\.kagi\.kagimacos$/i },
+  { name: 'DuckDuckGo', mac: /^com\.duckduckgo\.macos\.browser$/i },
+  { name: 'Internet Explorer', win: /^IE\.HTTPS?$/i },
+];
+
+/**
+ * A browser's display name from the id the OS stores for the default handler.
+ * @param {'mac'|'win'|'linux'} kind
+ * @param {string} id bundle id, ProgId or desktop file id ("brave-browser.desktop")
+ * @returns {string|null}
+ */
+function browserNameFromId(kind, id) {
+  const raw = String(id || '').trim();
+  if (!raw) return null;
+  const key = kind === 'linux' ? raw.replace(/\.desktop$/i, '') : raw;
+  const hit = BROWSER_IDS.find((b) => b[kind] && b[kind].test(key));
+  return hit ? hit.name : null;
+}
+
+/** Read an n-byte big-endian unsigned integer (n = 1, 2, 4 or 8) inside the buffer, or throw. */
+function readUIntBE(buf, pos, n) {
+  if (!Number.isInteger(pos) || pos < 0 || pos + n > buf.length || n < 1 || n > 8) throw new Error('plist: out of bounds');
+  if (n <= 6) return buf.readUIntBE(pos, n);
+  const v = buf.readBigUInt64BE(pos);
+  if (v > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('plist: integer too large');
+  return Number(v);
+}
+
+/**
+ * Parse a binary property list (bplist00): dicts, arrays, strings, numbers, booleans, dates and
+ * data. Returns undefined when the buffer is not one or is malformed.
+ * @param {Buffer} buf
+ */
+function parseBinaryPlist(buf) {
+  try {
+    if (!Buffer.isBuffer(buf) || buf.length < 40 || buf.toString('latin1', 0, 8) !== 'bplist00') return undefined;
+    const t = buf.length - 32;
+    const offSize = buf[t + 6];
+    const refSize = buf[t + 7];
+    const count = readUIntBE(buf, t + 8, 8);
+    const top = readUIntBE(buf, t + 16, 8);
+    const table = readUIntBE(buf, t + 24, 8);
+    if (!offSize || !refSize || top >= count || table + count * offSize > t) return undefined;
+    const offsetOf = (i) => readUIntBE(buf, table + i * offSize, offSize);
+    const value = (i, depth) => {
+      if (depth > 64 || i >= count) throw new Error('plist: bad reference');
+      const p = offsetOf(i);
+      if (p >= t) throw new Error('plist: bad offset');
+      const marker = buf[p];
+      const hi = marker >> 4;
+      const lo = marker & 0x0f;
+      const sized = () => {
+        if (lo !== 0x0f) return [lo, p + 1];
+        const m = buf[p + 1];
+        if (m >> 4 !== 0x1) throw new Error('plist: bad length');
+        const n = 1 << (m & 0x0f);
+        return [readUIntBE(buf, p + 2, n), p + 2 + n];
+      };
+      switch (hi) {
+        case 0x0:
+          return lo === 0x8 ? false : lo === 0x9 ? true : null;
+        case 0x1: {
+          const n = 1 << lo;
+          if (n === 8) return Number(buf.readBigInt64BE(p + 1));
+          return readUIntBE(buf, p + 1, n);
+        }
+        case 0x2:
+          return lo === 2 ? buf.readFloatBE(p + 1) : buf.readDoubleBE(p + 1);
+        case 0x3:
+          return new Date((buf.readDoubleBE(p + 1) + 978307200) * 1000);
+        case 0x4: {
+          const [n, s] = sized();
+          if (s + n > t) throw new Error('plist: data out of bounds');
+          return buf.subarray(s, s + n);
+        }
+        case 0x5: {
+          const [n, s] = sized();
+          if (s + n > t) throw new Error('plist: string out of bounds');
+          return buf.toString('latin1', s, s + n);
+        }
+        case 0x6: {
+          const [n, s] = sized();
+          if (s + 2 * n > t) throw new Error('plist: string out of bounds');
+          const b = Buffer.from(buf.subarray(s, s + 2 * n));
+          b.swap16();
+          return b.toString('utf16le');
+        }
+        case 0x8:
+          return { uid: readUIntBE(buf, p + 1, lo + 1) };
+        case 0xa: {
+          const [n, s] = sized();
+          if (s + n * refSize > t) throw new Error('plist: array out of bounds');
+          const out = [];
+          for (let k = 0; k < n; k += 1) out.push(value(readUIntBE(buf, s + k * refSize, refSize), depth + 1));
+          return out;
+        }
+        case 0xd: {
+          const [n, s] = sized();
+          if (s + 2 * n * refSize > t) throw new Error('plist: dict out of bounds');
+          const out = {};
+          for (let k = 0; k < n; k += 1) {
+            const key = value(readUIntBE(buf, s + k * refSize, refSize), depth + 1);
+            out[String(key)] = value(readUIntBE(buf, s + (n + k) * refSize, refSize), depth + 1);
+          }
+          return out;
+        }
+        default:
+          return null;
+      }
+    };
+    return value(top, 0);
+  } catch {
+    return undefined;
+  }
+}
+
+function xmlUnescape(s) {
+  return String(s)
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+/**
+ * Parse an XML property list (dict, array, key, string, integer, real, true, false, date, data).
+ * Returns undefined when it is not one or is malformed.
+ * @param {string} text
+ */
+function parseXmlPlist(text) {
+  try {
+    const s = String(text || '');
+    if (!/<plist[\s>]/.test(s)) return undefined;
+    const re = /<(\/?)(dict|array|key|string|integer|real|true|false|date|data)\s*(\/?)>/g;
+    const tokens = [];
+    let m;
+    while ((m = re.exec(s))) tokens.push({ close: m[1] === '/', tag: m[2], self: m[3] === '/', start: m.index, end: re.lastIndex });
+    let i = 0;
+    const leaf = (open) => {
+      const close = tokens[i++];
+      if (!close || !close.close || close.tag !== open.tag) throw new Error('plist: unclosed element');
+      return xmlUnescape(s.slice(open.end, close.start));
+    };
+    const value = (depth) => {
+      if (depth > 64) throw new Error('plist: too deep');
+      const t = tokens[i++];
+      if (!t || t.close) throw new Error('plist: unexpected token');
+      if (t.tag === 'true' || t.tag === 'false') {
+        if (!t.self) leaf(t);
+        return t.tag === 'true';
+      }
+      if (t.self) return t.tag === 'dict' ? {} : t.tag === 'array' ? [] : '';
+      if (t.tag === 'dict') {
+        const out = {};
+        while (tokens[i] && !(tokens[i].close && tokens[i].tag === 'dict')) {
+          const k = tokens[i++];
+          if (k.tag !== 'key' || k.close) throw new Error('plist: dict without key');
+          const key = k.self ? '' : leaf(k);
+          out[key] = value(depth + 1);
+        }
+        i += 1;
+        return out;
+      }
+      if (t.tag === 'array') {
+        const out = [];
+        while (tokens[i] && !(tokens[i].close && tokens[i].tag === 'array')) out.push(value(depth + 1));
+        i += 1;
+        return out;
+      }
+      const raw = leaf(t);
+      if (t.tag === 'integer') return parseInt(raw, 10);
+      if (t.tag === 'real') return parseFloat(raw);
+      return t.tag === 'string' ? raw : raw.trim();
+    };
+    return value(0);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The bundle id LaunchServices opens https (else http) links with, or null. */
+function launchServicesHandler(data) {
+  const handlers = data && Array.isArray(data.LSHandlers) ? data.LSHandlers : [];
+  for (const scheme of ['https', 'http']) {
+    const h = handlers.find((x) => x && typeof x === 'object' && String(x.LSHandlerURLScheme || '').toLowerCase() === scheme && (x.LSHandlerRoleAll || x.LSHandlerRoleViewer));
+    if (h) return String(h.LSHandlerRoleAll || h.LSHandlerRoleViewer);
+  }
+  return null;
+}
+
+/**
+ * The ProgId Windows opens https links with, from `reg query …\UrlAssociations\https /s /v ProgId`
+ * output. Newer Windows 11 builds keep it under UserChoiceLatest, which then wins.
+ * @param {string} stdout
+ * @returns {string|null}
+ */
+function parseRegProgId(stdout) {
+  const found = {};
+  let key = '';
+  for (const line of String(stdout || '').split(/\r?\n/)) {
+    if (/^HKEY_/i.test(line.trim())) {
+      key = line.trim();
+      continue;
+    }
+    const m = /^\s*ProgId\s+REG_[A-Z_]+\s+(.+?)\s*$/i.exec(line);
+    if (m) found[/\\UserChoiceLatest$/i.test(key) ? 'latest' : /\\UserChoice$/i.test(key) ? 'choice' : 'other'] = m[1];
+  }
+  return found.latest || found.choice || found.other || null;
+}
+
+/** A Windows ProgId without a known name, made readable: "VivaldiHTM.ABC" -> "Vivaldi". */
+function progIdLabel(progId) {
+  const s = String(progId || '').replace(/\.[^.]*$/, (x) => (/^\.[0-9A-Z]{6,}$/i.test(x) ? '' : x));
+  return s.replace(/(HTML?|URL)(-[0-9A-F]+)?$/i, '').replace(/[._-]+$/, '') || String(progId || '');
+}
+
+/** Read the `[Default Applications]` handler of x-scheme-handler/https (then http, text/html) from mimeapps.list text. */
+function mimeappsHandler(text) {
+  const ini = parseIni(String(text || ''));
+  const sect = ini['Default Applications'] || ini['default applications'];
+  if (!sect) return null;
+  for (const type of ['x-scheme-handler/https', 'x-scheme-handler/http', 'text/html']) {
+    const v = sect[type];
+    if (v) {
+      const first = String(v).split(';').map((x) => x.trim()).find(Boolean);
+      if (first) return first;
+    }
+  }
+  return null;
+}
+
+/** mimeapps.list files in XDG lookup order (the first one with a handler wins). */
+function mimeappsFiles(sys) {
+  const env = sys.env || {};
+  const home = sys.home;
+  const configHome = env.XDG_CONFIG_HOME || path.posix.join(home, '.config');
+  const configDirs = (env.XDG_CONFIG_DIRS || '/etc/xdg').split(':').filter(Boolean);
+  const dataHome = env.XDG_DATA_HOME || path.posix.join(home, '.local', 'share');
+  const dataDirs = (env.XDG_DATA_DIRS || '/usr/local/share:/usr/share').split(':').filter(Boolean);
+  const desktops = String(env.XDG_CURRENT_DESKTOP || '')
+    .split(':')
+    .map((d) => d.trim().toLowerCase())
+    .filter(Boolean);
+  const files = [];
+  for (const dir of [configHome, ...configDirs]) {
+    for (const d of desktops) files.push(path.posix.join(dir, `${d}-mimeapps.list`));
+    files.push(path.posix.join(dir, 'mimeapps.list'));
+  }
+  for (const dir of [dataHome, ...dataDirs]) files.push(path.posix.join(dir, 'applications', 'mimeapps.list'));
+  return files;
+}
+
+/** The Name= of a desktop file (for browsers the table does not know). */
+async function desktopFileName(id, sys) {
+  const env = sys.env || {};
+  const dataHome = env.XDG_DATA_HOME || path.posix.join(sys.home, '.local', 'share');
+  const dataDirs = (env.XDG_DATA_DIRS || '/usr/local/share:/usr/share').split(':').filter(Boolean);
+  const dirs = [
+    ...[dataHome, ...dataDirs].map((d) => path.posix.join(d, 'applications')),
+    path.posix.join(dataHome, 'flatpak', 'exports', 'share', 'applications'),
+    '/var/lib/flatpak/exports/share/applications',
+    '/var/lib/snapd/desktop/applications',
+  ];
+  const file = /\.desktop$/i.test(id) ? id : `${id}.desktop`;
+  if (/[\\/]/.test(file)) return null;
+  for (const dir of dirs) {
+    const text = await readText(path.posix.join(dir, file), 512 * 1024);
+    if (text == null) continue;
+    const ini = parseIni(text);
+    const entry = ini['Desktop Entry'];
+    if (entry && entry.Name) return String(entry.Name).trim() || null;
+  }
+  return null;
+}
+
+function regExe(sys, which) {
+  if (sys.platform === 'win32') {
+    const root = (sys.env && (sys.env.SystemRoot || sys.env.SYSTEMROOT || sys.env.windir)) || 'C:\\Windows';
+    return path.win32.join(root, 'System32', 'reg.exe');
+  }
+  return which('reg.exe') || '/mnt/c/Windows/System32/reg.exe';
+}
+
+async function windowsDefaultBrowser(sys, run, which) {
+  const key = 'HKCU\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https';
+  const r = await run(regExe(sys, which), ['query', key, '/s', '/v', 'ProgId'], { timeoutMs: DEFAULT_BROWSER_EXEC_MS });
+  if (!r || r.code !== 0) return null;
+  const progId = parseRegProgId(r.stdout);
+  if (!progId) return null;
+  return { name: browserNameFromId('win', progId) || progIdLabel(progId), id: progId, source: 'registry' };
+}
+
+async function macDefaultBrowser(sys) {
+  const file = path.posix.join(sys.home, 'Library', 'Preferences', 'com.apple.LaunchServices', 'com.apple.launchservices.secure.plist');
+  let buf = null;
+  try {
+    const st = await fsp.stat(file);
+    if (st.size > MAX_FILE_BYTES) return null;
+    buf = await fsp.readFile(file);
+  } catch (err) {
+    // No LaunchServices choices yet: macOS opens links in Safari.
+    if (err && err.code === 'ENOENT') return { name: 'Safari', id: 'com.apple.safari', source: 'default' };
+    return null;
+  }
+  const data = buf.toString('latin1', 0, 8) === 'bplist00' ? parseBinaryPlist(buf) : parseXmlPlist(buf.toString('utf8'));
+  if (data === undefined) return null;
+  const id = launchServicesHandler(data);
+  if (!id) return { name: 'Safari', id: 'com.apple.safari', source: 'default' };
+  return { name: browserNameFromId('mac', id) || id, id, source: 'launchservices' };
+}
+
+async function linuxDefaultBrowser(sys, run, which) {
+  let id = null;
+  let source = 'mimeapps';
+  for (const f of mimeappsFiles(sys)) {
+    const text = await readText(f, 1024 * 1024);
+    if (text == null) continue;
+    id = mimeappsHandler(text);
+    if (id) break;
+  }
+  if (!id) {
+    const bin = which('xdg-settings');
+    if (!bin) return null;
+    const r = await run(bin, ['get', 'default-web-browser'], { timeoutMs: DEFAULT_BROWSER_EXEC_MS });
+    const out = r && r.code === 0 ? String(r.stdout || '').trim().split(/\r?\n/)[0].trim() : '';
+    if (!out) return null;
+    id = out;
+    source = 'xdg-settings';
+  }
+  const name = browserNameFromId('linux', id) || (await desktopFileName(id, sys)) || id.replace(/\.desktop$/i, '');
+  return { name, id, source };
+}
+
+/**
+ * The user's default web browser: macOS LaunchServices (the secure plist, no exec), Windows and
+ * WSL the HKCU UrlAssociations choice (reg.exe), Linux mimeapps.list then xdg-settings. Cached
+ * for 60 s; never throws.
+ * @param {object} [sys] sysInfo()
+ * @param {{run?:Function, which?:Function}} [deps] test hooks for proc.run and proc.which
+ * @returns {Promise<{name:string, id:string, source:'launchservices'|'registry'|'mimeapps'|'xdg-settings'|'default'}|null>}
+ */
+async function readDefaultBrowser(sys = sysInfo(), deps = {}) {
+  const key = `${sys.platform}|${sys.isWSL ? 'wsl' : ''}|${sys.home}`;
+  if (browserCache && browserCache.key === key && Date.now() - browserCache.at < DEFAULT_BROWSER_CACHE_MS) return browserCache.value;
+  if (browserInflight && browserInflight.key === key) return browserInflight.promise;
+  const run = typeof deps.run === 'function' ? deps.run : proc.run;
+  const which = typeof deps.which === 'function' ? deps.which : proc.which;
+  const promise = (async () => {
+    let value = null;
+    try {
+      if (sys.platform === 'darwin') value = await macDefaultBrowser(sys);
+      else if (sys.platform === 'win32' || sys.isWSL) value = await windowsDefaultBrowser(sys, run, which);
+      else value = await linuxDefaultBrowser(sys, run, which);
+    } catch (err) {
+      log.debug('default browser lookup failed:', err && err.message);
+      value = null;
+    }
+    browserCache = { key, at: Date.now(), value };
+    return value;
+  })().finally(() => {
+    if (browserInflight && browserInflight.promise === promise) browserInflight = null;
+  });
+  browserInflight = { key, promise };
+  return promise;
+}
+
 // ---------------------------------------------------------------- editor titles
 
 const VSCODE_PRODUCTS = [
@@ -724,6 +1117,86 @@ function parseBrowserTitle(title, app = '') {
   return out;
 }
 
+// ---------------------------------------------------------------- tickets in tab titles
+
+const TICKET_KEY = '[A-Z][A-Z0-9_]{0,49}-[1-9]\\d{0,9}';
+const TICKET_KEY_ONLY_RE = new RegExp(`^\\[?#?(${TICKET_KEY})\\]?$`);
+const TICKET_BRACKET_RE = new RegExp(`^\\[#?(${TICKET_KEY})\\]\\s*(.*)$`);
+const TICKET_LEADING_RE = new RegExp(`^(${TICKET_KEY})(?::\\s*|\\s+)(.+)$`);
+const TICKET_PART_SEP = /\s[-\u2013\u2014|]\s/;
+// Jira Cloud ("- Jira"), Server/Data Center ("- Acme JIRA", "- Jira Software"), Service Management.
+const JIRA_TAIL_RE = /\bjira\b|^service (?:desk|management)$/i;
+const LINEAR_TAIL_RE = /^linear$/i;
+const AZURE_TAIL_RE = /^(?:boards|azure boards|azure devops(?: services| server)?)$/i;
+const AZURE_ITEM_RE = /^(?:Bug|Task|User Story|Feature|Epic|Issue|Product Backlog Item|Requirement|Test Case|Impediment|Change Request|Risk|Review)\s(\d{1,9}):\s*(.+)$/i;
+const MAX_TICKETS = 8;
+const TRACKER_NAMES = { jira: 'Jira', linear: 'Linear', github: 'GitHub issue', gitlab: 'GitLab issue', azure: 'Azure Boards' };
+
+/**
+ * Recognise a ticket in a browser tab title (the title without the browser's own suffix):
+ *   Jira:   "[ABC-123] Summary - Jira" (the bracket form needs no suffix), "ABC-123: Summary - Jira",
+ *           "Summary - ABC-123 - Jira", Server/Data Center "… - Acme JIRA", Service Management
+ *   Linear: "ENG-42 Summary - Linear", "Summary | ENG-42 | Linear"
+ *   GitHub: "Summary · Issue #12 · owner/repo · GitHub"           key "owner/repo#12"
+ *   GitLab: "Summary (#12) · Issues · group / project · GitLab"   key "group/project#12"
+ *   Azure Boards: "Bug 1234: Summary - Boards"                    key "AB#1234" (the mention syntax)
+ * Unbracketed keys count only next to a tracker's name, so "UTF-8" or "COVID-19" never match.
+ * @param {string} title
+ * @returns {{key:string, summary:string, tracker:'jira'|'linear'|'github'|'gitlab'|'azure'}|null}
+ */
+function parseTicketTitle(title) {
+  const t = cleanTitle(title);
+  if (!t || t.length > 1000) return null;
+  let m = /^(.*?)\s\u00b7\sIssue\s#(\d{1,9})\s\u00b7\s([\w.-]+\/[\w.-]+)(?:\s\u00b7\sGitHub)?$/.exec(t);
+  if (m) return { key: `${m[3]}#${m[2]}`, summary: m[1].trim(), tracker: 'github' };
+  m = /^(.*?)\s\(#(\d{1,9})\)\s\u00b7\sIssues?\s\u00b7\s(.+?)\s\u00b7\sGitLab$/.exec(t);
+  if (m) return { key: `${m[3].replace(/\s*\/\s*/g, '/')}#${m[2]}`, summary: m[1].trim(), tracker: 'gitlab' };
+  const parts = t
+    .split(TICKET_PART_SEP)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const tail = parts.length > 1 ? parts[parts.length - 1] : '';
+  const jira = JIRA_TAIL_RE.test(tail);
+  const linear = !jira && LINEAR_TAIL_RE.test(tail);
+  const azure = !jira && !linear && AZURE_TAIL_RE.test(tail);
+  const body = jira || linear || azure ? parts.slice(0, -1) : parts;
+  const whole = body.join(' - ');
+  if (azure) {
+    m = AZURE_ITEM_RE.exec(whole);
+    return m ? { key: `AB#${m[1]}`, summary: m[2].trim(), tracker: 'azure' } : null;
+  }
+  m = TICKET_BRACKET_RE.exec(whole);
+  if (m) return { key: m[1], summary: m[2].trim(), tracker: linear ? 'linear' : 'jira' };
+  if (!jira && !linear) return null;
+  const tracker = jira ? 'jira' : 'linear';
+  m = TICKET_LEADING_RE.exec(whole);
+  if (m) return { key: m[1], summary: m[2].trim(), tracker };
+  const at = body.findIndex((p) => TICKET_KEY_ONLY_RE.test(p));
+  if (at < 0) return null;
+  return {
+    key: TICKET_KEY_ONLY_RE.exec(body[at])[1],
+    summary: body
+      .filter((_, i) => i !== at)
+      .join(' - ')
+      .trim(),
+    tracker,
+  };
+}
+
+/** Tickets in the browser entries of a context: [{key, summary, tracker, browser, active?}], at most 8. */
+function ticketsFromBrowsers(browsers) {
+  const out = [];
+  for (const b of Array.isArray(browsers) ? browsers : []) {
+    if (!b || out.length >= MAX_TICKETS) continue;
+    const tk = parseTicketTitle(b.title);
+    if (!tk || out.some((x) => x.key === tk.key && x.browser === b.app)) continue;
+    const item = { key: tk.key, summary: tk.summary, browser: b.app || 'Browser', tracker: tk.tracker };
+    if (b.active) item.active = true;
+    out.push(item);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- editor history (storage.json, JetBrains)
 
 /**
@@ -1008,6 +1481,34 @@ function sortByStack(list) {
 
 function winKey(w) {
   return `${w.app || ''}\u0000${w.title || ''}`;
+}
+
+const MAX_APPS = 12;
+
+/**
+ * Running apps by number of windows (most first; ties keep stacking order, front first), from a
+ * driver window list. Our own dialog is left out; untitled windows count (titles can be hidden).
+ * @param {object[]} rawList driver.listWindows()
+ * @param {number} [max]
+ * @returns {{app:string, windows:number}[]}
+ */
+function runningApps(rawList, max = MAX_APPS) {
+  let list = (Array.isArray(rawList) ? rawList : []).filter((w) => w && typeof w === 'object');
+  list = sortByStack(list) || list;
+  const byApp = new Map();
+  for (const w of list) {
+    if (isOwnWindow(w)) continue;
+    const app = cleanTitle(w.app);
+    if (!app) continue;
+    const key = app.toLowerCase();
+    const hit = byApp.get(key);
+    if (hit) hit.windows += 1;
+    else byApp.set(key, { app, windows: 1, order: byApp.size });
+  }
+  return [...byApp.values()]
+    .sort((a, b) => b.windows - a.windows || a.order - b.order)
+    .slice(0, Math.max(0, max))
+    .map(({ app, windows }) => ({ app, windows }));
 }
 
 /**
@@ -1376,6 +1877,11 @@ async function gatherContext({ driver, projectDir, config, _sys } = {}) {
     windows: [],
     editors: [],
     browsers: [],
+    // Tickets (Jira, Linear, GitHub/GitLab issues, Azure Boards) recognised in browser tab titles.
+    tickets: [],
+    // Running apps by window count (top 12) and the browser links open in by default.
+    apps: [],
+    defaultBrowser: null,
     project: { dir, name: baseName(dir) || dir, git: null, stack: [] },
     cloud: { gcloud: null, aws: null, az: null, kubectl: null, docker: null },
     errors,
@@ -1385,6 +1891,8 @@ async function gatherContext({ driver, projectDir, config, _sys } = {}) {
     const probes = {
       osVersion: () => osVersion(sys),
       project: () => projectInfo(dir),
+      // Never rejects; its own commands time out well inside PROBE_TIMEOUT_MS.
+      defaultBrowser: () => readDefaultBrowser(sys),
     };
     if (ctxCfg.includeWindows) {
       if (driver !== null) probes.windows = () => probeWindows(driver);
@@ -1408,6 +1916,7 @@ async function gatherContext({ driver, projectDir, config, _sys } = {}) {
     });
 
     ctx.os.version = r.osVersion || null;
+    ctx.defaultBrowser = r.defaultBrowser || null;
     if (r.project) ctx.project = r.project;
     if (r.project && r.project.git && r.project.git.error) errors.push(`git: ${r.project.git.error}`);
     for (const k of ['gcloud', 'aws', 'az', 'kubectl', 'docker']) if (r[k] !== undefined) ctx.cloud[k] = r[k];
@@ -1420,10 +1929,12 @@ async function gatherContext({ driver, projectDir, config, _sys } = {}) {
       ctx.dialogFocused = cw.dialogFocused;
       ctx.frontWindow = cw.frontWindow;
       ctx.windows = cw.windows.slice(0, MAX_WINDOWS);
+      ctx.apps = runningApps(r.windows.list);
       const focusKey = cw.activeWindow ? winKey(cw.activeWindow) : cw.frontWindow ? winKey(cw.frontWindow) : null;
 
       const editorSeen = new Set();
       const pending = [];
+      const browserTabs = []; // every browser window (ctx.browsers keeps 12), for ticket titles
       for (const w of cw.windows) {
         const ed = parseEditorTitle(w.title, w.app, { knownNames });
         if (ed) {
@@ -1451,8 +1962,10 @@ async function gatherContext({ driver, projectDir, config, _sys } = {}) {
         if (br) {
           if (focusKey === winKey(w)) br.active = true;
           if (ctx.browsers.length < 12) ctx.browsers.push(br);
+          browserTabs.push(br);
         }
       }
+      ctx.tickets = ticketsFromBrowsers(browserTabs);
       await withTimeout(Promise.allSettled(pending), 1000, 'editor paths').catch((err) => errors.push(errorText('editors', err)));
     } else if (known && known.vscode.length) {
       // No window list (headless, some Wayland compositors): fall back to the editors' own records.
@@ -1622,6 +2135,15 @@ function render(ctx, lim) {
     lines.push(`Browsers: ${items.join('; ')}`);
   }
 
+  const tickets = (Array.isArray(ctx.tickets) ? ctx.tickets : ticketsFromBrowsers(ctx.browsers)).slice(0, lim.tickets);
+  if (tickets.length) {
+    const items = tickets.map((k) => {
+      const where = `${TRACKER_NAMES[k.tracker] || 'ticket'} in ${sanitize(k.browser || 'a browser', 30)}`;
+      return `${sanitize(k.key, 80)}${k.summary ? ` "${sanitize(k.summary, lim.ticketSummary)}"` : ''} (${where})${k.active ? ' [active]' : ''}`;
+    });
+    lines.push(`Tickets (from tab titles): ${items.join('; ')}`);
+  }
+
   if (lim.others > 0 && Array.isArray(ctx.windows)) {
     const shownKeys = new Set();
     if (ctx.activeWindow) shownKeys.add(winKey(ctx.activeWindow));
@@ -1635,6 +2157,13 @@ function render(ctx, lim) {
       lines.push(`Other windows: ${shown.join('; ')}${more > 0 ? `; +${more} more` : ''}`);
     }
   }
+
+  const apps = (Array.isArray(ctx.apps) ? ctx.apps : []).slice(0, lim.apps);
+  if (apps.length) {
+    const items = apps.map((a) => `${sanitize(a.app, 30)}${a.windows > 1 ? ` (${a.windows})` : ''}`);
+    lines.push(`Running apps (by window count): ${items.join(', ')}`);
+  }
+  if (ctx.defaultBrowser && ctx.defaultBrowser.name) lines.push(`Default browser: ${sanitize(ctx.defaultBrowser.name, 40)}`);
 
   const p = ctx.project;
   if (p && p.dir) {
@@ -1668,11 +2197,11 @@ function render(ctx, lim) {
 function formatContext(ctx) {
   if (!ctx || typeof ctx !== 'object') return '<desktop_context>\n(unavailable)\n</desktop_context>';
   const steps = [
-    { title: 100, otherTitle: 60, others: 8, editors: 8, browsers: 8, notes: 300 },
-    { title: 80, otherTitle: 40, others: 5, editors: 6, browsers: 6, notes: 200 },
-    { title: 60, otherTitle: 30, others: 3, editors: 5, browsers: 4, notes: 150 },
-    { title: 40, otherTitle: 0, others: 0, editors: 4, browsers: 3, notes: 100 },
-    { title: 30, otherTitle: 0, others: 0, editors: 3, browsers: 2, notes: 0 },
+    { title: 100, otherTitle: 60, others: 8, editors: 8, browsers: 8, tickets: 4, ticketSummary: 100, notes: 300, apps: 12 },
+    { title: 80, otherTitle: 40, others: 5, editors: 6, browsers: 6, tickets: 3, ticketSummary: 80, notes: 200, apps: 10 },
+    { title: 60, otherTitle: 30, others: 3, editors: 5, browsers: 4, tickets: 2, ticketSummary: 60, notes: 150, apps: 8 },
+    { title: 40, otherTitle: 0, others: 0, editors: 4, browsers: 3, tickets: 2, ticketSummary: 40, notes: 100, apps: 6 },
+    { title: 30, otherTitle: 0, others: 0, editors: 3, browsers: 2, tickets: 1, ticketSummary: 30, notes: 0, apps: 4 },
   ];
   let out = '';
   for (const lim of steps) {
@@ -1693,6 +2222,8 @@ function formatContext(ctx) {
 function _resetCaches() {
   dockerCache = null;
   dockerInflight = null;
+  browserCache = null;
+  browserInflight = null;
   cliCache.clear();
   wslMountRoot = null;
 }
@@ -1706,6 +2237,8 @@ module.exports = {
   isOwnWindow,
   parseEditorTitle,
   parseBrowserTitle,
+  parseTicketTitle,
+  ticketsFromBrowsers,
   classifyWindows,
   decodeFileUri,
   vscodeStorageFiles,
@@ -1717,6 +2250,16 @@ module.exports = {
   readAzure,
   readKubectl,
   probeDocker,
+  readDefaultBrowser,
+  browserNameFromId,
+  parseBinaryPlist,
+  parseXmlPlist,
+  launchServicesHandler,
+  parseRegProgId,
+  progIdLabel,
+  mimeappsHandler,
+  mimeappsFiles,
+  runningApps,
   gitInfo,
   parseGitStatus,
   stripCredentials,

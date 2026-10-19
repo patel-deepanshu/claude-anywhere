@@ -17,13 +17,17 @@
  * primary display (CGEvent space). The one exception is "displays", which
  * returns raw NSScreen frames (bottom-left origin) that darwin.js flips.
  *
- * Written in conservative ES5 style. It only touches ObjC, $ and Application
- * when they exist, so Node can syntax-check it and unit-test it with fakes.
+ * UI automation (uiTree, uiFind, uiAction, setBounds) reads and drives the
+ * accessibility tree of apps; see the "UI automation" section below.
+ *
+ * Written in conservative ES5 style. It only touches ObjC, $, Ref and
+ * Application when they exist, so Node can syntax-check it and unit-test it
+ * with fakes.
  */
 
-/* global ObjC, $, Application */
+/* global ObjC, $, Application, Ref */
 
-var HELPER_VERSION = 1;
+var HELPER_VERSION = 2;
 var HAS_OBJC = typeof ObjC !== 'undefined' && ObjC !== null && typeof ObjC.import === 'function';
 var IMPORT_ERRORS = [];
 
@@ -552,7 +556,15 @@ function fillTitlesFromAX(wins, budgetMs) {
  * user's) every later Apple event would go to whichever instance comes first.
  */
 function findAxWindowIndex(se, pid, info) {
-  var frames = axWindowFrames(se, pid);
+  return pickWindowIndex(axWindowFrames(se, pid), info);
+}
+
+/**
+ * The index of the accessibility window frame ({name, x, y, width, height}) that matches a CG
+ * window: same frame and title first, then the same frame, then the same title; -1 if none.
+ * Without a CG window, the first (frontmost) one.
+ */
+function pickWindowIndex(frames, info) {
   if (!frames.length) return -1;
   if (!info) return 0;
   var byFrame = -1;
@@ -1475,15 +1487,7 @@ function cmdWindows(a) {
 function cmdActive(a) {
   var front = frontApp();
   if (!front) return null;
-  var wins = onScreenWindows();
-  var win = null;
-  for (var i = 0; i < wins.length; i++) {
-    var w = wins[i];
-    if (w.pid === front.pid && w.layer === 0 && w.alpha > 0 && w.width > 1 && w.height > 1) {
-      win = w;
-      break;
-    }
-  }
+  var win = cgFrontWindow(front.pid);
   var ax = null;
   if (win && !win.title && a.axTitles !== false) ax = fillTitlesFromAX([win], 1000);
   return { pid: front.pid, app: front.name, bundleId: front.bundleId, window: win, ax: ax };
@@ -1633,6 +1637,120 @@ function cmdClose(a) {
   return { ok: true };
 }
 
+// ---------------------------------------------------------------- browser tabs
+
+/** Page text through the browser's own JavaScript bridge (works only where the user allowed it). */
+var PAGE_TEXT_JS = "(function(){var b=document.body;return b?String(b.innerText||b.textContent||''):'';})()";
+var BROWSER_WINDOW_LIMIT = 30;
+
+/**
+ * The scriptable application object of a running browser, found by process id (so the right
+ * one of several instances or channels answers) or else by name. Never launches the app.
+ */
+function browserApplication(a) {
+  var target = '';
+  var name = str(a.app);
+  if (a.pid !== undefined && a.pid !== null && isFinite(Number(a.pid))) {
+    var ra = $.NSRunningApplication.runningApplicationWithProcessIdentifier(int(a.pid, 'pid'));
+    if (isNil(ra)) throw fail('NOT_FOUND', 'process ' + a.pid + ' is not running');
+    target = str(ra.bundleIdentifier);
+    if (!name) name = str(ra.localizedName);
+  }
+  if (!target) target = name;
+  if (!target) throw fail('BAD_ARGS', 'browserTab needs the app name or its pid');
+  var app = Application(target);
+  if (typeof app.running === 'function' && !app.running()) throw fail('NOT_FOUND', name + ' is not running');
+  return { app: app, name: name || target };
+}
+
+/** The browser window whose title matches the CG window title, else its front window. */
+function pickBrowserWindow(app, title, nameOf) {
+  var wins = app.windows;
+  var count = Number(wins.length) || 0;
+  if (count === 0) throw fail('NOT_FOUND', 'the browser has no open window');
+  var want = str(title);
+  if (want) {
+    var n = Math.min(count, BROWSER_WINDOW_LIMIT);
+    for (var i = 0; i < n; i++) {
+      var name = '';
+      try {
+        name = String(nameOf(wins[i]) || '');
+      } catch (e) {
+        name = '';
+      }
+      if (name && (name === want || want.indexOf(name) === 0)) return { window: wins[i], matched: true };
+    }
+  }
+  return { window: wins[0], matched: false };
+}
+
+/**
+ * Read the active tab of a browser through its AppleScript dictionary: Chromium browsers
+ * (kind "chromium": Chrome, Brave, Edge, Chromium, Vivaldi, Opera, Arc) expose
+ * window.activeTab.url()/title(), Safari (kind "safari") window.currentTab / documents.
+ * The first call per browser shows macOS's Automation consent prompt and blocks until it is
+ * answered; a refusal is error -1743, reported as PERMISSION (perm "automation").
+ * With wantText it also tries the page text through the browser's JavaScript bridge, which
+ * only works where the user enabled "Allow JavaScript from Apple Events" (textError otherwise).
+ */
+function cmdBrowserTab(a) {
+  var kind = a.kind === 'safari' ? 'safari' : 'chromium';
+  var found = browserApplication(a);
+  var app = found.app;
+  var out = { url: null, title: '', matched: false, text: null, textError: null, app: found.name };
+  try {
+    var tab;
+    var pick;
+    if (kind === 'safari') {
+      pick = pickBrowserWindow(app, a.title, function (w) {
+        return w.name();
+      });
+      try {
+        tab = pick.window.currentTab();
+      } catch (e) {
+        tab = null;
+      }
+      if (tab) {
+        out.url = str(tab.url());
+        out.title = str(tab.name());
+      } else {
+        var doc = app.documents[0];
+        out.url = str(doc.url());
+        out.title = str(doc.name());
+      }
+      if (a.wantText && tab) {
+        try {
+          out.text = String(app.doJavaScript(PAGE_TEXT_JS, { in: tab }) || '');
+        } catch (e) {
+          out.textError = errMessage(e);
+        }
+      }
+    } else {
+      pick = pickBrowserWindow(app, a.title, function (w) {
+        return w.name();
+      });
+      tab = pick.window.activeTab();
+      out.url = str(tab.url());
+      out.title = str(tab.title());
+      if (a.wantText) {
+        try {
+          out.text = String(tab.execute({ javascript: PAGE_TEXT_JS }) || '');
+        } catch (e) {
+          out.textError = errMessage(e);
+        }
+      }
+    }
+    out.matched = pick.matched;
+  } catch (e) {
+    var c = classifyError(e);
+    if (c.code === 'PERMISSION') {
+      throw fail('PERMISSION', 'not allowed to control ' + found.name + ' (' + c.message + ')', { perm: 'automation', errorNumber: c.number });
+    }
+    throw e;
+  }
+  return out;
+}
+
 function cmdClipGet() {
   return { text: clipboardText() };
 }
@@ -1640,6 +1758,2445 @@ function cmdClipGet() {
 function cmdClipSet(a) {
   setClipboardText(a.text === undefined || a.text === null ? '' : String(a.text));
   return { ok: true };
+}
+
+// ---------------------------------------------------------------- UI automation (accessibility tree)
+
+/*
+ * uiTree, uiFind and uiAction read and drive the accessibility (AX) tree of an app; setBounds
+ * moves, resizes, maximizes, minimizes or full-screens a window.
+ *
+ * Two engines produce the same output:
+ * - "ax": the AX C API (HIServices) called through the JXA bridge, in this process. One request
+ *   per element (AXUIElementCopyMultipleAttributeValues), so hundreds of nodes take well under
+ *   a second, and only the Accessibility permission is needed. How the bridge hands CF values
+ *   over (a Ref or an object, attribute names as NSString or JS string, NSArray items) is not
+ *   documented, so the first request calibrates each of those against the application element
+ *   and its first child, and keeps what works.
+ * - "systemEvents": System Events UI element scripting, used when the AX bridge cannot be
+ *   calibrated. An Apple event per property list, and it also needs Automation consent.
+ *
+ * Element ids: mac:<pid>:<window>:<root><path>:<hash>. <window> is the CG window number (i<k>
+ * for the k-th AX window when it has none, - for none), <root> is w (the window) or a (the
+ * application: its menu bar and open menus), <path> lists child indices from the root, dot
+ * separated (v<k>: the k-th visible row or child of a table, outline, list or grid), and <hash>
+ * is a short hash of the element's AX role and name. uiAction follows the path; when the
+ * element there has another role or name (the window changed), it searches the root for the
+ * element with that hash, nearest to where it was (args.frame) and to the old path.
+ */
+
+var AX_OK = 0;
+var AX_ERR_FAILURE = -25200;
+var AX_ERR_INVALID_ELEMENT = -25202;
+var AX_ERR_CANNOT_COMPLETE = -25204;
+var AX_ERR_ATTRIBUTE_UNSUPPORTED = -25205;
+var AX_ERR_ACTION_UNSUPPORTED = -25206;
+var AX_ERR_API_DISABLED = -25211;
+
+// Seconds one AX request may wait for the target app (the system default is 6).
+var AX_MESSAGING_TIMEOUT = 3;
+// Opening a pop-up menu through AXPress can block until the menu closes again.
+var AX_POPUP_TIMEOUT = 0.6;
+var UI_BUDGET_MS = 8000;
+var UI_MAX_BUDGET_MS = 30000;
+var UI_RESOLVE_BUDGET_MS = 5000;
+var UI_TREE_MAX_VISIT = 8000;
+var UI_FIND_MAX_VISIT = 6000;
+var UI_MENU_MAX_VISIT = 2500;
+var UI_RESOLVE_MAX_VISIT = 5000;
+var UI_FIND_MAX_MATCHES = 400;
+var UI_RAW_DEPTH = 64;
+var UI_FLATTEN_MAX = 40;
+var UI_NAME_MAX = 200;
+var UI_VALUE_MAX = 500;
+var UI_LABEL_MAX = 40;
+var UI_PATH_PARTS = 6;
+var UI_SPARSE_NODES = 12;
+var UI_ENABLE_WAIT = 0.8;
+var UI_MENU_WAIT = 0.3;
+var UI_SETTLE = 0.05;
+var UI_FULLSCREEN_WAIT = 1.0;
+var UI_UNMINIMIZE_WAIT = 0.4;
+var WINDOW_LIST_ALL = 0; // kCGWindowListOptionAll
+
+var UI_NODE_ATTRS = [
+  'AXRole', 'AXSubrole', 'AXTitle', 'AXDescription', 'AXValue', 'AXHelp', 'AXPlaceholderValue',
+  'AXPosition', 'AXSize', 'AXEnabled', 'AXFocused', 'AXSelected', 'AXExpanded', 'AXDisclosing', 'AXURL',
+  'AXChildren', 'AXVisibleRows', 'AXVisibleChildren', 'AXTitleUIElement'
+];
+var UI_WINDOW_ATTRS = ['AXTitle', 'AXPosition', 'AXSize'];
+
+// AX role -> the shared role vocabulary (docs/ARCHITECTURE.md §4).
+var UI_ROLES = {
+  AXButton: 'button', AXMenuButton: 'button', AXDisclosureTriangle: 'button', AXColorWell: 'button', AXDockItem: 'button',
+  AXLink: 'link',
+  AXTextField: 'textbox', AXTextArea: 'textbox', AXSearchField: 'textbox', AXSecureTextField: 'textbox',
+  AXDateField: 'textbox', AXTimeField: 'textbox',
+  AXCheckBox: 'checkbox', AXSwitch: 'checkbox',
+  AXRadioButton: 'radio',
+  AXComboBox: 'combobox', AXPopUpButton: 'combobox',
+  AXMenuItem: 'menuitem', AXMenuBarItem: 'menuitem',
+  AXMenu: 'menu', AXMenuBar: 'menu',
+  AXTab: 'tab', AXTabGroup: 'tablist',
+  AXImage: 'image',
+  AXStaticText: 'text',
+  AXHeading: 'heading',
+  AXWindow: 'window', AXSheet: 'window', AXDrawer: 'window',
+  AXToolbar: 'toolbar',
+  AXGroup: 'group', AXSplitGroup: 'group', AXScrollArea: 'group', AXLayoutArea: 'group', AXLayoutItem: 'group',
+  AXRadioGroup: 'group', AXWebArea: 'group', AXList: 'group', AXBrowser: 'group', AXPopover: 'group',
+  AXOpaqueProviderGroup: 'group',
+  AXTable: 'table', AXOutline: 'table', AXGrid: 'table',
+  AXRow: 'row', AXCell: 'cell',
+  AXSlider: 'slider', AXIncrementor: 'slider', AXLevelIndicator: 'slider'
+};
+// Names the model may use for a role filter -> the shared vocabulary.
+var UI_ROLE_ALIASES = {
+  textfield: 'textbox', 'text field': 'textbox', input: 'textbox', edit: 'textbox', textarea: 'textbox',
+  searchfield: 'textbox', 'search field': 'textbox', 'text box': 'textbox',
+  statictext: 'text', 'static text': 'text', label: 'text',
+  'menu item': 'menuitem', 'check box': 'checkbox', toggle: 'checkbox', 'switch': 'checkbox',
+  'radio button': 'radio', radiobutton: 'radio',
+  'combo box': 'combobox', popup: 'combobox', 'pop up button': 'combobox', popupbutton: 'combobox',
+  dropdown: 'combobox', select: 'combobox',
+  'list item': 'listitem', 'tree item': 'treeitem', img: 'image', picture: 'image',
+  'tab list': 'tablist', tabs: 'tablist', hyperlink: 'link', anchor: 'link',
+  'menu bar': 'menu', menubar: 'menu', grid: 'table', outline: 'table', dialog: 'window', sheet: 'window'
+};
+// Unnamed containers that uiTree leaves out (their children take their place).
+var UI_TRANSPARENT = { AXGroup: 1, AXUnknown: 1, AXLayoutItem: 1, AXSplitGroup: 1, AXScrollArea: 1, AXOpaqueProviderGroup: 1 };
+// Roles whose name is their text.
+var UI_TEXT_ROLES = { AXStaticText: 1, AXHeading: 1 };
+// Roles named by a separate label element (AXTitleUIElement) when they have no title.
+var UI_LABELED_ROLES = {
+  AXTextField: 1, AXTextArea: 1, AXSearchField: 1, AXComboBox: 1, AXPopUpButton: 1, AXSlider: 1,
+  AXIncrementor: 1, AXDateField: 1, AXTimeField: 1, AXCheckBox: 1, AXRadioButton: 1, AXLevelIndicator: 1
+};
+// Roles whose AXValue is an on/off state, not text.
+var UI_STATE_VALUES = { AXRadioButton: 1, AXDisclosureTriangle: 1, AXMenuItem: 1, AXMenuBarItem: 1 };
+// Roles whose AXValue matters when System Events could not read the values of a whole list.
+var UI_VALUE_ROLES = {
+  AXStaticText: 1, AXTextField: 1, AXTextArea: 1, AXComboBox: 1, AXCheckBox: 1, AXRadioButton: 1, AXSlider: 1,
+  AXHeading: 1, AXPopUpButton: 1, AXDisclosureTriangle: 1
+};
+// Containers whose visible part is listed (v<k> path segments).
+var UI_VISIBLE_ROWS = { AXTable: 1, AXOutline: 1 };
+var UI_VISIBLE_CHILDREN = { AXList: 1, AXGrid: 1 };
+// Selected by setting AXSelected when they have no press action.
+var UI_SELECTABLE = { AXRow: 1, AXCell: 1, AXStaticText: 1, AXGroup: 1, AXImage: 1 };
+var UI_POPUP_ROLES = { AXPopUpButton: 1, AXComboBox: 1, AXMenuButton: 1 };
+var UI_PRESS_ACTIONS = ['AXPress', 'AXPick', 'AXConfirm', 'AXOpen'];
+var UI_ACTIONS = {
+  press: 1, focus: 1, setValue: 1, select: 1, expand: 1, collapse: 1, scrollIntoView: 1, showMenu: 1
+};
+// Chromium browsers: their web content tree needs AXEnhancedUserInterface (or AXManualAccessibility).
+var CHROMIUM_BUNDLE_RE = new RegExp(
+  '^(com\\.google\\.Chrome(\\.beta|\\.dev|\\.canary)?|com\\.brave\\.Browser(\\.beta|\\.nightly)?|' +
+    'com\\.microsoft\\.edgemac(\\.Beta|\\.Dev|\\.Canary)?|org\\.chromium\\.Chromium|com\\.vivaldi\\.Vivaldi|' +
+    'com\\.operasoftware\\.Opera(GX|Next)?|company\\.thebrowser\\.(Browser|dia)|com\\.naver\\.Whale|' +
+    'ru\\.yandex\\.desktop\\.yandex-browser|com\\.sidekick\\.Sidekick|net\\.imput\\.helium)$',
+  'i'
+);
+var UI_ID_RE = /^mac:(\d+):(\d+|i\d+|-):([wa])((?:v?\d+)(?:\.v?\d+)*)?:([0-9a-z]+)$/;
+var AXV_NUMBER = '(-?(?:\\d+\\.?\\d*|\\.\\d+)(?:e[-+]?\\d+)?)';
+var AXV_POINT_RE = new RegExp('\\bx:\\s*' + AXV_NUMBER + '\\s+y:\\s*' + AXV_NUMBER, 'i');
+var AXV_SIZE_RE = new RegExp('\\bw:\\s*' + AXV_NUMBER + '\\s+h:\\s*' + AXV_NUMBER, 'i');
+
+var AXS = null;
+// Processes whose web content tree this helper switched on (AXManualAccessibility...).
+var UI_ENABLED = {};
+
+// ------------------------------------------------ pure helpers (unit-tested in Node)
+
+function uiClean(s, max) {
+  if (s === null || s === undefined) return '';
+  var t = String(s)
+    .replace(/[\s\u00a0\u200b\ufeff]+/g, ' ')
+    .replace(/^ +| +$/g, '');
+  return max && t.length > max ? t.slice(0, max - 1) + '\u2026' : t;
+}
+
+function uiClip(s, max) {
+  var t = String(s === null || s === undefined ? '' : s);
+  return t.length > max ? t.slice(0, max - 1) + '\u2026' : t;
+}
+
+function uiNorm(s) {
+  return uiClean(s, 0).toLowerCase();
+}
+
+function uiValueText(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  return '';
+}
+
+/** The accessible name: title, description, the text of a text role, a label element, a placeholder. */
+function uiName(rec) {
+  var n = uiClean(rec.title, UI_NAME_MAX) || uiClean(rec.desc, UI_NAME_MAX);
+  if (!n && UI_TEXT_ROLES[rec.role] === 1) n = uiClean(uiValueText(rec.value), UI_NAME_MAX);
+  if (!n && rec.label) n = uiClean(rec.label, UI_NAME_MAX);
+  if (!n && rec.placeholder) n = uiClean(rec.placeholder, UI_NAME_MAX);
+  return n;
+}
+
+function uiDescription(rec, name) {
+  var d = uiClean(rec.desc, UI_NAME_MAX);
+  if (d && d !== name) return d;
+  var h = uiClean(rec.help, UI_NAME_MAX);
+  return h && h !== name ? h : '';
+}
+
+/** The shared role of an element; parentRole is the AX role of its parent. */
+function uiRole(rec, parentRole) {
+  var role = rec.role || '';
+  var sub = rec.subrole || '';
+  if (sub === 'AXTabButton') return 'tab';
+  if (sub === 'AXOutlineRow') return 'treeitem';
+  if (sub === 'AXSwitch') return 'checkbox';
+  if (role === 'AXRadioButton' && parentRole === 'AXTabGroup') return 'tab';
+  if (role === 'AXRow') {
+    if (parentRole === 'AXOutline') return 'treeitem';
+    if (parentRole === 'AXList') return 'listitem';
+    return 'row';
+  }
+  return hasOwn(UI_ROLES, role) ? UI_ROLES[role] : 'other';
+}
+
+function uiValue(rec, name) {
+  var role = rec.role;
+  if (role === 'AXCheckBox' || role === 'AXSwitch') {
+    if (rec.value === null || rec.value === undefined || rec.value === '') return '';
+    var c = Number(rec.value);
+    return c === 1 ? 'checked' : c === 0 ? 'unchecked' : c === 2 ? 'mixed' : '';
+  }
+  if (UI_STATE_VALUES[role] === 1) return '';
+  if (role === 'AXLink' && rec.url) return uiClip(rec.url, UI_VALUE_MAX);
+  var v = uiValueText(rec.value);
+  if (!v) return '';
+  if (UI_TEXT_ROLES[role] === 1 && uiClean(v, UI_NAME_MAX) === name) return '';
+  return uiClip(v, UI_VALUE_MAX);
+}
+
+function uiSelected(rec) {
+  if (rec.selected === true || rec.selected === false) return rec.selected;
+  if (rec.role === 'AXRadioButton' && rec.value !== null && rec.value !== undefined && rec.value !== '') {
+    var n = Number(rec.value);
+    if (n === 1 || n === 0) return n === 1;
+  }
+  return undefined;
+}
+
+function uiExpanded(rec) {
+  if (rec.expanded === true || rec.expanded === false) return rec.expanded;
+  if (rec.disclosing === true || rec.disclosing === false) return rec.disclosing;
+  if (rec.role === 'AXDisclosureTriangle' && rec.value !== null && rec.value !== undefined && rec.value !== '') {
+    var n = Number(rec.value);
+    if (n === 1 || n === 0) return n === 1;
+  }
+  return undefined;
+}
+
+function uiRound(n) {
+  var v = Math.round(n * 100) / 100;
+  return v === 0 ? 0 : v;
+}
+
+/** Logical global bounds (points, top-left origin); all zero when the element has no frame. */
+function uiBounds(rec) {
+  var p = rec.pos;
+  var s = rec.size;
+  if (!p || !s || !isFinite(p.x) || !isFinite(p.y) || !isFinite(s.w) || !isFinite(s.h)) return { x: 0, y: 0, width: 0, height: 0 };
+  return { x: uiRound(p.x), y: uiRound(p.y), width: uiRound(Math.max(0, s.w)), height: uiRound(Math.max(0, s.h)) };
+}
+
+function uiValidFrame(f) {
+  return Boolean(f) && isFinite(f.x) && isFinite(f.y) && f.width > 0 && f.height > 0;
+}
+
+function uiNoFrame() {
+  return { name: '', x: NaN, y: NaN, width: NaN, height: NaN };
+}
+
+/** FNV-1a (32 bit) of a string, base 36. */
+function uiHashText(s) {
+  var h = 0x811c9dc5;
+  for (var i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h + (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24)) >>> 0;
+  }
+  return (h >>> 0).toString(36);
+}
+
+function uiHash(rec, name) {
+  return uiHashText((rec.role || '') + '\u0001' + (name === undefined ? uiName(rec) : name));
+}
+
+function uiMakeId(pid, winKey, root, path, hash) {
+  return 'mac:' + pid + ':' + winKey + ':' + root + path.join('.') + ':' + hash;
+}
+
+/** Parse an element id; null if it is not one. */
+function uiParseId(id) {
+  var m = UI_ID_RE.exec(String(id === null || id === undefined ? '' : id));
+  if (!m) return null;
+  var pid = Number(m[1]);
+  if (!(pid > 0)) return null;
+  var win = m[2];
+  return {
+    id: m[0],
+    pid: pid,
+    winKey: win,
+    number: /^\d+$/.test(win) ? Number(win) : null,
+    axIndex: win.charAt(0) === 'i' ? Number(win.slice(1)) : null,
+    root: m[3],
+    path: m[4] ? m[4].split('.') : [],
+    hash: m[5]
+  };
+}
+
+/** A point from an AXValue description: "<AXValue 0x..> {value = x:10.000000 y:20.000000 type = kAXValueCGPointType}". */
+function parseAxPoint(d) {
+  var s = String(d || '');
+  if (s.indexOf('kAXValueAXErrorType') >= 0) return null;
+  var m = AXV_POINT_RE.exec(s);
+  if (!m) return null;
+  var x = Number(m[1]);
+  var y = Number(m[2]);
+  return isFinite(x) && isFinite(y) ? { x: x, y: y } : null;
+}
+
+/** A size from an AXValue description: "{value = w:300.000000 h:22.000000 type = kAXValueCGSizeType}". */
+function parseAxSize(d) {
+  var s = String(d || '');
+  if (s.indexOf('kAXValueAXErrorType') >= 0) return null;
+  var m = AXV_SIZE_RE.exec(s);
+  if (!m) return null;
+  var w = Number(m[1]);
+  var h = Number(m[2]);
+  return isFinite(w) && isFinite(h) ? { w: w, h: h } : null;
+}
+
+/** 3 = equal, 2 = starts with, 1 = contains, -1 = no match; needle is normalized (uiNorm). */
+function uiTextScore(hay, needle, exact) {
+  var h = uiNorm(hay);
+  if (!h || !needle) return -1;
+  if (h === needle) return 3;
+  if (exact) return -1;
+  if (h.indexOf(needle) === 0) return 2;
+  return h.indexOf(needle) >= 0 ? 1 : -1;
+}
+
+/** A role filter: {role} in the shared vocabulary (aliases allowed) or {ax} for an AX role or subrole. */
+function uiRoleQuery(role) {
+  var r = uiNorm(role);
+  if (!r) return null;
+  if (/^ax[a-z]/.test(r)) return { ax: r };
+  return { role: hasOwn(UI_ROLE_ALIASES, r) ? UI_ROLE_ALIASES[r] : r };
+}
+
+function uiRoleMatches(q, rec, role) {
+  if (!q) return true;
+  if (q.ax) return String(rec.role || '').toLowerCase() === q.ax || String(rec.subrole || '').toLowerCase() === q.ax;
+  return role === q.role;
+}
+
+function uiQuery(a) {
+  var q = {
+    name: uiNorm(a.name),
+    text: uiNorm(a.text),
+    role: uiRoleQuery(a.role),
+    exact: a.exact === true,
+    limit: clampInt(a.limit, 1, 200, 20)
+  };
+  if (!q.name && !q.text && !q.role) throw fail('BAD_ARGS', 'uiFind needs a name, text or role');
+  return q;
+}
+
+/** How well an element matches a query (higher is better), or -1. */
+function uiMatchScore(rec, name, role, q) {
+  if (q.role && !uiRoleMatches(q.role, rec, role)) return -1;
+  var score = 0;
+  if (q.name) {
+    var s = uiTextScore(name, q.name, q.exact);
+    if (s < 0) return -1;
+    score += s * 10;
+  }
+  if (q.text) {
+    var fields = [name, uiValueText(rec.value), rec.title, rec.desc, rec.help, rec.placeholder, rec.label, rec.url];
+    var best = -1;
+    for (var i = 0; i < fields.length; i++) {
+      var t = uiTextScore(fields[i], q.text, q.exact);
+      if (t > best) best = t;
+    }
+    if (best < 0) return -1;
+    score += best * 10;
+  }
+  if (rec.enabled !== false) score += 2;
+  if (rec.size && rec.size.w > 0 && rec.size.h > 0) score += 1;
+  return score;
+}
+
+function uiTransparent(rec, name) {
+  return UI_TRANSPARENT[rec.role] === 1 && !name && !uiValueText(rec.value) && rec.focused !== true;
+}
+
+function uiOutside(rec, clip) {
+  if (!clip || !rec.pos || !rec.size) return false;
+  var x = rec.pos.x;
+  var y = rec.pos.y;
+  var w = rec.size.w;
+  var h = rec.size.h;
+  if (!isFinite(x) || !isFinite(y) || !(w > 0) || !(h > 0)) return false;
+  return x + w <= clip.x || y + h <= clip.y || x >= clip.x + clip.width || y >= clip.y + clip.height;
+}
+
+function uiZeroSize(rec) {
+  return Boolean(rec.size) && isFinite(rec.size.w) && isFinite(rec.size.h) && (rec.size.w <= 0 || rec.size.h <= 0);
+}
+
+function uiLabel(role, name) {
+  return name ? role + ' "' + uiClean(name, UI_LABEL_MAX) + '"' : role;
+}
+
+function uiPathText(labels) {
+  if (labels.length <= UI_PATH_PARTS) return labels.join(' > ');
+  return labels[0] + ' > \u2026 > ' + labels.slice(labels.length - (UI_PATH_PARTS - 1)).join(' > ');
+}
+
+function uiTruthy(v) {
+  if (v === true || v === false) return v;
+  if (typeof v === 'number') return v !== 0;
+  var s = String(v === null || v === undefined ? '' : v)
+    .replace(/^\s+|\s+$/g, '')
+    .toLowerCase();
+  if (/^(1|true|on|yes|checked|selected)$/.test(s)) return true;
+  if (/^(0|false|off|no|unchecked|unselected)$/.test(s)) return false;
+  return null;
+}
+
+/**
+ * Choose the AX window for a target: an explicit AX index, else the one matching the CG window,
+ * else (when the CG window was only a default) the focused one, else the first. -1 if none.
+ * @param {{axIndex:(number|null), info:(object|null), explicit:boolean}} t
+ * @param {Array<{name:string,x:number,y:number,width:number,height:number}>} frames
+ * @param {(Function|object|null)} focused the focused window's frame, or a function returning it
+ */
+function uiChooseWindow(t, frames, focused) {
+  if (t.axIndex !== null && t.axIndex !== undefined) return t.axIndex >= 0 && t.axIndex < frames.length ? t.axIndex : -1;
+  if (!frames.length) return -1;
+  if (t.info) {
+    var i = pickWindowIndex(frames, t.info);
+    if (i >= 0 || t.explicit) return i;
+  }
+  var f = typeof focused === 'function' ? focused() : focused;
+  if (f && isFinite(f.x)) {
+    var byFrame = -1;
+    for (var k = 0; k < frames.length; k++) {
+      if (!near(frames[k], f)) continue;
+      if (!f.name || frames[k].name === f.name) return k;
+      if (byFrame < 0) byFrame = k;
+    }
+    if (byFrame >= 0) return byFrame;
+  }
+  return 0;
+}
+
+function uiNode(el, path, root, parentRole) {
+  return { el: el, path: path, root: root, parentRole: parentRole || '', rec: null };
+}
+
+function uiEmptyRec(role) {
+  return {
+    role: role, subrole: '', title: '', desc: '', value: null, help: '', placeholder: '', url: '', label: '',
+    pos: null, size: null, enabled: null, focused: null, selected: null, expanded: null, disclosing: null
+  };
+}
+
+// ------------------------------------------------ the AX bridge
+
+/** The AX bridge state: what is available, and how the bridge passes values (calibrated once). */
+function axState() {
+  if (AXS !== null) return AXS;
+  AXS = {
+    ok: false,
+    error: '',
+    broken: '',
+    attr: null,
+    cast: null,
+    multi: null,
+    listForm: null,
+    castMulti: null,
+    extract: null,
+    form: null,
+    names: {},
+    lists: {}
+  };
+  if (!HAS_OBJC) {
+    AXS.error = 'the Objective-C bridge is not available';
+    return AXS;
+  }
+  if (typeof Ref === 'undefined') {
+    AXS.error = 'JXA references (Ref) are not available';
+    return AXS;
+  }
+  // Normally in the ApplicationServices bridge metadata; bound by name if a macOS release lacks them.
+  var needed = [
+    ['AXUIElementCreateApplication', ['id', ['int']]],
+    ['AXUIElementCopyAttributeValue', ['int', ['id', 'id', 'void *']]],
+    ['AXUIElementSetAttributeValue', ['int', ['id', 'id', 'id']]],
+    ['AXUIElementPerformAction', ['int', ['id', 'id']]]
+  ];
+  for (var i = 0; i < needed.length; i++) {
+    var name = needed[i][0];
+    if (typeof $[name] === 'undefined' && typeof ObjC.bindFunction === 'function') {
+      try {
+        ObjC.bindFunction(name, needed[i][1]);
+      } catch (e) {
+        /* reported below */
+      }
+    }
+    if (typeof $[name] === 'undefined') {
+      AXS.error = name + ' is not available through the JXA bridge';
+      return AXS;
+    }
+  }
+  AXS.ok = true;
+  try {
+    // Set on the system-wide element, the limit applies to every element of this process.
+    if (typeof $.AXUIElementCreateSystemWide !== 'undefined' && typeof $.AXUIElementSetMessagingTimeout !== 'undefined') {
+      $.AXUIElementSetMessagingTimeout($.AXUIElementCreateSystemWide(), AX_MESSAGING_TIMEOUT);
+    }
+  } catch (e) {
+    /* the default timeout applies */
+  }
+  return AXS;
+}
+
+function axBridgeError(message) {
+  if (AXS) AXS.broken = message;
+  return fail('AX_BRIDGE', 'the accessibility API cannot be used through JXA here: ' + message);
+}
+
+/** Throw for AX errors that end the request: no permission, a hung app, a vanished element. */
+function axFatal(err, what) {
+  if (err === AX_ERR_API_DISABLED) {
+    throw fail('PERMISSION', 'macOS Accessibility permission is not granted (the accessibility API refused the request)', {
+      perm: 'accessibility',
+      errorNumber: err
+    });
+  }
+  if (err === AX_ERR_CANNOT_COMPLETE) {
+    throw fail('NOT_RESPONDING', (what || 'the app') + ' is not responding to accessibility requests', { errorNumber: err });
+  }
+  if (err === AX_ERR_INVALID_ELEMENT) throw fail('GONE', (what || 'the element') + ' no longer exists', { errorNumber: err });
+}
+
+/** An attribute or action name in the form the bridge accepts (NSString or JS string). */
+function axName(attr) {
+  if (AXS.attr === 'js') return attr;
+  if (!hasOwn(AXS.names, attr)) AXS.names[attr] = $(attr);
+  return AXS.names[attr];
+}
+
+/** An element as an argument: as returned by the bridge, or an NSArray item as object or Ref. */
+function axArg(el) {
+  if (el.native || AXS.form !== 'ref') return el.h;
+  return ObjC.castObjectToRef(el.h);
+}
+
+/** An out-parameter value as an object ('ref': it came back as a Ref). null for NULL or nil. */
+function axCast(raw, mode) {
+  if (raw === null || raw === undefined) return null;
+  var o = raw;
+  if (mode === 'ref') {
+    try {
+      var c = ObjC.castRefToObject(raw);
+      if (c !== null && c !== undefined) o = c;
+    } catch (e) {
+      o = raw; // already an object
+    }
+  }
+  return isNil(o) ? null : o;
+}
+
+function axCopy(el, attr) {
+  var out = Ref();
+  var err = Number($.AXUIElementCopyAttributeValue(axArg(el), axName(attr), out));
+  if (err !== AX_OK) return { err: isFinite(err) ? err : AX_ERR_FAILURE, o: null };
+  return { err: AX_OK, o: axCast(out[0], AXS.cast) };
+}
+
+/** A JS value for an object: string, number, boolean, array (of objects) or the object itself. */
+function axUnwrap(o) {
+  if (o === null || o === undefined) return null;
+  var t = typeof o;
+  if (t === 'string' || t === 'number' || t === 'boolean') return o;
+  if (isNil(o)) return null;
+  try {
+    var v = ObjC.unwrap(o);
+    return v === undefined ? o : v;
+  } catch (e) {
+    return o;
+  }
+}
+
+function axDescOf(o) {
+  if (o === null || o === undefined || typeof o === 'string' || typeof o === 'number' || typeof o === 'boolean') return '';
+  try {
+    return str(o.description);
+  } catch (e) {
+    return '';
+  }
+}
+
+/** Whether an attribute value is a "no value" placeholder (an AXValue error or NSNull). */
+function axIsMissing(o) {
+  if (o === null || o === undefined) return true;
+  var d = axDescOf(o);
+  return d === '<null>' || d.indexOf('kAXValueAXErrorType') >= 0;
+}
+
+/** Call a no-argument method that returns a string-ish object; its JS value or null. */
+function axSend(o, method) {
+  try {
+    var r = o[method];
+    if (r === undefined || r === null || isNil(r)) return null;
+    return ObjC.unwrap(r);
+  } catch (e) {
+    return null;
+  }
+}
+
+function axStr(o) {
+  var v = axUnwrap(o);
+  return typeof v === 'string' ? v : '';
+}
+
+/** A string, a number, a boolean or null; attributed strings, URLs and dates become text. */
+function axAny(o) {
+  var v = axUnwrap(o);
+  if (v === null || v === undefined) return null;
+  var t = typeof v;
+  if (t === 'string' || t === 'number' || t === 'boolean') return v;
+  if (Object.prototype.toString.call(v) === '[object Array]') return null;
+  var d = axDescOf(o);
+  if (!d || d === '<null>' || /^<AX(Value|UIElement)\b/.test(d) || d.indexOf('kAXValueAXErrorType') >= 0) return null;
+  var s = axSend(o, 'string');
+  if (typeof s === 'string') return s;
+  s = axSend(o, 'absoluteString');
+  if (typeof s === 'string') return s;
+  return d;
+}
+
+function axText(o) {
+  var v = axAny(o);
+  return typeof v === 'string' ? v : '';
+}
+
+function axBool(o) {
+  var v = axUnwrap(o);
+  if (v === true || v === false) return v;
+  if (typeof v === 'number') return v !== 0;
+  return null;
+}
+
+function axPoint(o) {
+  if (o === null || o === undefined) return null;
+  var v = axUnwrap(o);
+  if (v && typeof v === 'object' && typeof v.x === 'number' && typeof v.y === 'number') return { x: v.x, y: v.y };
+  return parseAxPoint(axDescOf(o));
+}
+
+function axSize(o) {
+  if (o === null || o === undefined) return null;
+  var v = axUnwrap(o);
+  if (v && typeof v === 'object' && typeof v.width === 'number' && typeof v.height === 'number') return { w: v.width, h: v.height };
+  return parseAxSize(axDescOf(o));
+}
+
+function axUrl(o) {
+  var v = axUnwrap(o);
+  if (typeof v === 'string') return v;
+  if (v === null || axIsMissing(o)) return '';
+  var s = axSend(o, 'absoluteString');
+  return typeof s === 'string' ? s : '';
+}
+
+/** NSArray items through count/objectAtIndex (a missing item stays null, so indices hold). */
+function axIndexItems(o) {
+  var n = 0;
+  try {
+    n = Number(o.count) || 0;
+  } catch (e) {
+    n = 0;
+  }
+  var out = [];
+  for (var i = 0; i < n; i++) {
+    var item = null;
+    try {
+      item = o.objectAtIndex(i);
+    } catch (e) {
+      item = null;
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+/** The items of an array object as a JS array (or null when it is not an array). */
+function axItems(o) {
+  if (o === null || o === undefined) return null;
+  var v = axUnwrap(o);
+  if (Object.prototype.toString.call(v) === '[object Array]') return v;
+  if (axIsMissing(o)) return null;
+  return axIndexItems(o);
+}
+
+/** The elements of an array attribute value, in order; unusable items are null. */
+function axElements(o) {
+  var out = [];
+  if (o === null || o === undefined) return out;
+  var items;
+  if (AXS.extract === 'index') {
+    items = axIndexItems(o);
+  } else {
+    var v = axUnwrap(o);
+    if (Object.prototype.toString.call(v) === '[object Array]') items = v;
+    else items = AXS.extract === 'unwrap' || axIsMissing(o) ? [] : axIndexItems(o);
+  }
+  for (var i = 0; i < items.length; i++) {
+    var h = items[i];
+    out.push(h === null || h === undefined || isNil(h) ? null : { h: h, native: false });
+  }
+  return out;
+}
+
+function axValueOf(value) {
+  if (typeof value === 'boolean') return $.NSNumber.numberWithBool(value);
+  if (typeof value === 'number') return $.NSNumber.numberWithDouble(value);
+  return $(String(value === null || value === undefined ? '' : value));
+}
+
+/** Several attributes in one request: {err, items} (items in order), or null when unavailable. */
+function axMulti(el, attrs) {
+  if (!AXS.multi) return null;
+  var key = attrs.join(',');
+  if (!hasOwn(AXS.lists, key)) AXS.lists[key] = AXS.listForm === 'js' ? attrs.slice() : $(attrs);
+  var out = Ref();
+  var err;
+  try {
+    err = Number($.AXUIElementCopyMultipleAttributeValues(axArg(el), AXS.lists[key], 0, out));
+  } catch (e) {
+    return null;
+  }
+  if (err !== AX_OK) return { err: isFinite(err) ? err : AX_ERR_FAILURE, items: null };
+  var items = axItems(axCast(out[0], AXS.castMulti));
+  if (!items || items.length !== attrs.length) return null;
+  return { err: AX_OK, items: items };
+}
+
+/** Attribute values by name (objects; a missing attribute is absent or a placeholder). */
+function axRead(el, attrs, what) {
+  var vals = {};
+  var i;
+  var m = axMulti(el, attrs);
+  if (m && m.err === AX_OK) {
+    for (i = 0; i < attrs.length; i++) vals[attrs[i]] = m.items[i];
+    return vals;
+  }
+  if (m) axFatal(m.err, what);
+  for (i = 0; i < attrs.length; i++) {
+    var r;
+    try {
+      r = axCopy(el, attrs[i]);
+    } catch (e) {
+      r = { err: AX_ERR_FAILURE, o: null };
+    }
+    if (r.err === AX_OK) vals[attrs[i]] = r.o;
+    else if (i === 0) axFatal(r.err, what);
+  }
+  return vals;
+}
+
+/** The text of a label element (AXTitleUIElement). */
+function axLabel(o) {
+  if (o === null || o === undefined || (typeof o !== 'object' && typeof o !== 'function') || axIsMissing(o)) return '';
+  var el = { h: o, native: false };
+  try {
+    var r = axCopy(el, 'AXValue');
+    var t = r.err === AX_OK ? axAny(r.o) : null;
+    if (typeof t !== 'string' || !t) {
+      r = axCopy(el, 'AXTitle');
+      t = r.err === AX_OK ? axAny(r.o) : null;
+    }
+    return typeof t === 'string' ? t : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+/** One element's record (role, names, value, frame, states and its child lists). */
+function axRec(el) {
+  var v = axRead(el, UI_NODE_ATTRS, null);
+  var rec = {
+    role: axStr(v.AXRole),
+    subrole: axStr(v.AXSubrole),
+    title: axText(v.AXTitle),
+    desc: axText(v.AXDescription),
+    value: hasOwn(v, 'AXValue') ? axAny(v.AXValue) : null,
+    help: axText(v.AXHelp),
+    placeholder: axText(v.AXPlaceholderValue),
+    url: axUrl(v.AXURL),
+    label: '',
+    pos: axPoint(v.AXPosition),
+    size: axSize(v.AXSize),
+    enabled: axBool(v.AXEnabled),
+    focused: axBool(v.AXFocused),
+    selected: axBool(v.AXSelected),
+    expanded: axBool(v.AXExpanded),
+    disclosing: axBool(v.AXDisclosing),
+    kids: hasOwn(v, 'AXChildren') ? v.AXChildren : null,
+    visRows: hasOwn(v, 'AXVisibleRows') ? v.AXVisibleRows : null,
+    visChildren: hasOwn(v, 'AXVisibleChildren') ? v.AXVisibleChildren : null,
+    kidList: null
+  };
+  if (!rec.title && !rec.desc && UI_LABELED_ROLES[rec.role] === 1 && hasOwn(v, 'AXTitleUIElement')) {
+    rec.label = axLabel(v.AXTitleUIElement);
+  }
+  return rec;
+}
+
+function axVisibleList(rec) {
+  if (UI_VISIBLE_ROWS[rec.role] === 1) return rec.visRows;
+  if (UI_VISIBLE_CHILDREN[rec.role] === 1) return rec.visChildren;
+  return null;
+}
+
+/** The children uiTree and uiFind walk: the visible rows or children of lists, else AXChildren. */
+function axChildList(rec) {
+  if (rec.kidList) return rec.kidList;
+  var list = null;
+  var vis = axVisibleList(rec);
+  if (vis) {
+    var items = axElements(vis);
+    if (items.length) list = { items: items, prefix: 'v' };
+  }
+  if (!list) list = { items: axElements(rec.kids), prefix: '' };
+  rec.kidList = list;
+  return list;
+}
+
+/**
+ * Find out how this bridge passes values, once: attribute names (NSString or JS string) and
+ * values (object or Ref) against the application's role, multi-attribute reads, and how array
+ * items are taken out (unwrap or objectAtIndex) and passed back (object or Ref) against the
+ * application's first child. Throws PERMISSION / NOT_RESPONDING / NOT_FOUND for the app, and
+ * AX_BRIDGE when no form works.
+ */
+function axCalibrate(app, appName) {
+  var st = AXS;
+  var i;
+  var r;
+  if (st.attr === null) {
+    var combos = [['ns', 'none'], ['ns', 'ref'], ['js', 'none'], ['js', 'ref']];
+    var seen = [];
+    var found = false;
+    for (i = 0; i < combos.length && !found; i++) {
+      st.attr = combos[i][0];
+      st.cast = combos[i][1];
+      try {
+        r = axCopy(app, 'AXRole');
+      } catch (e) {
+        seen.push(st.attr + '/' + st.cast + ': ' + errMessage(e));
+        continue;
+      }
+      if (r.err === AX_ERR_API_DISABLED || r.err === AX_ERR_CANNOT_COMPLETE || r.err === AX_ERR_INVALID_ELEMENT) {
+        st.attr = null;
+        st.cast = null;
+        axFatal(r.err, appName || 'the app');
+      }
+      if (r.err === AX_OK && axStr(r.o) === 'AXApplication') found = true;
+      else seen.push(st.attr + '/' + st.cast + ': ' + (r.err === AX_OK ? 'read ' + JSON.stringify(axStr(r.o)) : 'error ' + r.err));
+    }
+    if (!found) {
+      st.attr = null;
+      st.cast = null;
+      throw axBridgeError('cannot read attributes (' + seen.join('; ') + ')');
+    }
+  }
+  if (st.multi === null) {
+    st.multi = false;
+    if (typeof $.AXUIElementCopyMultipleAttributeValues !== 'undefined') {
+      var modes = [['ns', 'none'], ['ns', 'ref'], ['js', 'none'], ['js', 'ref']];
+      for (i = 0; i < modes.length && !st.multi; i++) {
+        st.listForm = modes[i][0];
+        st.castMulti = modes[i][1];
+        st.lists = {};
+        st.multi = true;
+        var m = null;
+        try {
+          m = axMulti(app, ['AXRole', 'AXTitle']);
+        } catch (e) {
+          m = null;
+        }
+        if (m && (m.err === AX_ERR_CANNOT_COMPLETE || m.err === AX_ERR_INVALID_ELEMENT)) {
+          // The app, not the bridge: read attributes one by one now and calibrate again next time.
+          st.multi = null;
+          break;
+        }
+        if (!(m && m.err === AX_OK && axStr(m.items[0]) === 'AXApplication')) st.multi = false;
+      }
+    }
+  }
+  if (st.form !== null) return;
+  var kids = axCopy(app, 'AXChildren');
+  if (kids.err !== AX_OK) {
+    axFatal(kids.err, appName || 'the app');
+    throw fail('NOT_FOUND', (appName || 'the app') + ' has no accessible windows or menus');
+  }
+  var cands = [];
+  var v = axUnwrap(kids.o);
+  if (Object.prototype.toString.call(v) === '[object Array]' && v.length) cands.push(['unwrap', v[0]]);
+  try {
+    if (kids.o && Number(kids.o.count) > 0) cands.push(['index', kids.o.objectAtIndex(0)]);
+  } catch (e) {
+    /* not an NSArray object */
+  }
+  if (!cands.length) throw fail('NOT_FOUND', (appName || 'the app') + ' has no accessible windows or menus');
+  var forms = ['obj', 'ref'];
+  var busy = false;
+  for (i = 0; i < cands.length; i++) {
+    for (var f = 0; f < forms.length; f++) {
+      st.extract = cands[i][0];
+      st.form = forms[f];
+      try {
+        var rr = axCopy({ h: cands[i][1], native: false }, 'AXRole');
+        if (rr.err === AX_OK && /^AX/.test(axStr(rr.o))) return;
+        if (rr.err === AX_ERR_CANNOT_COMPLETE) busy = true;
+      } catch (e) {
+        /* try the next form */
+      }
+    }
+  }
+  st.extract = null;
+  st.form = null;
+  // A hung app proves nothing about the bridge: try again on the next request.
+  if (busy) axFatal(AX_ERR_CANNOT_COMPLETE, appName || 'the app');
+  throw axBridgeError('cannot use the elements of an array');
+}
+
+function axWindowFrame(el) {
+  try {
+    var v = axRead(el, UI_WINDOW_ATTRS, 'the window');
+    var p = axPoint(v.AXPosition);
+    var s = axSize(v.AXSize);
+    return { name: axText(v.AXTitle), x: p ? p.x : NaN, y: p ? p.y : NaN, width: s ? s.w : NaN, height: s ? s.h : NaN };
+  } catch (e) {
+    if (e.code === 'PERMISSION' || e.code === 'NOT_RESPONDING') throw e;
+    return uiNoFrame();
+  }
+}
+
+var AX_ENGINE = {
+  name: 'ax',
+  root: function (ctx, key) {
+    if (key === 'w') return ctx.win ? uiNode(ctx.win, [], 'w', '') : null;
+    return uiNode(ctx.app, [], 'a', '');
+  },
+  load: function (ctx, node) {
+    if (!node.rec) node.rec = axRec(node.el);
+    return node.rec;
+  },
+  kids: function (ctx, node) {
+    var rec = AX_ENGINE.load(ctx, node);
+    var list = axChildList(rec);
+    var out = [];
+    for (var i = 0; i < list.items.length; i++) {
+      if (list.items[i]) out.push(uiNode(list.items[i], node.path.concat([list.prefix + i]), node.root, rec.role));
+    }
+    return out;
+  },
+  child: function (ctx, node, seg) {
+    var rec = AX_ENGINE.load(ctx, node);
+    var visible = seg.charAt(0) === 'v';
+    var index = Number(visible ? seg.slice(1) : seg);
+    var items = axElements(visible ? axVisibleList(rec) : rec.kids);
+    if (!(index >= 0 && index < items.length) || !items[index]) return null;
+    return uiNode(items[index], node.path.concat([seg]), node.root, rec.role);
+  },
+  count: function (ctx, node) {
+    return axChildList(AX_ENGINE.load(ctx, node)).items.length;
+  },
+  roleOf: function (ctx, node) {
+    return AX_ENGINE.load(ctx, node).role;
+  },
+  perform: function (ctx, node, action) {
+    var err;
+    try {
+      err = Number($.AXUIElementPerformAction(axArg(node.el), axName(action)));
+    } catch (e) {
+      return { ok: false, err: AX_ERR_FAILURE, message: errMessage(e) };
+    }
+    return { ok: err === AX_OK, err: isFinite(err) ? err : AX_ERR_FAILURE };
+  },
+  set: function (ctx, node, attr, value) {
+    var err;
+    try {
+      err = Number($.AXUIElementSetAttributeValue(axArg(node.el), axName(attr), axValueOf(value)));
+    } catch (e) {
+      return { ok: false, err: AX_ERR_FAILURE, message: errMessage(e) };
+    }
+    return { ok: err === AX_OK, err: isFinite(err) ? err : AX_ERR_FAILURE };
+  },
+  settable: function (ctx, node, attr) {
+    if (typeof $.AXUIElementIsAttributeSettable === 'undefined') return null;
+    try {
+      var out = Ref();
+      var err = Number($.AXUIElementIsAttributeSettable(axArg(node.el), axName(attr), out));
+      if (err === AX_ERR_ATTRIBUTE_UNSUPPORTED) return false;
+      if (err !== AX_OK) return null;
+      return axBool(out[0]);
+    } catch (e) {
+      return null;
+    }
+  },
+  actions: function (ctx, node) {
+    if (typeof $.AXUIElementCopyActionNames === 'undefined') return null;
+    try {
+      var out = Ref();
+      var err = Number($.AXUIElementCopyActionNames(axArg(node.el), out));
+      if (err === AX_ERR_ACTION_UNSUPPORTED) return [];
+      if (err !== AX_OK) return null;
+      // A CFArrayRef out-parameter, like the multi-attribute read's.
+      var items = axItems(axCast(out[0], AXS.multi ? AXS.castMulti : 'ref'));
+      if (!items) return null;
+      var names = [];
+      for (var i = 0; i < items.length; i++) {
+        var s = axStr(items[i]);
+        if (s) names.push(s);
+      }
+      return names;
+    } catch (e) {
+      return null;
+    }
+  },
+  get: function (ctx, node, attr) {
+    try {
+      var r = axCopy(node.el, attr);
+      return r.err === AX_OK ? axAny(r.o) : null;
+    } catch (e) {
+      return null;
+    }
+  },
+  appSet: function (ctx, attr, value) {
+    return AX_ENGINE.set(ctx, { el: ctx.app }, attr, value).ok;
+  },
+  activate: function (ctx) {
+    uiActivateApp(ctx.pid);
+    AX_ENGINE.appSet(ctx, 'AXFrontmost', true);
+    if (ctx.win) {
+      var w = { el: ctx.win };
+      AX_ENGINE.perform(ctx, w, 'AXRaise');
+      AX_ENGINE.set(ctx, w, 'AXMain', true);
+    }
+    return uiWaitFront(ctx.pid);
+  },
+  timeout: function (ctx, node, seconds) {
+    if (typeof $.AXUIElementSetMessagingTimeout === 'undefined') return;
+    try {
+      $.AXUIElementSetMessagingTimeout(axArg(node.el), seconds);
+    } catch (e) {
+      /* the global limit applies */
+    }
+  }
+};
+
+// ------------------------------------------------ the System Events engine
+
+var SE_PROPS = ['role', 'subrole', 'name', 'description', 'help', 'value', 'position', 'size', 'enabled', 'focused', 'selected'];
+
+/** Run a System Events getter; undefined on errors other than a missing permission. */
+function seGet(fn) {
+  try {
+    return fn();
+  } catch (e) {
+    var c = classifyError(e);
+    if (c.code === 'PERMISSION') throw fail('PERMISSION', c.message, { perm: c.perm, errorNumber: c.number });
+    return undefined;
+  }
+}
+
+function seBulk(coll, prop) {
+  var v = seGet(function () {
+    return coll[prop]();
+  });
+  return Object.prototype.toString.call(v) === '[object Array]' ? v : null;
+}
+
+function seS(v) {
+  if (typeof v === 'string') return v;
+  return typeof v === 'number' ? String(v) : '';
+}
+
+function seV(v) {
+  var t = typeof v;
+  return t === 'string' || t === 'number' || t === 'boolean' ? v : null;
+}
+
+function seB(v) {
+  return v === true || v === false ? v : null;
+}
+
+function sePair(v, a, b) {
+  if (!v || typeof v.length !== 'number' || v.length < 2) return null;
+  var x = Number(v[0]);
+  var y = Number(v[1]);
+  if (!isFinite(x) || !isFinite(y)) return null;
+  var o = {};
+  o[a] = x;
+  o[b] = y;
+  return o;
+}
+
+/** A record from System Events properties (get(prop) returns one element's value). */
+function seRec(get) {
+  var rec = uiEmptyRec(seS(get('role')));
+  rec.subrole = seS(get('subrole'));
+  rec.title = seS(get('name'));
+  rec.desc = seS(get('description'));
+  rec.help = seS(get('help'));
+  rec.value = seV(get('value'));
+  rec.pos = sePair(get('position'), 'x', 'y');
+  rec.size = sePair(get('size'), 'w', 'h');
+  rec.enabled = seB(get('enabled'));
+  rec.focused = seB(get('focused'));
+  rec.selected = seB(get('selected'));
+  return rec;
+}
+
+/** Label and placeholder of an unnamed text field, the same way the AX engine names it. */
+function seExtras(rec, spec) {
+  if (rec.title || rec.desc || UI_LABELED_ROLES[rec.role] !== 1) return rec;
+  var lab = seGet(function () {
+    return spec.attributes.byName('AXTitleUIElement').value();
+  });
+  if (lab && (typeof lab === 'object' || typeof lab === 'function')) {
+    var t = seGet(function () {
+      return lab.value();
+    });
+    if (typeof t !== 'string' || !t) {
+      t = seGet(function () {
+        return lab.name();
+      });
+    }
+    if (typeof t === 'string') rec.label = t;
+  }
+  if (!rec.label) {
+    var ph = seGet(function () {
+      return spec.attributes.byName('AXPlaceholderValue').value();
+    });
+    if (typeof ph === 'string') rec.placeholder = ph;
+  }
+  return rec;
+}
+
+function seError(e) {
+  var c = classifyError(e);
+  if (c.code === 'PERMISSION') throw fail('PERMISSION', c.message, { perm: c.perm, errorNumber: c.number });
+  return { ok: false, err: c.number, message: c.message };
+}
+
+var SE_ENGINE = {
+  name: 'systemEvents',
+  root: function (ctx, key) {
+    if (key === 'w') return ctx.win ? uiNode(ctx.win, [], 'w', '') : null;
+    var node = uiNode(ctx.proc, [], 'a', '');
+    node.rec = uiEmptyRec('AXApplication');
+    return node;
+  },
+  load: function (ctx, node) {
+    if (node.rec) return node.rec;
+    var spec = node.el;
+    var role = seGet(function () {
+      return spec.role();
+    });
+    if (typeof role !== 'string' || !role) throw fail('GONE', 'the element no longer exists');
+    var rec = seRec(function (prop) {
+      return prop === 'role'
+        ? role
+        : seGet(function () {
+            return spec[prop]();
+          });
+    });
+    node.rec = seExtras(rec, spec);
+    return node.rec;
+  },
+  kids: function (ctx, node) {
+    var parent = SE_ENGINE.load(ctx, node);
+    var coll = node.el.uiElements;
+    var roles = seBulk(coll, 'role');
+    if (!roles || !roles.length) return [];
+    var cols = { role: roles };
+    for (var p = 1; p < SE_PROPS.length; p++) {
+      var col = seBulk(coll, SE_PROPS[p]);
+      cols[SE_PROPS[p]] = col && col.length === roles.length ? col : null;
+    }
+    if (!cols.description) {
+      var alt = seBulk(coll, 'accessibilityDescription');
+      cols.description = alt && alt.length === roles.length ? alt : null;
+    }
+    var out = [];
+    for (var i = 0; i < roles.length; i++) {
+      var spec = coll[i];
+      var rec = seRec(function (prop) {
+        return cols[prop] ? cols[prop][i] : undefined;
+      });
+      if (!cols.value && UI_VALUE_ROLES[rec.role] === 1) {
+        rec.value = seV(
+          seGet(function () {
+            return spec.value();
+          })
+        );
+      }
+      var kid = uiNode(spec, node.path.concat([String(i)]), node.root, parent.role);
+      kid.rec = seExtras(rec, spec);
+      out.push(kid);
+    }
+    return out;
+  },
+  child: function (ctx, node, seg) {
+    if (!/^\d+$/.test(seg)) return null;
+    return uiNode(node.el.uiElements[Number(seg)], node.path.concat([seg]), node.root, '');
+  },
+  count: function (ctx, node) {
+    var n = seGet(function () {
+      return node.el.uiElements.length;
+    });
+    return typeof n === 'number' ? n : -1;
+  },
+  roleOf: function (ctx, node) {
+    if (node.rec) return node.rec.role;
+    var r = seGet(function () {
+      return node.el.role();
+    });
+    return typeof r === 'string' ? r : '';
+  },
+  perform: function (ctx, node, action) {
+    try {
+      node.el.actions.byName(action).perform();
+      return { ok: true, err: null };
+    } catch (e) {
+      return seError(e);
+    }
+  },
+  set: function (ctx, node, attr, value) {
+    try {
+      node.el.attributes.byName(attr).value = value;
+      return { ok: true, err: null };
+    } catch (e) {
+      return seError(e);
+    }
+  },
+  settable: function (ctx, node, attr) {
+    var v = seGet(function () {
+      return node.el.attributes.byName(attr).settable();
+    });
+    return v === true || v === false ? v : null;
+  },
+  actions: function (ctx, node) {
+    var v = seGet(function () {
+      return node.el.actions.name();
+    });
+    if (Object.prototype.toString.call(v) !== '[object Array]') return null;
+    var names = [];
+    for (var i = 0; i < v.length; i++) if (typeof v[i] === 'string' && v[i]) names.push(v[i]);
+    return names;
+  },
+  get: function (ctx, node, attr) {
+    return seV(
+      seGet(function () {
+        return node.el.attributes.byName(attr).value();
+      })
+    );
+  },
+  appSet: function (ctx, attr, value) {
+    try {
+      ctx.proc.attributes.byName(attr).value = value;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  },
+  activate: function (ctx) {
+    uiActivateApp(ctx.pid);
+    try {
+      ctx.proc.frontmost = true;
+    } catch (e) {
+      /* activation above may already have worked */
+    }
+    if (ctx.win) {
+      try {
+        ctx.win.actions.byName('AXRaise').perform();
+      } catch (e) {
+        /* not raisable */
+      }
+    }
+    return uiWaitFront(ctx.pid);
+  },
+  timeout: function () {
+    /* System Events keeps its own limits */
+  }
+};
+
+// ------------------------------------------------ targets and contexts
+
+function uiActivateApp(pid) {
+  try {
+    var ra = $.NSRunningApplication.runningApplicationWithProcessIdentifier(pid);
+    if (isNil(ra)) return false;
+    try {
+      ra.unhide;
+    } catch (e) {
+      /* not hidden */
+    }
+    return Boolean(ra.activateWithOptions(ACTIVATE_IGNORING_OTHER_APPS));
+  } catch (e) {
+    return false;
+  }
+}
+
+function uiWaitFront(pid) {
+  for (var i = 0; i < 6; i++) {
+    var f = frontApp();
+    if (f && f.pid === pid) return true;
+    pump(0.05);
+  }
+  return false;
+}
+
+/** The frontmost normal (layer 0, visible) CG window of a process, or null. */
+function cgFrontWindow(pid) {
+  var wins = onScreenWindows();
+  for (var i = 0; i < wins.length; i++) {
+    var w = wins[i];
+    if (w.pid === pid && w.layer === 0 && w.alpha > 0 && w.width > 1 && w.height > 1) return w;
+  }
+  return null;
+}
+
+/** The CG window number of a process's window with this frame (on any Space), or null. */
+function cgNumberFor(pid, frame) {
+  if (!uiValidFrame(frame)) return null;
+  var all = readWindowList(WINDOW_LIST_ALL, NULL_WINDOW_ID);
+  for (var i = 0; i < all.length; i++) {
+    var w = all[i];
+    if (w.pid === pid && w.layer === 0 && near(w, frame)) return w.number;
+  }
+  return null;
+}
+
+function fileExists(p) {
+  try {
+    return Boolean($.NSFileManager.defaultManager.fileExistsAtPath($(p)));
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * The app and window a UI request is about: args pid (default: the frontmost app) and number (a
+ * CG window) or axIndex (an AX window); with neither, the app's frontmost window.
+ */
+function uiTarget(a) {
+  var t = { pid: null, number: null, axIndex: null, info: null, explicit: false, app: '', bundleId: '', bundlePath: '' };
+  if (a.pid !== undefined && a.pid !== null && a.pid !== '') {
+    t.pid = int(a.pid, 'pid');
+  } else {
+    var front = frontApp();
+    if (!front) throw fail('NOT_FOUND', 'no app is active');
+    t.pid = front.pid;
+  }
+  var ra = $.NSRunningApplication.runningApplicationWithProcessIdentifier(t.pid);
+  if (isNil(ra)) throw fail('NOT_FOUND', 'process ' + t.pid + ' is not running');
+  try {
+    t.app = str(ra.localizedName);
+    t.bundleId = str(ra.bundleIdentifier);
+    var url = ra.bundleURL;
+    if (!isNil(url)) t.bundlePath = str(url.path);
+  } catch (e) {
+    /* informational */
+  }
+  if (a.number !== undefined && a.number !== null && a.number !== '') {
+    t.number = int(a.number, 'number');
+    t.explicit = true;
+    t.info = windowInfo(t.number);
+    if (!t.info) throw fail('NOT_FOUND', 'window ' + t.number + ' was not found (it may have been closed)');
+    if (t.info.pid !== t.pid) throw fail('NOT_FOUND', 'window ' + t.number + ' does not belong to process ' + t.pid);
+  } else if (a.axIndex !== undefined && a.axIndex !== null && a.axIndex !== '') {
+    t.axIndex = int(a.axIndex, 'axIndex');
+    t.explicit = true;
+  } else {
+    t.info = cgFrontWindow(t.pid);
+    if (t.info) t.number = t.info.number;
+  }
+  return t;
+}
+
+/** Fill ctx.win, winKey, frame and window ({id, app, title}) from the chosen AX window. */
+function uiSetWindow(ctx, t, idx, winEl, frames) {
+  if (idx < 0 || !winEl) {
+    if (t.explicit) {
+      throw fail(
+        'NOT_FOUND',
+        'no accessibility window of ' + (t.app || 'process ' + t.pid) + ' matches window ' + (t.number !== null ? t.number : 'i' + t.axIndex)
+      );
+    }
+    ctx.win = null;
+    ctx.winKey = '-';
+    ctx.frame = null;
+    ctx.window = { id: String(t.pid), app: t.app, title: '' };
+    return;
+  }
+  var frame = frames[idx];
+  var number = t.info && (t.explicit || near(frame, t.info)) ? t.info.number : cgNumberFor(t.pid, frame);
+  ctx.win = winEl;
+  ctx.winKey = number !== null && number !== undefined ? String(number) : 'i' + idx;
+  ctx.frame = uiValidFrame(frame) ? { x: frame.x, y: frame.y, width: frame.width, height: frame.height } : null;
+  var title = frame.name || (t.info && number === t.info.number ? t.info.title : '') || '';
+  ctx.window = { id: number !== null && number !== undefined ? t.pid + ':' + number : String(t.pid), app: t.app, title: title };
+}
+
+function axOpen(t) {
+  var st = axState();
+  if (!st.ok) throw axBridgeError(st.error);
+  if (st.broken) throw fail('AX_BRIDGE', 'the accessibility API cannot be used through JXA here: ' + st.broken);
+  var h = null;
+  try {
+    h = $.AXUIElementCreateApplication(t.pid);
+  } catch (e) {
+    throw axBridgeError('AXUIElementCreateApplication failed: ' + errMessage(e));
+  }
+  if (h === null || h === undefined || isNil(h)) throw fail('NOT_FOUND', 'process ' + t.pid + ' has no accessibility element');
+  var app = { h: h, native: true };
+  axCalibrate(app, t.app);
+  var ctx = { eng: AX_ENGINE, pid: t.pid, app: app, win: null, target: t };
+  var w = axCopy(app, 'AXWindows');
+  if (w.err !== AX_OK) axFatal(w.err, t.app || 'the app');
+  var wins = w.err === AX_OK ? axElements(w.o) : [];
+  var frames = [];
+  for (var i = 0; i < wins.length; i++) frames.push(wins[i] ? axWindowFrame(wins[i]) : uiNoFrame());
+  var idx = uiChooseWindow(t, frames, function () {
+    var f = axCopy(app, 'AXFocusedWindow');
+    if (f.err !== AX_OK || axIsMissing(f.o)) return null;
+    return axWindowFrame({ h: f.o, native: false });
+  });
+  uiSetWindow(ctx, t, idx, idx >= 0 ? wins[idx] : null, frames);
+  return ctx;
+}
+
+function seOpen(t) {
+  var se;
+  try {
+    se = systemEvents();
+  } catch (e) {
+    throw fail('UNSUPPORTED', 'System Events is not available: ' + errMessage(e));
+  }
+  var frames;
+  try {
+    frames = axWindowFrames(se, t.pid);
+  } catch (e) {
+    var c = classifyError(e);
+    if (c.code === 'PERMISSION') throw fail('PERMISSION', c.message, { perm: c.perm, errorNumber: c.number });
+    if (c.code === 'NOT_FOUND') throw fail('NOT_FOUND', (t.app || 'process ' + t.pid) + ' is not known to System Events (' + c.message + ')');
+    throw e;
+  }
+  var proc = axProcess(se, t.pid);
+  var ctx = { eng: SE_ENGINE, pid: t.pid, se: se, proc: proc, win: null, target: t };
+  var idx = uiChooseWindow(t, frames, frames.length ? frames[0] : null);
+  uiSetWindow(ctx, t, idx, idx >= 0 ? proc.windows[idx] : null, frames);
+  return ctx;
+}
+
+/**
+ * Open the target with the AX engine (or System Events when the AX bridge is unusable, or when
+ * args.engine says so) and run fn(ctx).
+ */
+function uiWithContext(a, fn) {
+  if (typeof $.AXIsProcessTrusted !== 'undefined') {
+    var trusted = null;
+    try {
+      trusted = Boolean($.AXIsProcessTrusted());
+    } catch (e) {
+      trusted = null;
+    }
+    if (trusted === false) throw fail('PERMISSION', 'macOS Accessibility permission is not granted', { perm: 'accessibility' });
+  }
+  var t = uiTarget(a);
+  var want = a.engine === 'systemEvents' || a.engine === 'se' ? 'se' : a.engine === 'ax' ? 'ax' : 'auto';
+  var ctx = null;
+  var bridgeError = '';
+  if (want !== 'se') {
+    try {
+      ctx = axOpen(t);
+    } catch (e) {
+      if (e.code !== 'AX_BRIDGE' || want === 'ax') throw e;
+      bridgeError = errMessage(e);
+    }
+  }
+  if (!ctx) ctx = seOpen(t);
+  ctx.bridgeError = bridgeError;
+  try {
+    return fn(ctx);
+  } catch (e) {
+    if (e && e.code === 'GONE') throw fail('NOT_FOUND', errMessage(e) + '; find it again (ui_find or ui_tree)');
+    throw e;
+  }
+}
+
+function uiLoad(ctx, node, st) {
+  try {
+    return ctx.eng.load(ctx, node);
+  } catch (e) {
+    if (e.code === 'PERMISSION') throw e;
+    if (e.code === 'NOT_RESPONDING') {
+      if (!st) throw e;
+      st.notResponding = true;
+      st.stop = true;
+    }
+    return null;
+  }
+}
+
+function uiKids(ctx, node, st) {
+  try {
+    return ctx.eng.kids(ctx, node);
+  } catch (e) {
+    if (e.code === 'PERMISSION') throw e;
+    if (e.code === 'NOT_RESPONDING') {
+      if (!st) throw e;
+      st.notResponding = true;
+      st.stop = true;
+    }
+    return [];
+  }
+}
+
+function uiCount(ctx, node) {
+  try {
+    return ctx.eng.count(ctx, node);
+  } catch (e) {
+    return -1;
+  }
+}
+
+function uiNodeId(ctx, node, rec, name) {
+  return uiMakeId(ctx.pid, ctx.winKey, node.root, node.path, uiHash(rec, name));
+}
+
+/** Where uiTree and uiFind look: the window and open menus (main), and the menu bar. */
+function uiRoots(ctx) {
+  var eng = ctx.eng;
+  var out = { main: [], menuBars: [] };
+  if (ctx.win) out.main.push({ node: eng.root(ctx, 'w'), clip: ctx.frame });
+  var kids = uiKids(ctx, eng.root(ctx, 'a'), null);
+  for (var i = 0; i < kids.length; i++) {
+    var rec = uiLoad(ctx, kids[i], null);
+    if (!rec) continue;
+    if (rec.role === 'AXMenu') out.main.push({ node: kids[i], clip: null });
+    else if (rec.role === 'AXMenuBar') out.menuBars.push({ node: kids[i], clip: null });
+  }
+  return out;
+}
+
+// ------------------------------------------------ uiTree
+
+/**
+ * The children of a node as uiTree shows them: unnamed groups are replaced by their children,
+ * zero-size leaves and elements outside the window (scrolled away) are left out.
+ */
+function uiVisibleKids(ctx, node, st, clip) {
+  var out = [];
+  var stack = [{ list: uiKids(ctx, node, st), i: 0 }];
+  while (stack.length) {
+    if (st.visited >= st.maxVisit || Date.now() > st.deadline) {
+      st.truncated = true;
+      st.stop = true;
+      break;
+    }
+    var top = stack[stack.length - 1];
+    if (top.i >= top.list.length) {
+      stack.pop();
+      continue;
+    }
+    var kid = top.list[top.i++];
+    var rec = uiLoad(ctx, kid, st);
+    st.visited++;
+    if (st.stop) break;
+    if (!rec || !rec.role) continue;
+    var count = null;
+    if (rec.role === 'AXWebArea') {
+      st.webAreas++;
+      count = uiCount(ctx, kid);
+      if (count === 0) st.webAreaEmpty = true;
+    }
+    if (clip && uiOutside(rec, clip)) continue;
+    var name = uiName(rec);
+    if (uiTransparent(rec, name)) {
+      if (stack.length < UI_FLATTEN_MAX) stack.push({ list: uiKids(ctx, kid, st), i: 0 });
+      continue;
+    }
+    if (uiZeroSize(rec) && (count === null ? uiCount(ctx, kid) : count) === 0) continue;
+    out.push(kid);
+  }
+  return out;
+}
+
+function uiEmit(ctx, node, parent, st) {
+  var rec = node.rec;
+  var name = uiName(rec);
+  var out = { id: uiNodeId(ctx, node, rec, name), role: uiRole(rec, node.parentRole), name: name };
+  var value = uiValue(rec, name);
+  if (value) out.value = value;
+  var d = uiDescription(rec, name);
+  if (d) out.description = d;
+  out.bounds = uiBounds(rec);
+  out.enabled = rec.enabled !== false;
+  out.focused = rec.focused === true;
+  var sel = uiSelected(rec);
+  if (sel !== undefined) out.selected = sel;
+  var ex = uiExpanded(rec);
+  if (ex !== undefined) out.expanded = ex;
+  out.parent = parent ? parent.id : null;
+  out.children = [];
+  st.nodes.push(out);
+  if (parent) parent.children.push(out.id);
+  return out;
+}
+
+/** Breadth first from the window (and open menus): up to depth output levels and maxNodes nodes. */
+function uiBuildTree(ctx, a) {
+  var depthMax = clampInt(a.depth, 0, 50, 6);
+  var maxNodes = clampInt(a.maxNodes, 1, 5000, 400);
+  var st = {
+    nodes: [],
+    truncated: false,
+    stop: false,
+    visited: 0,
+    webAreas: 0,
+    webAreaEmpty: false,
+    notResponding: false,
+    maxVisit: UI_TREE_MAX_VISIT,
+    deadline: Date.now() + clampInt(a.budgetMs, 300, UI_MAX_BUDGET_MS, UI_BUDGET_MS)
+  };
+  var roots = uiRoots(ctx);
+  var list = roots.main.slice();
+  if (!ctx.win) list = list.concat(roots.menuBars);
+  var queue = [];
+  for (var r = 0; r < list.length && st.nodes.length < maxNodes; r++) {
+    var rec = uiLoad(ctx, list[r].node, null);
+    if (!rec) {
+      if (list[r].node.root === 'w') throw fail('NOT_FOUND', 'the window was closed');
+      continue;
+    }
+    st.visited++;
+    queue.push({ node: list[r].node, out: uiEmit(ctx, list[r].node, null, st), depth: 0, clip: list[r].clip });
+  }
+  var qi = 0;
+  while (qi < queue.length && !st.stop) {
+    var item = queue[qi++];
+    if (item.depth >= depthMax) {
+      if (!st.truncated && uiCount(ctx, item.node) > 0) st.truncated = true;
+      continue;
+    }
+    var kids = uiVisibleKids(ctx, item.node, st, item.clip);
+    for (var k = 0; k < kids.length; k++) {
+      if (st.nodes.length >= maxNodes) {
+        st.truncated = true;
+        st.stop = true;
+        break;
+      }
+      queue.push({ node: kids[k], out: uiEmit(ctx, kids[k], item.out, st), depth: item.depth + 1, clip: item.clip });
+    }
+  }
+  return st;
+}
+
+// ------------------------------------------------ uiFind
+
+/**
+ * Depth first, in document order, from each root ({node, clip?, labels?, depth?});
+ * visit(node, rec, name, role, labels) returns false to stop. labels is the readable path of
+ * non-transparent ancestors and the node. With st.deferred (an array), elements outside their
+ * root's clip (scrolled out of the window) are not entered but added to it, for a later walk.
+ */
+function uiWalk(ctx, roots, st, visit) {
+  for (var r = 0; r < roots.length && !st.stop; r++) {
+    var stack = [{ node: roots[r].node, labels: roots[r].labels || [], depth: roots[r].depth || 0, clip: roots[r].clip || null }];
+    while (stack.length) {
+      if (st.visited >= st.maxVisit || Date.now() > st.deadline) {
+        st.truncated = true;
+        st.stop = true;
+        break;
+      }
+      var item = stack.pop();
+      var rec = uiLoad(ctx, item.node, st);
+      st.visited++;
+      if (st.stop) break;
+      if (!rec || !rec.role) continue;
+      if (st.skipAppWindows && item.depth === 1 && rec.role === 'AXWindow') continue;
+      if (st.deferred && item.clip && item.depth > 0 && uiOutside(rec, item.clip)) {
+        st.deferred.push({ node: item.node, labels: item.labels, depth: item.depth, clip: null });
+        continue;
+      }
+      var name = uiName(rec);
+      var role = uiRole(rec, item.node.parentRole);
+      if (rec.role === 'AXWebArea') {
+        st.webAreas = (st.webAreas || 0) + 1;
+        if (uiCount(ctx, item.node) === 0) st.webAreaEmpty = true;
+      }
+      var labels = uiTransparent(rec, name) ? item.labels : item.labels.concat([uiLabel(role, name)]);
+      if (visit(item.node, rec, name, role, labels) === false) {
+        st.stop = true;
+        break;
+      }
+      if (item.depth >= UI_RAW_DEPTH) continue;
+      var kids = uiKids(ctx, item.node, st);
+      for (var k = kids.length - 1; k >= 0; k--) stack.push({ node: kids[k], labels: labels, depth: item.depth + 1, clip: item.clip });
+    }
+  }
+}
+
+function uiFindResult(ctx, m) {
+  var rec = m.rec;
+  var out = {
+    id: uiNodeId(ctx, m.node, rec, m.name),
+    role: m.role,
+    name: m.name,
+    value: uiValue(rec, m.name),
+    bounds: uiBounds(rec),
+    enabled: rec.enabled !== false,
+    path: uiPathText(m.labels)
+  };
+  var d = uiDescription(rec, m.name);
+  if (d) out.description = d;
+  return out;
+}
+
+/**
+ * Matches in what the window shows and the app's open menus, then in the parts of the window
+ * scrolled out of view, then (for menu queries, or when nothing matched) in the menu bar.
+ */
+function uiFindIn(ctx, q, a) {
+  var budget = clampInt(a.budgetMs, 300, UI_MAX_BUDGET_MS, UI_BUDGET_MS);
+  var st = {
+    visited: 0,
+    deadline: Date.now() + budget,
+    maxVisit: UI_FIND_MAX_VISIT,
+    stop: false,
+    truncated: false,
+    webAreas: 0,
+    webAreaEmpty: false,
+    notResponding: false,
+    deferred: []
+  };
+  var roots = uiRoots(ctx);
+  var found = [];
+  var order = 0;
+  var collect = function (penalty) {
+    return function (node, rec, name, role, labels) {
+      var s = uiMatchScore(rec, name, role, q);
+      if (s >= 0) found.push({ node: node, rec: rec, name: name, role: role, labels: labels, score: s - penalty, order: order++ });
+      return found.length < UI_FIND_MAX_MATCHES;
+    };
+  };
+  uiWalk(ctx, roots.main, st, collect(0));
+  var hidden = st.deferred;
+  st.deferred = null;
+  // Scrolled out of view: after what is visible, and a little lower (it needs scrolling first).
+  if (hidden.length && found.length < q.limit && !st.stop) uiWalk(ctx, hidden, st, collect(1));
+  var menus = Boolean(q.role && (q.role.role === 'menuitem' || q.role.role === 'menu' || /^axmenu/.test(q.role.ax || '')));
+  if (roots.menuBars.length && !st.notResponding && (menus || !found.length || !ctx.win)) {
+    var st2 = {
+      visited: 0,
+      deadline: Math.max(st.deadline, Date.now() + 1500),
+      maxVisit: UI_MENU_MAX_VISIT,
+      stop: false,
+      truncated: false
+    };
+    uiWalk(ctx, roots.menuBars, st2, collect(menus || !ctx.win ? 0 : 5));
+  }
+  found.sort(function (x, y) {
+    return y.score - x.score || x.order - y.order;
+  });
+  var matches = [];
+  for (var i = 0; i < found.length && matches.length < q.limit; i++) matches.push(uiFindResult(ctx, found[i]));
+  return { matches: matches, stats: st };
+}
+
+// ------------------------------------------------ web content trees (Chromium, Electron)
+
+/** 'chromium' (a Chromium browser), 'electron' (an Electron app) or ''. */
+function uiAppKind(t) {
+  if (t.kind !== undefined) return t.kind;
+  var kind = '';
+  if (CHROMIUM_BUNDLE_RE.test(t.bundleId || '')) kind = 'chromium';
+  else if (t.bundlePath && fileExists(t.bundlePath + '/Contents/Frameworks/Electron Framework.framework')) kind = 'electron';
+  t.kind = kind;
+  return kind;
+}
+
+/**
+ * Whether the tree looks like web content whose accessibility is switched off: an empty web
+ * area, or a Chromium or Electron window with no web area and next to nothing in it.
+ */
+function uiSparse(ctx, st) {
+  if (st.webAreaEmpty) return true;
+  return uiAppKind(ctx.target) !== '' && !st.webAreas && st.visited < UI_SPARSE_NODES;
+}
+
+/**
+ * Ask a Chromium browser or an Electron app to build its web content tree: AXManualAccessibility
+ * (Electron, recent Chromium) and, for Chromium browsers, AXEnhancedUserInterface (what VoiceOver
+ * sets). Once per process per helper. Returns what was enabled ('chromium', 'electron', 'app') or ''.
+ */
+function uiEnableApp(ctx) {
+  var key = String(ctx.pid);
+  if (UI_ENABLED[key]) return '';
+  UI_ENABLED[key] = true;
+  var kind = uiAppKind(ctx.target);
+  var any = ctx.eng.appSet(ctx, 'AXManualAccessibility', true);
+  if (kind === 'chromium') any = ctx.eng.appSet(ctx, 'AXEnhancedUserInterface', true) || any;
+  if (!any) return '';
+  sleep(UI_ENABLE_WAIT);
+  return kind || 'app';
+}
+
+// ------------------------------------------------ uiAction
+
+function uiErrText(r) {
+  if (r && r.message) return ' (' + r.message + ')';
+  return r && r.err !== null && r.err !== undefined ? ' (error ' + r.err + ')' : '';
+}
+
+/** Throw for action results that must not fall back to clicking: no permission, element gone. */
+function uiCheck(r) {
+  if (!r || r.ok) return;
+  if (r.err === AX_ERR_API_DISABLED) axFatal(r.err);
+  if (r.err === AX_ERR_INVALID_ELEMENT) {
+    throw fail('NOT_FOUND', 'the element no longer exists; find it again (ui_find or ui_tree)', { errorNumber: r.err });
+  }
+}
+
+function uiRoleText(node) {
+  return uiRole(node.rec, node.parentRole);
+}
+
+/**
+ * Whether an action opens a menu: AppKit tracks the menu inside the action handler, so the app
+ * answers only once the menu closes, and the request is given a short time limit instead.
+ */
+function uiOpensMenu(node, action) {
+  if (action === 'AXShowMenu') return true;
+  var role = node.rec ? node.rec.role : '';
+  return action === 'AXPress' && (UI_POPUP_ROLES[role] === 1 || role === 'AXMenuBarItem');
+}
+
+function uiPerform(ctx, node, action) {
+  var r;
+  if (uiOpensMenu(node, action)) {
+    ctx.eng.timeout(ctx, node, AX_POPUP_TIMEOUT);
+    try {
+      r = ctx.eng.perform(ctx, node, action);
+    } finally {
+      ctx.eng.timeout(ctx, node, AX_MESSAGING_TIMEOUT);
+    }
+  } else {
+    r = ctx.eng.perform(ctx, node, action);
+  }
+  if (r.ok) return { ok: true, method: action };
+  uiCheck(r);
+  if (r.err === AX_ERR_CANNOT_COMPLETE) {
+    // Typically the action opened a modal dialog or a menu, which keeps the app from answering.
+    return { ok: true, method: action, confirmed: false, reason: 'the app did not confirm in time; it may be showing a dialog or menu' };
+  }
+  return { ok: false, method: 'none', reason: action + ' failed on this ' + uiRoleText(node) + uiErrText(r) };
+}
+
+function uiSetSelected(ctx, node) {
+  var r = ctx.eng.set(ctx, node, 'AXSelected', true);
+  uiCheck(r);
+  return r.ok ? { ok: true, method: 'AXSelected' } : { ok: false, method: 'none', reason: 'AXSelected cannot be set' + uiErrText(r) };
+}
+
+function uiPress(ctx, node) {
+  var names = ctx.eng.actions(ctx, node);
+  if (names === null) return uiPerform(ctx, node, 'AXPress');
+  for (var i = 0; i < UI_PRESS_ACTIONS.length; i++) {
+    if (names.indexOf(UI_PRESS_ACTIONS[i]) >= 0) return uiPerform(ctx, node, UI_PRESS_ACTIONS[i]);
+  }
+  if (UI_SELECTABLE[node.rec.role] === 1 && ctx.eng.settable(ctx, node, 'AXSelected') === true) {
+    var s = uiSetSelected(ctx, node);
+    if (s.ok) return s;
+  }
+  return {
+    ok: false,
+    method: 'none',
+    reason: 'this ' + uiRoleText(node) + ' has no press action' + (names.length ? ' (it supports ' + names.join(', ') + ')' : '')
+  };
+}
+
+function uiFocus(ctx, node) {
+  var rec = node.rec;
+  var front = ctx.eng.activate(ctx);
+  if (rec.role === 'AXWindow' || rec.role === 'AXSheet' || rec.role === 'AXDrawer') {
+    return front ? { ok: true, method: 'AXRaise' } : { ok: false, method: 'AXRaise', reason: 'the app did not come to the front' };
+  }
+  var r = ctx.eng.set(ctx, node, 'AXFocused', true);
+  uiCheck(r);
+  if (!r.ok) return { ok: false, method: 'none', reason: 'the element cannot take keyboard focus' + uiErrText(r) };
+  // Keyboard input only reaches it once its app is frontmost.
+  if (!front) return { ok: false, method: 'AXFocused', reason: 'the app did not come to the front' };
+  return { ok: true, method: 'AXFocused' };
+}
+
+function uiSetValue(ctx, node, value) {
+  var eng = ctx.eng;
+  var rec = node.rec;
+  if (value === undefined || value === null) throw fail('BAD_ARGS', 'setValue needs a value');
+  if (rec.role === 'AXCheckBox' || rec.role === 'AXRadioButton' || rec.role === 'AXSwitch') {
+    var want = uiTruthy(value);
+    if (want === null) throw fail('BAD_ARGS', 'a ' + uiRoleText(node) + ' takes true or false (got "' + value + '")');
+    if ((Number(rec.value) === 1) === want) return { ok: true, method: 'unchanged' };
+    if (rec.role === 'AXRadioButton' && !want) {
+      return { ok: false, method: 'none', reason: 'a radio button is turned off by choosing another one' };
+    }
+    return uiPress(ctx, node);
+  }
+  if (rec.subrole === 'AXSecureTextField') return { ok: false, method: 'none', reason: 'password fields must be typed into' };
+  if (eng.settable(ctx, node, 'AXValue') === false) {
+    return { ok: false, method: 'none', reason: 'the value of this ' + uiRoleText(node) + ' cannot be set directly' };
+  }
+  var numeric = typeof rec.value === 'number' && String(value) !== '' && isFinite(Number(value));
+  var v = numeric ? Number(value) : String(value);
+  var r = eng.set(ctx, node, 'AXValue', v);
+  uiCheck(r);
+  if (!r.ok) return { ok: false, method: 'none', reason: 'setting the value failed' + uiErrText(r) };
+  sleep(UI_SETTLE);
+  var now = eng.get(ctx, node, 'AXValue');
+  if (numeric) {
+    if (typeof now === 'number' && isFinite(now)) {
+      // Sliders and steppers snap to their steps: report what they took.
+      return Math.abs(now - v) < 1e-9 ? { ok: true, method: 'AXValue' } : { ok: true, method: 'AXValue', value: now };
+    }
+    return { ok: true, method: 'AXValue', confirmed: false };
+  }
+  var got = uiValueText(now).replace(/\r\n?/g, '\n');
+  if (got !== v.replace(/\r\n?/g, '\n')) {
+    return { ok: false, method: 'AXValue', reason: 'the app did not keep the value (it reads back as ' + JSON.stringify(uiClip(got, 80)) + ')' };
+  }
+  return { ok: true, method: 'AXValue' };
+}
+
+/** Open a pop-up button, combo box or menu button; ok when it opened or probably did. */
+function uiOpenPopup(ctx, node) {
+  var r = uiPerform(ctx, node, 'AXShowMenu');
+  if (!r.ok) r = uiPerform(ctx, node, 'AXPress');
+  if (!r.ok) r.reason = 'the pop-up did not open' + (r.reason ? ': ' + r.reason : '');
+  return r;
+}
+
+/** The menu item named `want` (normalized) under node, or in the app's open menus. */
+function uiFindMenuItem(ctx, node, want) {
+  var best = null;
+  var visit = function (n, rec, name) {
+    if (rec.role !== 'AXMenuItem') return true;
+    var s = uiTextScore(name, want, false);
+    if (s > 0 && (!best || s > best.s)) best = { node: n, s: s };
+    return !(best && best.s === 3);
+  };
+  // A fresh node: its children are read again, now that the menu is open.
+  var fresh = uiNode(node.el, node.path, node.root, node.parentRole);
+  uiWalk(ctx, [{ node: fresh }], { visited: 0, deadline: Date.now() + 3000, maxVisit: 800, stop: false }, visit);
+  if (!best || best.s < 3) {
+    var roots = uiRoots(ctx);
+    var menus = [];
+    for (var i = 0; i < roots.main.length; i++) if (roots.main[i].node.root === 'a') menus.push(roots.main[i]);
+    uiWalk(ctx, menus, { visited: 0, deadline: Date.now() + 3000, maxVisit: 800, stop: false }, visit);
+  }
+  return best ? best.node : null;
+}
+
+function uiSelectOption(ctx, node, label) {
+  var rec = node.rec;
+  if (rec.role === 'AXComboBox' && ctx.eng.settable(ctx, node, 'AXValue') !== false) {
+    var sv = uiSetValue(ctx, node, label);
+    if (sv.ok) return sv;
+  }
+  if (ctx.eng.name !== 'ax') {
+    return { ok: false, method: 'none', reason: 'choosing an option needs the accessibility API; press the pop-up, then the option' };
+  }
+  var opened = uiOpenPopup(ctx, node);
+  if (!opened.ok) return opened;
+  sleep(UI_MENU_WAIT);
+  var item = uiFindMenuItem(ctx, node, uiNorm(label));
+  if (!item) {
+    ctx.eng.perform(ctx, node, 'AXCancel');
+    return { ok: false, method: 'none', reason: 'the pop-up has no option named "' + label + '"' };
+  }
+  var p = uiPerform(ctx, item, 'AXPress');
+  if (p.ok) p.method = 'menu';
+  return p;
+}
+
+function uiSelect(ctx, node, value) {
+  var rec = node.rec;
+  if (value !== undefined && value !== null && String(value) !== '' && UI_POPUP_ROLES[rec.role] === 1) {
+    return uiSelectOption(ctx, node, String(value));
+  }
+  if (rec.role === 'AXRadioButton' || rec.role === 'AXMenuItem' || rec.role === 'AXMenuBarItem' || rec.subrole === 'AXTabButton') {
+    return uiPress(ctx, node);
+  }
+  if (ctx.eng.settable(ctx, node, 'AXSelected') !== false) {
+    var s = uiSetSelected(ctx, node);
+    if (s.ok) return s;
+  }
+  var names = ctx.eng.actions(ctx, node);
+  if (names && names.indexOf('AXPick') >= 0) return uiPerform(ctx, node, 'AXPick');
+  if (names && names.indexOf('AXPress') >= 0) return uiPerform(ctx, node, 'AXPress');
+  return { ok: false, method: 'none', reason: 'this ' + uiRoleText(node) + ' cannot be selected' };
+}
+
+function uiExpand(ctx, node, open) {
+  var eng = ctx.eng;
+  var rec = node.rec;
+  if (uiExpanded(rec) === open) return { ok: true, method: 'unchanged' };
+  var attrs = [['AXExpanded', rec.expanded], ['AXDisclosing', rec.disclosing]];
+  for (var i = 0; i < attrs.length; i++) {
+    if (attrs[i][1] !== true && attrs[i][1] !== false) continue;
+    var r = eng.set(ctx, node, attrs[i][0], open);
+    uiCheck(r);
+    if (r.ok) return { ok: true, method: attrs[i][0] };
+  }
+  if (rec.role === 'AXDisclosureTriangle') return uiPerform(ctx, node, 'AXPress');
+  if (UI_POPUP_ROLES[rec.role] === 1) return open ? uiOpenPopup(ctx, node) : uiPerform(ctx, node, 'AXCancel');
+  // A disclosure triangle among the children (outline rows, disclosure groups).
+  var kids = uiKids(ctx, node, null);
+  for (var k = 0; k < kids.length; k++) {
+    var kr = uiLoad(ctx, kids[k], null);
+    if (!kr || kr.role !== 'AXDisclosureTriangle') continue;
+    if (uiExpanded(kr) === open) return { ok: true, method: 'unchanged' };
+    var p = uiPerform(ctx, kids[k], 'AXPress');
+    if (p.ok) p.method = 'AXDisclosureTriangle';
+    return p;
+  }
+  return { ok: false, method: 'none', reason: 'this ' + uiRoleText(node) + ' cannot be ' + (open ? 'expanded' : 'collapsed') };
+}
+
+function uiDo(ctx, node, action, value) {
+  if (/^AX[A-Za-z]+$/.test(action)) return uiPerform(ctx, node, action);
+  switch (action) {
+    case 'press':
+      return uiPress(ctx, node);
+    case 'focus':
+      return uiFocus(ctx, node);
+    case 'setValue':
+      return uiSetValue(ctx, node, value);
+    case 'select':
+      return uiSelect(ctx, node, value);
+    case 'expand':
+      return uiExpand(ctx, node, true);
+    case 'collapse':
+      return uiExpand(ctx, node, false);
+    case 'scrollIntoView':
+      return uiPerform(ctx, node, 'AXScrollToVisible');
+    case 'showMenu':
+      return uiPerform(ctx, node, 'AXShowMenu');
+    default:
+      throw fail('BAD_ARGS', 'unknown UI action "' + action + '"');
+  }
+}
+
+/** How close a search candidate is to the element an id named: frame first, then path. */
+function uiResolveScore(node, rec, p, frame) {
+  var prefix = 0;
+  while (prefix < node.path.length && prefix < p.path.length && node.path[prefix] === p.path[prefix]) prefix++;
+  var score = prefix * 10 - Math.abs(node.path.length - p.path.length);
+  if (uiValidFrame(frame)) {
+    var b = uiBounds(rec);
+    var dist = 1e6;
+    if (b.width > 0 && b.height > 0) {
+      var dx = b.x + b.width / 2 - (frame.x + frame.width / 2);
+      var dy = b.y + b.height / 2 - (frame.y + frame.height / 2);
+      dist = Math.sqrt(dx * dx + dy * dy);
+    }
+    score -= dist * 1000;
+  }
+  return score;
+}
+
+/**
+ * The element an id names: by its path when the element there still has the id's role and
+ * name, else by searching its root for that role and name (nearest to `frame`, the bounds
+ * uiFind reported, and to the old path). Throws NOT_FOUND when it is gone or ambiguous.
+ */
+function uiResolve(ctx, p, frame) {
+  var eng = ctx.eng;
+  var root = eng.root(ctx, p.root);
+  if (!root) throw fail('NOT_FOUND', 'the window of this element was closed; find it again (ui_find or ui_tree)');
+  var node = root;
+  var prev = null;
+  for (var i = 0; i < p.path.length && node; i++) {
+    var next = null;
+    try {
+      next = eng.child(ctx, node, p.path[i]);
+    } catch (e) {
+      if (e.code === 'PERMISSION' || e.code === 'NOT_RESPONDING') throw e;
+      next = null;
+    }
+    prev = node;
+    node = next;
+  }
+  if (node) {
+    var rec = uiLoad(ctx, node, null);
+    if (rec && rec.role && uiHash(rec) === p.hash) {
+      if (prev) node.parentRole = eng.roleOf(ctx, prev);
+      return { node: node, how: 'path' };
+    }
+  }
+  var best = null;
+  var second = null;
+  var st = { visited: 0, deadline: Date.now() + UI_RESOLVE_BUDGET_MS, maxVisit: UI_RESOLVE_MAX_VISIT, stop: false, skipAppWindows: p.root === 'a' };
+  uiWalk(ctx, [{ node: eng.root(ctx, p.root) }], st, function (n, r2, name) {
+    if (uiHash(r2, name) !== p.hash) return true;
+    var c = { node: n, score: uiResolveScore(n, r2, p, frame) };
+    if (!best || c.score > best.score) {
+      second = best;
+      best = c;
+    } else if (!second || c.score > second.score) {
+      second = c;
+    }
+    return true;
+  });
+  if (!best) throw fail('NOT_FOUND', 'the element is no longer there (the window changed or closed); find it again (ui_find or ui_tree)');
+  if (second && second.score === best.score && !uiValidFrame(frame)) {
+    throw fail('NOT_FOUND', 'the window changed and several elements now match this id; find it again (ui_find or ui_tree)');
+  }
+  return { node: best.node, how: 'search' };
+}
+
+// ------------------------------------------------ commands
+
+/**
+ * Args for another walk after switching a web content tree on, with what is left of a total time
+ * of twice the budget (so the request stays within the driver's timeout); null when none is left.
+ */
+function uiRetryArgs(a, end) {
+  var left = end - Date.now();
+  if (left < 500) return null;
+  var b = {};
+  for (var k in a) {
+    if (hasOwn(a, k)) b[k] = a[k];
+  }
+  b.budgetMs = left;
+  return b;
+}
+
+function uiTotalEnd(a) {
+  return Date.now() + 2 * clampInt(a.budgetMs, 300, UI_MAX_BUDGET_MS, UI_BUDGET_MS);
+}
+
+function cmdUiTree(a) {
+  return uiWithContext(a, function (ctx) {
+    var end = uiTotalEnd(a);
+    var st = uiBuildTree(ctx, a);
+    var enabled = '';
+    if (uiSparse(ctx, st)) {
+      enabled = uiEnableApp(ctx);
+      for (var i = 0; enabled && i < 2; i++) {
+        var again = uiRetryArgs(a, end);
+        if (!again) break;
+        st = uiBuildTree(ctx, again);
+        if (!uiSparse(ctx, st)) break;
+        if (i === 0) sleep(UI_ENABLE_WAIT);
+      }
+    }
+    var out = { window: ctx.window, nodes: st.nodes, truncated: st.truncated, engine: ctx.eng.name, visited: st.visited };
+    if (enabled) out.enabledAccessibility = enabled;
+    if (uiSparse(ctx, st)) out.sparse = true;
+    if (st.notResponding) out.notResponding = true;
+    if (ctx.bridgeError) out.bridgeError = ctx.bridgeError;
+    return out;
+  });
+}
+
+function cmdUiFind(a) {
+  var q = uiQuery(a);
+  return uiWithContext(a, function (ctx) {
+    var end = uiTotalEnd(a);
+    var r = uiFindIn(ctx, q, a);
+    var enabled = '';
+    if (!r.matches.length && uiSparse(ctx, r.stats)) {
+      enabled = uiEnableApp(ctx);
+      for (var i = 0; enabled && i < 2; i++) {
+        var again = uiRetryArgs(a, end);
+        if (!again) break;
+        r = uiFindIn(ctx, q, again);
+        if (r.matches.length || !uiSparse(ctx, r.stats)) break;
+        if (i === 0) sleep(UI_ENABLE_WAIT);
+      }
+    }
+    var out = { window: ctx.window, matches: r.matches, truncated: r.stats.truncated, engine: ctx.eng.name, visited: r.stats.visited };
+    if (enabled) out.enabledAccessibility = enabled;
+    if (uiSparse(ctx, r.stats)) out.sparse = true;
+    if (r.stats.notResponding) out.notResponding = true;
+    if (ctx.bridgeError) out.bridgeError = ctx.bridgeError;
+    return out;
+  });
+}
+
+/**
+ * Act on an element: {id, action, value?, frame?} -> {ok, method, reason?, confirmed?, id,
+ * resolved: 'path'|'search', role, name, bounds, windowId}. ok false (with a reason) means the
+ * action is not available on that element, so the caller may click it instead.
+ */
+function cmdUiAction(a) {
+  var p = uiParseId(a.id);
+  if (!p) throw fail('BAD_ARGS', 'not a macOS UI element id: ' + a.id);
+  var action = String(a.action || '');
+  if (UI_ACTIONS[action] !== 1 && !/^AX[A-Za-z]+$/.test(action)) {
+    throw fail('BAD_ARGS', 'unknown UI action "' + action + '" (use press, focus, setValue, select, expand, collapse, scrollIntoView or showMenu)');
+  }
+  // Menu bar ids do not depend on a window.
+  var t = { pid: p.pid, engine: a.engine };
+  if (p.root === 'w') {
+    if (p.number !== null) t.number = p.number;
+    else if (p.axIndex !== null) t.axIndex = p.axIndex;
+    else throw fail('BAD_ARGS', 'not a macOS UI element id: ' + a.id);
+  }
+  return uiWithContext(t, function (ctx) {
+    var found = uiResolve(ctx, p, a.frame);
+    var node = found.node;
+    var res = uiDo(ctx, node, action, a.value);
+    var name = uiName(node.rec);
+    res.id = uiNodeId(ctx, node, node.rec, name);
+    res.resolved = found.how;
+    res.role = uiRole(node.rec, node.parentRole);
+    res.name = name;
+    res.bounds = uiBounds(node.rec);
+    res.windowId = ctx.window.id;
+    return res;
+  });
+}
+
+// ------------------------------------------------ window bounds
+
+function flipRect(r, primaryHeight) {
+  return { x: r.x, y: primaryHeight - (r.y + r.height), width: r.width, height: r.height };
+}
+
+/** Every screen's full and visible (without menu bar and Dock) frame, top-left origin. */
+function screenFrames() {
+  pump(0.01);
+  var screens = $.NSScreen.screens;
+  var n = isNil(screens) ? 0 : Number(screens.count);
+  var out = [];
+  var primaryHeight = 0;
+  for (var i = 0; i < n; i++) {
+    var s = screens.objectAtIndex(i);
+    var f = rectOf(s.frame);
+    var v = f;
+    try {
+      v = rectOf(s.visibleFrame);
+    } catch (e) {
+      v = f;
+    }
+    if (i === 0) primaryHeight = f.height;
+    out.push({ full: flipRect(f, primaryHeight), visible: flipRect(v, primaryHeight) });
+  }
+  return out;
+}
+
+/** The visible frame of the screen that holds most of `rect` (its centre first). */
+function visibleFrameFor(rect, screens) {
+  if (!screens.length) return null;
+  if (!uiValidFrame(rect)) return screens[0].visible;
+  var cx = rect.x + rect.width / 2;
+  var cy = rect.y + rect.height / 2;
+  var i;
+  for (i = 0; i < screens.length; i++) {
+    var f = screens[i].full;
+    if (cx >= f.x && cx < f.x + f.width && cy >= f.y && cy < f.y + f.height) return screens[i].visible;
+  }
+  var best = 0;
+  var bestArea = -1;
+  for (i = 0; i < screens.length; i++) {
+    var g = screens[i].full;
+    var w = Math.min(rect.x + rect.width, g.x + g.width) - Math.max(rect.x, g.x);
+    var h = Math.min(rect.y + rect.height, g.y + g.height) - Math.max(rect.y, g.y);
+    var area = w > 0 && h > 0 ? w * h : 0;
+    if (area > bestArea) {
+      bestArea = area;
+      best = i;
+    }
+  }
+  return screens[best].visible;
+}
+
+function seWindowFrame(w) {
+  var pos = seGet(function () {
+    return w.position();
+  });
+  var size = seGet(function () {
+    return w.size();
+  });
+  var p = sePair(pos, 'x', 'y');
+  var s = sePair(size, 'width', 'height');
+  return p && s ? { x: p.x, y: p.y, width: s.width, height: s.height } : null;
+}
+
+function seWindowFlag(w, attr) {
+  var v = seGet(function () {
+    return w.attributes.byName(attr).value();
+  });
+  return v === true || v === 1;
+}
+
+/**
+ * Move and resize a window to `target` ({x, y, width, height}, integers). The size is set again
+ * after the move when the old position constrained it, and the position again when resizing
+ * moved it. AXEnhancedUserInterface (Chromium with accessibility on) animates and misplaces
+ * moves, so it is off meanwhile.
+ */
+function seSetFrame(proc, w, target) {
+  var eui = null;
+  try {
+    eui = proc.attributes.byName('AXEnhancedUserInterface').value();
+  } catch (e) {
+    eui = null;
+  }
+  if (eui === true) {
+    try {
+      proc.attributes.byName('AXEnhancedUserInterface').value = false;
+    } catch (e) {
+      eui = null;
+    }
+  }
+  try {
+    var x = Math.round(target.x);
+    var y = Math.round(target.y);
+    var width = Math.round(target.width);
+    var height = Math.round(target.height);
+    w.position = [x, y];
+    w.size = [width, height];
+    var now = seWindowFrame(w);
+    if (now && (Math.abs(now.width - width) > 2 || Math.abs(now.height - height) > 2)) {
+      w.size = [width, height];
+      now = seWindowFrame(w);
+    }
+    if (now && (Math.abs(now.x - x) > 2 || Math.abs(now.y - y) > 2)) {
+      w.position = [x, y];
+      now = seWindowFrame(w);
+    }
+    return now;
+  } finally {
+    if (eui === true) {
+      try {
+        proc.attributes.byName('AXEnhancedUserInterface').value = true;
+      } catch (e) {
+        /* best effort */
+      }
+    }
+  }
+}
+
+function optNum(v) {
+  return v === undefined || v === null || v === '' ? null : num(v, 'bounds');
+}
+
+/**
+ * {pid, number?, state?: 'maximize'|'minimize'|'restore'|'fullscreen', x?, y?, width?, height?,
+ * frame? (restore to it)} -> {ok, state, before, frame, reason?}. Through System Events, like
+ * focus and minimize. Maximize fills the visible frame of the window's screen.
+ */
+function cmdSetBounds(a) {
+  var pid = int(a.pid, 'pid');
+  var number = a.number === undefined || a.number === null ? null : int(a.number, 'number');
+  var info = number === null ? cgFrontWindow(pid) : windowInfo(number);
+  if (number !== null && !info) return { ok: false, reason: 'window ' + number + ' not found' };
+  if (info && info.pid !== pid) return { ok: false, reason: 'window ' + number + ' does not belong to process ' + pid };
+  var state = a.state ? String(a.state) : '';
+  if (state && state !== 'maximize' && state !== 'minimize' && state !== 'restore' && state !== 'fullscreen') {
+    throw fail('BAD_ARGS', 'unknown window state "' + state + '" (use maximize, minimize, restore or fullscreen)');
+  }
+  var want = { x: optNum(a.x), y: optNum(a.y), width: optNum(a.width), height: optNum(a.height) };
+  if (!state && want.x === null && want.y === null && want.width === null && want.height === null) {
+    throw fail('BAD_ARGS', 'setBounds needs x, y, width, height or a state');
+  }
+  var se = systemEvents();
+  var index = findAxWindowIndex(se, pid, info);
+  if (index < 0) return { ok: false, reason: 'no matching accessibility window' };
+  var proc = axProcess(se, pid);
+  var w = proc.windows[index];
+  var before = seWindowFrame(w);
+  var out = { ok: true, state: state || 'bounds', before: before, frame: null };
+  if (state === 'minimize') {
+    w.attributes.byName('AXMinimized').value = true;
+    out.frame = before;
+    return out;
+  }
+  if (seWindowFlag(w, 'AXMinimized')) {
+    w.attributes.byName('AXMinimized').value = false;
+    sleep(UI_UNMINIMIZE_WAIT);
+  }
+  var full = seWindowFlag(w, 'AXFullScreen');
+  if (state === 'fullscreen') {
+    if (!full) {
+      try {
+        w.attributes.byName('AXFullScreen').value = true;
+      } catch (e) {
+        var c = classifyError(e);
+        if (c.code === 'PERMISSION') throw fail('PERMISSION', c.message, { perm: c.perm, errorNumber: c.number });
+        // Older apps: the green title bar button.
+        var button = null;
+        try {
+          var list = w.buttons.whose({ subrole: 'AXFullScreenButton' });
+          if (list.length) button = list[0];
+        } catch (e2) {
+          button = null;
+        }
+        if (!button) return { ok: false, state: state, before: before, frame: before, reason: 'the window cannot go full screen' };
+        button.actions.byName('AXPress').perform();
+      }
+    }
+    out.frame = seWindowFrame(w);
+    return out;
+  }
+  if (full) {
+    w.attributes.byName('AXFullScreen').value = false;
+    sleep(UI_FULLSCREEN_WAIT);
+    before = seWindowFrame(w) || before;
+  }
+  var target = null;
+  if (state === 'maximize') {
+    target = visibleFrameFor(before || info, screenFrames());
+  } else if (state === 'restore') {
+    target = a.frame && uiValidFrame(a.frame) ? a.frame : null;
+  } else {
+    var base = before || { x: NaN, y: NaN, width: NaN, height: NaN };
+    target = {
+      x: want.x !== null ? want.x : base.x,
+      y: want.y !== null ? want.y : base.y,
+      width: want.width !== null ? want.width : base.width,
+      height: want.height !== null ? want.height : base.height
+    };
+    if (!uiValidFrame(target)) {
+      return { ok: false, state: out.state, before: before, frame: before, reason: 'the window frame could not be read; give x, y, width and height' };
+    }
+  }
+  out.frame = target ? seSetFrame(proc, w, target) : seWindowFrame(w);
+  return out;
 }
 
 var COMMANDS = {
@@ -1667,6 +4224,11 @@ var COMMANDS = {
   focus: cmdFocus,
   minimize: cmdMinimize,
   close: cmdClose,
+  browserTab: cmdBrowserTab,
+  uiTree: cmdUiTree,
+  uiFind: cmdUiFind,
+  uiAction: cmdUiAction,
+  setBounds: cmdSetBounds,
   clipGet: cmdClipGet,
   clipSet: cmdClipSet,
   exit: function () {

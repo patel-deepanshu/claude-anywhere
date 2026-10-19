@@ -8,8 +8,7 @@ safeguards and what remains your responsibility.
 - The daemon binds to **127.0.0.1** only, on port 47120 by default, falling back to a nearby port and then a random one.
 - Every `/api/*` call except `/api/health` and the launch-code exchange (`/api/launch`, below) needs a **random per-run token**, compared in constant time. A new token is made each time the daemon starts, so `anywhere restart` invalidates every copy. The token goes to these places:
   - `~/.claude-anywhere/daemon.json` (mode 0600), where the CLI, TUI and plugin look up the running daemon;
-  - `~/.claude-anywhere/run/mcp-<instance>.json` (mode 0600), the MCP config of the dialog's own Claude Code session, deleted when the daemon stops;
-  - the environment of the `anywhere` MCP server that session starts, and of the Electron shell (`ANYWHERE_UI_URL`) if you use it. A process environment is readable only by its owner;
+  - the environment of the Electron shell (`ANYWHERE_UI_URL`) if you use it, as a single-use launch code (below);
   - the output of `anywhere url`, and of `anywhere start` (also with `--json` or `--foreground`) and `anywhere show` only when you must open the page yourself: no window could open, or `--no-open`. `--show-token` adds it to `start` and `status`. `/anywhere` runs `start` through Claude Code's Bash tool, so when no window could open the token URL also ends up in that session's transcript under `~/.claude/projects/`;
   - the terminal of a daemon you run in the foreground (`anywhere start --foreground`), when it opened no window. A daemon running in the background writes only the bare address and a pointer to `anywhere url` to its log (`~/.claude-anywhere/logs/daemon.log`); logs written by older versions may still hold the token URL, and `anywhere logs` masks it (`token=***`).
 
@@ -18,6 +17,34 @@ safeguards and what remains your responsibility.
 - The UI is served with a strict Content-Security-Policy: no inline scripts, no third-party origins, no framing.
 - The UI removes the token from the address bar after loading.
 - The dialog window is opened with a **single-use launch code** that expires after 60 s, rather than the token. Electron gets its URL through the environment. As a result, the token never appears on a browser command line that other local users could read in the process list. `anywhere url` (and `anywhere start` or `show` when no window could open) still prints a token URL for manual use, so keep that output (and those transcripts) private.
+- **The engines get their own token.** The MCP servers of the dialog's Claude Code session and of the call
+  assistant run with a second per-run token, written to `~/.claude-anywhere/run/mcp-<instance>.json` and
+  `~/.claude-anywhere/calls/<id>/engine/` (0600, deleted when they stop). It reaches the MCP and feature routes,
+  but never answers an approval card or a question, changes settings or the mode, or shuts the daemon down
+  (403 `ENGINE_FORBIDDEN`). Reading those run files, like `daemon.json`, is a credential read (high risk, no
+  "Always" rule), and a command that names the daemon's approval, settings, mode, launch or shutdown routes is
+  critical.
+- **Only a real click allows a critical card.** The dialog window gets a third credential of its own, only by
+  trading a launch code minted for a dialog window (never one an API caller asked for); it is kept in that tab's
+  memory and never written to a file. `POST /api/approval` believes `via: "click"` only from a request that
+  carries it from the daemon's own origin (else 403 `CLICK_NEEDS_DIALOG`), and a critical card is allowed only by
+  such a click, or, where the card allows it, by the typed word `allow` in the terminal dialog; an allow without a
+  `via`, by voice or by a key is refused (409 `CRITICAL_NEEDS_CLICK`). The arm-calls card is click-only. Claude's
+  own mouse and keyboard tools refuse to click, drag, scroll or type in the Claude Anywhere dialog, and all of
+  them pause while a critical card is waiting.
+- **The desktop assistant cannot operate the dialog either** (`OWN_DIALOG`). Its accessibility actions
+  (`ui_click`, `ui_set_value`, `ui_action`, a `ui_click` step of `batch_actions`) refuse elements of the dialog,
+  found by the window the lookup searched, the window or process named in the element id, or else the element's
+  position on screen; their real-pointer and keyboard fallbacks are checked like `click` and `type_text`.
+  `set_window` refuses the dialog, and `quit_app` never ends the dialog's own browser or its helper processes.
+  On GNOME and KDE under Wayland, where no program can tell where the dialog is or which window has the focus,
+  the dialog's pages report whether they are on screen and focused (an engine cannot send that report): Claude's
+  clicks wait while the dialog is visible, and its keys while it may have the focus (minimize the dialog, or use
+  an X11 session, sway or Hyprland). Settings that loosen approvals (a more permissive mode, a new always-allow
+  rule, an always-ask rule removed) are refused (409 `LOOSENING_WHILE_WORKING`) while Claude is working, so its
+  own input can never be what pressed Save.
+- **Reading the daemon's tokens needs a card.** `daemon.json` and the run files hold the tokens; reading them is
+  high risk whether `cat`, `jq`, or interpreter code on the command line (`python3 -c`, `node -e`) does it.
 
 ## 2. What Claude may do without asking
 
@@ -29,7 +56,7 @@ Every tool call Claude Code would normally prompt for goes to the dialog through
 |---|---|
 | low | reading files, searching, screenshots, listing windows, `git status`, `gcloud config list`, reading one environment variable (`printenv HOME`, `echo $HOME`) |
 | medium | editing files inside the project, clicks, typing, opening URLs, builds and tests, `git commit`, full environment dumps (`env`, `printenv`, `export -p`, `set`, `gci env:`) |
-| high | reading credential stores (keychains and keyrings, browser cookie and password stores, shell history, `/proc/*/environ`, private keys, cloud CLI credentials, and Claude Anywhere's own `config.json`, which holds `voice.sttApiKey`), deploys and cloud changes (`gcloud run deploy`, `terraform apply`, `kubectl delete`), recursive deletes, `sudo`, force-pushes, package installs, `curl … \| sh` and decoded or computed scripts piped into a shell (`base64 -d \| sh`, `eval "$(…)"` of an unknown command), commands whose name is only known at run time (`$X args`), `find … -exec rm` outside the project, git config keys that run commands (`core.hooksPath`, `core.fsmonitor`, `!` aliases), remote shells, edits outside the project or to secrets (also through Windows path aliases such as `\\?\C:\…` or `file::$DATA`), typing text that looks like a secret, system key combos |
+| high | reading credential stores (keychains and keyrings, browser cookie and password stores, shell history, `/proc/*/environ`, private keys, cloud CLI credentials, and Claude Anywhere's own `config.json`, which holds `voice.sttApiKey` and `jira.apiToken`), deploys and cloud changes (`gcloud run deploy`, `terraform apply`, `kubectl delete`), recursive deletes, `sudo`, force-pushes, package installs, `curl … \| sh` and decoded or computed scripts piped into a shell (`base64 -d \| sh`, `eval "$(…)"` of an unknown command), commands whose name is only known at run time (`$X args`), `find … -exec rm` outside the project, git config keys that run commands (`core.hooksPath`, `core.fsmonitor`, `!` aliases), remote shells, edits outside the project or to secrets (also through Windows path aliases such as `\\?\C:\…` or `file::$DATA`), typing text that looks like a secret, system key combos |
 | critical | `rm -rf /`, disk formatting, shutdown, deleting cloud projects, and any change to Claude Anywhere's or Claude Code's own config or settings (self-escalation) |
 
 Typed text (`type_text`) gets the same command scrutiny, judged by where it lands. Focus never lowers
@@ -37,6 +64,13 @@ command-shaped text: a line that would run as a command keeps its full verdict, 
 app. Only known chat, mail, office and notes apps relax a plain sentence ("Reboot the router if the light
 is red.") to medium. In a terminal, with a Return in it, or in an app the classifier does not know, the
 text gets full scrutiny.
+
+The desktop assistant's tools ([DESKTOP.md](DESKTOP.md)) follow the same scale. Reading app controls, on-screen
+text (OCR), the app list, bookmarks and tab titles is low; pressing controls, setting fields, launching apps,
+opening web pages, switching tabs and arranging windows is medium. High: a secret-looking value typed into a field,
+`quit_app` with `force` or on a system process or Claude itself, `launch_app` with a shell or interpreter command,
+`browser_open` with a non-web link or an executable. `batch_actions` is as risky as its riskiest step, its card lists
+every step, and it never gets an "Always (session)" rule; neither does any high desktop-tool call.
 
 | Mode | Asks you for |
 |---|---|
@@ -89,6 +123,49 @@ The classifier still enforces approvals, even if the model is tricked.
   - Delete `~/.claude-anywhere/run/screenshot-*.png` to clear them sooner. `anywhere uninstall` keeps the rest of `~/.claude-anywhere` (settings, logs) unless you add `--purge`.
 - Desktop context (window titles, editor folders, git remotes with credentials stripped, the active cloud project) is sent with each command. Turn it off with `context.attachDesktopContext false`.
 - Browser speech recognition sends audio to the browser vendor's service. Server STT sends it to the provider you configure, or keeps it local with whisper.cpp.
+- The natural voice (Piper) runs locally: announcements and read-aloud text never leave the computer. Its files are downloaded only when you run `anywhere voice install` (or press Install), from Piper's GitHub release and Hugging Face (`rhasspy/piper-voices`), over HTTPS; the engine runs a test sentence before the install counts as done. Announcements never read out secret-looking values.
+- Jira: the API token is stored in `config.json` (0600), shown nowhere (`anywhere config`, the dialog, `/api/config` and `/api/jira/status` mask it; `--reveal` is needed to print it), redacted in logs (including `Authorization: Basic …` and `ATATT…` tokens), and sent only to the Jira site it was saved for. Moving, assigning and commenting on issues are medium-risk actions (an approval card in `ask` mode); a comment containing something that looks like a secret always asks.
+- `read_browser_tab` reads the address of a browser window without input on macOS (Apple Events) and Windows (UI Automation); elsewhere, and for the page text, it briefly focuses the browser and uses Ctrl/Cmd+L, A and C, then restores your clipboard and focus. Reading the page text is a medium-risk action; the pause and the top-left-corner failsafe stop it before any key.
+
+## 6. Calls and the cloned voice
+
+Details in [CALLS.md](CALLS.md); the enforcement points are listed in [CALLS-DESIGN.md](CALLS-DESIGN.md) §1.3.
+
+- **Your voice only, with consent.** The enrollment accepts only takes recorded live in its view (virtual and
+  loopback microphones are refused, in the page and again in the daemon), starts with a spoken consent sentence
+  carrying a one-time code that is checked by local speech recognition, transcribes every script line locally (a
+  recording that does not say its line is refused), and anchors the speaker check on the consent take: every line
+  must sound like the person who read the consent, a session that splits into two voices is refused, and the takes
+  chosen for the reference clip must match the consent speaker. The voice sidecar has no operation that clones an arbitrary audio file: it loads a voice
+  only from the profile folder, after checking the consent record and the reference's sha256. The profile is
+  0700/0600, never uploaded, and `anywhere clone-voice delete` removes it with the consent recording.
+- **Disclosure.** Every greeting is composed in code as "Hi <caller>, this is <you>'s AI assistant… I'm
+  transcribing this call… <closing question>"; `calls.greeting` sets only the closing question (one question, at
+  most 80 characters, without your name or words that could take the disclosure back). The assistant says
+  nothing before the disclosure has played in full: a greeting that failed to synthesize or play does not count,
+  it is said again with the next voice (Piper, then the system voice), and the call is ended without another word
+  if it cannot be played. A cached greeting is checked by local speech recognition before it is kept. The cloned
+  voice says text of your choice only in the dialog's Test field; `anywhere clone-voice test` plays only the fixed
+  test sentence.
+- **Arming.** Answering is never stored and never on by default. It is turned on only by a click on **Allow once**
+  on a critical card in the dialog window (no "Always" rule, no voice, no key, no permission mode, no typed
+  `allow`, no API request without the dialog's credential), expires after at most 12 hours, and respects quiet
+  hours (times that do not parse block arming instead of turning quiet hours off); `calls off` stops it without a
+  confirmation, also while a call is being picked up (Accept is then not pressed, or the call is handed to you).
+- **During a call** the assistant is a separate `claude -p --model haiku` with no built-in tools and only the
+  call tools (look up and assign unassigned tickets to the bound caller, comment, a chat message after the call,
+  defer, end). The daemon checks each call: the active call, the caller's Jira account (from the call app, never
+  from speech), per-call budgets, allowed projects, server-built JQL, and text without secrets or foreign links.
+  Everything the caller says is untrusted input; everything else becomes a follow-up in your notes. Answering
+  clicks only inside the call's window or popup (never the dialog, a terminal or an editor), and is verified. The
+  caller's name comes from the call app's title or notification; when vision reads a different name from the
+  screen, the caller stays unbound and nothing is assigned or sent to them. The name is cleaned of links before
+  it appears in a Jira comment.
+- **Data.** Speech recognition and synthesis run locally. When the caller objects to the transcription, the
+  transcript stops and the notes keep only what was done (no summary of what they said). Transcripts and action logs stay in
+  `~/.claude-anywhere/calls/<id>/` (0600, 30 days); the notes go to your Desktop folder, which OneDrive or iCloud
+  may sync (set `calls.notesDir` to avoid that). The Cliq client secret and refresh token are stored like the
+  Jira token (0600, masked, never accepted as command-line arguments).
 
 ## Reporting
 

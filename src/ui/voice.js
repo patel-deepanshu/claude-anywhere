@@ -13,7 +13,14 @@
  * alone arms the next utterance).
  *
  * Output: speechSynthesis (sentence-chunked, Chrome stops utterances after
- * ~15 s) or POST /api/tts. cancelSpeech() also POSTs /api/tts/stop.
+ * ~15 s) or POST /api/tts. cancelSpeech() also POSTs /api/tts/stop. With no
+ * voice chosen, the most natural free voice is used (rankVoices).
+ *
+ * Announcements (SSE 'announce', decided by the daemon): queued and never
+ * overlapping, the newest permission or question first. Each plays an
+ * optional WebAudio chime, then the daemon's WAV (GET /api/tts/audio, played
+ * from a blob: URL) or, without audio, the text through speechSynthesis.
+ * Barge-in (cancelSpeech: the mic, typing, Esc) stops them and empties the queue.
  */
 
 import { WavRecorder } from './wav-recorder.js';
@@ -63,7 +70,8 @@ export function stripMarkdownForSpeech(text) {
   s = s.replace(/(^|[^\w*])[*_]([^*_\n]+)[*_](?=[^\w*]|$)/g, '$1$2');
   s = s.replace(/~~(.*?)~~/g, '$1');
   s = s.replace(/<[^>]+>/g, '');
-  s = s.replace(/https?:\/\/\S+/g, 'the link');
+  // The sentence's own punctuation after a URL stays ("…at the link.").
+  s = s.replace(/https?:\/\/\S+?(?=[.,;:!?)\]]*(?:\s|$))/g, 'the link');
   s = s.replace(/[ \t]+/g, ' ');
   s = s.replace(/\n{2,}/g, '\n');
   return s.trim();
@@ -314,6 +322,76 @@ export function getBrowserVoices() {
   }
 }
 
+// The most natural free voices by name, best first: Edge's online neural voices ("Microsoft Aria
+// Online (Natural)"), other neural voices, Apple's downloadable Premium and Enhanced voices, Siri,
+// then Chrome's network voices ("Google US English"). Anything else ranks after them.
+const NATURAL_TIERS = [/\bnatural\b/i, /\bneural\b/i, /\bpremium\b/i, /\benhanced\b/i, /\bsiri\b/i, /\bgoogle\b/i];
+// macOS novelty and robotic voices: last resort only.
+const NOVELTY_VOICES = /^(?:albert|bad news|bahh|bells|boing|bubbles|cellos|deranged|good news|hysterical|jester|organ|pipe organ|superstar|trinoids|whisper|wobble|zarvox|fred|junior|ralph|kathy|princess|agnes|bruce|vicki|victoria|grandma|grandpa|rocko|shelley|flo|eddy|reed|sandy)\b/i;
+// Edge lists child voices first among its natural English voices.
+const CHILD_VOICES = /\b(?:ana|maisie)\b/i;
+
+function voiceLang(v) {
+  return String((v && v.lang) || '').replace(/_/g, '-').toLowerCase();
+}
+
+/**
+ * Rank voices for a language, most natural first. Only voices of the same base language
+ * ("en" for "en-US") are returned; within a quality tier the exact region, then the
+ * browser's default voice, comes first.
+ * @param {Array<{name:string, lang:string, default?:boolean, localService?:boolean}>} voices
+ * @param {string} [lang] e.g. "en-US"
+ * @returns {Array} a new, sorted array
+ */
+export function rankVoices(voices, lang) {
+  const list = Array.isArray(voices) ? voices.filter((v) => v && v.name) : [];
+  const want = String(lang || '').replace(/_/g, '-').toLowerCase();
+  const prefix = want.split('-')[0];
+  const tier = (v) => {
+    const name = String(v.name);
+    const i = NATURAL_TIERS.findIndex((re) => re.test(name));
+    if (i >= 0) return i;
+    return NOVELTY_VOICES.test(name) ? NATURAL_TIERS.length + 1 : NATURAL_TIERS.length;
+  };
+  const scored = list
+    .map((v, index) => {
+      const l = voiceLang(v);
+      const exact = Boolean(want) && l === want;
+      const sameBase = !prefix || l === prefix || l.startsWith(`${prefix}-`);
+      return { v, index, sameBase, score: tier(v) * 10 + (exact ? 0 : 3) + (CHILD_VOICES.test(v.name) ? 2 : 0) + (v.default ? 0 : 1) };
+    })
+    .filter((x) => x.sameBase);
+  scored.sort((a, b) => a.score - b.score || a.index - b.index);
+  return scored.map((x) => x.v);
+}
+
+/**
+ * The most natural voice for a language, or null when the browser has none for it.
+ * @param {Array} voices
+ * @param {string} [lang]
+ */
+export function pickNaturalVoice(voices, lang) {
+  return rankVoices(voices, lang)[0] || null;
+}
+
+// Two-note chimes, one per announcement kind (Hz): a settled fifth when work is done, a bright
+// rise that asks for attention, a rising "question" interval, and a falling one for errors.
+export const CHIME_NOTES = {
+  done: [659.25, 987.77],
+  info: [783.99, 1046.5],
+  permission: [880, 1318.51],
+  question: [587.33, 880],
+  error: [622.25, 466.16],
+};
+const ANNOUNCE_KINDS = new Set(['done', 'permission', 'question', 'error', 'info']);
+const URGENT_KINDS = new Set(['permission', 'question']);
+// Announcements that waited longer than this are no longer news.
+const ANNOUNCE_MAX_AGE_MS = 120000;
+const ANNOUNCE_QUEUE_MAX = 8;
+// How long a queued announcement waits for speech the user asked for (a read-aloud) to end.
+const ANNOUNCE_WAIT_MS = 20000;
+const ANNOUNCE_TEXT_MAX = 900;
+
 function sttErrorMessage(code, lang) {
   switch (code) {
     case 'not-allowed':
@@ -344,10 +422,12 @@ function sttErrorMessage(code, lang) {
  *   onError?: (message:string, opts?:{level?:string, code?:string}) => void,
  *   onLevel?: (level:number) => void,              0..1 microphone level (server recording)
  *   getServerVoice?: () => {serverStt?:boolean, sttProvider?:string, sttHint?:string, serverTts?:boolean, ttsProvider?:string},
+ *   fetchBlob?: (path:string, opts?:{timeoutMs?:number}) => Promise<Blob>,  authenticated GET of binary data
+ *                                                  (announcement audio); without it, announcements are spoken from their text
  *   Recorder?: typeof WavRecorder                  server-transcription recorder (tests pass a fake)
  * }} opts
  */
-export function createVoice({ getConfig, api, onInterim, onFinal, onState, onError, onLevel, getServerVoice, Recorder = WavRecorder } = {}) {
+export function createVoice({ getConfig, api, onInterim, onFinal, onState, onError, onLevel, getServerVoice, fetchBlob, Recorder = WavRecorder } = {}) {
   const g = globalThis;
   const SR = g.SpeechRecognition || g.webkitSpeechRecognition || null;
   const synth = g.speechSynthesis || null;
@@ -365,6 +445,16 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
   let speakGen = 0;
   let lastStopPost = 0;
   const liveUtterances = new Set();
+  // Announcements: the queue, the one playing, and the audio clip or chime it is playing.
+  const announceQueue = [];
+  const announceSeen = [];
+  let announcing = null;
+  let pumpTimer = 0;
+  let waitingSince = 0;
+  let clip = null; // { el, url, finish }
+  let chimeOut = null; // the chime's output node, disconnected to silence it
+  let naturalPending = 0; // speakGen of a read-aloud waiting for POST /api/tts/synthesize
+  let audioCtx = null;
 
   const cb = (fn, ...args) => {
     if (typeof fn !== 'function') return undefined;
@@ -392,8 +482,20 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
     }
   };
 
+  /** Speech other than an announcement: a read-aloud, a spoken answer, the server's voice. */
+  function otherSpeech() {
+    return (
+      speakingBrowser ||
+      Boolean(synth && synth.speaking) ||
+      Boolean(clip) ||
+      (naturalPending !== 0 && naturalPending === speakGen) ||
+      (serverPending !== 0 && serverPending === speakGen) ||
+      Date.now() < serverSpeakUntil
+    );
+  }
+
   function isSpeaking() {
-    return speakingBrowser || Boolean(synth && synth.speaking) || (serverPending !== 0 && serverPending === speakGen) || Date.now() < serverSpeakUntil;
+    return Boolean(announcing) || otherSpeech();
   }
 
   /**
@@ -882,6 +984,7 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
     });
   }
 
+  /** The chosen voice, else the most natural one for the language (rankVoices). */
   function pickVoice(name, lang) {
     const voices = getBrowserVoices();
     if (!voices.length) return null;
@@ -889,20 +992,30 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
       const v = voices.find((x) => x.name === name || x.voiceURI === name);
       if (v) return v;
     }
-    const base = String(lang || '').toLowerCase();
-    const prefix = base.split('-')[0];
-    return (
-      voices.find((x) => x.lang && x.lang.toLowerCase() === base && x.default) ||
-      voices.find((x) => x.lang && x.lang.toLowerCase() === base) ||
-      voices.find((x) => x.lang && x.lang.toLowerCase().startsWith(prefix)) ||
-      null
-    );
+    return pickNaturalVoice(voices, lang || (g.navigator && g.navigator.language) || 'en-US');
   }
 
-  function speakBrowser(text, gen, vc) {
+  /**
+   * @param {string} text
+   * @param {number} gen
+   * @param {object} [vc] voice settings
+   * @param {() => void} [onDone] called once: the last chunk ended, speech failed (after the
+   *   server fallback), or it was stopped
+   */
+  function speakBrowser(text, gen, vc, onDone) {
     const v = vc || voiceCfg();
+    let doneCalled = false;
+    const done = () => {
+      if (doneCalled) return;
+      doneCalled = true;
+      if (typeof onDone === 'function') onDone();
+      afterSpeech();
+    };
     const chunks = splitSentences(text, 180);
-    if (!chunks.length) return;
+    if (!chunks.length) {
+      done();
+      return;
+    }
     const voice = pickVoice(v.ttsVoice, v.language);
     const rate = Math.max(0.5, Math.min(2, Number(v.ttsRate) || 1));
     speakingBrowser = true;
@@ -925,7 +1038,10 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
           emitState();
         }
       };
-      u.onend = end;
+      u.onend = () => {
+        end();
+        if (last || gen !== speakGen) done();
+      };
       u.onerror = (e) => {
         end();
         if (gen === speakGen) {
@@ -934,7 +1050,9 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
         }
         const code = e && e.error;
         if (code && code !== 'interrupted' && code !== 'canceled' && i === 0) {
-          speakServer(text, gen, v).catch(() => {});
+          speakServer(text, gen, v).catch(() => {}).then(done);
+        } else if (last || gen !== speakGen || !code || code === 'interrupted' || code === 'canceled') {
+          done();
         }
       };
       liveUtterances.add(u);
@@ -949,6 +1067,14 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
 
   async function speakServer(text, gen, vc) {
     if (gen !== speakGen) return;
+    try {
+      await speakServerNow(text, gen, vc);
+    } finally {
+      afterSpeech();
+    }
+  }
+
+  async function speakServerNow(text, gen, vc) {
     const rate = Math.max(0.5, Math.min(2, Number((vc || voiceCfg()).ttsRate) || 1));
     const est = ((text.length / 14) * 1000) / rate + 2000;
     serverSpeakUntil = Date.now() + Math.min(120000, est);
@@ -987,8 +1113,11 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
   async function speak(text, overrides) {
     const clean = speechText(text);
     if (!clean) return;
+    // What is asked for now wins over an announcement already playing (the queue resumes after).
+    stopAnnouncement();
     const gen = ++speakGen;
     stopBrowserSpeech();
+    stopClip();
     const vc = { ...voiceCfg(), ...(overrides || {}) };
     let p = ttsProvider(vc);
     if (p === 'off' || p === 'none') return;
@@ -1020,15 +1149,31 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
     speakingBrowser = false;
   }
 
-  /** Stop any speech, in the browser and on the daemon (POST /api/tts/stop). */
+  /**
+   * Stop any speech, in the browser and on the daemon (POST /api/tts/stop), including
+   * announcement audio, and drop the announcements still waiting (barge-in).
+   */
   function cancelSpeech() {
-    const wasSpeaking = isSpeaking();
+    const wasSpeaking = isSpeaking() || announceQueue.length > 0;
+    announceQueue.length = 0;
+    clearTimeout(pumpTimer);
+    pumpTimer = 0;
+    waitingSince = 0;
+    stopAnnouncement();
     speakGen += 1;
     stopBrowserSpeech();
+    stopClip();
+    naturalPending = 0;
     if (wasSpeaking) lastSpeechEnd = Date.now();
     serverSpeakUntil = 0;
     clearTimeout(speakTimer);
     speakTimer = 0;
+    postStop();
+    if (wasSpeaking) emitState();
+  }
+
+  /** Ask the daemon to stop speaking (at most every 400 ms). */
+  function postStop() {
     const now = Date.now();
     if (now - lastStopPost > 400) {
       lastStopPost = now;
@@ -1036,7 +1181,408 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
         .then(() => api('POST', '/api/tts/stop', {}, { timeoutMs: 5000 }))
         .catch(() => {});
     }
-    if (wasSpeaking) emitState();
+  }
+
+  /** Stop speech that is not an announcement, without touching the announcement queue. */
+  function interruptOtherSpeech() {
+    const server = (serverPending !== 0 && serverPending === speakGen) || Date.now() < serverSpeakUntil;
+    speakGen += 1;
+    stopBrowserSpeech();
+    stopClip();
+    naturalPending = 0;
+    serverSpeakUntil = 0;
+    clearTimeout(speakTimer);
+    speakTimer = 0;
+    if (server) postStop();
+  }
+
+  // -------------------------------------------------------------- announcements
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function audioContext() {
+    if (audioCtx) return audioCtx;
+    const AC = g.AudioContext || g.webkitAudioContext;
+    if (typeof AC !== 'function') return null;
+    try {
+      audioCtx = new AC();
+    } catch {
+      audioCtx = null;
+    }
+    return audioCtx;
+  }
+
+  /** Suspend the chime's AudioContext while nothing plays (no idle audio stream). */
+  function idleAudio() {
+    const ctx = audioCtx;
+    if (!ctx || chimeOut || ctx.state !== 'running' || typeof ctx.suspend !== 'function') return;
+    try {
+      const p = ctx.suspend();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    } catch {
+      /* closed */
+    }
+  }
+
+  /**
+   * Let a chime play later without a click: call from a user gesture (browsers keep an
+   * AudioContext locked until one; Safari wants it started inside the gesture). The context is
+   * suspended again right away and only runs while a chime plays.
+   */
+  function unlockAudio() {
+    const ctx = audioContext();
+    if (!ctx || ctx.state !== 'suspended') return;
+    try {
+      const p = ctx.resume();
+      if (p && typeof p.then === 'function') p.then(idleAudio, () => {});
+    } catch {
+      /* not allowed */
+    }
+  }
+
+  /**
+   * A short, soft two-note chime (WebAudio, no files). Resolves when the speech after it may
+   * start; does nothing when audio is not available or not allowed yet.
+   * @param {string} kind done | permission | question | error | info
+   */
+  async function playChime(kind) {
+    const ctx = audioContext();
+    if (!ctx) return;
+    if (ctx.state === 'suspended') {
+      try {
+        await Promise.race([ctx.resume(), sleep(250)]);
+      } catch {
+        return;
+      }
+    }
+    if (ctx.state !== 'running') return;
+    const notes = CHIME_NOTES[kind] || CHIME_NOTES.info;
+    const out = ctx.createGain();
+    out.gain.value = 0.8;
+    out.connect(ctx.destination);
+    chimeOut = out;
+    const t0 = ctx.currentTime + 0.02;
+    const step = 0.14;
+    notes.forEach((freq, i) => {
+      const start = t0 + i * step;
+      const tail = i === notes.length - 1 ? 0.75 : 0.45;
+      // A sine with two quiet overtones and a fast attack: a soft bell rather than a beep.
+      for (const [mult, level] of [[1, 0.16], [2, 0.035], [3, 0.012]]) {
+        const osc = ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.value = freq * mult;
+        const env = ctx.createGain();
+        env.gain.setValueAtTime(0.0001, start);
+        env.gain.exponentialRampToValueAtTime(level, start + 0.012);
+        env.gain.exponentialRampToValueAtTime(0.0001, start + tail);
+        osc.connect(env);
+        env.connect(out);
+        osc.start(start);
+        osc.stop(start + tail + 0.05);
+      }
+    });
+    // Speech may start while the last note rings out.
+    await sleep(Math.round((step * notes.length + 0.2) * 1000));
+    setTimeout(() => {
+      if (chimeOut === out) chimeOut = null;
+      try {
+        out.disconnect();
+      } catch {
+        /* already */
+      }
+      idleAudio();
+    }, 900);
+  }
+
+  function stopChime() {
+    const out = chimeOut;
+    chimeOut = null;
+    if (!out) return;
+    try {
+      out.disconnect();
+    } catch {
+      /* already */
+    }
+    idleAudio();
+  }
+
+  /** Stop the audio clip that is playing (its blob: URL is revoked). */
+  function stopClip() {
+    const c = clip;
+    clip = null;
+    if (c) c.finish();
+  }
+
+  /**
+   * Fetch a WAV from the daemon and play it in an <audio> element from a blob: URL.
+   * Resolves when it ends or is stopped; rejects when it cannot be fetched or played.
+   * @param {string} id GET /api/tts/audio?id=
+   * @param {number} [durationMs]
+   * @param {number} gen
+   */
+  async function playClip(id, durationMs, gen) {
+    if (typeof fetchBlob !== 'function') throw new Error('Audio playback is not available here.');
+    const AudioEl = g.Audio;
+    const urls = g.URL;
+    if (typeof AudioEl !== 'function' || !urls || typeof urls.createObjectURL !== 'function') throw new Error('Audio playback is not available here.');
+    const blob = await fetchBlob(`/api/tts/audio?id=${encodeURIComponent(id)}`, { timeoutMs: 20000 });
+    if (gen !== speakGen) return;
+    if (!blob || !blob.size) throw new Error('The daemon sent no audio.');
+    const url = urls.createObjectURL(blob);
+    const el = new AudioEl();
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      let timer = 0;
+      const finish = (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        el.onended = null;
+        el.onerror = null;
+        if (clip && clip.el === el) clip = null;
+        try {
+          el.pause();
+        } catch {
+          /* not playing */
+        }
+        try {
+          el.removeAttribute('src');
+        } catch {
+          /* ignore */
+        }
+        try {
+          urls.revokeObjectURL(url);
+        } catch {
+          /* ignore */
+        }
+        lastSpeechEnd = Date.now();
+        emitState();
+        if (err) reject(err);
+        else resolve();
+      };
+      clip = { el, url, finish: () => finish() };
+      el.onended = () => finish();
+      el.onerror = () => finish(new Error('The audio could not be played.'));
+      const d = Number(durationMs);
+      timer = setTimeout(() => finish(), d > 0 ? Math.min(240000, d + 5000) : 120000);
+      el.src = url;
+      emitState();
+      let p;
+      try {
+        p = el.play();
+      } catch (err) {
+        finish(err);
+        return;
+      }
+      if (p && typeof p.catch === 'function') p.catch((err) => finish(err || new Error('The audio could not be played.')));
+    });
+  }
+
+  /**
+   * Speak text and resolve once it has been said (or stopped). Uses speechSynthesis with the
+   * chosen or most natural voice, or the daemon's voice when speech output is set to it.
+   */
+  async function sayText(text, gen, max = ANNOUNCE_TEXT_MAX) {
+    const clean = speechText(text, max);
+    if (!clean) return;
+    const vc = voiceCfg();
+    let p = ttsProvider(vc);
+    if (p === 'off' || p === 'none') return;
+    if (p === 'server' && (vc.tts || 'auto') === 'auto' && synth) {
+      await waitForVoices(800);
+      if (gen !== speakGen) return;
+      p = ttsProvider(vc);
+    }
+    if (p === 'browser' && synth) {
+      await sleep(60); // Chrome drops speak() calls issued in the same tick as cancel()
+      if (gen !== speakGen) return;
+      const rate = Math.max(0.5, Math.min(2, Number(vc.ttsRate) || 1));
+      const maxMs = Math.min(180000, ((clean.length / 11) * 1000) / rate + 8000);
+      await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          // A synthesizer that never reports the end must not hold the queue.
+          if (gen === speakGen) stopBrowserSpeech();
+          resolve();
+        }, maxMs);
+        speakBrowser(clean, gen, vc, () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+      return;
+    }
+    await speakServerNow(clean, gen, vc);
+  }
+
+  function rememberAnnounced(id) {
+    if (!id) return false;
+    if (announceSeen.includes(id)) return true;
+    announceSeen.push(id);
+    if (announceSeen.length > 64) announceSeen.shift();
+    return false;
+  }
+
+  /**
+   * Queue an announcement from the daemon: {id, kind, text, audio: null|{id, mime, durationMs}, chime, ts}.
+   * Announcements never overlap; the newest permission or question goes to the front.
+   * @returns {boolean} whether it was queued
+   */
+  function announce(item) {
+    if (!item || typeof item !== 'object') return false;
+    const text = typeof item.text === 'string' ? item.text.trim() : '';
+    const audio = item.audio && typeof item.audio === 'object' && typeof item.audio.id === 'string' && item.audio.id ? item.audio : null;
+    if (!text && !audio) return false;
+    if ((voiceCfg().tts || 'auto') === 'off') return false;
+    if (rememberAnnounced(typeof item.id === 'string' || typeof item.id === 'number' ? String(item.id) : '')) return false;
+    const kind = ANNOUNCE_KINDS.has(item.kind) ? item.kind : 'info';
+    const entry = { id: item.id, kind, text, audio, chime: item.chime === true, at: Date.now() };
+    if (URGENT_KINDS.has(kind)) announceQueue.unshift(entry);
+    else announceQueue.push(entry);
+    while (announceQueue.length > ANNOUNCE_QUEUE_MAX) {
+      let drop = -1;
+      for (let i = announceQueue.length - 1; i >= 0; i -= 1) {
+        if (!URGENT_KINDS.has(announceQueue[i].kind)) {
+          drop = i;
+          break;
+        }
+      }
+      announceQueue.splice(drop >= 0 ? drop : announceQueue.length - 1, 1);
+    }
+    schedulePump(0);
+    return true;
+  }
+
+  function schedulePump(ms) {
+    clearTimeout(pumpTimer);
+    pumpTimer = setTimeout(pump, ms);
+  }
+
+  function afterSpeech() {
+    if (announceQueue.length && !announcing) schedulePump(150);
+  }
+
+  function pump() {
+    pumpTimer = 0;
+    if (announcing || !announceQueue.length) return;
+    if (otherSpeech()) {
+      // A read-aloud the user asked for finishes first (up to a limit).
+      if (!waitingSince) waitingSince = Date.now();
+      if (Date.now() - waitingSince < ANNOUNCE_WAIT_MS) {
+        schedulePump(250);
+        return;
+      }
+      interruptOtherSpeech();
+    }
+    waitingSince = 0;
+    let entry = announceQueue.shift();
+    while (entry && Date.now() - entry.at > ANNOUNCE_MAX_AGE_MS) entry = announceQueue.shift();
+    if (entry) runAnnouncement(entry);
+  }
+
+  async function runAnnouncement(entry) {
+    stopBrowserSpeech();
+    stopClip();
+    const gen = ++speakGen;
+    announcing = entry;
+    const stopped = new Promise((resolve) => {
+      entry.abort = resolve;
+    });
+    emitState();
+    const play = async () => {
+      const v = voiceCfg();
+      if (entry.chime && v.chime !== false) {
+        await playChime(entry.kind).catch(() => {});
+        if (gen !== speakGen || announcing !== entry) return;
+      }
+      if (entry.audio) {
+        try {
+          await playClip(entry.audio.id, entry.audio.durationMs, gen);
+          return;
+        } catch (err) {
+          if (gen !== speakGen || announcing !== entry) return;
+          // Expired or unplayable audio: say the text instead.
+          if (g.console && g.console.warn) g.console.warn('Announcement audio failed; speaking the text instead.', err && err.message);
+        }
+      }
+      if (entry.text) await sayText(entry.text, gen);
+    };
+    try {
+      await Promise.race([play(), stopped]);
+    } catch (err) {
+      if (g.console && g.console.warn) g.console.warn('Announcement failed', err && err.message);
+    } finally {
+      if (announcing === entry) {
+        announcing = null;
+        lastSpeechEnd = Date.now();
+        emitState();
+      }
+      if (announceQueue.length) schedulePump(250);
+    }
+  }
+
+  /** End the announcement that is playing (the queue stays). */
+  function stopAnnouncement() {
+    const entry = announcing;
+    if (!entry) return;
+    announcing = null;
+    stopChime();
+    stopClip();
+    // Said by the daemon's voice (speech output set to the system voice): stop it there too.
+    if ((serverPending !== 0 && serverPending === speakGen) || Date.now() < serverSpeakUntil) {
+      serverSpeakUntil = 0;
+      postStop();
+    }
+    if (typeof entry.abort === 'function') entry.abort();
+    lastSpeechEnd = Date.now();
+  }
+
+  /**
+   * Drop announcements of a kind (its card was answered): queued ones, and the one playing.
+   * @param {string} kind
+   */
+  function dropAnnouncements(kind) {
+    for (let i = announceQueue.length - 1; i >= 0; i -= 1) if (announceQueue[i].kind === kind) announceQueue.splice(i, 1);
+    if (announcing && announcing.kind === kind) {
+      stopAnnouncement();
+      interruptOtherSpeech();
+      emitState();
+      afterSpeech();
+    }
+  }
+
+  /**
+   * Read text aloud with the daemon's natural voice (POST /api/tts/synthesize, then play the
+   * WAV); falls back to speak() when that fails.
+   * @param {string} text
+   */
+  async function speakNatural(text) {
+    const clean = speechText(text);
+    if (!clean) return;
+    stopAnnouncement();
+    const gen = ++speakGen;
+    stopBrowserSpeech();
+    stopClip();
+    naturalPending = gen;
+    emitState();
+    try {
+      const res = await api('POST', '/api/tts/synthesize', { text: clean }, { timeoutMs: 60000 });
+      if (gen !== speakGen) return;
+      if (!res || typeof res.id !== 'string' || !res.id) throw new Error('the daemon sent no audio');
+      naturalPending = 0;
+      await playClip(res.id, res.durationMs, gen);
+    } catch (err) {
+      if (gen !== speakGen) return;
+      naturalPending = 0;
+      fail(`The natural voice couldn't read this (${(err && err.message) || 'unknown error'}), so the browser voice reads it instead.`, 'tts', 'info');
+      speak(text);
+      return;
+    } finally {
+      if (naturalPending === gen) naturalPending = 0;
+      emitState();
+      afterSpeech();
+    }
   }
 
   /** @returns {{stt:string, tts:string, sttName:string, ttsName:string}} */
@@ -1065,7 +1611,13 @@ export function createVoice({ getConfig, api, onInterim, onFinal, onState, onErr
     isActive: () => Boolean(session),
     isSpeaking,
     speak,
+    speakNatural,
     cancelSpeech,
+    announce,
+    dropAnnouncements,
+    /** The announcement playing and the ones waiting (kinds), for the UI and tests. */
+    announcements: () => ({ current: announcing ? announcing.kind : null, queued: announceQueue.map((e) => e.kind) }),
+    unlockAudio,
     provider,
     phase: () => phase,
     mode: () => (session ? session.mode : null),
